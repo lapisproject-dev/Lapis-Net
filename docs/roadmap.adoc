@@ -253,14 +253,20 @@ Proposed as an Opus-planned wave (cryptographically novel, Double-Ratchet/MLS im
 highly security-critical) in the 2026-07-17 gap analysis; not yet started pending explicit
 go-ahead.
 
+**Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
+see V0.9's own section above) does **not** implement this wave's MLS target — V0.9.2's
+`EncryptionMode.MLS_ARCHIVE` stays reserved and rejected outright, with no implementation plan in
+that arc. The two MLS references are unrelated until this wave actually starts.
+
 == V0.9 — Asynchronous messages (email replacement)
 
 Target: envelope/body message format, optional ECIES/MLS-archive encryption, DHT-inbox +
 GossipSub-listener discovery, Lightning-HTLC first-contact spam deposit, market-based pinning —
 full spec in the vault concept note "Asynchrone Nachrichten (E-Mail-Ersatz)" (not yet mirrored
-into this repo's `docs/`). Split into four sub-waves on 2026-08-04; V0.9.1 has landed, V0.9.2–V0.9.4
-are not started. Functionally independent of V0.8 (separate subsystem, shares only the identity
-keypair and protocol core) — could in principle be sequenced before or after V0.8's own sub-waves.
+into this repo's `docs/`). Split into four sub-waves on 2026-08-04; V0.9.1 and V0.9.2 have landed,
+V0.9.3–V0.9.4 are not started. Functionally independent of V0.8 (separate subsystem, shares only
+the identity keypair and protocol core) — could in principle be sequenced before or after V0.8's
+own sub-waves.
 
 [cols="1,3"]
 |===
@@ -270,8 +276,9 @@ keypair and protocol core) — could in principle be sequenced before or after V
 | Mail envelope/body format (implemented — see below).
 
 | V0.9.2
-| Encryption: `HYBRID_ECIES` and `MLS_ARCHIVE` modes, already wire-representable and rejected
-outright by V0.9.1's codec and validator.
+| Encryption: `HYBRID_ECIES` mode (implemented — see below). `MLS_ARCHIVE` remains reserved and
+rejected outright at the same three layers V0.9.1 left it — no implementation plan exists for it in
+this arc; V0.8's own (separate) Double Ratchet/MLS target is unaffected.
 
 | V0.9.3
 | Threading, attachment fetch/encryption, address book, and the browser HTTP routes + inbox UI.
@@ -333,3 +340,63 @@ doc comments rather than silently omitted:
   signed and carried but nothing walks them — V0.9.3), **no attachment fetching, verification, or
   encryption key field** (`AttachmentRef.size` is declared, never checked — V0.9.3), and **no
   browser HTTP routes** (V0.9.3).
+
+=== V0.9.2 — Hybrid-ECIES encryption
+
+Target: make `EncryptionMode.HYBRID_ECIES` functional — a fresh AES-256-GCM content key per
+message, wrapped once per recipient plus once for the sender via ECIES on secp256k1, with the
+associated-data binding closing the "wrap transplant"/surreptitious-forwarding attack class
+identified in the sub-wave plan (an attacker reattaching a legitimately-sealed body and its wraps
+to a new, differently-signed envelope). `EncryptionMode.MLS_ARCHIVE` stays reserved and rejected
+outright at the same three layers V0.9.1 left it — no implementation plan exists for it in this
+arc (V0.8's own, separate Double Ratchet/MLS target is unaffected by this decision).
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.9.2
+| `HybridEcies.seal`/`open` — AES-256-GCM body encryption plus one ECIES-wrapped content key per
+recipient and one for the sender's own self-wrap ("Sender wrappt zusätzlich für sich selbst").
+`MailAadContext` — the content-independent envelope context (sender, full recipient set,
+timestamp, mode, `replyTo`/`threadRoot`) both AEADs are bound to; this is what makes a
+transplanted wrap/body pair fail to decrypt under a different envelope. `EciesWrap`/
+`EciesWrapCodec` — fixed-width (81-byte) inline wrap records, always inline (no CID-referenced
+blob variant — see architecture doc for why). `SealedBody`/`SealedBodyCodec` — the AES-256-GCM
+sealed-body blob, occupying the same frame slot the plaintext `MessageBody` blob used to.
+`ecdhSharedSecret` (`lapis-net-identity`) — the secp256k1 ECDH primitive, confirmed empirically to
+return `SHA-256(compressed shared point)`, not a raw curve coordinate. `MailDecryptionException` —
+the single undifferentiated failure type `HybridEcies.open` throws for every decrypt failure.
+`InboxPayload` (`Plaintext`/`Sealed`) — `InboxGossip`'s validator never decrypts and never holds a
+private key; an accepted `HYBRID_ECIES` message stays sealed in the index until an explicit,
+caller-driven `HybridEcies.open` call. HKDF-SHA256 (BouncyCastle) derives each wrap's AES key and
+GCM nonce from the ECDH shared secret, the ephemeral public key (as salt), and the wrap's own AAD
+digest (as info) — the wrap nonce is never transmitted, unlike the body's explicit random nonce.
+`HybridEciesAdversarialTest` — the mandatory security-critical spec: wrap transplant (the flagship
+case), tampered ephemeral key, off-curve ephemeral key rejected before ECDH, tampered wrap
+ciphertext, tampered body GCM tag/nonce, recipient-list truncation, oversized declared
+recipient/wrap counts rejected before allocation, and seal() freshness (no key/nonce reuse).
+|===
+
+==== Progress
+
+V0.9.2 is implemented (see `docs/architecture.adoc`'s "Hybrid-ECIES mail encryption (V0.9.2)"
+section). Deliberate scope cuts, stated as such in the code's own doc comments rather than
+silently omitted:
+
+* **No forward secrecy.** Archived mail must stay decryptable for as long as the recipient holds
+  their long-term identity key — this is the explicit product requirement for a store-and-forward
+  email replacement, not an oversight. V0.8's (separate) Double Ratchet is the forward-secret 1:1
+  channel.
+* **No post-quantum hybrid.** secp256k1 ECDH only — a future PQ-hybrid KEM would be a new
+  `EncryptionMode` wire value.
+* **No key rotation for archived mail.** A sealed body is bound to the identity keys that existed
+  at send time; rotating an identity key makes previously received mail permanently unreadable.
+* **No multi-device wrapping.** Exactly one wrap per recipient's single published identity key —
+  V0.8's multi-device sub-wave was cut from this arc.
+* **`MLS_ARCHIVE` still reserved and rejected outright** — no implementation plan exists for it in
+  this arc.
+* **Wraps are always inline**, never a CID-referenced blob — a blob would be unfetchable in this
+  codebase for the same reason `MailFrameCodec` carries the body inline (see architecture doc).
+* **The gossip validator never decrypts and never holds a private key** — a positive property
+  carried forward from V0.9.1's design, not a limitation of this wave.

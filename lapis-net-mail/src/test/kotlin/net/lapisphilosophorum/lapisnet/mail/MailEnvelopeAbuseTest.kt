@@ -290,54 +290,94 @@ class MailEnvelopeAbuseTest :
             }
         }
 
-        test("(f) reserved encryption modes are rejected outright at all three layers") {
-            // Layer 1: the constructor.
+        test("(f) MLS_ARCHIVE is rejected outright at all three layers, HYBRID_ECIES is not") {
+            // Layer 1: the constructor. MLS_ARCHIVE stays rejected verbatim.
             val sender = Secp256k1KeyPair.generate()
             val recipient = Secp256k1KeyPair.generate().publicKey
             shouldThrow<IllegalArgumentException> {
-                MessageEnvelope.create(sender, listOf(recipient), testCid(1), encryption = EncryptionMode.HYBRID_ECIES)
-            }
-            shouldThrow<IllegalArgumentException> {
                 MessageEnvelope.create(sender, listOf(recipient), testCid(1), encryption = EncryptionMode.MLS_ARCHIVE)
             }
+            // HYBRID_ECIES is rejected by the constructor ONLY for an incomplete wrap list - a
+            // COMPLETE one (recipients.size + 1) is accepted, see MessageEnvelopeTest's dedicated
+            // cases for that invariant in isolation.
+            shouldThrow<IllegalArgumentException> {
+                MessageEnvelope.create(sender, listOf(recipient), testCid(1), encryption = EncryptionMode.HYBRID_ECIES)
+            }
 
-            // Layer 2: the decoder. Flip an otherwise-valid envelope's encryption byte in place.
-            val envelope = MessageEnvelope.create(sender, listOf(recipient), testCid(1))
-            val bytes = MessageEnvelopeCodec.encode(envelope)
-            val encryptionByteOffset = 4 + 1 + 1 + 33 + 2 + 33 * 1 + 8
-
-            val hybridBytes = bytes.copyOf()
-            hybridBytes[encryptionByteOffset] = EncryptionMode.HYBRID_ECIES.wireValue
-            val hybridException =
-                shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(hybridBytes) }
-            hybridException.message?.contains("reserved") shouldBe true
-
-            val mlsBytes = bytes.copyOf()
-            mlsBytes[encryptionByteOffset] = EncryptionMode.MLS_ARCHIVE.wireValue
-            val mlsException = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(mlsBytes) }
-            mlsException.message?.contains("reserved") shouldBe true
-
-            // Layer 3: the validator. Wrapped in a frame, decode() throws before onGossipMessage
-            // ever reaches its own belt-and-braces encryption check - both layers are exercised by
-            // construction here, since decode() is the very first thing onGossipMessage does after
-            // MailFrameCodec.decode().
+            // Layer 2/3, HYBRID_ECIES half: a COMPLETE, well-formed hybrid envelope is accepted at
+            // both the decoder and the validator.
             val identity = DualKeyIdentity.generate()
             val node = LapisNode.create(identity)
             node.start(bootstrapPeers = emptyList())
             try {
                 val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-abuse-f"))
                 val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+
+                val senderKeyPair = Secp256k1KeyPair.generate()
+                val recipientKeyPair = Secp256k1KeyPair.generate()
+                val messageBody = MessageBody(subject = "s", body = "b")
+                val context =
+                    MailAadContext.forNewMessage(
+                        sender = senderKeyPair.publicKey,
+                        recipients = listOf(recipientKeyPair.publicKey),
+                        sentAtEpochSecond = 1_000,
+                    )
+                val sealed = HybridEcies.seal(messageBody, senderKeyPair, context)
+                val hybridEnvelope =
+                    MessageEnvelope.create(
+                        sender = senderKeyPair,
+                        recipients = listOf(recipientKeyPair.publicKey),
+                        contentCid = sealed.contentCid,
+                        sentAtEpochSecond = 1_000,
+                        encryption = EncryptionMode.HYBRID_ECIES,
+                        wraps = sealed.wraps,
+                    )
+                val hybridEnvelopeBytes = MessageEnvelopeCodec.encode(hybridEnvelope)
+
+                MessageEnvelopeCodec.decode(hybridEnvelopeBytes) shouldBe hybridEnvelope
+
+                val hybridFrame = MailFrameCodec.encode(hybridEnvelopeBytes, sealed.sealedBodyBytes)
+                val hybridIndex = InboxIndex()
+                val hybridResult =
+                    InboxGossip.onGossipMessage(hybridFrame, from, storage, hybridIndex, recipientKeyPair.publicKey)
+
+                hybridResult shouldBe ValidationResult.Valid
+                hybridIndex.latest().size shouldBe 1
+
+                // ... but a BYTE-FLIPPED hybrid envelope is still rejected - functional does not
+                // mean unchecked.
+                val corruptedHybridBytes = hybridEnvelopeBytes.copyOf()
+                corruptedHybridBytes[corruptedHybridBytes.size - 1] =
+                    (corruptedHybridBytes[corruptedHybridBytes.size - 1] + 1).toByte()
+                val corruptedFrame = MailFrameCodec.encode(corruptedHybridBytes, sealed.sealedBodyBytes)
+                val corruptedIndex = InboxIndex()
+                val corruptedResult =
+                    InboxGossip.onGossipMessage(
+                        corruptedFrame,
+                        from,
+                        storage,
+                        corruptedIndex,
+                        recipientKeyPair.publicKey,
+                    )
+
+                corruptedResult shouldBe ValidationResult.Invalid
+                corruptedIndex.latest() shouldBe emptyList()
+
+                // Layer 2/3, MLS_ARCHIVE half: still rejected outright, unchanged from V0.9.1.
+                val bytes = MessageEnvelopeCodec.encode(MessageEnvelope.create(sender, listOf(recipient), testCid(1)))
+                val encryptionByteOffset = 4 + 1 + 1 + 33 + 2 + 33 * 1 + 8
+                val mlsBytes = bytes.copyOf()
+                mlsBytes[encryptionByteOffset] = EncryptionMode.MLS_ARCHIVE.wireValue
+                val mlsException =
+                    shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(mlsBytes) }
+                mlsException.message?.contains("reserved") shouldBe true
+
                 val bodyBytes = encodedBody()
-
-                listOf(hybridBytes, mlsBytes).forEach { tamperedEnvelopeBytes ->
-                    val frameBytes = MailFrameCodec.encode(tamperedEnvelopeBytes, bodyBytes)
-                    val index = InboxIndex()
-
-                    val result = InboxGossip.onGossipMessage(frameBytes, from, storage, index, recipient)
-
-                    result shouldBe ValidationResult.Invalid
-                    index.latest() shouldBe emptyList()
-                }
+                val mlsFrame = MailFrameCodec.encode(mlsBytes, bodyBytes)
+                val mlsIndex = InboxIndex()
+                val mlsResult = InboxGossip.onGossipMessage(mlsFrame, from, storage, mlsIndex, recipient)
+                mlsResult shouldBe ValidationResult.Invalid
+                mlsIndex.latest() shouldBe emptyList()
 
                 val mintingNode = LapisNode.create(DualKeyIdentity.generate())
                 mintingNode.start(bootstrapPeers = emptyList())

@@ -3,13 +3,19 @@ package net.lapisphilosophorum.lapisnet.mail
 /**
  * How a [MessageEnvelope]'s referenced [MessageBody] blob is protected.
  *
- * **Only [NONE] is functional in V0.9.1.** [HYBRID_ECIES] and [MLS_ARCHIVE] exist as wire values
- * and enum constants so the V0.9.2 encryption wave needs no wire-format or schema change - they
- * are structurally representable but rejected outright at every layer that can reject them
- * ([MessageEnvelope]'s constructor, [MessageEnvelopeCodec.decode], and [InboxGossip]'s
- * validator). This mirrors `LtrRecordCodec`'s own `proofType = 2` precedent, which was
- * `PROOF_TYPE_LIGHTNING_RESERVED` and rejected outright through V0.5 before V0.6 implemented it
- * (see that file's own comment on the constant).
+ * **[NONE] and [HYBRID_ECIES] are both functional as of V0.9.2.** [HYBRID_ECIES] is
+ * `lapis-net-mail`'s hybrid AES-256-GCM + ECIES-on-secp256k1 encryption scheme - see
+ * [HybridEcies]'s class doc comment for the encryption itself and [MailAadContext]'s for the
+ * associated-data binding that stops a sealed body/wrap pair from being transplanted onto a
+ * different envelope.
+ *
+ * **[MLS_ARCHIVE] remains reserved and rejected outright** at every layer that can reject it
+ * ([MessageEnvelope]'s constructor, [MessageEnvelopeCodec.decode], and [InboxGossip]'s validator) -
+ * no implementation plan exists for it in this arc (V0.9.1-V0.9.4). This mirrors
+ * `LtrRecordCodec`'s own `proofType = 2` precedent, which was `PROOF_TYPE_LIGHTNING_RESERVED` and
+ * rejected outright through V0.5 before V0.6 implemented it (see that file's own comment on the
+ * constant) - the same mechanism this codebase uses whenever a wire value needs to exist before
+ * its implementation does.
  */
 enum class EncryptionMode(
     val wireValue: Byte,

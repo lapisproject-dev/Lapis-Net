@@ -107,4 +107,62 @@ class TwoNodeMailGossipIntegrationTest :
                 runCatching { nodeB.stop() }
             }
         }
+
+        test("V0.9.2: a HYBRID_ECIES message sent on node A propagates sealed to node B, which decrypts it locally") {
+            val identityA = DualKeyIdentity.generate()
+            val identityB = DualKeyIdentity.generate()
+            val nodeA = LapisNode.create(identityA)
+            val nodeB = LapisNode.create(identityB)
+            try {
+                nodeA.start(bootstrapPeers = emptyList())
+                nodeB.start(bootstrapPeers = emptyList())
+
+                val storageA = NabuStorage.attach(nodeA, Files.createTempDirectory("mail-gossip-hybrid-a"))
+                val storageB = NabuStorage.attach(nodeB, Files.createTempDirectory("mail-gossip-hybrid-b"))
+
+                val pubsubA = GossipPubSub.attach(nodeA)
+                val pubsubB = GossipPubSub.attach(nodeB)
+                val inboxB = InboxGossip.attach(pubsubB, storageB, identityB.secp256k1KeyPair.publicKey)
+
+                val senderOnA = MailSender(pubsubA, storageA)
+
+                nodeA.connect(PeerInfo(nodeB.peerId, nodeB.listenAddresses()))
+
+                val sent =
+                    senderOnA.send(
+                        localIdentity = identityA.secp256k1KeyPair,
+                        recipients = listOf(identityB.secp256k1KeyPair.publicKey),
+                        subject = "secret",
+                        body = "# encrypted hi\n\nfrom node A",
+                        encryption = EncryptionMode.HYBRID_ECIES,
+                    )
+
+                val deadline = Instant.now().plus(Duration.ofSeconds(20))
+                var inboxOnB = inboxB.messages()
+                while (inboxOnB.isEmpty() && Instant.now().isBefore(deadline)) {
+                    senderOnA.republish(sent)
+                    Thread.sleep(500)
+                    inboxOnB = inboxB.messages()
+                }
+
+                inboxOnB shouldHaveSize 1
+                val received = inboxOnB.single()
+                received.envelope shouldBe sent.envelope
+                received.envelope.encryption shouldBe EncryptionMode.HYBRID_ECIES
+                // The validator on B never decrypted it - it is still sealed in the index.
+                (received.payload is InboxPayload.Sealed) shouldBe true
+                received.body shouldBe null
+
+                val sealedOnB = (received.payload as InboxPayload.Sealed).sealedBody
+                val opened = HybridEcies.open(received.envelope, sealedOnB, identityB.secp256k1KeyPair)
+                opened shouldBe sent.body
+
+                inboxB.stop()
+                pubsubA.stop()
+                pubsubB.stop()
+            } finally {
+                runCatching { nodeA.stop() }
+                runCatching { nodeB.stop() }
+            }
+        }
     })

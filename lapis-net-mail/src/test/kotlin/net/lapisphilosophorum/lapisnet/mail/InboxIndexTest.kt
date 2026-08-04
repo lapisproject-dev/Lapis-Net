@@ -108,4 +108,27 @@ class InboxIndexTest :
 
             index.latest() shouldBe messages
         }
+
+        test("a Sealed-payload InboxMessage dedups and evicts identically to a Plaintext one") {
+            val index = InboxIndex(maxTracked = 2, maxPersisted = 100)
+            val sender = Secp256k1KeyPair.generate()
+            val recipient = Secp256k1KeyPair.generate().publicKey
+            val sealedBody = SealedBody(ByteArray(GCM_NONCE_SIZE), ByteArray(64))
+            val envelope1 = MessageEnvelope.create(sender, listOf(recipient), testCid(101))
+            val envelope2 = MessageEnvelope.create(sender, listOf(recipient), testCid(102))
+            val envelope3 = MessageEnvelope.create(sender, listOf(recipient), testCid(103))
+            val sealedMessage1 = InboxMessage(envelope1, sealedBody)
+            val sealedMessage2 = InboxMessage(envelope2, sealedBody)
+            val sealedMessage3 = InboxMessage(envelope3, sealedBody)
+
+            index.add(sealedMessage1) shouldBe true
+            index.add(sealedMessage1) shouldBe false // dedup
+            index.add(sealedMessage2) shouldBe true
+            index.add(sealedMessage3) shouldBe true // evicts sealedMessage1 (maxTracked = 2)
+
+            index.size() shouldBe 2
+            index.latest().map { it.envelope } shouldBe listOf(envelope2, envelope3)
+            (sealedMessage2.payload is InboxPayload.Sealed) shouldBe true
+            sealedMessage2.body shouldBe null
+        }
     })

@@ -19,11 +19,36 @@ internal data class MailContentId(
     override fun hashCode(): Int = bytes.contentHashCode()
 }
 
-/** One accepted inbox message: the verified envelope plus the body blob it is CID-bound to. */
+/** What an accepted inbox message actually carries. V0.9.2: encrypted mail stays SEALED in the
+ * index - [InboxGossip]'s validator holds only a public key and deliberately never decrypts (see
+ * that class's doc comment). Call [HybridEcies.open] explicitly, with a keypair, to read a
+ * [Sealed] payload. */
+sealed interface InboxPayload {
+    class Plaintext(
+        val body: MessageBody,
+    ) : InboxPayload
+
+    class Sealed(
+        val sealedBody: SealedBody,
+    ) : InboxPayload
+}
+
+/** One accepted inbox message: the verified envelope plus its [InboxPayload] - either the
+ * plaintext [MessageBody] ([EncryptionMode.NONE]) or a still-[SealedBody]
+ * ([EncryptionMode.HYBRID_ECIES]). See [InboxPayload]'s doc comment for why encrypted mail is
+ * never decrypted at this layer. */
 class InboxMessage(
     val envelope: MessageEnvelope,
-    val body: MessageBody,
-)
+    val payload: InboxPayload,
+) {
+    /** Source-compatibility convenience for [EncryptionMode.NONE] messages - `null` when the
+     * payload is still [InboxPayload.Sealed]. */
+    val body: MessageBody? get() = (payload as? InboxPayload.Plaintext)?.body
+
+    constructor(envelope: MessageEnvelope, body: MessageBody) : this(envelope, InboxPayload.Plaintext(body))
+
+    constructor(envelope: MessageEnvelope, sealedBody: SealedBody) : this(envelope, InboxPayload.Sealed(sealedBody))
+}
 
 /**
  * Bounded, in-memory index of [InboxMessage]s accepted by [InboxGossip]'s validator, keyed by

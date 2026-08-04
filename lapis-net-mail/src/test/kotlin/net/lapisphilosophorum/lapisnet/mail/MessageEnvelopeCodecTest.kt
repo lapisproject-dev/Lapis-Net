@@ -163,21 +163,28 @@ class MessageEnvelopeCodecTest :
             }
         }
 
-        test("decode rejects reserved encryption wire values with a 'reserved' message, unknown ones as 'unknown'") {
+        test(
+            "decode rejects MLS_ARCHIVE as reserved; a byte-flip to HYBRID_ECIES now fails on the missing wrap section",
+        ) {
             val sender = Secp256k1KeyPair.generate()
             val recipient = Secp256k1KeyPair.generate().publicKey
             val bytes = MessageEnvelopeCodec.encode(MessageEnvelope.create(sender, listOf(recipient), testCid(1)))
             val encryptionByteOffset = 4 + 1 + 1 + 33 + 2 + 33 * 1 + 8
 
-            val hybrid = bytes.copyOf()
-            hybrid[encryptionByteOffset] = 1
-            val hybridException = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(hybrid) }
-            hybridException.message?.contains("reserved") shouldBe true
-
+            // MLS_ARCHIVE is still rejected outright as "reserved" - unchanged from V0.9.1.
             val mls = bytes.copyOf()
             mls[encryptionByteOffset] = 2
             val mlsException = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(mls) }
             mlsException.message?.contains("reserved") shouldBe true
+
+            // HYBRID_ECIES is now functional (V0.9.2) - flipping an otherwise-NONE envelope's byte
+            // to 1 no longer fails with "reserved". It still fails, but for a DIFFERENT reason:
+            // decode() now expects a wrap section after the (still-NONE-shaped) threadRoot/reply
+            // fields, and the bytes that follow (the signature) do not parse as a valid wrap count.
+            val hybrid = bytes.copyOf()
+            hybrid[encryptionByteOffset] = 1
+            val hybridException = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(hybrid) }
+            hybridException.message?.contains("reserved") shouldBe false
 
             val unknown = bytes.copyOf()
             unknown[encryptionByteOffset] = 7
@@ -186,7 +193,9 @@ class MessageEnvelopeCodecTest :
             unknownException.message?.contains("unknown") shouldBe true
         }
 
-        test("encodeSignedBody's raw-field overload accepts HYBRID_ECIES while decode of those bytes throws") {
+        test(
+            "encodeSignedBody's raw-field overload writes HYBRID_ECIES with a 0-wrap section, decode of those bytes throws",
+        ) {
             val sender = Secp256k1KeyPair.generate()
             val recipient = Secp256k1KeyPair.generate().publicKey
 
@@ -199,6 +208,8 @@ class MessageEnvelopeCodecTest :
                     contentCid = testCid(1),
                     replyTo = null,
                     threadRoot = null,
+                    // wraps defaults to emptyList() - the raw overload writes the wrap section
+                    // with whatever it is given, no consistency check against recipients.size.
                 )
             val signature =
                 sender.sign(
@@ -208,7 +219,41 @@ class MessageEnvelopeCodecTest :
                 )
             val encoded = body + signature
 
-            shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(encoded) }
+            val exception = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(encoded) }
+            exception.message?.contains("wrap count") shouldBe true
+        }
+
+        test("encodeSignedBody's raw-field overload can emit an inconsistent wrapCount that decode then rejects") {
+            // This is the adversarial-test-enablement contract the raw overload's doc comment
+            // promises: it writes the wrap section with WHATEVER wraps it is given, so a caller can
+            // deliberately construct a wrapCount that does not match recipients.size + 1.
+            val sender = Secp256k1KeyPair.generate()
+            val recipient = Secp256k1KeyPair.generate().publicKey
+            val wrongCountWraps =
+                (1..3).map { EciesWrap(Secp256k1KeyPair.generate().publicKey, ByteArray(WRAPPED_KEY_SIZE)) }
+
+            val body =
+                MessageEnvelopeCodec.encodeSignedBody(
+                    sender = sender.publicKey,
+                    recipients = listOf(recipient),
+                    sentAtEpochSecond = 1000,
+                    encryption = EncryptionMode.HYBRID_ECIES,
+                    contentCid = testCid(1),
+                    replyTo = null,
+                    threadRoot = null,
+                    wraps = wrongCountWraps,
+                )
+            val signature =
+                sender.sign(
+                    java.security.MessageDigest
+                        .getInstance("SHA-256")
+                        .digest(body),
+                )
+            val encoded = body + signature
+
+            val exception = shouldThrow<MalformedMessageEnvelopeException> { MessageEnvelopeCodec.decode(encoded) }
+            exception.message?.contains("wrap count") shouldBe true
+            exception.message?.contains("does not match recipient count") shouldBe true
         }
 
         test("an envelope at the recipient cap still encodes, signs, verifies, and round-trips") {

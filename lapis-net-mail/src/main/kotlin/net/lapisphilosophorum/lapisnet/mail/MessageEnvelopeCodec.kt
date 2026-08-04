@@ -33,8 +33,16 @@ class MalformedMessageEnvelopeException(
  * Layout of [encodeSignedBody]'s output: `magic(4) | version(1) | flags(1) | sender(33) |
  * recipientCount(2) | recipients(33*count) | sentAtEpochSecond(8) | encryption(1) |
  * contentCidLen(2) | contentCid(contentCidLen) | replyToLen(2, only if flags bit0 set) |
- * replyTo(replyToLen) | threadRootLen(2, only if flags bit1 set) | threadRoot(threadRootLen)`.
- * [encode] appends the 64-byte signature after that.
+ * replyTo(replyToLen) | threadRootLen(2, only if flags bit1 set) | threadRoot(threadRootLen) |
+ * wrapCount(2) | wrap(81)*wrapCount (only if encryption == HYBRID_ECIES)`. [encode] appends the
+ * 64-byte signature after that.
+ *
+ * **`VERSION` stays `1` for the V0.9.2 wrap-section addition.** An [EncryptionMode.NONE]
+ * envelope's encoding is byte-identical to V0.9.1's, so no existing artifact changes meaning; the
+ * new section is gated by an existing, already-signed field (the encryption byte itself); and a
+ * pre-V0.9.2 node that meets a `HYBRID_ECIES` envelope rejects it at the encryption check (see
+ * [decode]) before ever reaching the wrap section, so it can never misparse the new bytes. Bumping
+ * the version would break every V0.9.1 envelope for no security gain.
  */
 object MessageEnvelopeCodec {
     private val MAGIC = "LNME".toByteArray(Charsets.US_ASCII)
@@ -51,19 +59,23 @@ object MessageEnvelopeCodec {
     const val MAX_CID_BYTES = 128
 
     /** [net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest] treats the whole signed
-     * body as a single part, capped at this size. Worst case: `4+1+1+33 + 2 + 64*33 (recipients) +
-     * 8 + 1 + 2+128 (contentCid) + 2+128 (replyTo) + 2+128 (threadRoot)` ≈ 2.6 KB - comfortably
-     * under this limit. */
+     * body as a single part, capped at this size. Worst case (V0.9.2, including a full
+     * HYBRID_ECIES wrap section): `4+1+1+33 + 2 + 64*33 (recipients) + 8 + 1 + 2+128 (contentCid) +
+     * 2+128 (replyTo) + 2+128 (threadRoot) ≈ 2.6 KB + 2 + 65*81 (wrap section, EciesWrapCodec) =
+     * 5,267 → ≈ 7.9 KB` - comfortably under this limit. */
     const val MAX_BODY_SIZE = 0xFFFF
 
     /** Builds the exact bytes that get domain-separated-digested and signed - see
      * [MessageEnvelope.create]. Deliberately accepts ANY [EncryptionMode] (including the reserved
-     * [EncryptionMode.HYBRID_ECIES]/[EncryptionMode.MLS_ARCHIVE]) - this is the "structurally
-     * representable" half of the V0.9.2 forward-compatibility requirement (see [EncryptionMode]'s
-     * doc comment): it lets a future encryption wave add real payloads without touching this
-     * codec, and it lets adversarial tests build reserved-mode bytes without reflection. Every
-     * OTHER path ([MessageEnvelope]'s constructor, [MessageEnvelope.create], [decode]) rejects
-     * them - only this raw-field overload does not. */
+     * [EncryptionMode.MLS_ARCHIVE]) - this is the "structurally representable" half of the
+     * forward-compatibility requirement (see [EncryptionMode]'s doc comment): it lets a future
+     * encryption wave add real payloads without touching this codec, and it lets adversarial tests
+     * build reserved-mode bytes without reflection. Every OTHER path ([MessageEnvelope]'s
+     * constructor, [MessageEnvelope.create], [decode]) rejects [EncryptionMode.MLS_ARCHIVE] - only
+     * this raw-field overload does not. It also writes the wrap section with WHATEVER [wraps] it is
+     * given and no consistency requirement against [recipients].size - that is precisely what lets
+     * adversarial tests construct a wrap-count mismatch; every other path enforces the invariant
+     * (see [MessageEnvelope]'s [init] block). */
     fun encodeSignedBody(
         sender: Secp256k1PublicKey,
         recipients: List<Secp256k1PublicKey>,
@@ -72,6 +84,7 @@ object MessageEnvelopeCodec {
         contentCid: Cid,
         replyTo: Cid?,
         threadRoot: Cid?,
+        wraps: List<EciesWrap> = emptyList(),
     ): ByteArray {
         require(recipients.isNotEmpty()) { "an envelope must have at least one recipient" }
         require(recipients.size <= MAX_RECIPIENTS) {
@@ -113,6 +126,9 @@ object MessageEnvelopeCodec {
                 writeShort(threadRootBytes.size)
                 write(threadRootBytes)
             }
+            if (encryption == EncryptionMode.HYBRID_ECIES) {
+                EciesWrapCodec.encodeInto(this, wraps)
+            }
         }
         val body = out.toByteArray()
         require(body.size <= MAX_BODY_SIZE) { "encoded envelope body exceeds $MAX_BODY_SIZE bytes: ${body.size}" }
@@ -129,6 +145,7 @@ object MessageEnvelopeCodec {
             contentCid = envelope.contentCid,
             replyTo = envelope.replyTo,
             threadRoot = envelope.threadRoot,
+            wraps = envelope.wraps,
         )
 
     /** The full canonical artifact: signed body followed by the 64-byte signature. */
@@ -145,9 +162,10 @@ object MessageEnvelopeCodec {
      * [MessageEnvelope.verify] before trusting it.
      *
      * @throws MalformedMessageEnvelopeException if the bytes are structurally invalid, including
-     * an unknown encryption wire value or a known-but-reserved one ([EncryptionMode.HYBRID_ECIES]/
-     * [EncryptionMode.MLS_ARCHIVE] - rejected outright in V0.9.1, see [EncryptionMode]'s doc
-     * comment).
+     * an unknown encryption wire value, a known-but-reserved one ([EncryptionMode.MLS_ARCHIVE] -
+     * still rejected outright, see [EncryptionMode]'s doc comment), or - new in V0.9.2 - a
+     * [EncryptionMode.HYBRID_ECIES] wrap section whose declared count does not match
+     * `recipientCount + 1` (see [EciesWrapCodec.decodeFrom]).
      */
     fun decode(bytes: ByteArray): MessageEnvelope {
         try {
@@ -182,9 +200,9 @@ object MessageEnvelopeCodec {
             val encryption =
                 EncryptionMode.fromWireValue(encryptionByte)
                     ?: throw MalformedMessageEnvelopeException("unknown encryption mode: $encryptionByte")
-            if (encryption != EncryptionMode.NONE) {
+            if (encryption == EncryptionMode.MLS_ARCHIVE) {
                 throw MalformedMessageEnvelopeException(
-                    "encryption mode $encryption is reserved for V0.9.2 and rejected outright in V0.9.1",
+                    "encryption mode $encryption is reserved and rejected outright",
                 )
             }
 
@@ -232,6 +250,13 @@ object MessageEnvelopeCodec {
                     null
                 }
 
+            val wraps =
+                if (encryption == EncryptionMode.HYBRID_ECIES) {
+                    EciesWrapCodec.decodeFrom(input, expectedWrapCount = recipientCount + 1)
+                } else {
+                    emptyList()
+                }
+
             val signature = ByteArray(SIGNATURE_SIZE).also { input.readFully(it) }
             if (input.available() > 0) throw MalformedMessageEnvelopeException("trailing bytes after signature")
 
@@ -243,6 +268,7 @@ object MessageEnvelopeCodec {
                 contentCid = Cid.cast(contentCidBytes),
                 replyTo = replyTo,
                 threadRoot = threadRoot,
+                wraps = wraps,
                 signature = signature,
             )
         } catch (e: EOFException) {

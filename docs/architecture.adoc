@@ -1227,14 +1227,16 @@ nothing legitimately subscribed to it could be the intended recipient of an enve
 that identity, so there is no mesh-wide convergence property worth preserving here, unlike on a
 network-wide topic.
 
-**Encryption is wire-representable and rejected outright.** `EncryptionMode.HYBRID_ECIES` and
-`EncryptionMode.MLS_ARCHIVE` exist as enum constants and wire values so the future V0.9.2 wave
-needs no wire-format or schema change, but only `EncryptionMode.NONE` is functional in V0.9.1: the
-two reserved modes are rejected at three independent layers — `MessageEnvelope`'s constructor,
-`MessageEnvelopeCodec.decode`, and `InboxGossip`'s validator (belt-and-braces, since `decode()`
-already rejects them before the validator's own check could ever run). This mirrors
-`LtrRecordCodec`'s own pre-V0.6 `proofType = 2` precedent, which was rejected outright through V0.5
-before V0.6 implemented it as `PROOF_TYPE_LIGHTNING`.
+**Encryption was wire-representable and rejected outright in V0.9.1.** `EncryptionMode.HYBRID_ECIES`
+and `EncryptionMode.MLS_ARCHIVE` existed as enum constants and wire values from V0.9.1 onward so a
+later encryption wave would need no wire-format or schema change, but only `EncryptionMode.NONE`
+was functional in V0.9.1 itself: both reserved modes were rejected at three independent layers —
+`MessageEnvelope`'s constructor, `MessageEnvelopeCodec.decode`, and `InboxGossip`'s validator
+(belt-and-braces, since `decode()` already rejected them before the validator's own check could
+ever run). This mirrored `LtrRecordCodec`'s own pre-V0.6 `proofType = 2` precedent, which was
+rejected outright through V0.5 before V0.6 implemented it as `PROOF_TYPE_LIGHTNING`. **As of V0.9.2**
+(see that section below), `HYBRID_ECIES` is functional; only `MLS_ARCHIVE` remains rejected at all
+three layers.
 
 **Two independent caps, as established in V0.1.7.** `InboxIndex` mirrors `VeritasGrantIndex`'s
 two-cap structure: an evicting, LRU-ish in-memory tracking cap (`MAX_TRACKED_MESSAGES`, 8,000) and
@@ -1267,8 +1269,9 @@ GossipSub's asynchronous mesh formation.
 * **No attachment fetching, verification, or encryption.** `AttachmentRef.size` is a declared value,
   never checked against the referenced blob; there is deliberately no encryption-key field — V0.9.3.
 * **No browser HTTP routes.** `lapis-net-browser` is untouched by this wave — V0.9.3.
-* **No encryption.** `HYBRID_ECIES`/`MLS_ARCHIVE` are wire-representable but rejected outright, as
-  above — V0.9.2.
+* **No encryption in V0.9.1 itself** — `HYBRID_ECIES`/`MLS_ARCHIVE` were wire-representable but
+  rejected outright, as above. Addressed for `HYBRID_ECIES` in V0.9.2 (see that section below);
+  `MLS_ARCHIVE` remains rejected.
 
 **Known gap closed: CID multihash length overflow.** A pre-merge security audit of this wave found
 that `MessageEnvelopeCodec`'s `contentCid`/`replyTo`/`threadRoot` decode sites and
@@ -1285,6 +1288,135 @@ at all four call sites before `Cid.cast(...)` is ever invoked, plus a defense-in
 regression coverage. The three pre-existing sibling codecs with the same underlying construct
 (`VeritasGrantCodec`, `LtrRecordCodec`, `KarmaVoteCodec`) were out of scope for this fix and are
 tracked separately.
+
+== Hybrid-ECIES mail encryption (V0.9.2)
+
+`lapis-net-mail`'s V0.9.2 sub-wave makes `EncryptionMode.HYBRID_ECIES` functional, the second of
+the two encryption modes V0.9.1 shipped as wire-representable-but-rejected. `EncryptionMode.MLS_ARCHIVE`
+stays reserved and rejected outright at the same three layers V0.9.1 left it (`MessageEnvelope`'s
+constructor, `MessageEnvelopeCodec.decode`, `InboxGossip`'s validator) — no implementation plan
+exists for it in this arc.
+
+**The scheme, in one paragraph.** A fresh 32-byte AES-256-GCM content key encrypts the
+`MessageBodyCodec`-encoded body into a `SealedBody` blob, which occupies exactly the frame slot the
+plaintext body blob used to — so `MessageEnvelope.contentCid` and `InboxGossip`'s CID-binding check
+work unchanged for both modes. That content key is then ECIES-wrapped once per recipient, plus once
+more for the sender's own public key ("Sender wrappt zusätzlich für sich selbst" — sent mail stays
+readable to its own sender). Each wrap (`EciesWrap`) is a fixed-width 81-byte record: a 33-byte
+ephemeral secp256k1 public key plus a 48-byte AES-256-GCM-wrapped copy of the content key (32-byte
+key + 16-byte GCM tag). Wraps are carried inline in the envelope's signed body — see "wraps are
+always inline" below.
+
+**The AAD binding, and the attack it closes.** This is the single most important design decision in
+this sub-wave. Consider an attacker who observes a legitimately-sealed message: envelope A, signed
+by sender S1, addressed to recipient R1, with sealed body `C_A` and wrap list `W_A`. The attacker
+holds their own valid keypair S2 and constructs envelope B: `sender = S2`, same recipients, same
+`contentCid`, same `sentAtEpochSecond`/`replyTo`/`threadRoot`, `encryption = HYBRID_ECIES`,
+`wraps = W_A` — and signs it correctly with S2's own key. Envelope B is **structurally valid and
+correctly signed**. It passes every V0.9.1 check: the signature verifies under the embedded sender
+key S2, R1 is addressed, and the CID binding holds because the body bytes are unchanged. R1's inbox
+accepts it and shows a message apparently from S2 whose content S1 actually wrote in confidence to
+R1. Nothing in V0.9.1's checks stops this — only the associated data can. `MailAadContext` closes it
+by deriving a canonical, content-independent serialization of the envelope's context (sender, the
+*full* recipient set, timestamp, encryption mode, `replyTo`/`threadRoot` — deliberately NOT
+`contentCid`, see below) and folding it into two domain-separated SHA-256 digests: `aadForBody`
+(binds the body AEAD to the sealed-body format version and this context) and `aadForWrap` (per
+recipient slot, additionally binding `contentCid`, the slot index, the slot's public key, and the
+ephemeral public key). Both are passed as AES-GCM associated data. Because envelope B's sender
+differs, R1's re-derived `aadForWrap` differs from the one S1 sealed under — the HKDF-derived wrap
+key differs AND the GCM AAD check fails, so `HybridEcies.open` fails for two independent reasons,
+not one. `HybridEciesAdversarialTest`'s wrap-transplant case proves this concretely: it opens the
+*identical* wrap/body bytes once under envelope A's context (succeeds) and once under envelope B's
+(fails) — isolating the AAD, and nothing else, as the cause.
+
+`contentCid` is deliberately excluded from `aadForBody` (it is the CID of the body AEAD's own
+*output*, so including it would be circular) — but a body swap is still caught, in three
+independent ways: `aadForWrap` includes `contentCid`, so a swapped body cannot unwrap the content
+key at all; `HybridEcies.open` separately re-checks `MessageBodyCodec.cidFor(sealedBodyBytes) ==
+envelope.contentCid` before ever calling `aadForBody`; and `contentCid` is itself inside the
+envelope's signed body, so an unchanged sender cannot swap it without breaking their own signature.
+
+**The key derivation, and what `Secp256k1.ecdh` actually returns.** `fr.acinq.secp256k1:secp256k1-kmp:0.23.0`'s
+`ecdh(privateKey, publicKey)` was empirically confirmed — not assumed — to return exactly
+`SHA-256(compressed 33-byte serialization of the shared point)`, libsecp256k1's default ECDH hash
+function, NOT the raw X coordinate (`lapis-net-identity`'s `ecdhSharedSecret` doc comment states
+the finding; `EcdhAgreementTest` pins it as a regression, independently recomputing the shared
+point via the same jar's `pubKeyTweakMul`/`pubKeyCompress` primitives). Consequently the ECDH
+output is already full-entropy and needs no additional pre-hash before use as HKDF input keying
+material — HKDF-Extract is retained anyway (cheap, lets the ephemeral public key participate as
+salt, keeps the construction textbook-shaped) but is not load-bearing for entropy here.
+HKDF-Expand IS load-bearing: `HKDF-SHA256(ikm = ecdhSharedSecret(...), salt =
+ephemeralPublicKey.bytes, info = "LapisNet:mail-hybrid-ecies:v1:wrap-key" || aadForWrap(...), L =
+44)` yields a 32-byte AES key and a 12-byte GCM nonce, per recipient slot — making each slot's
+derived key a distinct function of the AAD context, so a transplanted wrap fails at the KDF layer,
+not merely at the AEAD tag check. **The wrap's GCM nonce is never transmitted** — it is
+HKDF-derived, putting zero attacker-controlled nonce bytes on the wire (the wrap key is single-use
+by construction: a fresh ephemeral keypair per `seal()` call and a distinct HKDF context per
+recipient slot make nonce reuse impossible unless the ephemeral key itself repeats, in which case a
+transmitted nonce would not help either). This mirrors RFC 9180 (HPKE)'s key-schedule shape. The
+**body's** AEAD nonce, by contrast, IS an explicit random 12-byte field in the `SealedBody` blob —
+the content key is sender-chosen and not tied to a freshly-generated asymmetric key, so an explicit
+random nonce is the belt-and-braces choice for that layer, and gives the freshness invariant a
+second, independent source.
+
+**Wraps are always inline** — there is deliberately no CID-referenced "recipients blob" variant for
+high recipient counts. A CID-referenced blob is unfetchable in this codebase for exactly the reason
+`MailFrameCodec` already carries the body inline instead of a pointer (see that section above):
+`Kademlia.dialPeer` is documented broken since V0.1.4, and `InboxGossip`'s validator may make no
+network calls — a recipient could never reliably obtain their own wrap from a blob referenced only
+by CID. At `MAX_RECIPIENTS = 64` the worst-case wrap section is `2 + 65 × 81 = 5,267` bytes, which
+brings the largest possible signed envelope body from V0.9.1's ~2.6 KB to ~7.9 KB — about 12% of the
+65,535-byte envelope-section ceiling and 3% of the 256 KiB gossip ceiling. There is no size
+pressure to relieve. A future high-fan-out variant would get its own `EncryptionMode` wire value —
+the mechanism this codebase already uses for forward-compatible mode additions (`LtrRecordCodec`'s
+`proofType` precedent) — not a retrofit of this one. The wire format's `VERSION` byte stays `1`: an
+`EncryptionMode.NONE` envelope's encoding is byte-identical to V0.9.1's, the new wrap section is
+gated by the already-signed encryption byte, and a pre-V0.9.2 node rejects a `HYBRID_ECIES`
+envelope at the encryption check before ever reaching the wrap section.
+
+**The validator never decrypts.** `InboxGossip.onGossipMessage` is only ever given a
+`Secp256k1PublicKey` — private key material never enters the GossipSub validator, by construction.
+An accepted `HYBRID_ECIES` message is indexed as `InboxPayload.Sealed`, still encrypted; decryption
+is an explicit, later, caller-driven `HybridEcies.open` call with a keypair. `InboxMessage` is now a
+thin wrapper over a sealed `InboxPayload` (`Plaintext` or `Sealed`) rather than an always-decoded
+`MessageBody`, with a `body: MessageBody?` convenience accessor (`null` for still-sealed mail) kept
+for source compatibility with V0.9.1 call sites.
+
+**Bounded work, independent of wrap count.** `HybridEcies.open` locates its own wrap slot by index
+(comparing the local identity against the envelope's signed recipient list, falling back to the
+sender for the self-wrap) — never by trial-decrypting every wrap in the list. It performs exactly
+one ECDH and two AES-GCM operations per call, regardless of how many recipients the envelope
+addresses; a trial-decryption loop would let a 65-wrap envelope cost 65 ECDH operations per delivery
+attempt, an amplification vector this design removes entirely. `EciesWrapCodec.decodeFrom` applies
+the same check-then-allocate discipline as every other codec in this module: `wrapCount` is
+validated against both an absolute cap (`MAX_WRAPS = 65`) and the expected `recipientCount + 1`
+BEFORE a single wrap record is allocated — total allocation for the wrap section is bounded at
+`65 × 81 = 5,265` bytes before any input is trusted, mirroring the CID-length-overflow lesson from
+V0.9.1's own security round above.
+
+**Deliberately accepted gaps:**
+
+* **No forward secrecy.** Archived mail must stay decryptable for as long as the recipient holds
+  their long-term secp256k1 identity key — there is intentionally no ratchet, no ephemeral-key
+  deletion, and no post-compromise security; compromise of a recipient's long-term private key
+  retroactively exposes every message ever sealed to them. This is the explicit product requirement
+  for a store-and-forward email replacement, not an oversight — V0.8's Double Ratchet is the
+  forward-secret 1:1 channel and is a different subsystem.
+* **No post-quantum hybrid.** secp256k1 ECDH only — a store-and-forward archive is precisely the
+  harvest-now-decrypt-later target, accepted for now; a PQ-hybrid KEM would be a new
+  `EncryptionMode` wire value.
+* **No key rotation for archived mail.** A sealed body is bound to the identity keys that existed
+  at send time; rotating an identity key makes previously received mail permanently unreadable.
+* **No multi-device wrapping.** Exactly one wrap per recipient's single published identity key — a
+  recipient with two devices must share the private key between them; V0.8's multi-device sub-wave
+  was cut from this arc.
+* **`MLS_ARCHIVE` remains reserved and rejected outright**, as above.
+
+**Wire-format changes.** `MessageEnvelopeCodec.encodeSignedBody`'s layout gains an optional trailing
+section: `... | replyTo(replyToLen) | threadRootLen(2) | threadRoot(threadRootLen) | wrapCount(2) |
+wrap(81) * wrapCount` — present iff `encryption == HYBRID_ECIES`. `SealedBodyCodec`'s independent
+layout: `magic(4) "LNSB" | version(1) | flags(1, reserved) | nonce(12) | ciphertextLen(2) |
+ciphertext(ciphertextLen)` (ciphertext includes the trailing 16-byte GCM tag).
 
 == Diagrams
 

@@ -123,13 +123,50 @@ class MessageEnvelopeTest :
             }
         }
 
-        test("create rejects HYBRID_ECIES encryption") {
+        test("create rejects HYBRID_ECIES without a complete wrap list") {
             val sender = Secp256k1KeyPair.generate()
             val recipient = Secp256k1KeyPair.generate().publicKey
 
+            // Empty wraps.
             shouldThrow<IllegalArgumentException> {
                 MessageEnvelope.create(sender, listOf(recipient), testCid(1), encryption = EncryptionMode.HYBRID_ECIES)
             }
+
+            // recipients.size wraps (missing the sender's own self-wrap - must be size + 1).
+            val oneWrapTooFew =
+                listOf(
+                    EciesWrap(Secp256k1KeyPair.generate().publicKey, ByteArray(WRAPPED_KEY_SIZE)),
+                )
+            shouldThrow<IllegalArgumentException> {
+                MessageEnvelope.create(
+                    sender,
+                    listOf(recipient),
+                    testCid(1),
+                    encryption = EncryptionMode.HYBRID_ECIES,
+                    wraps = oneWrapTooFew,
+                )
+            }
+        }
+
+        test("create accepts HYBRID_ECIES with recipients.size + 1 wraps") {
+            val sender = Secp256k1KeyPair.generate()
+            val recipient = Secp256k1KeyPair.generate().publicKey
+            val wraps =
+                (0..1).map {
+                    EciesWrap(Secp256k1KeyPair.generate().publicKey, ByteArray(WRAPPED_KEY_SIZE))
+                }
+
+            val envelope =
+                MessageEnvelope.create(
+                    sender,
+                    listOf(recipient),
+                    testCid(1),
+                    encryption = EncryptionMode.HYBRID_ECIES,
+                    wraps = wraps,
+                )
+
+            envelope.wraps.size shouldBe 2
+            MessageEnvelope.verify(envelope) shouldBe true
         }
 
         test("create rejects MLS_ARCHIVE encryption") {

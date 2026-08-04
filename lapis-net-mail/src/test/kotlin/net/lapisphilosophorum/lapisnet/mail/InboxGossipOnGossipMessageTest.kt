@@ -60,7 +60,7 @@ class InboxGossipOnGossipMessageTest :
                 val tracked = index.latest()
                 tracked.size shouldBe 1
                 tracked.single().envelope.sender shouldBe sender.publicKey
-                tracked.single().body.subject shouldBe "hello"
+                tracked.single().body!!.subject shouldBe "hello"
 
                 // Durable persistence, verified the same way TwoNodeVeritasGossipIntegrationTest
                 // does: re-putting the identical bytes is idempotent/deterministic and yields the
@@ -198,4 +198,116 @@ class InboxGossipOnGossipMessageTest :
         // repository mocks nothing, and there is no way to make a real NabuStorage.put() fail on
         // demand without either mocking or corrupting the temp directory mid-test (itself flaky).
         // Skipped, exactly as the plan's own test list anticipates.
+
+        test("V0.9.2: a valid HYBRID_ECIES frame is Valid and lands in the index as InboxPayload.Sealed") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-ongossip-hybrid"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+
+                val sender = Secp256k1KeyPair.generate()
+                val recipient = identity.secp256k1KeyPair
+                val body = MessageBody(subject = "encrypted", body = "hidden")
+                val context = MailAadContext.forNewMessage(sender.publicKey, listOf(recipient.publicKey), 1_000)
+                val sealed = HybridEcies.seal(body, sender, context)
+                val envelope =
+                    MessageEnvelope.create(
+                        sender = sender,
+                        recipients = listOf(recipient.publicKey),
+                        contentCid = sealed.contentCid,
+                        sentAtEpochSecond = 1_000,
+                        encryption = EncryptionMode.HYBRID_ECIES,
+                        wraps = sealed.wraps,
+                    )
+                val frame = MailFrameCodec.encode(MessageEnvelopeCodec.encode(envelope), sealed.sealedBodyBytes)
+
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, recipient.publicKey)
+
+                result shouldBe ValidationResult.Valid
+                val tracked = index.latest()
+                tracked.size shouldBe 1
+                (tracked.single().payload is InboxPayload.Sealed) shouldBe true
+                tracked.single().body shouldBe null
+                HybridEcies.open(envelope, sealed.sealedBody, recipient) shouldBe body
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("V0.9.2: an MLS_ARCHIVE frame is Invalid") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-ongossip-mls"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+                val recipient = identity.secp256k1KeyPair.publicKey
+
+                val sender = Secp256k1KeyPair.generate()
+                val envelope = MessageEnvelope.create(sender, listOf(recipient), testCidForMls())
+                val bytes = MessageEnvelopeCodec.encode(envelope)
+                val encryptionByteOffset = 4 + 1 + 1 + 33 + 2 + 33 * 1 + 8
+                bytes[encryptionByteOffset] = EncryptionMode.MLS_ARCHIVE.wireValue
+                val bodyBytes = MessageBodyCodec.encode(MessageBody(subject = "s", body = "b"))
+                val frame = MailFrameCodec.encode(bytes, bodyBytes)
+
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, recipient)
+
+                result shouldBe ValidationResult.Invalid
+                index.latest() shouldBe emptyList()
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("V0.9.2: a HYBRID_ECIES frame whose body section is a plaintext MessageBody blob is Invalid") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-ongossip-wrong-blob-type"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+
+                val sender = Secp256k1KeyPair.generate()
+                val recipient = identity.secp256k1KeyPair
+                // A structurally-valid plaintext MessageBody blob, wrong type for HYBRID_ECIES -
+                // SealedBodyCodec.decode must reject it (bad magic: "LNMB" != "LNSB").
+                val plaintextBodyBytes = MessageBodyCodec.encode(MessageBody(subject = "s", body = "b"))
+                val plaintextContentCid = MessageBodyCodec.cidFor(plaintextBodyBytes)
+                val context = MailAadContext.forNewMessage(sender.publicKey, listOf(recipient.publicKey), 1_000)
+                // Reuse a real wrap list shape (count-correct) so decode() gets past the wrap
+                // section - it is the SealedBodyCodec.decode(frame.bodyBytes) call that must fail.
+                val sealed =
+                    HybridEcies.seal(MessageBody(subject = "irrelevant", body = "irrelevant"), sender, context)
+                val envelope =
+                    MessageEnvelope.create(
+                        sender = sender,
+                        recipients = listOf(recipient.publicKey),
+                        contentCid = plaintextContentCid,
+                        sentAtEpochSecond = 1_000,
+                        encryption = EncryptionMode.HYBRID_ECIES,
+                        wraps = sealed.wraps,
+                    )
+                val frame = MailFrameCodec.encode(MessageEnvelopeCodec.encode(envelope), plaintextBodyBytes)
+
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, recipient.publicKey)
+
+                result shouldBe ValidationResult.Invalid
+                index.latest() shouldBe emptyList()
+            } finally {
+                node.stop()
+            }
+        }
     })
+
+private fun testCidForMls(): io.ipfs.cid.Cid =
+    io.ipfs.cid.Cid.buildCidV1(
+        io.ipfs.cid.Cid.Codec.Raw,
+        io.ipfs.multihash.Multihash.Type.sha2_256,
+        ByteArray(32) { 3 },
+    )

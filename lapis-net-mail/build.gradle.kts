@@ -27,10 +27,19 @@
 // subsystem, not a scoring dimension, and shares only the identity keypair and the protocol core
 // (see docs/roadmap.adoc's V0.9 entry and docs/architecture.adoc's Layering section). Nothing in
 // MessageEnvelope's data model needs a VeritasGrant, LtrRecord, KarmaVote, or MadliDailyVector.
+// V0.9.2 addition: BouncyCastle stays `implementation`, same reasoning as
+// lapis-net-identity/build.gradle.kts's own comment about secp256k1-kmp/BouncyCastle - its
+// HKDFBytesGenerator/HKDFParameters types (used internally by HybridEcies's key derivation) never
+// appear in any public signature of this module. No secp256k1-kmp dependency is added here: the
+// ECDH primitive (ecdhSharedSecret) lives in lapis-net-identity and reaches this module through the
+// existing `api(project(":lapis-net-identity"))` edge above as a Lapis-value-typed function
+// (Secp256k1PrivateKey, Secp256k1PublicKey in/out) - no third-party crypto type crosses the
+// module boundary, upholding lapis-net-identity's own stated rule.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
     api(project(":lapis-net-storage"))
     api(project(":lapis-net-networking"))
     api(rootProject.libs.java.cid)
+    implementation(rootProject.libs.bouncycastle.provider)
 }

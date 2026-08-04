@@ -20,11 +20,18 @@ private const val SIGNATURE_SIZE = 64
  * own and is instead authenticated transitively through this binding.
  *
  * **Scope cuts (V0.9.1) - see [InboxGossip]'s class doc comment for the full list, repeated here
- * because they bear directly on this type:** only [EncryptionMode.NONE] is functional this wave
- * (see the [init] block); there is no DHT inbox record, gossip-only delivery, no catch-up path for
- * an offline recipient; a sender who lists themself among [recipients] never sees the message in
- * their own inbox (GossipSub never delivers a node's own publishes to its own subscription - see
- * [net.lapisphilosophorum.lapisnet.networking.GossipPubSub.subscribe]'s doc comment).
+ * because they bear directly on this type:** there is no DHT inbox record, gossip-only delivery,
+ * no catch-up path for an offline recipient; a sender who lists themself among [recipients] never
+ * sees the message in their own inbox (GossipSub never delivers a node's own publishes to its own
+ * subscription - see [net.lapisphilosophorum.lapisnet.networking.GossipPubSub.subscribe]'s doc
+ * comment).
+ *
+ * **V0.9.2: [EncryptionMode.NONE] and [EncryptionMode.HYBRID_ECIES] are both functional** (see the
+ * [init] block); [EncryptionMode.MLS_ARCHIVE] remains reserved and rejected outright - no
+ * implementation plan exists in this arc. A [EncryptionMode.HYBRID_ECIES] envelope carries exactly
+ * `recipients.size + 1` [wraps] (one per recipient plus the sender's own self-wrap) - see
+ * [HybridEcies]'s class doc comment for the encryption scheme itself and [MailAadContext]'s for the
+ * associated-data binding that ties [wraps] to this exact sender/recipient/content combination.
  *
  * [replyTo]/[threadRoot] are carried and signed but nothing walks them into a thread yet - that is
  * V0.9.3 (thread assembly).
@@ -37,10 +44,15 @@ class MessageEnvelope private constructor(
     val contentCid: Cid,
     val replyTo: Cid?,
     val threadRoot: Cid?,
+    wraps: List<EciesWrap>,
     signature: ByteArray,
 ) {
     /** Immutable snapshot - safe from later mutation of any list the caller passed in. */
     val recipients: List<Secp256k1PublicKey> = recipients.toList()
+
+    /** Empty for [EncryptionMode.NONE]; exactly `recipients.size + 1` entries for
+     * [EncryptionMode.HYBRID_ECIES] - see this class's doc comment. Immutable snapshot. */
+    val wraps: List<EciesWrap> = wraps.toList()
 
     private val storedSignature: ByteArray = signature.copyOf()
 
@@ -59,8 +71,20 @@ class MessageEnvelope private constructor(
         require(this.recipients.toSet().size == this.recipients.size) {
             "recipients must not contain duplicates"
         }
-        require(encryption == EncryptionMode.NONE) {
-            "encryption mode $encryption is reserved for V0.9.2 and rejected outright in V0.9.1"
+        require(encryption != EncryptionMode.MLS_ARCHIVE) {
+            "encryption mode $encryption is reserved and rejected outright - no implementation plan exists in this arc"
+        }
+        when (encryption) {
+            EncryptionMode.NONE ->
+                require(this.wraps.isEmpty()) {
+                    "an unencrypted envelope must carry no recipient wraps, had ${this.wraps.size}"
+                }
+            EncryptionMode.HYBRID_ECIES ->
+                require(this.wraps.size == this.recipients.size + 1) {
+                    "a hybrid-ecies envelope must carry exactly one wrap per recipient plus the sender's " +
+                        "self-wrap (${this.recipients.size + 1}), had ${this.wraps.size}"
+                }
+            EncryptionMode.MLS_ARCHIVE -> Unit // unreachable - rejected above
         }
         val contentCidBytes = contentCid.toBytes()
         require(contentCidBytes.size in 1..MessageEnvelopeCodec.MAX_CID_BYTES) {
@@ -100,6 +124,7 @@ class MessageEnvelope private constructor(
             contentCid == other.contentCid &&
             replyTo == other.replyTo &&
             threadRoot == other.threadRoot &&
+            wraps == other.wraps &&
             storedSignature.contentEquals(other.storedSignature)
     }
 
@@ -111,20 +136,26 @@ class MessageEnvelope private constructor(
         result = 31 * result + contentCid.hashCode()
         result = 31 * result + (replyTo?.hashCode() ?: 0)
         result = 31 * result + (threadRoot?.hashCode() ?: 0)
+        result = 31 * result + wraps.hashCode()
         result = 31 * result + storedSignature.contentHashCode()
         return result
     }
 
-    /** Never includes the signature or a full recipient key - only fingerprints/counts, mirroring
-     * [net.lapisphilosophorum.lapisnet.trust.VeritasGrant.toString]'s precedent. */
+    /** Never includes the signature, a full recipient key, or wrap bytes - only fingerprints/
+     * counts, mirroring [net.lapisphilosophorum.lapisnet.trust.VeritasGrant.toString]'s
+     * precedent. */
     override fun toString(): String =
         "MessageEnvelope(sender=${sender.fingerprint()}, recipients=${recipients.size}, " +
-            "encryption=$encryption, contentCid=$contentCid)"
+            "encryption=$encryption, contentCid=$contentCid, wraps=${wraps.size})"
 
     companion object {
         private fun signingDigest(body: ByteArray): ByteArray = domainSeparatedDigest(MAIL_ENVELOPE_DOMAIN_TAG, body)
 
-        /** Creates and signs a new envelope from [sender] to [recipients], bound to [contentCid]. */
+        /** Creates and signs a new envelope from [sender] to [recipients], bound to [contentCid].
+         * For [EncryptionMode.HYBRID_ECIES], [wraps] must already be the complete, correctly
+         * AAD-bound wrap list produced by [HybridEcies.seal] - this function does not build or
+         * validate the wraps' cryptographic content itself, only the count invariant (enforced by
+         * the constructor's [init] block). */
         fun create(
             sender: Secp256k1KeyPair,
             recipients: List<Secp256k1PublicKey>,
@@ -133,6 +164,7 @@ class MessageEnvelope private constructor(
             encryption: EncryptionMode = EncryptionMode.NONE,
             replyTo: Cid? = null,
             threadRoot: Cid? = null,
+            wraps: List<EciesWrap> = emptyList(),
         ): MessageEnvelope {
             val body =
                 MessageEnvelopeCodec.encodeSignedBody(
@@ -143,6 +175,7 @@ class MessageEnvelope private constructor(
                     contentCid = contentCid,
                     replyTo = replyTo,
                     threadRoot = threadRoot,
+                    wraps = wraps,
                 )
             val signature = sender.sign(signingDigest(body))
             return MessageEnvelope(
@@ -153,6 +186,7 @@ class MessageEnvelope private constructor(
                 contentCid,
                 replyTo,
                 threadRoot,
+                wraps,
                 signature,
             )
         }
@@ -184,6 +218,7 @@ class MessageEnvelope private constructor(
             replyTo: Cid?,
             threadRoot: Cid?,
             signature: ByteArray,
+            wraps: List<EciesWrap> = emptyList(),
         ): MessageEnvelope =
             MessageEnvelope(
                 sender,
@@ -193,6 +228,7 @@ class MessageEnvelope private constructor(
                 contentCid,
                 replyTo,
                 threadRoot,
+                wraps,
                 signature,
             )
     }

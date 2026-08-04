@@ -8,11 +8,16 @@ import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 
 /** The result of a [MailSender.send] call: the signed envelope, the decoded body, the body's CID,
  * and the exact frame bytes that were published - kept around so [MailSender.republish] can
- * re-send the identical frame without re-signing or re-storing anything. */
+ * re-send the identical frame without re-signing or re-storing anything.
+ *
+ * [sealedBody] is non-null only for [EncryptionMode.HYBRID_ECIES] sends - it lets a caller (or a
+ * test) prove the sender's own self-wrap opens their own sent mail without touching the network,
+ * e.g. `HybridEcies.open(sent.envelope, sent.sealedBody!!, localIdentity)`. */
 class SentMessage(
     val envelope: MessageEnvelope,
     val body: MessageBody,
     val bodyCid: Cid,
+    val sealedBody: SealedBody?,
     frameBytes: ByteArray,
 ) {
     private val storedFrameBytes: ByteArray = frameBytes.copyOf()
@@ -31,10 +36,13 @@ class MailSender(
     private val storage: NabuStorage,
 ) {
     /**
-     * Builds a [MessageBody] from [subject]/[body]/[attachments]/[headers], stores it in
-     * [storage], signs a [MessageEnvelope] bound to that blob's CID with [localIdentity], stores
-     * the envelope too, then publishes the combined [MailFrameCodec] frame to every recipient's
-     * inbox topic ([InboxTopics.forRecipient]).
+     * Builds a [MessageBody] from [subject]/[body]/[attachments]/[headers]. For
+     * [EncryptionMode.NONE] (the default), stores the plaintext body blob in [storage], signs a
+     * [MessageEnvelope] bound to that blob's CID with [localIdentity], stores the envelope too,
+     * then publishes the combined [MailFrameCodec] frame to every recipient's inbox topic
+     * ([InboxTopics.forRecipient]). For [EncryptionMode.HYBRID_ECIES], the body is
+     * [HybridEcies.seal]ed first and the SEALED blob (never the plaintext) is what gets stored and
+     * published - see [HybridEcies]'s class doc comment for the encryption scheme.
      *
      * **Load-bearing order** (mirrors `net.lapisphilosophorum.lapisnet.trust.VeritasGossip.announce`'s
      * put-then-index-then-publish ordering, where publish-last is a documented invariant, not an
@@ -52,7 +60,10 @@ class MailSender(
      * **No self-delivery.** If [recipients] includes [localIdentity]'s own public key, this node
      * will never see the message in its own [InboxGossip]: GossipSub never delivers a node's own
      * [GossipPubSub.publish] calls to its own [GossipPubSub.subscribe] handler (see that method's
-     * doc comment). A local "sent" view is V0.9.3.
+     * doc comment). For [EncryptionMode.HYBRID_ECIES], the sender's own self-wrap (see
+     * [HybridEcies]'s class doc comment) still lets them open their OWN [SentMessage.sealedBody]
+     * locally via [HybridEcies.open] - that is a local decrypt of what this call already returned,
+     * not network self-delivery. A local "sent" inbox view is V0.9.3.
      *
      * One publish per recipient - an N-recipient message is N publishes of the identical frame.
      */
@@ -65,9 +76,29 @@ class MailSender(
         headers: Map<String, String> = emptyMap(),
         replyTo: Cid? = null,
         threadRoot: Cid? = null,
+        encryption: EncryptionMode = EncryptionMode.NONE,
         sentAtEpochSecond: Long = System.currentTimeMillis() / 1000,
     ): SentMessage {
         val messageBody = MessageBody(subject, body, attachments, headers)
+
+        return when (encryption) {
+            EncryptionMode.NONE ->
+                sendPlaintext(localIdentity, recipients, messageBody, replyTo, threadRoot, sentAtEpochSecond)
+            EncryptionMode.HYBRID_ECIES ->
+                sendHybridEcies(localIdentity, recipients, messageBody, replyTo, threadRoot, sentAtEpochSecond)
+            EncryptionMode.MLS_ARCHIVE ->
+                throw IllegalArgumentException("encryption mode MLS_ARCHIVE is reserved and not implemented")
+        }
+    }
+
+    private fun sendPlaintext(
+        localIdentity: Secp256k1KeyPair,
+        recipients: List<Secp256k1PublicKey>,
+        messageBody: MessageBody,
+        replyTo: Cid?,
+        threadRoot: Cid?,
+        sentAtEpochSecond: Long,
+    ): SentMessage {
         val bodyBytes = MessageBodyCodec.encode(messageBody)
         val bodyCid = storage.put(bodyBytes)
 
@@ -87,7 +118,55 @@ class MailSender(
         val frame = MailFrameCodec.encode(envelopeBytes, bodyBytes)
         recipients.forEach { recipient -> pubsub.publish(InboxTopics.forRecipient(recipient), frame) }
 
-        return SentMessage(envelope, messageBody, bodyCid, frame)
+        return SentMessage(envelope, messageBody, bodyCid, sealedBody = null, frameBytes = frame)
+    }
+
+    private fun sendHybridEcies(
+        localIdentity: Secp256k1KeyPair,
+        recipients: List<Secp256k1PublicKey>,
+        messageBody: MessageBody,
+        replyTo: Cid?,
+        threadRoot: Cid?,
+        sentAtEpochSecond: Long,
+    ): SentMessage {
+        // MailAadContext.forNewMessage and MessageEnvelope.create must be built from the IDENTICAL
+        // sentAtEpochSecond value - reading System.currentTimeMillis() twice (once for the AAD
+        // context, once for the envelope) would seal the content key against one timestamp and
+        // sign the envelope with another, producing mail that nobody - including the sender -
+        // could ever decrypt. sentAtEpochSecond is already materialized exactly once, as this
+        // function's own parameter (defaulted in send(), never re-read here) - this comment exists
+        // so a future edit does not reintroduce a second System.currentTimeMillis() call.
+        val context =
+            MailAadContext.forNewMessage(
+                sender = localIdentity.publicKey,
+                recipients = recipients,
+                sentAtEpochSecond = sentAtEpochSecond,
+                replyTo = replyTo,
+                threadRoot = threadRoot,
+            )
+        val sealed = HybridEcies.seal(messageBody, localIdentity, context)
+        // Body put FIRST - same load-bearing invariant as the plaintext path, applied to the
+        // sealed blob instead of the plaintext one.
+        storage.put(sealed.sealedBodyBytes)
+
+        val envelope =
+            MessageEnvelope.create(
+                sender = localIdentity,
+                recipients = recipients,
+                contentCid = sealed.contentCid,
+                sentAtEpochSecond = sentAtEpochSecond,
+                encryption = EncryptionMode.HYBRID_ECIES,
+                replyTo = replyTo,
+                threadRoot = threadRoot,
+                wraps = sealed.wraps,
+            )
+        val envelopeBytes = MessageEnvelopeCodec.encode(envelope)
+        storage.put(envelopeBytes)
+
+        val frame = MailFrameCodec.encode(envelopeBytes, sealed.sealedBodyBytes)
+        recipients.forEach { recipient -> pubsub.publish(InboxTopics.forRecipient(recipient), frame) }
+
+        return SentMessage(envelope, messageBody, sealed.contentCid, sealedBody = sealed.sealedBody, frameBytes = frame)
     }
 
     /**

@@ -30,8 +30,13 @@ private val logger = KotlinLogging.logger {}
  *  - **No thread assembly.** `replyTo`/`threadRoot` are carried and signed but nothing walks them
  *    into a thread - V0.9.3.
  *  - **No browser HTTP routes.** `lapis-net-browser` is untouched by this wave - V0.9.3.
- *  - **No encryption.** `HYBRID_ECIES`/`MLS_ARCHIVE` are wire-representable but rejected outright -
- *    V0.9.2.
+ *  - **V0.9.2: `HYBRID_ECIES` is functional; `MLS_ARCHIVE` remains reserved and rejected outright**
+ *    - no implementation plan exists for it in this arc. **This validator never decrypts and never
+ *    holds a private key** - a positive property, not a limitation: it is only ever given a
+ *    [Secp256k1PublicKey] (see [attach]'s `localIdentity` parameter), so private key material
+ *    never enters the GossipSub validator, by construction. An accepted `HYBRID_ECIES` message is
+ *    indexed as [InboxPayload.Sealed] - decryption is an explicit, later, caller-driven
+ *    [HybridEcies.open] call.
  *  - **No attachment fetching, verification, or encryption.** [AttachmentRef.size] is declared,
  *    never checked; no key field - V0.9.3.
  *  - **No self-delivery.** GossipSub never delivers a node's own [GossipPubSub.publish] calls to
@@ -139,9 +144,9 @@ class InboxGossip private constructor(
                 }
 
             // Belt-and-braces: unreachable via the decode() path above today (decode() already
-            // rejects a reserved encryption mode), kept so a future codec change can never silently
-            // let a reserved mode through this validator without this function also changing.
-            if (envelope.encryption != EncryptionMode.NONE) {
+            // rejects MLS_ARCHIVE), kept so a future codec change can never silently let a
+            // reserved mode through this validator without this function also changing.
+            if (envelope.encryption == EncryptionMode.MLS_ARCHIVE) {
                 logger.debug { "rejected envelope from $from with reserved encryption mode ${envelope.encryption}" }
                 return ValidationResult.Invalid
             }
@@ -159,16 +164,27 @@ class InboxGossip private constructor(
                 return ValidationResult.Invalid
             }
 
+            // cidFor is a pure function of raw bytes - this check is unchanged and correct for
+            // BOTH EncryptionMode.NONE (frame.bodyBytes is a plaintext MessageBody blob) and
+            // EncryptionMode.HYBRID_ECIES (frame.bodyBytes is a SealedBody blob). The name reads
+            // slightly misleadingly for the sealed case, but the binding it enforces is identical.
             if (MessageBodyCodec.cidFor(frame.bodyBytes) != envelope.contentCid) {
                 logger.debug { "rejected envelope from $from whose contentCid does not match the frame's body" }
                 return ValidationResult.Invalid
             }
 
-            val body =
+            val payload =
                 try {
-                    MessageBodyCodec.decode(frame.bodyBytes)
+                    when (envelope.encryption) {
+                        EncryptionMode.NONE -> InboxPayload.Plaintext(MessageBodyCodec.decode(frame.bodyBytes))
+                        EncryptionMode.HYBRID_ECIES -> InboxPayload.Sealed(SealedBodyCodec.decode(frame.bodyBytes))
+                        EncryptionMode.MLS_ARCHIVE -> return ValidationResult.Invalid // unreachable, checked above
+                    }
                 } catch (e: MalformedMessageBodyException) {
                     logger.debug(e) { "rejected structurally malformed body from $from" }
+                    return ValidationResult.Invalid
+                } catch (e: MalformedSealedBodyException) {
+                    logger.debug(e) { "rejected structurally malformed sealed body from $from" }
                     return ValidationResult.Invalid
                 }
 
@@ -197,7 +213,7 @@ class InboxGossip private constructor(
                 }
             }
 
-            if (!index.add(InboxMessage(envelope, body))) {
+            if (!index.add(InboxMessage(envelope, payload))) {
                 // Narrow race: canAccept() and add() are two separate @Synchronized lock
                 // acquisitions - a concurrent gossip delivery of the identical content id could win
                 // the index slot between the two calls above. Still propagates.
