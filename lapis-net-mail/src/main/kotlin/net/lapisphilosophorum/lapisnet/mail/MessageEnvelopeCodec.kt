@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.mail
 
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream

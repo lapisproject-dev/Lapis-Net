@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.virtus
 
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -186,6 +187,12 @@ object LtrRecordCodec {
             val cidLen = input.readUnsignedShort()
             if (cidLen !in 1..MAX_CID_BYTES) throw MalformedLtrRecordException("invalid CID length: $cidLen")
             val cidBytes = ByteArray(cidLen).also { input.readFully(it) }
+            // Field-length cap above bounds the WIRE bytes for this field, not the multihash length
+            // declared INSIDE those bytes - see CidBytesValidation's class doc comment for why
+            // Cid.cast() must never see bytes that fail this check.
+            if (!CidBytesValidation.isSafeToCast(cidBytes)) {
+                throw MalformedLtrRecordException("cid declares an unsafe multihash length")
+            }
 
             val initialValueMsat = input.readLong()
             if (initialValueMsat !in MIN_INITIAL_VALUE_MSAT..MAX_INITIAL_VALUE_MSAT) {
@@ -220,6 +227,14 @@ object LtrRecordCodec {
             throw MalformedLtrRecordException("failed to decode record", e)
         } catch (e: MalformedLtrRecordException) {
             throw e
+        } catch (e: OutOfMemoryError) {
+            // Defense in depth, independent of CidBytesValidation.isSafeToCast's guard above: if
+            // some other unforeseen path ever attempts an oversized allocation while decoding a
+            // record, this must still surface as a clean malformed-input rejection, never an Error
+            // escaping to LtrGossip.onGossipMessage's caller. Deliberately narrow - only
+            // OutOfMemoryError, not a blanket Throwable/Error catch, which would risk masking a
+            // real JVM problem unrelated to this decode call.
+            throw MalformedLtrRecordException("record field declared an oversized allocation", e)
         } catch (e: RuntimeException) {
             // Covers IllegalArgumentException from LtrRecord's/OnChainProof's own constructor
             // validation and io.ipfs.cid.Cid.CidEncodingException from Cid.cast() on malformed CID

@@ -7,6 +7,7 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
 import io.libp2p.core.pubsub.ValidationResult
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey

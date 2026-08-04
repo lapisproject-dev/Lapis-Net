@@ -48,7 +48,9 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
 == Module map
 
 * `lapis-net-core` — shared abstractions, including the `crypto` package's domain-separated
-  digest and public-fingerprint helpers used by all signing code in the project
+  digest and public-fingerprint helpers used by all signing code in the project, and the `cid`
+  package's shared CID-decode-safety pre-flight check (`CidBytesValidation`, moved here from
+  `lapis-net-mail` — see the "Known gap closed" note under V0.9.1 below)
 * `lapis-net-identity` — identity (implemented in V0.1.2, see below), now also encrypted at rest
   (V0.4, see below)
 * `lapis-net-storage` — storage/DHT (Nabu, implemented in V0.1.4, see below)
@@ -1292,9 +1294,39 @@ signature verification and before the addressing check, so no valid signature or
 addressing was required. Fixed by `CidBytesValidation.isSafeToCast`, a shared pre-flight check run
 at all four call sites before `Cid.cast(...)` is ever invoked, plus a defense-in-depth
 `OutOfMemoryError` catch in both codecs' `decode()`. See `MailCidLengthOverflowDosTest` for the
-regression coverage. The three pre-existing sibling codecs with the same underlying construct
-(`VeritasGrantCodec`, `LtrRecordCodec`, `KarmaVoteCodec`) were out of scope for this fix and are
-tracked separately.
+regression coverage.
+
+**Follow-up (found and fixed 2026-08-04): the same construct also affected three pre-existing
+sibling codecs.** `VeritasGrantCodec`'s occasion-reference CID (V0.1.5), `LtrRecordCodec`'s record
+CID (V0.2.1), and `KarmaVoteCodec`'s target CID (V0.3) all had the identical unguarded
+`Cid.cast(cidBytes)` construct this wave's audit found and fixed in the mail module — noted above
+at the time as "out of scope for this fix, tracked separately." `CidBytesValidation` has since
+moved out of `lapis-net-mail` into `lapis-net-core` (`net.lapisphilosophorum.lapisnet.core.cid`),
+the shared home all four modules already depended on, so `VeritasGrantCodec.decode`,
+`LtrRecordCodec.decode`, and `KarmaVoteCodec.decode` now run the identical pre-flight guard before
+their own `Cid.cast(...)` calls, each with the same defense-in-depth `OutOfMemoryError` catch. See
+`VeritasCidLengthOverflowDosTest`, `LtrCidLengthOverflowDosTest`, and `KarmaCidLengthOverflowDosTest`
+for the regression coverage.
+
+**Second follow-up (found and fixed 2026-08-04): `lapis-net-browser`'s `parseCidOrNull` called
+`Cid.decode(String)` directly, bypassing the guard entirely.** Unlike the four codec call sites
+above, `BrowserApi.kt`'s `parseCidOrNull` never went through `Cid.cast(byteArray)` at all — it
+called `io.ipfs.cid.Cid.decode(value: String)`, which internally does its own
+`Multibase.decode(v)` then `Cid.cast(data)` (the exact same unguarded construct) for the common
+case, plus a *second*, separate unguarded path for the legacy CIDv0 shortcut
+(`v.length() == 46 && v.startsWith("Qm")` → `Multihash.fromBase58(v)`, which calls
+`Multihash.deserialize` directly and never touches `Cid.cast`). Reachable via `POST /api/karma`
+(`targetCid`), `POST /api/ltr/lightning` (`cid`), and `GET /api/mail/thread/{cid}` / `GET
+/api/mail/attachment/{cid}` — all before any signature check. The embedded browser server binds to
+`127.0.0.1` only, but installs no CORS plugin, so any page the user's browser visits while the node
+is running could reach these routes with a plain cross-origin request. Fixed by making
+`parseCidOrNull` decode the multibase/base58 bytes itself and validate them before ever calling
+`Cid.cast`/`Multihash.deserialize`: the common path via `CidBytesValidation.isSafeToCast` (as
+above), and the legacy CIDv0 shortcut via a new `CidBytesValidation.isSafeToDeserializeMultihash`
+entry point, which validates the `type-varint | length-varint | hash-bytes` layout
+`Multihash.deserialize` itself expects (no leading version/codec pair, unlike `isSafeToCast`). See
+`BrowserCidLengthOverflowDosTest` for the regression coverage, including an end-to-end
+`POST /api/karma` test.
 
 == Hybrid-ECIES mail encryption (V0.9.2)
 

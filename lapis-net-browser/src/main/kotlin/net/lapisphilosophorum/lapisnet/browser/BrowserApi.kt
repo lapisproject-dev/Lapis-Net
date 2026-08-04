@@ -2,6 +2,9 @@ package net.lapisphilosophorum.lapisnet.browser
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
+import io.ipfs.multibase.Base58
+import io.ipfs.multibase.Multibase
+import io.ipfs.multihash.Multihash
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -19,6 +22,7 @@ import io.ktor.server.routing.routing
 import io.libp2p.core.PeerInfo
 import io.libp2p.core.multiformats.Multiaddr
 import kotlinx.serialization.Serializable
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
@@ -682,10 +686,35 @@ private val MAX_CID_STRING_LENGTH = KarmaVoteCodec.MAX_CID_BYTES * 4
 
 /** Parses [value] as a [Cid], or `null` for any malformed input - never throws, so route handlers
  * can turn this straight into a 400 response instead of crashing, mirroring
- * [parseHexPublicKeyOrNull]'s established pattern for this file. */
+ * [parseHexPublicKeyOrNull]'s established pattern for this file.
+ *
+ * **Deliberately does NOT call `io.ipfs.cid.Cid.decode(String)` directly.** That method has two
+ * separate byte-parsing paths - both funnel attacker-controlled bytes into
+ * `Multihash.deserialize`'s `byte[] hash = new byte[len]` allocation BEFORE its own constructor's
+ * `hash.length > 127` bound check ever runs, exactly the CID multihash length overflow OOM-DoS this
+ * project's other four CID-decoding call sites (`MessageEnvelopeCodec`, `MessageBodyCodec`,
+ * `LtrRecordCodec`, `KarmaVoteCodec`, `VeritasGrantCodec`) were fixed to guard against with
+ * [CidBytesValidation] - see that object's class doc comment for the full mechanism:
+ * - The common path: `Multibase.decode(v)` then `Cid.cast(data)` - guarded here by decoding the
+ *   multibase bytes ourselves and checking [CidBytesValidation.isSafeToCast] before ever calling
+ *   [Cid.cast].
+ * - The legacy CIDv0 shortcut (`v.length() == 46 && v.startsWith("Qm")`): `Multihash.fromBase58(v)`,
+ *   which never goes through [Cid.cast] at all and is NOT covered by `isSafeToCast` - guarded here
+ *   by decoding the base58 bytes ourselves and checking
+ *   [CidBytesValidation.isSafeToDeserializeMultihash] first. This mirrors `Cid.decode`'s own
+ *   branch selection exactly, so behavior for well-formed input is unchanged. */
 internal fun parseCidOrNull(value: String): Cid? {
     if (value.length > MAX_CID_STRING_LENGTH) return null
-    return runCatching { Cid.decode(value) }.getOrNull()
+
+    if (value.length == 46 && value.startsWith("Qm")) {
+        val multihashBytes = runCatching { Base58.decode(value) }.getOrNull() ?: return null
+        if (!CidBytesValidation.isSafeToDeserializeMultihash(multihashBytes)) return null
+        return runCatching { Cid.buildV0(Multihash.deserialize(multihashBytes)) }.getOrNull()
+    }
+
+    val cidBytes = runCatching { Multibase.decode(value) }.getOrNull() ?: return null
+    if (!CidBytesValidation.isSafeToCast(cidBytes)) return null
+    return runCatching { Cid.cast(cidBytes) }.getOrNull()
 }
 
 /** Picks the "best" dialable multiaddr for this node to advertise (V0.4 QR/deep-link connect,

@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.mail
 
 import io.ipfs.cid.Cid
 import io.ipfs.multihash.Multihash
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream

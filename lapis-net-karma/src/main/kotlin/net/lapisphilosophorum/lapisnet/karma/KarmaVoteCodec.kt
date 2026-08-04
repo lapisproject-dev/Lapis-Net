@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.karma
 
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -154,6 +155,12 @@ object KarmaVoteCodec {
             val cidLen = input.readUnsignedShort()
             if (cidLen !in 1..MAX_CID_BYTES) throw MalformedKarmaVoteException("invalid CID length: $cidLen")
             val cidBytes = ByteArray(cidLen).also { input.readFully(it) }
+            // Field-length cap above bounds the WIRE bytes for this field, not the multihash length
+            // declared INSIDE those bytes - see CidBytesValidation's class doc comment for why
+            // Cid.cast() must never see bytes that fail this check.
+            if (!CidBytesValidation.isSafeToCast(cidBytes)) {
+                throw MalformedKarmaVoteException("cid declares an unsafe multihash length")
+            }
 
             val timestampSeconds = input.readLong()
 
@@ -182,6 +189,14 @@ object KarmaVoteCodec {
             throw MalformedKarmaVoteException("failed to decode vote", e)
         } catch (e: MalformedKarmaVoteException) {
             throw e
+        } catch (e: OutOfMemoryError) {
+            // Defense in depth, independent of CidBytesValidation.isSafeToCast's guard above: if
+            // some other unforeseen path ever attempts an oversized allocation while decoding a
+            // vote, this must still surface as a clean malformed-input rejection, never an Error
+            // escaping to KarmaGossip.onGossipMessage's caller. Deliberately narrow - only
+            // OutOfMemoryError, not a blanket Throwable/Error catch, which would risk masking a
+            // real JVM problem unrelated to this decode call.
+            throw MalformedKarmaVoteException("vote field declared an oversized allocation", e)
         } catch (e: RuntimeException) {
             // Covers IllegalArgumentException from KarmaVote's/ChainAnchorClaim's own constructor
             // validation and io.ipfs.cid.Cid.CidEncodingException from Cid.cast() on malformed CID

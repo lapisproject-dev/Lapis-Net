@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.trust
 
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -169,6 +170,14 @@ object VeritasGrantCodec {
                     val cidLen = input.readUnsignedShort()
                     if (cidLen !in 1..MAX_CID_BYTES) throw MalformedVeritasGrantException("invalid CID length: $cidLen")
                     val cidBytes = ByteArray(cidLen).also { buf -> input.readFully(buf) }
+                    // Field-length cap above bounds the WIRE bytes for this field, not the multihash length
+                    // declared INSIDE those bytes - see CidBytesValidation's class doc comment for why
+                    // Cid.cast() must never see bytes that fail this check.
+                    if (!CidBytesValidation.isSafeToCast(cidBytes)) {
+                        throw MalformedVeritasGrantException(
+                            "occasion reference CID declares an unsafe multihash length",
+                        )
+                    }
                     Cid.cast(cidBytes)
                 }
 
@@ -190,6 +199,14 @@ object VeritasGrantCodec {
             throw MalformedVeritasGrantException("failed to decode grant", e)
         } catch (e: MalformedVeritasGrantException) {
             throw e
+        } catch (e: OutOfMemoryError) {
+            // Defense in depth, independent of CidBytesValidation.isSafeToCast's guard above: if
+            // some other unforeseen path ever attempts an oversized allocation while decoding a
+            // grant, this must still surface as a clean malformed-input rejection, never an Error
+            // escaping to VeritasGossip.onGossipMessage's caller. Deliberately narrow - only
+            // OutOfMemoryError, not a blanket Throwable/Error catch, which would risk masking a
+            // real JVM problem unrelated to this decode call.
+            throw MalformedVeritasGrantException("grant field declared an oversized allocation", e)
         } catch (e: RuntimeException) {
             // Covers IllegalArgumentException from VeritasGrant's own constructor validation and
             // io.ipfs.cid.Cid.CidEncodingException from Cid.cast() on malformed CID bytes - decode()
