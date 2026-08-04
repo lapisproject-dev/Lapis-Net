@@ -33,8 +33,11 @@ real client, the Minimal-Browser (`lapis-net-browser`). See
 link:docs/architecture.adoc[docs/architecture.adoc] for full technical detail
 and link:docs/roadmap.adoc[docs/roadmap.adoc] for the wave-by-wave history.
 Not yet implemented: an embedded Lightning node (proof verification only, no
-payment sending), BOLT-12 offer publication, NAT traversal hardening, and
-end-to-end/asynchronous messaging (planned next waves).
+payment sending), BOLT-12 offer publication, NAT traversal hardening,
+end-to-end messaging (X3DH/Double Ratchet/MLS calls, V0.8), and mail
+encryption, threading, attachments, and spam protection (V0.9.2–V0.9.4 — the
+V0.9.1 envelope/body format and GossipSub inbox propagation are implemented,
+see `lapis-net-mail` below).
 
 == Modules
 
@@ -65,6 +68,9 @@ end-to-end/asynchronous messaging (planned next waves).
 
 | `lapis-net-madli`
 | Madli (machine-to-machine node reputation): five-metric observation vector with Veritas-weighted, manipulation-resistant weighted-median aggregation.
+
+| `lapis-net-mail`
+| Asynchronous messages (the e-mail replacement): signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1).
 
 | `lapis-net-browser`
 | Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data and the LTR record-authoring endpoints.

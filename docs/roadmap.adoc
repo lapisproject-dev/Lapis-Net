@@ -258,13 +258,78 @@ go-ahead.
 Target: envelope/body message format, optional ECIES/MLS-archive encryption, DHT-inbox +
 GossipSub-listener discovery, Lightning-HTLC first-contact spam deposit, market-based pinning —
 full spec in the vault concept note "Asynchrone Nachrichten (E-Mail-Ersatz)" (not yet mirrored
-into this repo's `docs/`).
+into this repo's `docs/`). Split into four sub-waves on 2026-08-04; V0.9.1 has landed, V0.9.2–V0.9.4
+are not started. Functionally independent of V0.8 (separate subsystem, shares only the identity
+keypair and protocol core) — could in principle be sequenced before or after V0.8's own sub-waves.
 
-=== Progress
+[cols="1,3"]
+|===
+| Sub-wave | Content
 
-**Not started.** Fully specified at the concept level (message format, three encryption modes,
-dual discovery channels, threading, attachments, spam protection, pinning economy), zero code
-exists in this repository. Proposed as a Sonnet-planned wave with an Opus review pass for the
-ECIES encryption scheme specifically, in the 2026-07-17 gap analysis; not yet started pending
-explicit go-ahead. Functionally independent of V0.8 (separate subsystem, shares only the identity
-keypair and protocol core) — could in principle be sequenced before or after V0.8 once approved.
+| V0.9.1
+| Mail envelope/body format (implemented — see below).
+
+| V0.9.2
+| Encryption: `HYBRID_ECIES` and `MLS_ARCHIVE` modes, already wire-representable and rejected
+outright by V0.9.1's codec and validator.
+
+| V0.9.3
+| Threading, attachment fetch/encryption, address book, and the browser HTTP routes + inbox UI.
+
+| V0.9.4
+| Spam protection (Lightning-HTLC first-contact deposit) and the market-based pinning economy.
+|===
+
+=== V0.9.1 — Mail envelope/body format
+
+Target: the message format itself and its propagation path — a signed, addressed envelope bound by
+CID to its own body blob, gossiped on one topic per recipient identity, persisted in Nabu at both
+ends. Functionally independent of V0.8 (separate subsystem, shares only the identity keypair and
+the protocol core).
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.9.1
+| `lapis-net-mail`: `MessageEnvelope` (sender, up-to-64 recipients, `sentAtEpochSecond`,
+`EncryptionMode`, `contentCid`, `replyTo`, `threadRoot`, secp256k1 signature over the new
+`"LapisNet:mail-envelope:v1"` domain tag) and `MessageBody` (subject, verbatim-Markdown body,
+`AttachmentRef` list, canonically-sorted headers), stored as its own Nabu blob and bound to the
+envelope through `contentCid`. `MessageEnvelopeCodec`/`MessageBodyCodec`/`MailFrameCodec` —
+length-prefixed sequential binary layouts with magic, version byte, reserved-flag-bits-must-be-zero
+checks, and every variable-length field length-validated BEFORE allocation, following
+`VeritasGrantCodec`'s discipline verbatim. `EncryptionMode.HYBRID_ECIES`/`MLS_ARCHIVE` are
+wire-representable but rejected outright at three layers (constructor, decoder, validator),
+mirroring `LtrRecordCodec`'s pre-V0.6 `proofType = 2` precedent. `InboxTopics.forRecipient` — one
+GossipSub topic per recipient identity, gossip-only because `Kademlia.dialPeer` is documented
+broken (V0.1.4). `InboxGossip` — a single validator step doing decode → addressing check →
+signature → CID binding → dedup → persist → index, with zero clock and zero network calls, and
+envelopes not addressed to the local identity dropped without ever being persisted. `InboxIndex` —
+the established two-cap structure (evicting LRU tracking cap + separate non-evicting persistence
+reservation cap). `MailSender` — body put, envelope put, then publish to every recipient's inbox
+topic, publish strictly last. `MailEnvelopeAbuseTest` — the mandatory adversarial spec (unaddressed
+envelope, 10,000-recipient bound-before-allocation, unusable body reference, post-hoc body
+substitution, degenerate all-`0xFF`/all-zero signatures, reserved encryption modes).
+|===
+
+==== Progress
+
+V0.9.1 is implemented (see `docs/architecture.adoc`'s "Asynchronous messages: mail envelope and
+body (V0.9.1)" section). Explicitly cut from this sub-wave, and stated as such in the code's own
+doc comments rather than silently omitted:
+
+* **No DHT inbox record** — gossip-only, because `Kademlia.dialPeer` is documented broken since
+  V0.1.4. A node offline during the gossip window has no catch-up path: best-effort convergence,
+  the same accepted limitation `VeritasGossip` already carries.
+* **No relay population.** GossipSub only forwards on topics a peer subscribes to, and an inbox
+  topic is identity-scoped — so delivery effectively requires a live sender-to-recipient
+  connection, strictly weaker than V0.1.7's network-wide Veritas topic.
+* **No self-delivery.** GossipSub never delivers a node's own publishes to its own subscription, so
+  a sender that addresses itself never sees the message in its own inbox; a local "sent" view is
+  V0.9.3.
+* **No encryption** (V0.9.2), **no topic sharding**, **no newsletter/subscription model**, **no
+  address book or pubkey-to-name mapping**, **no thread assembly** (`replyTo`/`threadRoot` are
+  signed and carried but nothing walks them — V0.9.3), **no attachment fetching, verification, or
+  encryption key field** (`AttachmentRef.size` is declared, never checked — V0.9.3), and **no
+  browser HTTP routes** (V0.9.3).

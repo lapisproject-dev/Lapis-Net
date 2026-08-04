@@ -20,7 +20,9 @@ machine-to-machine node-reputation system rating infrastructure serving
 quality with Veritas-weighted, decay-weighted, weighted-median aggregation
 (V0.5), and `LightningProof` — the second, fully cryptographically
 verified `LtrProof` implementation, verified in the gossip hot path, plus
-the first LTR record-authoring HTTP endpoint (V0.6, see below) — are
+the first LTR record-authoring HTTP endpoint (V0.6, see below), and the first piece of the
+asynchronous-messaging arc — a signed, addressed mail envelope bound to its own body blob by CID,
+propagated over one GossipSub topic per recipient identity (V0.9.1, see below) — are
 implemented. Remaining modules are still skeletons. This document grows
 as modules gain real implementations.
 
@@ -67,6 +69,10 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   (V0.3), to QR/deep-link connect + self-trust-linking (V0.4), and to `POST /api/ltr/lightning` —
   the first LTR record-authoring endpoint (V0.6, see below) — the first real Lapis Net client,
   application layer (see Layering above)
+* `lapis-net-mail` — asynchronous messages (the e-mail replacement): the signed `MessageEnvelope` +
+  CID-bound `MessageBody` format, one GossipSub inbox topic per recipient identity, and Nabu
+  persistence of both blobs (V0.9.1, see below). Not a scoring dimension — a separate subsystem
+  sharing only the identity keypair and the protocol core (see Layering above)
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-test` — shared test fixtures and helpers (not yet consumed by other modules' tests)
@@ -1167,6 +1173,118 @@ Bitswap-modulation "structurally ready, not end-to-end exercised" precedent:**
 With V0.6 landed, both of the fach-spec's "Zwei Zahlungswege" payment paths have a working
 `LtrProof` implementation — `OnChainProof` (structural only, live chain verification still an open
 gap) and `LightningProof` (fully cryptographically verified, including in the gossip hot path).
+
+== Asynchronous messages: mail envelope and body (V0.9.1)
+
+`lapis-net-mail` is the first sub-wave of V0.9 (the "email replacement" arc — see
+`docs/roadmap.adoc`'s V0.9 entry for the full four-sub-wave split). It implements the message
+format itself and its propagation path; it does not implement encryption, threading, attachments,
+or a browser UI — those are later sub-waves.
+
+**The two types.** A `MessageEnvelope` is the signed, addressed wrapper: sender, up to
+`MAX_RECIPIENTS` (64) recipient public keys, `sentAtEpochSecond`, an `EncryptionMode`, a
+`contentCid`, optional `replyTo`/`threadRoot` CIDs, and a secp256k1 signature over the new
+`"LapisNet:mail-envelope:v1"` domain tag. A `MessageBody` is the payload — subject, verbatim
+Markdown body (not rendered or sanitized here, that is a browser-UI concern for V0.9.3),
+`AttachmentRef` list, canonically-sorted headers — stored as its own Nabu blob. `contentCid` is
+that blob's CID and is itself covered by the envelope's signature, so the body carries no
+signature of its own: it is authenticated transitively, through the CID binding, by whoever signed
+the envelope.
+
+**The gossip frame carries the body, not just a CID pointer.** This is a deliberate departure from
+the SPEC's original wording, forced by two facts about the existing codebase: `NabuStorage.get()`
+falls through to a live Kademlia DHT provider lookup on a local cache miss, which a GossipSub
+validator must never do (see below); and cross-node DHT provider discovery has been documented
+broken since V0.1.4 (`Kademlia.dialPeer`, see the Storage section above), so a receiving node could
+never reliably fetch a body it only knew by CID anyway. `MailFrameCodec` therefore wraps both the
+`MessageEnvelopeCodec`-encoded envelope and the `MessageBodyCodec`-encoded body in one wire frame.
+This is the exact same reasoning, and the exact same resolution, as `VeritasGossip` publishing full
+grant bytes rather than a CID pointer in V0.1.7. The body is still independently stored as its own
+Nabu blob by both sender and receiver, and `contentCid` is still covered by the envelope signature
+— every property the original wording wanted is preserved, just checked locally instead of over
+the network.
+
+**One GossipSub topic per recipient identity.** `InboxTopics.forRecipient(key)` derives
+`"LapisNet:inbox:<64 lowercase hex chars of sha256(compressed pubkey)>:v1"`. Deliberately NOT a DHT
+inbox record — gossip-only, for the same `Kademlia.dialPeer`-is-broken reason above. A node offline
+during the gossip window has no catch-up path: best-effort convergence, the same accepted
+limitation `VeritasGossip`'s single network-wide topic already carries, now applied to a
+per-identity topic instead.
+
+**Zero clock and zero network calls in the validator.** `InboxGossip.onGossipMessage` is the single
+GossipSub validator step: decode the frame, decode the envelope, check the local identity is
+actually in the recipient list, verify the signature, check the CID binding against the frame's
+body bytes, decode the body, dedup, persist, index — all without ever calling
+`NabuStorage.get()`/`findProviders()`, `System.currentTimeMillis()`, or `Instant.now()`. This
+mirrors `KarmaGossip`/`MadliGossip`/`LtrGossip`'s identical rule. `MessageEnvelope.sentAtEpochSecond`
+is attacker-controlled and is never consulted for an accept/reject decision.
+
+**Envelopes not addressed to this identity are dropped without being persisted.** The addressing
+check runs before signature verification and before any storage call, and a rejection here means
+the envelope is neither persisted, indexed, nor re-propagated — a deliberate divergence from
+`VeritasGossip`'s "keep relaying even what we can't use" rule. An inbox topic is identity-scoped:
+nothing legitimately subscribed to it could be the intended recipient of an envelope that omits
+that identity, so there is no mesh-wide convergence property worth preserving here, unlike on a
+network-wide topic.
+
+**Encryption is wire-representable and rejected outright.** `EncryptionMode.HYBRID_ECIES` and
+`EncryptionMode.MLS_ARCHIVE` exist as enum constants and wire values so the future V0.9.2 wave
+needs no wire-format or schema change, but only `EncryptionMode.NONE` is functional in V0.9.1: the
+two reserved modes are rejected at three independent layers — `MessageEnvelope`'s constructor,
+`MessageEnvelopeCodec.decode`, and `InboxGossip`'s validator (belt-and-braces, since `decode()`
+already rejects them before the validator's own check could ever run). This mirrors
+`LtrRecordCodec`'s own pre-V0.6 `proofType = 2` precedent, which was rejected outright through V0.5
+before V0.6 implemented it as `PROOF_TYPE_LIGHTNING`.
+
+**Two independent caps, as established in V0.1.7.** `InboxIndex` mirrors `VeritasGrantIndex`'s
+two-cap structure: an evicting, LRU-ish in-memory tracking cap (`MAX_TRACKED_MESSAGES`, 8,000) and
+a separate, never-evicting persistence-reservation cap (`MAX_PERSISTED_MESSAGES`, 8,000) that
+independently bounds `NabuStorage.put()` calls. Both numbers are smaller than the trust/virtus/madli
+modules' 64,000 — a mail message's blob is up to roughly 48 KB versus a Veritas grant's roughly
+2 KB, so an equal count would be a far larger disk/heap budget; both are provisional and should be
+revisited against real usage.
+
+**`MailSender`.** `send()` builds a `MessageBody`, `put()`s it in Nabu, signs a `MessageEnvelope`
+bound to that blob's CID, `put()`s the envelope too, then publishes the combined `MailFrameCodec`
+frame to every recipient's inbox topic — publish strictly last, after both puts succeed, mirroring
+`VeritasGossip.announce`'s documented put-then-publish invariant. `republish()` re-sends an
+already-built message's frame without re-signing or re-storing anything, for retrying against
+GossipSub's asynchronous mesh formation.
+
+**Known, deliberately accepted gaps:**
+
+* **No DHT inbox record**, **no catch-up path** for an offline recipient — gossip-only, as above.
+* **No relay population.** GossipSub only forwards on topics a peer subscribes to, and an inbox
+  topic is identity-scoped, so delivery effectively requires a live sender-to-recipient connection
+  at send time — strictly weaker than V0.1.7's network-wide Veritas topic.
+* **No self-delivery.** GossipSub never delivers a node's own `publish()` calls to its own
+  `subscribe()` handler, so a sender that lists themself among recipients never sees the message in
+  their own inbox. A local "sent" view is V0.9.3.
+* **No topic sharding, no newsletter/subscription model, no address book or pubkey-to-name
+  mapping.**
+* **No thread assembly.** `replyTo`/`threadRoot` are carried and signed but nothing walks them into
+  a thread yet — V0.9.3.
+* **No attachment fetching, verification, or encryption.** `AttachmentRef.size` is a declared value,
+  never checked against the referenced blob; there is deliberately no encryption-key field — V0.9.3.
+* **No browser HTTP routes.** `lapis-net-browser` is untouched by this wave — V0.9.3.
+* **No encryption.** `HYBRID_ECIES`/`MLS_ARCHIVE` are wire-representable but rejected outright, as
+  above — V0.9.2.
+
+**Known gap closed: CID multihash length overflow.** A pre-merge security audit of this wave found
+that `MessageEnvelopeCodec`'s `contentCid`/`replyTo`/`threadRoot` decode sites and
+`MessageBodyCodec`'s per-attachment CID decode site capped the CID *field*'s wire byte count
+(`MAX_CID_BYTES = 128`) but passed those bytes straight to `io.ipfs.cid.Cid.cast(...)`, whose
+underlying `Multihash.deserialize` allocates `new byte[declaredLength]` off an attacker-controlled
+varint read from *inside* those bytes, before `Multihash`'s own 127-byte constructor bound check
+ever runs. An 8-byte CID payload declaring a multihash length of `0x7FFFFFFF` was enough to throw
+an uncaught `OutOfMemoryError` out of `InboxGossip.onGossipMessage` itself — reachable before
+signature verification and before the addressing check, so no valid signature or correct
+addressing was required. Fixed by `CidBytesValidation.isSafeToCast`, a shared pre-flight check run
+at all four call sites before `Cid.cast(...)` is ever invoked, plus a defense-in-depth
+`OutOfMemoryError` catch in both codecs' `decode()`. See `MailCidLengthOverflowDosTest` for the
+regression coverage. The three pre-existing sibling codecs with the same underlying construct
+(`VeritasGrantCodec`, `LtrRecordCodec`, `KarmaVoteCodec`) were out of scope for this fix and are
+tracked separately.
 
 == Diagrams
 
