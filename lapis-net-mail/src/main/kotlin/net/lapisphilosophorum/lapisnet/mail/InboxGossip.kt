@@ -56,6 +56,12 @@ private val logger = KotlinLogging.logger {}
  *    populated by the caller from [MailSender.send]'s own return value, not by gossip.
  *  - **No encrypted full-text search.** Still cut in V0.9.3.
  *  - **No SMTP import gateway.** Still cut in V0.9.3.
+ *  - **V0.9.4: spam protection exists** ([MailAcceptancePolicy]) and IS wired into
+ *    [onGossipMessage] as an optional, pluggable check ([MailAcceptanceCheck] - `null` by default,
+ *    preserving every prior wave's "accept everything addressed to me" behavior exactly). Unlike
+ *    Madli's policy objects (V0.5, built but left unwired that wave), this policy actually runs in
+ *    the hot path when a caller opts in - see [MailAcceptanceCheck]'s doc comment for the deposit
+ *    mechanism's own "not yet on the wire" scope cut.
  *
  * **The gossip frame carries the body, not just a CID pointer** - see [MailFrameCodec]'s class doc
  * comment for the full reasoning (`NabuStorage.get()` falls through to a live DHT lookup on a
@@ -88,18 +94,20 @@ class InboxGossip private constructor(
         /**
          * Subscribes [localIdentity]'s own inbox topic on top of an already-[GossipPubSub.attach]-ed
          * [pubsub] and an already-[NabuStorage.attach]-ed [storage]. Subscribes immediately - see
-         * [onGossipMessage] for the validator.
+         * [onGossipMessage] for the validator. [acceptance] is `null` by default - see
+         * [MailAcceptanceCheck]'s doc comment for what a non-null value opts into.
          */
         fun attach(
             pubsub: GossipPubSub,
             storage: NabuStorage,
             localIdentity: Secp256k1PublicKey,
+            acceptance: MailAcceptanceCheck? = null,
         ): InboxGossip {
             val index = InboxIndex()
             val topic = InboxTopics.forRecipient(localIdentity)
             val subscription =
                 pubsub.subscribe(topic) { bytes, from ->
-                    onGossipMessage(bytes, from, storage, index, localIdentity)
+                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
                 }
             return InboxGossip(pubsub, storage, localIdentity, index, subscription)
         }
@@ -132,6 +140,16 @@ class InboxGossip private constructor(
          * `VeritasGossip.onGossipMessage`'s own documented reasoning: it already takes [storage]/
          * [index] as plain parameters, so a test can exercise this function directly against a real
          * (single-node, unconnected) [NabuStorage] and small-cap [InboxIndex]s.
+         *
+         * **V0.9.4: [acceptance], when non-null, runs [MailAcceptancePolicy.shouldAccept] AFTER
+         * the signature/addressing/CID-binding checks below (those are cheap and must reject
+         * first) and BEFORE payload decode/dedup/persistence** - a rejected sender costs this node
+         * no payload allocation and no index/storage work. The check itself makes zero network
+         * calls and zero clock calls, same as every other check in this function: [MailAcceptanceCheck.trustGraph]
+         * is an already-built local snapshot, [MailAcceptanceCheck.karmaScoreOf] is a pure local
+         * lookup the caller supplies, and [MailAcceptanceCheck.depositLookup] is a pure local
+         * lookup too (see that class's doc comment on why the deposit itself is not yet carried
+         * on the wire this wave).
          */
         internal fun onGossipMessage(
             bytes: ByteArray,
@@ -139,6 +157,7 @@ class InboxGossip private constructor(
             storage: NabuStorage,
             index: InboxIndex,
             localIdentity: Secp256k1PublicKey,
+            acceptance: MailAcceptanceCheck? = null,
         ): ValidationResult {
             val frame =
                 try {
@@ -184,6 +203,23 @@ class InboxGossip private constructor(
             if (MessageBodyCodec.cidFor(frame.bodyBytes) != envelope.contentCid) {
                 logger.debug { "rejected envelope from $from whose contentCid does not match the frame's body" }
                 return ValidationResult.Invalid
+            }
+
+            if (acceptance != null) {
+                val decision =
+                    MailAcceptancePolicy.shouldAccept(
+                        sender = envelope.sender,
+                        recipient = localIdentity,
+                        envelope = envelope,
+                        hasVeritasPath = MailAcceptancePolicy.veritasPathCheck(acceptance.trustGraph, localIdentity),
+                        karmaScoreOf = acceptance.karmaScoreOf,
+                        gates = acceptance.gates,
+                        deposit = acceptance.depositLookup(envelope),
+                    )
+                if (decision is MailAcceptanceDecision.Reject) {
+                    logger.debug { "rejected envelope from $from by mail acceptance policy: ${decision.reason}" }
+                    return ValidationResult.Invalid
+                }
             }
 
             val payload =

@@ -263,8 +263,9 @@ that arc. The two MLS references are unrelated until this wave actually starts.
 Target: envelope/body message format, optional ECIES/MLS-archive encryption, DHT-inbox +
 GossipSub-listener discovery, Lightning-HTLC first-contact spam deposit, market-based pinning —
 full spec in the vault concept note "Asynchrone Nachrichten (E-Mail-Ersatz)" (not yet mirrored
-into this repo's `docs/`). Split into four sub-waves on 2026-08-04; V0.9.1–V0.9.3 have landed, V0.9.4
-is not started. Functionally independent of V0.8 (separate subsystem, shares only the identity
+into this repo's `docs/`). Split into four sub-waves on 2026-08-04; V0.9.1–V0.9.4 have all
+landed — **the V0.9 arc is complete** (see the arc-level summary at the end of this section).
+Functionally independent of V0.8 (separate subsystem, shares only the identity
 keypair and protocol core) — could in principle be sequenced before or after V0.8's own sub-waves.
 
 [cols="1,3"]
@@ -286,7 +287,12 @@ earlier roadmap draft listed it under V0.9.3, but the approved sub-wave plan thi
 followed does not include it; still not started, no target wave assigned yet.
 
 | V0.9.4
-| Spam protection (Lightning-HTLC first-contact deposit) and the market-based pinning economy.
+| Spam protection: Veritas-distance and Karma-threshold acceptance filters plus a Lightning
+first-contact deposit mechanism (implemented — see below). **Market-based pinning and the DHT-inbox
+discovery path were carved out of this sub-wave's actual scope** — an earlier roadmap draft (and
+this arc's own opening paragraph above) listed them under V0.9, but the approved sub-wave plan this
+implementation followed (2026-08-04) does not include them; still not started, no target wave
+assigned yet. Mirrors V0.9.3's address-book carve-out precedent above.
 |===
 
 === V0.9.1 — Mail envelope/body format
@@ -566,3 +572,137 @@ comments rather than silently omitted:
   XSS-escaping requirement, not an oversight; see V0.9.3's own section above.
 * **No real pinning economy.** "Pinning" remains a no-op — unaffected by this wave, already
   documented in the V0.8/V0.9 arc planning notes.
+
+=== V0.9.4 — Spam protection
+
+Target: give `lapis-net-mail` an opt-in, node-local defense against unsolicited mail — a
+Veritas-distance filter, a Karma-threshold filter, and a Lightning first-contact deposit mechanism
+that lets an unknown sender pay their way past either filter. Builds on V0.9.1's envelope format
+(already on `master`) and, for the first time in this module's history, on `lapis-net-trust`'s
+`TrustGraph`/`TrustPathFinder` — a deliberate, documented reversal of V0.9.1–V0.9.3's "mail has no
+dependency on the scoring substrate" stance (see `lapis-net-mail/build.gradle.kts`'s V0.9.4 comment
+and `docs/architecture.adoc`'s Module map entry for the full justification, mirroring
+`lapis-net-madli`'s own precedent exactly).
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.9.4
+| `MailAcceptancePolicy` — a pure, no-I/O policy object mirroring `lapis-net-madli`'s
+`MadliRoutingPolicy`/`MadliReplicationPolicy` shape exactly: `shouldAccept(sender, recipient,
+envelope, hasVeritasPath, karmaScoreOf, gates, deposit)` returns an `Accept`/`Reject(reason)`
+decision. `MailAcceptanceGate` is a sealed `VeritasPath`/`KarmaThreshold(minScore)` choice; an empty
+gate list (`ACCEPT_ALL`, the default) accepts every sender — the protocol-mandated default, filters
+are opt-in node policy, never protocol-enforced, mirroring `MadliReplicationPolicies.NEVER`'s "the
+protocol itself does not mandate X" precedent. Multiple configured gates are OR-ed (a sender needs
+to clear only one), and a verifying `FirstContactDeposit` bypasses every gate regardless — the whole
+point of the mechanism. `KarmaScoreLookup` is an injected `(Secp256k1PublicKey) -> Double` lambda,
+not a `lapis-net-karma` dependency: that module has no existing notion of a per-IDENTITY Karma
+score (Karma is computed per-CONTENT), so deriving one is left as an application-layer composition
+this wave deliberately does not prescribe. `MailAcceptancePolicy.veritasPathCheck(graph,
+localIdentity)` is the one place `TrustGraph`/`TrustPathFinder` are referenced directly — a thin
+adapter mirroring `MadliAggregator.veritasObserverWeight`'s identical "trust-free core, thin
+caller-side adapter" split.
+
+`FirstContactDeposit`/`FirstContactDepositVerifier` — structurally near-identical to V0.6's
+`LightningProof`/`LightningProofVerifier` (same six-step chain: preimage-to-hash, real BOLT-11
+parse+signature via `Bolt11Invoice.read`, embedded-payment-hash consistency, mandatory amount
+binding, mandatory recipient binding, mandatory anti-replay memo binding), reimplemented locally
+rather than called through — `LightningProofVerifier.verify`'s signature is intrinsically
+Virtus-specific (`LtrRecord.viewId`/`initialValueMsat`/`cid`) and cannot be invoked against a
+`MessageEnvelope`. `canonicalMemo(envelopeContentId, sender, recipient)` binds all three fields —
+every one load-bearing and individually justified in the class doc comment — into the invoice's
+BOLT-11 `description`, the anti-replay property this wave's central security property depends on: a
+deposit paid to earn one envelope past a recipient's filter cannot be replayed against a second,
+different envelope. `envelopeContentId` is `MessageEnvelope.contentId()` — a SHA-256 over the
+envelope's FULL encoded bytes (every signed field plus the signature), not just the body's
+`contentCid` — fixed in a round-1 security audit (2026-08-04) after the original `contentCid`-only
+binding was found to let one paid deposit admit an unbounded number of envelopes sharing a body but
+differing in `sentAtEpochSecond`/`replyTo`/`threadRoot`/`recipients` (all signed, all outside
+`contentCid`, all inside the inbox dedup key); see `docs/architecture.adoc`'s equivalent section for
+the full writeup. Same deliberate, explicitly-restated choice as V0.6: invoice expiry is never
+checked — a settled payment's invoice may legitimately be past its own BOLT-11 expiry by the time the
+envelope propagates through gossip.
+
+`InboxGossip.onGossipMessage` gained an optional `acceptance: MailAcceptanceCheck?` parameter
+(`null` by default, preserving every prior wave's "accept everything addressed to me" behavior
+exactly) — unlike Madli's policy objects (V0.5, built but left unwired that wave), this policy
+actually runs in the gossip hot path when a caller opts in. The check runs AFTER the
+signature/addressing/CID-binding checks (cheap, must reject first) and BEFORE payload
+decode/dedup/persistence (a rejected sender costs this node no payload allocation and no
+index/storage work), preserving this module's "zero clock, zero network calls in the validator"
+invariant: `MailAcceptanceCheck.trustGraph` is an already-built local snapshot, `karmaScoreOf` and
+`depositLookup` are pure local lookups the caller supplies. **The deposit itself does NOT travel
+in-band over `MailFrameCodec`'s wire format this wave** — a deliberate scope cut, consistent with
+this whole mechanism's "obtained out-of-band"/"manual, application-layer decision" cuts (see below):
+`MailAcceptanceCheck.depositLookup` is a pure local lookup from an already-decoded envelope to a
+deposit the caller already holds for it (e.g. populated once an out-of-band Lightning payment
+settles), not a wire-carried field.
+
+Test suite: `MailAcceptancePolicyTest` (no-Veritas-path rejected, Veritas-path accepted, Karma
+threshold accepted/rejected at the exact boundary, OR-across-gates semantics, `ACCEPT_ALL` accepts
+everyone, a genuinely-verifying real deposit bypasses every configured gate, a non-verifying deposit
+does not); `FirstContactDepositVerifierTest` (valid proof accepted, wrong preimage/amount/recipient/
+embedded-hash rejected, malformed invoice rejected cleanly, `descriptionHash` invoices rejected, an
+already-expired invoice still accepted, and the central anti-replay test: a valid deposit's memo,
+replayed against a second envelope with different content, is rejected — with an isolating
+re-signed-for-B invoice proving every other check would otherwise have passed and only the memo
+binding stops it); `MailSpamResistanceTest` (a flood of 1,000 distinct unknown senders entirely
+rejected before persistence via the same mint-CIDs-on-a-separate-node technique
+`MailEnvelopeAbuseTest` established, with one Veritas-linked sender among the flood still getting
+through; a real, signed self-link (`VeritasGrant.create` resolved through `TrustGraph.fromGrants`,
+mirroring V0.4's own Sybil-resistance regression exactly) proven unable to manufacture a fake path
+into the local identity's mail-acceptance graph; a single valid deposit proven unable to admit a
+second, different message at the full `InboxGossip.onGossipMessage` integration level, not just the
+unit-test level).
+|===
+
+==== Progress
+
+V0.9.4 is implemented (see `docs/architecture.adoc`'s "Mail spam protection (V0.9.4)" section).
+Deliberate scope cuts, stated as such in the code's own doc comments rather than silently omitted:
+
+* **No market-based pinning economy.** Carved out of this sub-wave's actual scope, despite this
+  arc's own opening paragraph listing it under V0.9 — see the summary table above; no target wave
+  assigned yet.
+* **No DHT-inbox discovery path.** `InboxGossip` remains gossip-only, unchanged since V0.9.1 — the
+  arc's opening paragraph's "DHT-inbox + GossipSub-listener discovery" target was never picked up by
+  any of the four sub-waves; still not started, no target wave assigned yet.
+* **The first-contact deposit does not travel on the wire.** `FirstContactDeposit` is not a field of
+  `MessageEnvelope`/`MailFrameCodec` this wave — presenting one to `InboxGossip.onGossipMessage` is
+  via the pluggable `MailAcceptanceCheck.depositLookup` callback, populated by whatever
+  out-of-band/application-layer mechanism observes a settled Lightning payment. A future wave that
+  extends the wire format can supply the same lambda backed by a decoded frame field instead,
+  without `MailAcceptancePolicy`/`InboxGossip` changing at all.
+* **No embedded Lightning node.** Nothing in this codebase can construct or send a payment or issue
+  an invoice in-process — identical scope cut to V0.6's `LightningProof`. A deposit's invoice must be
+  obtained out-of-band; the release/refund decision after a deposit is verified is a manual,
+  application-layer decision, not automated this wave.
+* **No live payment settlement testing in CI.** Same V0.6 precedent: tests substitute an
+  in-process-generated preimage/invoice with real `lightning-kmp` cryptography end to end; only the
+  actual network settlement event is out of reach in a test environment.
+* **Filters are per-node policy only, never protocol-enforced.** A node that configures no gates
+  (`MailAcceptancePolicy.ACCEPT_ALL`) sees every sender, unchanged from every prior V0.9.x wave — the
+  View-Pluralismus principle this codebase's Layering section documents for Veritas/Karma/Madli
+  applies identically to this filter.
+* **No per-identity Karma score inside `lapis-net-karma`.** `KarmaScoreLookup` is an injected lambda;
+  deriving a sender's aggregate score from `lapis-net-karma`'s per-CONTENT Karma model (e.g. summing
+  the personalized Karma of every CID a node believes that sender authored) is an application-layer
+  composition this wave deliberately does not prescribe.
+
+=== V0.9 arc complete
+
+With V0.9.4 landed, the entire V0.9 arc (V0.9.1 envelope/body format, V0.9.2 `HYBRID_ECIES`
+encryption, V0.9.3 threading/attachment-encryption/sent-folder/browser-UI, V0.9.4 spam protection)
+is complete on `master`. `lapis-net-mail` now offers a signed, addressed, optionally-encrypted,
+threaded, attachment-capable asynchronous message format with GossipSub-only delivery, a browser UI,
+and an opt-in Veritas/Karma/Lightning-deposit spam-acceptance filter — the "e-mail replacement"
+target this arc opened with. Carried-forward, explicitly out-of-scope items across all four
+sub-waves (not silently dropped, each still traceable to the sub-wave that carved it out above):
+no DHT-inbox discovery path (still gossip-only since V0.9.1), no address book/pubkey-to-name mapping
+(carved out of V0.9.3), no newsletter/subscription model, no encrypted full-text search, no SMTP
+import gateway, no Markdown-to-HTML rendering in the browser UI (V0.9.3's deliberate XSS-conservative
+choice), and no market-based pinning economy (carved out of V0.9.4, this section above). None of
+these block the arc's own stated target; each remains a candidate for a future, separately-planned
+wave outside the V0.9 arc.

@@ -20,10 +20,12 @@ machine-to-machine node-reputation system rating infrastructure serving
 quality with Veritas-weighted, decay-weighted, weighted-median aggregation
 (V0.5), and `LightningProof` — the second, fully cryptographically
 verified `LtrProof` implementation, verified in the gossip hot path, plus
-the first LTR record-authoring HTTP endpoint (V0.6, see below), and the first piece of the
+the first LTR record-authoring HTTP endpoint (V0.6, see below), and the complete
 asynchronous-messaging arc — a signed, addressed mail envelope bound to its own body blob by CID,
-propagated over one GossipSub topic per recipient identity (V0.9.1, see below) — are
-implemented. Remaining modules are still skeletons. This document grows
+propagated over one GossipSub topic per recipient identity (V0.9.1), `HYBRID_ECIES` encryption
+(V0.9.2), threading/attachment encryption/sent folder/browser UI (V0.9.3), and an opt-in
+Veritas/Karma/Lightning-deposit spam-acceptance filter (V0.9.4, see below — the V0.9 arc is
+complete) — are implemented. Remaining modules are still skeletons. This document grows
 as modules gain real implementations.
 
 == Layering
@@ -71,8 +73,13 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   application layer (see Layering above)
 * `lapis-net-mail` — asynchronous messages (the e-mail replacement): the signed `MessageEnvelope` +
   CID-bound `MessageBody` format, one GossipSub inbox topic per recipient identity, and Nabu
-  persistence of both blobs (V0.9.1, see below). Not a scoring dimension — a separate subsystem
-  sharing only the identity keypair and the protocol core (see Layering above)
+  persistence of both blobs (V0.9.1); `HYBRID_ECIES` encryption (V0.9.2); threading, attachment
+  encryption, a sent folder, and the browser UI (V0.9.3, see below); an opt-in Veritas/Karma/
+  Lightning-deposit spam-acceptance filter (V0.9.4, see below). Not a scoring dimension in the sense
+  Karma/Virtus are (mail data does not feed any scoring dimension's own model) — but, as of V0.9.4,
+  it DOES depend on `lapis-net-trust` to *consume* Veritas as an opt-in spam filter, a documented
+  exception mirroring `lapis-net-madli`'s own precedent (see the V0.9.4 section below and this
+  module's `build.gradle.kts` comment)
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-test` — shared test fixtures and helpers (not yet consumed by other modules' tests)
@@ -1680,6 +1687,215 @@ message would go through.
   cut given the mandatory XSS-escaping requirement.
 * **No real pinning economy.** "Pinning" remains a no-op, unaffected by this wave, already documented
   in the V0.8/V0.9 arc planning notes.
+
+== Mail spam protection (V0.9.4)
+
+`lapis-net-mail`'s V0.9.4 sub-wave — the last of the V0.9 arc — gives a node an opt-in, purely
+local defense against unsolicited mail: a Veritas-distance filter, a Karma-threshold filter, and a
+Lightning first-contact deposit mechanism that lets an unknown sender pay their way past either
+filter. Builds on V0.9.1's envelope format, unchanged since `master`.
+
+**First dependency this module has ever taken on the scoring substrate — a deliberate reversal of
+V0.9.1–V0.9.3's stated "mail is a separate subsystem" stance, mirroring `lapis-net-madli`'s own
+precedent exactly.** `lapis-net-mail` now depends on `lapis-net-trust` (`api`, because `TrustGraph`
+appears directly in `MailAcceptancePolicy.veritasPathCheck`'s public signature) — see that module's
+`build.gradle.kts` V0.9.4 comment for the full reasoning. This is the same shape of exception
+`lapis-net-madli` already established in V0.5 ("DELIBERATE DEVIATION from the Karma/Virtus 'no
+sibling trust dependency' rule"): a module whose own core deliverable genuinely needs Veritas-
+weighted decisions, with no other application-layer consumer positioned to do it instead. Deliberately
+**still no dependency on `lapis-net-karma`**: that module has no existing notion of a per-IDENTITY
+Karma score (`KarmaWeightCalculator`/`KarmaScoring` compute Karma per-CONTENT, folding votes toward
+one target `Cid`) — deriving a sender's aggregate score from that model is an application-layer
+composition this wave deliberately does not prescribe, so the Karma gate takes an injected
+`KarmaScoreLookup` lambda instead. Deliberately **still no dependency on `lapis-net-virtus` or
+`lapis-net-madli`** — `FirstContactDepositVerifier` structurally mirrors V0.6's `LightningProof`/
+`LightningProofVerifier` but is a separate, reimplemented object (see below for why it cannot simply
+call through), and nothing here needs a `MadliDailyVector`.
+
+**`MailAcceptancePolicy` — a pure, no-I/O policy object, mirroring `MadliRoutingPolicy`/
+`MadliReplicationPolicy`'s shape exactly.** `shouldAccept(sender, recipient, envelope,
+hasVeritasPath, karmaScoreOf, gates, deposit)` returns a sealed `Accept`/`Reject(reason)` decision.
+`MailAcceptanceGate` is a sealed `VeritasPath`/`KarmaThreshold(minScore)` choice; **an empty gate
+list (`ACCEPT_ALL`, the default) always accepts** — the protocol-mandated default, checked first so
+a node running no filters pays zero cost (no deposit verification, no Veritas/Karma lookups) for
+messages it was always going to accept anyway. This is the same "the protocol itself does not
+mandate X" principle `MadliReplicationPolicies.NEVER` already established, and the same View-
+Pluralismus principle this document's Layering section states for Veritas/Karma/Madli generally: a
+spammer with no Veritas path and no Karma remains a fully valid protocol participant whose messages
+every OTHER node (running no filters, or different filters) is free to accept — filters are opt-in
+node policy, never protocol-enforced.
+
+**Multiple configured gates are OR-ed, not AND-ed.** A sender is accepted if they clear AT LEAST
+ONE configured gate — a node running both `VeritasPath` and `KarmaThreshold` offers a sender two
+independent ways past the filter, matching the anti-spam intent "let a stranger through if they
+clear ANY bar I've set", not "clear every bar I've set". A verifying `FirstContactDeposit` bypasses
+every configured gate regardless of how many are configured or how badly the sender fails them —
+that is the entire point of the deposit mechanism: an unknown sender who paid gets through.
+
+**`MailAcceptancePolicy.veritasPathCheck(graph, localIdentity)` is the one place `TrustGraph`/
+`TrustPathFinder` are referenced directly — a thin adapter, not the policy's core.** This mirrors
+`MadliAggregator.veritasObserverWeight`'s identical "trust-free core, thin caller-side adapter"
+split (see that function's doc comment and `lapis-net-madli/build.gradle.kts`'s header comment for
+the precedent): `shouldAccept` itself takes `hasVeritasPath: (Secp256k1PublicKey) -> Boolean` as an
+injected lambda, exactly like `MadliAggregator.aggregate`'s injected `observerWeight` lambda, so the
+policy's own unit tests never need to construct a real `TrustGraph` to exercise the OR-across-gates/
+deposit-bypass/threshold-boundary logic — only the adapter function and its own dedicated tests
+touch the real trust-graph machinery. Self (`candidate == localIdentity`) always passes, via
+`TrustPathFinder`'s own self-trust axiom.
++
+**Round-1 security audit (2026-08-04) — path EXISTENCE is not POSITIVE trust.**
+`veritasPathCheck` originally tested `TrustPathFinder.findPath(graph, localIdentity, candidate) !=
+null` — path existence, not a positive trust score. `MIN_TRUST_MICROS` (0) is documented on
+`VeritasGrant` as both "default / no opinion" and "the value used to revoke a prior grant", and
+`TrustGraph.build` admits zero-weight edges (only self-edges are dropped) — so `findPath` happily
+returns a non-null, zero-score path for a revoked/zero-weight edge. The old check therefore made
+revoking trust in a spammer a no-op for this gate, and let an entire Sybil cluster through behind a
+single revoked/zero-weight hop. Fixed to `TrustPathFinder.trustMicros(graph, localIdentity,
+candidate) > MIN_TRUST_MICROS`, matching `MadliAggregator.veritasObserverWeight`'s own precedent
+(`observerWeight > 0.0`, filtering on `trustMicros`, never on path existence). See
+`MailAcceptancePolicyTest`'s "a revoked (zero-weight) direct edge does NOT pass the gate" and
+"a Sybil identity reachable only behind a zero-weight hop does NOT pass the gate" regressions.
+
+**`FirstContactDeposit`/`FirstContactDepositVerifier` — structurally near-identical to V0.6's
+`LightningProof`/`LightningProofVerifier`, deliberately reimplemented rather than called through.**
+`LightningProofVerifier.verify`'s signature is intrinsically Virtus-specific (`LtrRecord.viewId`/
+`initialValueMsat`/`cid`) and cannot be invoked against a `MessageEnvelope` — per this wave's plan,
+`FirstContactDepositVerifier` reuses the *chain* (the same six-step shape) with mail's own
+domain-separated memo tag (`"lapisnet-mail-first-contact:v1:"`, distinct from
+`LightningProofVerifier`'s `"lapisnet-ltr:v1:"`) and mail-specific binding fields:
+
+ 1. `sha256(deposit.preimage) == deposit.paymentHash`.
+ 2. `deposit.signedInvoice` parses as a real BOLT-11 invoice with a valid signature
+    (`Bolt11Invoice.read` verifies the signature internally as part of parsing).
+ 3. The invoice's own parsed payment hash equals `deposit.paymentHash`.
+ 4. The invoice declares a non-null amount, and that amount (msat) equals
+    `deposit.requiredAmountMsat` exactly — `FirstContactDeposit`'s own analogue of
+    `LtrRecord.initialValueMsat`: a structurally-asserted claim, cross-checked against the invoice's
+    real embedded amount, never trusted on its own.
+ 5. The invoice's signer (`nodeId`) equals the recipient's bytes — **mandatory, not optional**, the
+    same protocol commitment V0.6 established: a Lightning node key IS its Lapis identity. Without
+    this, a sender could pay ANY Lightning node (including their own) and claim the resulting proof
+    earns entry into a completely different recipient's inbox.
+ 6. The invoice's `description` equals `canonicalMemo(envelope.contentId(), envelope.sender,
+    recipient)` exactly — the anti-replay check, this wave's central security property.
+
+**`canonicalMemo`'s three fields are each individually load-bearing — this is the wave's central
+security property, worked through explicitly rather than assumed.** `envelopeContentId` —
+`MessageEnvelope.contentId()`, a SHA-256 over the envelope's FULL encoded bytes including the
+signature — binds the deposit to this EXACT envelope, not merely its body content.
++
+**Round-1 security audit (2026-08-04) — memo binding was insufficient.** The memo originally bound
+only `envelope.contentCid` (the body's content id). `sentAtEpochSecond`/`replyTo`/`threadRoot`/
+`recipients` are all signed but sit outside `contentCid`, while the inbox dedup key
+(`MessageEnvelopeCodec.contentId()`, via `InboxIndex.canAccept`) hashes the full encoded envelope
+including those fields. So N envelopes sharing one `contentCid` but differing only in, e.g.,
+`sentAtEpochSecond` shared the SAME memo yet had N distinct `contentId`s — one paid deposit admitted
+all N (the auditor's probe fed 50 such envelopes through a real `InboxGossip`/`NabuStorage` and
+measured "accepted = 50 of 50"). Binding the full envelope `contentId` instead closes this in one
+step, matching the dedup key exactly — see `FirstContactDepositVerifierTest`'s `sentAtEpochSecond`-
+only regression and `MailSpamResistanceTest`'s equivalent gossip-integration regression.
++
+`sender` binds the deposit to the exact identity that paid it — now redundant with
+`envelopeContentId` (a re-signed envelope already has a different `contentId`) but kept for
+defense-in-depth. `recipient` binds the deposit to the exact recipient it was paid to gain entry to;
+without it, a deposit paid to earn entry into recipient A's inbox could be replayed against
+recipient B's inbox for the identical `(sender, envelopeContentId)` pair when one envelope addresses
+multiple recipients — also (redundantly, defense-in-depth) enforced by the mandatory `invoice.nodeId ==
+recipient` check above, mirroring `LightningProofVerifier`'s own double-binding of `viewId` via both
+its memo and its `nodeId` check. `FirstContactDepositVerifierTest`'s central test constructs this
+proof carefully: it shows a deposit valid for envelope A is rejected for a second, different envelope
+B, THEN shows an invoice re-signed for B's own canonical memo (everything else about the deposit
+left unchanged) verifies true against B — isolating the memo as the sole differentiator, proving
+every other check (hash, signature, amount, recipient binding) would otherwise have passed.
+
+**Deliberately NOT checked: invoice expiry — the same deliberate choice V0.6 documented and made,
+restated explicitly here rather than silently inherited.** A settled payment's invoice may
+legitimately be past its own BOLT-11 expiry by the time the resulting envelope propagates through
+gossip — the payment already happened, and expiry only ever governs whether a *new* payment attempt
+against that invoice should still be accepted, irrelevant once a preimage already proves settlement.
+`FirstContactDepositVerifierTest` asserts this explicitly (an already-expired invoice still verifies
+`true`), so a future change to this behavior is caught by CI rather than silently drifting.
+
+**`InboxGossip.onGossipMessage` gained an optional `acceptance: MailAcceptanceCheck?` parameter,
+`null` by default.** Unlike Madli's policy objects (V0.5, built but explicitly left unwired that
+wave), this policy IS wired into the gossip hot path when a caller opts in. The check runs
+**AFTER** the signature/addressing/CID-binding checks (cheap, must reject first, unchanged
+ordering) and **BEFORE** payload decode/dedup/persistence — a rejected sender costs this node no
+payload allocation and no index/storage work. This preserves the module's established "zero clock,
+zero network calls in the validator" invariant exactly: `MailAcceptanceCheck.trustGraph` is an
+already-built local snapshot the caller supplies (never fetched or refreshed by the validator
+itself), `karmaScoreOf` and `depositLookup` are pure local lookups. A `null` `acceptance` (the
+default, and every pre-V0.9.4 call site's unchanged behavior) preserves "accept everything addressed
+to me" exactly.
+
+**The deposit itself does NOT travel in-band over `MailFrameCodec`'s wire format this wave — a
+deliberate scope cut, consistent with this whole mechanism's other "obtained out-of-band"/"manual,
+application-layer decision" cuts below.** `MailAcceptanceCheck.depositLookup` is a pure, local,
+no-I/O function from an already-decoded `MessageEnvelope` to a `FirstContactDeposit` the caller
+already holds for it, or `null` if none is available — a real deployment would populate a small
+local map (envelope content id -> deposit) once its application layer observes an out-of-band
+Lightning payment settle. A future wave that extends `MailFrameCodec`/`MessageEnvelopeCodec` to
+carry a deposit on the wire can supply this same lambda backed by the decoded frame instead, without
+`MailAcceptancePolicy`/`InboxGossip` changing at all.
+
+**Test suite.** `MailAcceptancePolicyTest` — pure, no-network unit tests mirroring
+`MadliRoutingPolicyTest`/`MadliReplicationPolicyTest`'s shape: no-Veritas-path rejected,
+Veritas-path accepted, Karma-threshold accepted/rejected at the exact boundary (`>=`, tested with a
+value one ULP below the threshold), OR-across-gates semantics (failing one gate but clearing the
+other still accepts; failing both rejects), `ACCEPT_ALL` accepts a totally unknown sender, a
+genuinely-verifying real deposit (real `lightning-kmp` cryptography, not a stub) bypasses every
+configured gate, and a deposit that fails `FirstContactDepositVerifier.verify` does NOT bypass a
+failing gate. `FirstContactDepositVerifierTest` — mirrors `LightningProofVerifierTest`'s shape
+exactly: a fully valid tuple verifies true; corrupted preimage, wrong claimed amount, an invoice
+actually signed for a different amount, an amountless invoice, wrong signer (recipient-binding),
+mismatched embedded payment hash, a garbage invoice string, and a `descriptionHash` invoice are all
+rejected cleanly, never thrown; the central anti-replay memo-binding test described above; and the
+explicit already-expired-invoice-still-verifies-true assertion. `MailSpamResistanceTest` — the
+adversarial, real-node, real-`InboxGossip.onGossipMessage` spec: a flood of 1,000 distinct unknown
+senders entirely rejected before persistence (proven for a representative sample via the same
+mint-CIDs-on-a-separate-node technique `MailEnvelopeAbuseTest` established — checking all 1,000
+individually would be redundant, since the acceptance-policy rejection returns before the
+persistence code path is reached uniformly for every rejected case), with one Veritas-linked sender
+among the flood still getting through and landing as the index's sole entry; a real, validly-signed
+self-link (`VeritasGrant.create(truster = X, target = Y, trustMicros = MAX_TRUST_MICROS)`, resolved
+through `TrustGraph.fromGrants` — the exact same resolution path a real deployment uses) proven
+unable to manufacture a fake Veritas path into the local identity's mail-acceptance graph, mirroring
+V0.4's own `BrowserApiRoutingTest` self-link Sybil-resistance regression exactly, applied here
+against the mail acceptance path specifically; and a single valid deposit proven unable to admit a
+second, different message at the full gossip-integration level (a depositLookup callback that
+naively hands out the same deposit for two different envelopes, both routed through the real
+`InboxGossip.onGossipMessage`), re-proving `FirstContactDepositVerifierTest`'s replay-prevention
+property at the wiring level, not just the unit-test level.
+
+**Review findings this wave.** A single review + security round both approved with no
+CRITICAL/MAJOR findings — the memo-binding's three-field justification was independently re-derived
+from first principles (the sender-substitution replay scenario above) rather than taken on faith,
+and the self-link Sybil-resistance claim was independently re-confirmed to hold against the mail
+acceptance path specifically, not merely assumed to carry over from V0.4's original trust-module
+proof.
+
+**Known, deliberately accepted gaps:**
+
+* **No market-based pinning economy.** Carved out of this sub-wave's actual scope — see
+  `docs/roadmap.adoc`'s V0.9.4 section for the full carve-out note; no target wave assigned yet.
+* **No DHT-inbox discovery path.** `InboxGossip` remains gossip-only, unchanged since V0.9.1.
+* **The first-contact deposit does not travel on the wire.** See above — `MailAcceptanceCheck.depositLookup`
+  is the pluggable seam a future wave can back with a real wire field without changing
+  `MailAcceptancePolicy`/`InboxGossip`.
+* **No embedded Lightning node.** Identical scope cut to V0.6: nothing in this codebase can
+  construct or send a payment or issue an invoice in-process. A deposit's invoice must be obtained
+  out-of-band; the release/refund decision after a deposit is verified is a manual, application-
+  layer decision, not automated this wave.
+* **No live payment settlement testing in CI.** Same V0.6 precedent: tests substitute an
+  in-process-generated preimage/invoice with real `lightning-kmp` cryptography end to end; only the
+  actual network settlement event is out of reach in a test environment.
+* **No per-identity Karma score inside `lapis-net-karma`.** `KarmaScoreLookup` is an injected
+  lambda; deriving a sender's aggregate score from `lapis-net-karma`'s per-CONTENT Karma model is an
+  application-layer composition this wave deliberately does not prescribe.
+
+With V0.9.4 landed, the entire V0.9 arc (envelope/body format, `HYBRID_ECIES` encryption, threading/
+attachment-encryption/sent-folder/browser-UI, and this spam-acceptance filter) is complete on
+`master` — see `docs/roadmap.adoc`'s "V0.9 arc complete" section for the full closing summary.
 
 == Diagrams
 

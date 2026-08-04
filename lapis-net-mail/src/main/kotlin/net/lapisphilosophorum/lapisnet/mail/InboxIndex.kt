@@ -7,8 +7,9 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
  * `HashMap`/`HashSet` key - a plain `ByteArray` uses reference equality. Mirrors
  * `net.lapisphilosophorum.lapisnet.trust.GrantContentId` /
  * `net.lapisphilosophorum.lapisnet.virtus.LtrContentId` exactly, duplicated locally rather than
- * reused: this module has no dependency edge to `lapis-net-trust`/`lapis-net-virtus` (see this
- * module's `build.gradle.kts` comment - mail is a separate subsystem, not a scoring dimension).
+ * reused: even though this module gained a dependency edge to `lapis-net-trust` in V0.9.4 (see
+ * this module's `build.gradle.kts` comment), `GrantContentId` itself is `internal` to that module
+ * and not exposed for reuse - the duplication reasoning stands independent of the dependency edge.
  * Internal: only [InboxIndex] (same package) needs this.
  */
 internal data class MailContentId(
