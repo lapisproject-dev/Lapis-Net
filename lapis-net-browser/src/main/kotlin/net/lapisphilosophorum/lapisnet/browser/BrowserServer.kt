@@ -11,6 +11,9 @@ import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.karma.BitcoinTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.ElectrumTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
+import net.lapisphilosophorum.lapisnet.mail.InboxGossip
+import net.lapisphilosophorum.lapisnet.mail.MailSender
+import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -55,6 +58,7 @@ class BrowserServer private constructor(
     private val karma: KarmaGossip,
     private val karmaAnchorCache: KarmaAnchorCache,
     private val posts: PostAnnouncementGossip,
+    private val mailInbox: InboxGossip,
     private val httpEngine: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>,
     /** The HTTP port actually bound, resolved after [httpEngine] started - may differ from the
      * `httpPort` passed to [start] when that was `0` (OS-assigned). */
@@ -97,6 +101,7 @@ class BrowserServer private constructor(
     fun stop() {
         try {
             runCatching { httpEngine.stop(HTTP_STOP_GRACE_PERIOD_MILLIS, HTTP_STOP_TIMEOUT_MILLIS) }
+            mailInbox.stop()
             posts.stop()
             karma.stop()
             virtus.stop()
@@ -163,9 +168,29 @@ class BrowserServer private constructor(
             val karma = KarmaGossip.attach(pubsub, storage)
             val posts = PostAnnouncementGossip.attach(pubsub, storage)
             val karmaAnchorCache = KarmaAnchorCache(karmaAnchorSource)
+            // V0.9.3 - InboxGossip.attach subscribes this identity's own inbox topic immediately,
+            // same "attach = subscribe now" contract as veritas/virtus/karma/posts above.
+            // MailSender/SentFolder are plain, resource-free objects - constructed here purely so
+            // every BrowserServer has its own instance, never shared across servers in a
+            // multi-node test.
+            val mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+            val mailSender = MailSender(pubsub, storage)
+            val sentFolder = SentFolder()
 
             val deps =
-                BrowserApiDependencies(identity, node, storage, veritas, virtus, karma, posts, karmaAnchorCache)
+                BrowserApiDependencies(
+                    identity,
+                    node,
+                    storage,
+                    veritas,
+                    virtus,
+                    karma,
+                    posts,
+                    karmaAnchorCache,
+                    mailInbox,
+                    mailSender,
+                    sentFolder,
+                )
             val httpEngine =
                 embeddedServer(Netty, port = httpPort, host = httpHost) {
                     installBrowserApi(deps)
@@ -194,6 +219,7 @@ class BrowserServer private constructor(
                 karma,
                 karmaAnchorCache,
                 posts,
+                mailInbox,
                 httpEngine,
                 boundPort,
             )

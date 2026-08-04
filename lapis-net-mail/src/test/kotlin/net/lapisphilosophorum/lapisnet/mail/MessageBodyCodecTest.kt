@@ -75,8 +75,10 @@ class MessageBodyCodecTest :
             badVersion[4] = 99
             shouldThrow<MalformedMessageBodyException> { MessageBodyCodec.decode(badVersion) }
 
+            // bit0 (0x01) is FLAG_ATTACHMENTS_MAY_HAVE_KEY as of V0.9.3 and is legitimately
+            // settable - bit1 (0x02) remains reserved, so it is what this case exercises.
             val badFlags = bytes.copyOf()
-            badFlags[5] = 1
+            badFlags[5] = 2
             shouldThrow<MalformedMessageBodyException> { MessageBodyCodec.decode(badFlags) }
 
             shouldThrow<MalformedMessageBodyException> { MessageBodyCodec.decode(bytes.copyOf(2)) }
@@ -186,6 +188,44 @@ class MessageBodyCodecTest :
             val roundTripped = MessageBodyCodec.decode(MessageBodyCodec.encode(body))
 
             roundTripped.body shouldBe raw
+        }
+
+        // V0.9.3 regression: a body with only UNENCRYPTED attachments must encode byte-identical
+        // to what V0.9.1/V0.9.2 would have produced (flags byte literally 0x00) - see
+        // MessageBodyCodec's class doc comment for the non-breaking justification this proves.
+        test("a body with only unencrypted attachments encodes with flags byte 0x00 - byte-identical to pre-V0.9.3") {
+            val attachments =
+                (1..3).map { AttachmentRef(testCid(it.toByte()), "file-$it.txt", "text/plain", it.toLong()) }
+            val body = MessageBody(subject = "s", body = "b", attachments = attachments)
+
+            val bytes = MessageBodyCodec.encode(body)
+
+            bytes[5] shouldBe 0.toByte() // flags byte: magic(4) + version(1) = offset 5
+            MessageBodyCodec.decode(bytes) shouldBe body
+        }
+
+        test("round-trips attachments with a mix of encrypted and unencrypted attachment refs") {
+            val key = ByteArray(MessageBodyCodec.ATTACHMENT_KEY_SIZE) { it.toByte() }
+            val attachments =
+                listOf(
+                    AttachmentRef(testCid(1), "plain.txt", "text/plain", 10),
+                    AttachmentRef(testCid(2), "secret.pdf", "application/pdf", 20, encryptionKey = key),
+                )
+            val body = MessageBody(subject = "s", body = "b", attachments = attachments)
+
+            val bytes = MessageBodyCodec.encode(body)
+            bytes[5] shouldBe 1.toByte() // FLAG_ATTACHMENTS_MAY_HAVE_KEY set
+
+            val decoded = MessageBodyCodec.decode(bytes)
+            decoded shouldBe body
+            decoded.attachments[0].encryptionKey shouldBe null
+            decoded.attachments[1].encryptionKey shouldBe key
+        }
+
+        test("AttachmentRef rejects a key of the wrong length") {
+            shouldThrow<IllegalArgumentException> {
+                AttachmentRef(testCid(1), "n", "text/plain", 1, encryptionKey = ByteArray(31))
+            }
         }
     })
 

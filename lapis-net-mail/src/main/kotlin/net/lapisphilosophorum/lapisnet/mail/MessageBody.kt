@@ -5,18 +5,30 @@ import java.util.SortedMap
 import java.util.TreeMap
 
 /**
- * A reference to an attachment blob. V0.9.1 defines the shape only - nothing fetches, verifies,
- * or decrypts an attachment this wave, and [size] is a DECLARED value that is never checked
- * against the referenced blob. There is deliberately NO encryption-key field: attachment
- * encryption lands in V0.9.3 (see [InboxGossip]'s class doc comment for the module's full scope-cut
- * list).
+ * A reference to an attachment blob. [size] is a DECLARED value that is never checked against the
+ * referenced blob (V0.9.1 scope cut, still true in V0.9.3).
+ *
+ * **[encryptionKey] (V0.9.3).** `null` for an unencrypted attachment; a 32-byte AES-256 key for one
+ * independently encrypted via [MailAttachmentCipher] - see that object's class doc comment for the
+ * "always a fresh key, never the body's HYBRID_ECIES content key" design decision and why it holds
+ * regardless of the enclosing [MessageBody]'s own [EncryptionMode]. This is what makes "an
+ * unencrypted newsletter with one encrypted PDF attachment" representable: attachment encryption is
+ * orthogonal to body encryption, not derived from it.
  */
 class AttachmentRef(
     val cid: Cid,
     val name: String,
     val mime: String,
     val size: Long,
+    encryptionKey: ByteArray? = null,
 ) {
+    private val storedEncryptionKey: ByteArray? = encryptionKey?.copyOf()
+
+    /** 32-byte AES-256 key for this attachment's independently-encrypted blob (see
+     * [MailAttachmentCipher]), or `null` if unencrypted. Returns a fresh copy on every access -
+     * never log this at any log level. */
+    val encryptionKey: ByteArray? get() = storedEncryptionKey?.copyOf()
+
     init {
         val cidBytes = cid.toBytes()
         require(cidBytes.size in 1..MessageBodyCodec.MAX_CID_BYTES) {
@@ -35,20 +47,38 @@ class AttachmentRef(
         require(size in 0..MessageBodyCodec.MAX_ATTACHMENT_SIZE_BYTES) {
             "attachment size must be 0..${MessageBodyCodec.MAX_ATTACHMENT_SIZE_BYTES}, was $size"
         }
+        storedEncryptionKey?.let {
+            require(it.size == MessageBodyCodec.ATTACHMENT_KEY_SIZE) {
+                "attachment encryptionKey must be exactly ${MessageBodyCodec.ATTACHMENT_KEY_SIZE} bytes " +
+                    "(AES-256), was ${it.size}"
+            }
+        }
     }
 
-    override fun equals(other: Any?): Boolean =
-        other is AttachmentRef && cid == other.cid && name == other.name && mime == other.mime && size == other.size
+    override fun equals(other: Any?): Boolean {
+        if (other !is AttachmentRef) return false
+        val keysEqual =
+            when {
+                storedEncryptionKey == null && other.storedEncryptionKey == null -> true
+                storedEncryptionKey != null && other.storedEncryptionKey != null ->
+                    storedEncryptionKey.contentEquals(other.storedEncryptionKey)
+                else -> false
+            }
+        return cid == other.cid && name == other.name && mime == other.mime && size == other.size && keysEqual
+    }
 
     override fun hashCode(): Int {
         var result = cid.hashCode()
         result = 31 * result + name.hashCode()
         result = 31 * result + mime.hashCode()
         result = 31 * result + size.hashCode()
+        result = 31 * result + (storedEncryptionKey?.contentHashCode() ?: 0)
         return result
     }
 
-    override fun toString(): String = "AttachmentRef(cid=$cid, name=$name, mime=$mime, size=$size)"
+    /** Never includes the key bytes themselves - only whether one is present. */
+    override fun toString(): String =
+        "AttachmentRef(cid=$cid, name=$name, mime=$mime, size=$size, encrypted=${storedEncryptionKey != null})"
 }
 
 /**

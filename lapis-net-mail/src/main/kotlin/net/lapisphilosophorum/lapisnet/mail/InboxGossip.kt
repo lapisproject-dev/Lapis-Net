@@ -25,11 +25,17 @@ private val logger = KotlinLogging.logger {}
  *    topic is identity-scoped - so delivery effectively requires a live sender-to-recipient
  *    connection at send time, strictly weaker than `VeritasGossip`'s network-wide topic.
  *  - **No topic sharding.**
- *  - **No newsletter/subscription model.**
+ *  - **No newsletter/subscription model.** Still cut in V0.9.3 - stated explicitly, not an
+ *    oversight.
  *  - **No address book, no pubkey-to-name mapping.** Recipients are raw compressed secp256k1 keys.
- *  - **No thread assembly.** `replyTo`/`threadRoot` are carried and signed but nothing walks them
- *    into a thread - V0.9.3.
- *  - **No browser HTTP routes.** `lapis-net-browser` is untouched by this wave - V0.9.3.
+ *    Still cut in V0.9.3, despite an earlier roadmap draft mentioning it for this sub-wave - see
+ *    `docs/roadmap.adoc`'s V0.9.3 section for the explicit carve-out.
+ *  - **V0.9.3: thread assembly exists** ([ThreadBuilder]), built from `replyTo` alone -
+ *    `threadRoot` is still carried and signed but structurally unused (see [ThreadBuilder]'s class
+ *    doc comment for why, and for the non-recursive, cycle-safe traversal it uses).
+ *  - **V0.9.3: browser HTTP routes exist** (`lapis-net-browser`'s `GET /api/mail`,
+ *    `GET /api/mail/sent`, `GET /api/mail/thread/{cid}`, `POST /api/mail`,
+ *    `GET /api/mail/attachment/{cid}`).
  *  - **V0.9.2: `HYBRID_ECIES` is functional; `MLS_ARCHIVE` remains reserved and rejected outright**
  *    - no implementation plan exists for it in this arc. **This validator never decrypts and never
  *    holds a private key** - a positive property, not a limitation: it is only ever given a
@@ -37,12 +43,19 @@ private val logger = KotlinLogging.logger {}
  *    never enters the GossipSub validator, by construction. An accepted `HYBRID_ECIES` message is
  *    indexed as [InboxPayload.Sealed] - decryption is an explicit, later, caller-driven
  *    [HybridEcies.open] call.
- *  - **No attachment fetching, verification, or encryption.** [AttachmentRef.size] is declared,
- *    never checked; no key field - V0.9.3.
- *  - **No self-delivery.** GossipSub never delivers a node's own [GossipPubSub.publish] calls to
- *    its own [GossipPubSub.subscribe] handler (see that method's doc comment) - a sender that lists
- *    themself among recipients never sees the message in their own inbox. A local "sent" view is
- *    V0.9.3.
+ *  - **V0.9.3: attachment encryption exists** ([MailAttachmentCipher], [EncryptedAttachmentBlobCodec])
+ *    - but attachment **fetching** over the network is still limited by the same
+ *    `NabuStorage.get()`/`Kademlia.dialPeer` gap documented below: a node can only decrypt an
+ *    attachment blob it already has locally. [AttachmentRef.size] remains declared, never checked
+ *    against the real blob.
+ *  - **V0.9.3: no self-delivery, but a local "sent" view now exists** ([SentFolder]). GossipSub
+ *    still never delivers a node's own [GossipPubSub.publish] calls to its own
+ *    [GossipPubSub.subscribe] handler (see that method's doc comment) - a sender that lists
+ *    themself among recipients still never sees the message via gossip in their own inbox; what
+ *    changed is that [SentFolder] now gives the sender's own UI a local record of what it sent,
+ *    populated by the caller from [MailSender.send]'s own return value, not by gossip.
+ *  - **No encrypted full-text search.** Still cut in V0.9.3.
+ *  - **No SMTP import gateway.** Still cut in V0.9.3.
  *
  * **The gossip frame carries the body, not just a CID pointer** - see [MailFrameCodec]'s class doc
  * comment for the full reasoning (`NabuStorage.get()` falls through to a live DHT lookup on a

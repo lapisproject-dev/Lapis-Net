@@ -63,7 +63,10 @@ class MailSender(
      * doc comment). For [EncryptionMode.HYBRID_ECIES], the sender's own self-wrap (see
      * [HybridEcies]'s class doc comment) still lets them open their OWN [SentMessage.sealedBody]
      * locally via [HybridEcies.open] - that is a local decrypt of what this call already returned,
-     * not network self-delivery. A local "sent" inbox view is V0.9.3.
+     * not network self-delivery. **A local "sent" view exists as of V0.9.3** ([SentFolder]) - this
+     * function itself does not populate one (it has no reference to any particular [SentFolder]
+     * instance); a caller (e.g. `POST /api/mail`'s route handler in `lapis-net-browser`) must
+     * explicitly call `SentFolder.add` with this call's returned [SentMessage].
      *
      * One publish per recipient - an N-recipient message is N publishes of the identical frame.
      */

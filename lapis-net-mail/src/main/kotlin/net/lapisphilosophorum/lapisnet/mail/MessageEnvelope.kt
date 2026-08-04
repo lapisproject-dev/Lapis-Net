@@ -33,8 +33,9 @@ private const val SIGNATURE_SIZE = 64
  * [HybridEcies]'s class doc comment for the encryption scheme itself and [MailAadContext]'s for the
  * associated-data binding that ties [wraps] to this exact sender/recipient/content combination.
  *
- * [replyTo]/[threadRoot] are carried and signed but nothing walks them into a thread yet - that is
- * V0.9.3 (thread assembly).
+ * [replyTo]/[threadRoot] are carried and signed - as of V0.9.3, [replyTo] alone is walked into a
+ * thread by [ThreadBuilder] (see that object's class doc comment for why [threadRoot] remains
+ * structurally unused: this wave resolves the "nothing walks them" sentence only for [replyTo]).
  */
 class MessageEnvelope private constructor(
     val sender: Secp256k1PublicKey,

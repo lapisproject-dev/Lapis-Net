@@ -20,6 +20,8 @@ dependencies {
     implementation(project(":lapis-net-trust"))
     implementation(project(":lapis-net-virtus"))
     implementation(project(":lapis-net-karma"))
+    // V0.9.3 - new edge: mail was explicitly untouched by browser through V0.9.2.
+    implementation(project(":lapis-net-mail"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)
@@ -43,4 +45,8 @@ dependencies {
     // module's test code interacts with lapis-net-virtus's compiled classes directly.
     testImplementation(rootProject.libs.lightning.kmp)
     testImplementation(rootProject.libs.bitcoin.kmp)
+    // V0.9.3 - MailXssRenderingTest.kt needs a real, JS/DOM-executing headless browser to prove
+    // mail.js's rendering function actually escapes an injected XSS payload, not just describe the
+    // intent - see that test's own doc comment and gradle/libs.versions.toml's htmlunit note.
+    testImplementation(rootProject.libs.htmlunit)
 }

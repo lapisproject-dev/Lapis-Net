@@ -30,15 +30,25 @@ class MalformedMessageBodyException(
  * blob's CID (see [cidFor]) and is itself covered by the envelope's signature. This is not an
  * omission - see [MessageBody]'s own doc comment.
  *
- * Layout of [encode]'s output: `magic(4) | version(1) | flags(1, reserved, must be zero) |
- * subjectLen(2) | subject(subjectLen) | bodyLen(2) | body(bodyLen) | attachmentCount(2) |
- * (cidLen(2) | cid(cidLen) | nameLen(2) | name(nameLen) | mimeLen(2) | mime(mimeLen) | size(8)) *
- * attachmentCount | headerCount(2) | (keyLen(2) | key(keyLen) | valueLen(2) | value(valueLen)) *
- * headerCount`, headers in strictly increasing unsigned-byte key order.
+ * Layout of [encode]'s output: `magic(4) | version(1) | flags(1, bit0 = FLAG_ATTACHMENTS_MAY_HAVE_KEY,
+ * all other bits reserved) | subjectLen(2) | subject(subjectLen) | bodyLen(2) | body(bodyLen) |
+ * attachmentCount(2) | (cidLen(2) | cid(cidLen) | nameLen(2) | name(nameLen) | mimeLen(2) |
+ * mime(mimeLen) | size(8) | [keyPresent(1) | key(32) if keyPresent - ONLY present at all when
+ * flags bit0 is set]) * attachmentCount | headerCount(2) | (keyLen(2) | key(keyLen) | valueLen(2)
+ * | value(valueLen)) * headerCount`, headers in strictly increasing unsigned-byte key order.
+ *
+ * **`VERSION` stays `1` for the V0.9.3 attachment-key addition**, mirroring
+ * [MessageEnvelopeCodec]'s identical V0.9.2 wrap-section justification: (1) a body with zero keyed
+ * attachments encodes byte-identical to V0.9.1/V0.9.2 - [FLAG_ATTACHMENTS_MAY_HAVE_KEY] is only set
+ * when at least one attachment carries a key; (2) the new per-attachment `keyPresent`/`key`
+ * sub-fields are gated by that already-reserved, now-used flag bit, never silent structural drift;
+ * (3) a pre-V0.9.3 decoder cleanly rejects a body that sets the bit via its own pre-existing
+ * `if (flags != 0) throw ...` check - a typed rejection, never a misparse.
  */
 object MessageBodyCodec {
     private val MAGIC = "LNMB".toByteArray(Charsets.US_ASCII)
     private const val VERSION: Byte = 1
+    private const val FLAG_ATTACHMENTS_MAY_HAVE_KEY = 0x01
 
     const val MAX_SUBJECT_BYTES = 512
     const val MAX_MARKDOWN_BYTES = 32_768
@@ -54,25 +64,32 @@ object MessageBodyCodec {
     const val MAX_HEADER_KEY_BYTES = 64
     const val MAX_HEADER_VALUE_BYTES = 512
 
+    /** AES-256 key size for an independently-encrypted attachment (V0.9.3) - see
+     * [AttachmentRef.encryptionKey] and [MailAttachmentCipher]. */
+    const val ATTACHMENT_KEY_SIZE = 32
+
     /**
      * Cap on a fully-encoded [MessageBody] blob. Worst-case arithmetic (why the sub-caps above are
      * sized the way they are - a naive choice would overflow this):
-     * `512 (subject) + 32768 (markdown) + 16 * (2+128 cid + 2+128 name + 2+64 mime + 8 size = 334)
-     * = 5344 + 16 * (2+64 key + 2+512 value = 580) = 9280` → total ≈ 48 KB, comfortably under this
-     * limit and far under [net.lapisphilosophorum.lapisnet.networking.GossipPubSub]'s 256 KiB
-     * gossip message-size ceiling.
+     * `512 (subject) + 32768 (markdown) + 16 * (2+128 cid + 2+128 name + 2+64 mime + 8 size + 1
+     * keyPresent + 32 key = 367) = 5,872 + 16 * (2+64 key + 2+512 value = 580) = 9,280` → total ≈
+     * 48 KB (delta of +528 bytes over the pre-V0.9.3 arithmetic, from the attachment key
+     * sub-fields), comfortably under this limit and far under
+     * [net.lapisphilosophorum.lapisnet.networking.GossipPubSub]'s 256 KiB gossip message-size
+     * ceiling.
      */
     const val MAX_BODY_BLOB_SIZE = 0xFFFF
 
     fun encode(body: MessageBody): ByteArray {
         val subjectBytes = body.subject.toByteArray(Charsets.UTF_8)
         val bodyBytes = body.body.toByteArray(Charsets.UTF_8)
+        val anyKeyed = body.attachments.any { it.encryptionKey != null }
 
         val out = ByteArrayOutputStream()
         DataOutputStream(out).apply {
             write(MAGIC)
             writeByte(VERSION.toInt())
-            writeByte(0) // flags: all bits reserved, must be zero
+            writeByte(if (anyKeyed) FLAG_ATTACHMENTS_MAY_HAVE_KEY else 0)
             writeShort(subjectBytes.size)
             write(subjectBytes)
             writeShort(bodyBytes.size)
@@ -89,6 +106,13 @@ object MessageBodyCodec {
                 writeShort(mimeBytes.size)
                 write(mimeBytes)
                 writeLong(attachment.size)
+                if (anyKeyed) {
+                    val key = attachment.encryptionKey
+                    writeByte(if (key != null) 1 else 0)
+                    // Fixed ATTACHMENT_KEY_SIZE bytes, no length prefix needed - mirrors the
+                    // sender(33)/signature(64) fixed-field precedent in MessageEnvelopeCodec.
+                    if (key != null) write(key)
+                }
             }
             writeShort(body.headers.size)
             body.headers.forEach { (key, value) ->
@@ -123,7 +147,10 @@ object MessageBodyCodec {
             if (version != VERSION) throw MalformedMessageBodyException("unsupported version $version")
 
             val flags = input.readUnsignedByte()
-            if (flags != 0) throw MalformedMessageBodyException("reserved flag bits must be zero: $flags")
+            if (flags and FLAG_ATTACHMENTS_MAY_HAVE_KEY.inv() != 0) {
+                throw MalformedMessageBodyException("reserved flag bits must be zero: $flags")
+            }
+            val attachmentsMayHaveKey = flags and FLAG_ATTACHMENTS_MAY_HAVE_KEY != 0
 
             val subjectLen = input.readUnsignedShort()
             if (subjectLen > MAX_SUBJECT_BYTES) throw MalformedMessageBodyException("subject too long: $subjectLen")
@@ -168,11 +195,27 @@ object MessageBodyCodec {
                         throw MalformedMessageBodyException("invalid attachment size: $size")
                     }
 
+                    val encryptionKey =
+                        if (attachmentsMayHaveKey) {
+                            val present = input.readUnsignedByte()
+                            if (present !in 0..1) {
+                                throw MalformedMessageBodyException("invalid attachment key-present flag: $present")
+                            }
+                            if (present == 1) {
+                                ByteArray(ATTACHMENT_KEY_SIZE).also { buf -> input.readFully(buf) }
+                            } else {
+                                null
+                            }
+                        } else {
+                            null
+                        }
+
                     AttachmentRef(
                         cid = Cid.cast(cidBytes),
                         name = String(nameBytes, Charsets.UTF_8),
                         mime = String(mimeBytes, Charsets.UTF_8),
                         size = size,
+                        encryptionKey = encryptionKey,
                     )
                 }
 

@@ -1418,6 +1418,269 @@ wrap(81) * wrapCount` — present iff `encryption == HYBRID_ECIES`. `SealedBodyC
 layout: `magic(4) "LNSB" | version(1) | flags(1, reserved) | nonce(12) | ciphertextLen(2) |
 ciphertext(ciphertextLen)` (ciphertext includes the trailing 16-byte GCM tag).
 
+== Mail threading, attachment encryption, and the browser UI (V0.9.3)
+
+`lapis-net-mail`'s V0.9.3 sub-wave adds thread assembly, per-attachment encryption independent of
+body encryption, a local sent-folder view, and — in `lapis-net-browser` — five HTTP routes plus a
+hand-written mail UI. Builds directly on V0.9.1's envelope/body format and V0.9.2's `HYBRID_ECIES`
+encryption, both already on `master`; no wire-breaking change to either.
+
+**Threading key: `MessageEnvelope.replyTo` compared against `contentCid`, not `contentId()`.** This
+is the single most consequential design fact for `ThreadBuilder` and is easy to get backwards, since
+it is inferred from the type system rather than stated as a sentence anywhere in V0.9.1/V0.9.2:
+`replyTo` and `threadRoot` share `contentCid`'s exact type (`io.ipfs.cid.Cid`) and reference the
+*parent message's body-blob CID* (`MessageBodyCodec.cidFor`) — never the parent envelope's own
+SHA-256 fingerprint (`MessageEnvelope.contentId()`, a raw `ByteArray` used only internally by
+`InboxIndex`/`MailContentId` for gossip dedup, a strictly finer key). One consequence, inherited
+from V0.9.1's field typing and not fixable without a wire-breaking change: two different envelopes
+whose `MessageBody` bytes happen to be byte-identical collide on the same threading key
+(`ThreadBuilder`'s internal test-seam overload documents "last one wins" for that case explicitly —
+never reachable via the real `InboxGossip.messages()`/`SentFolder.latest()` paths, which already
+dedup upstream by envelope content id). `threadRoot` remains carried-and-signed but structurally
+unused this wave — only `replyTo` is walked into a tree.
+
+**`ThreadBuilder` mirrors `lapis-net-trust`'s `VeritasGrantResolver` traversal discipline exactly**
+— explicit-stack, non-recursive DFS, a global visited-CID set, and a hard depth cap
+(`MAX_THREAD_DEPTH = 4,096`, the same rationale/magnitude as `VeritasGrantResolver.MAX_CHAIN_DEPTH`)
+— because a mail thread is structurally the same forked-DAG-with-a-possible-cycle problem that
+resolver already solves for the trust-grant backward-hash chain, and this codebase already has a
+battle-tested solution for it. The one place the algorithm's *shape* diverges: `ThreadBuilder` needs
+a **two-phase (ENTER/LEAVE) post-order walk**, because it must fully build every child `ThreadNode`
+before assembling the parent (`VeritasGrantResolver`'s single-phase stack only ever needs to find
+leaf tips, never reconstruct a tree).
+
+**Why a genuine cycle is honestly constructible here, unlike in the trust module.**
+`VeritasGrantResolver`'s doc comment argues a hash-chain cycle is cryptographically infeasible
+through the real API, because a successor's `previousGrantId` is fixed to an *already-computed*
+predecessor content id at grant-creation time. Mail has no such causality constraint: `contentCid`
+is a pure function of `MessageBody` bytes alone, computable *before* any envelope exists,
+independently for two unrelated bodies. A genuine 2-cycle (envelope A replies to B replies to A) —
+and even a length-1 self-reference (`replyTo == own contentCid`) — is therefore trivially
+constructible via the real production API (two real, correctly signed `MessageEnvelope`s, no
+test-seam hack), and `ThreadBuilderTest` exercises exactly that construction rather than a synthetic
+one.
+
+**Cycle rejection happens at root selection, not mid-walk.** `replyTo` is a single-valued parent
+pointer — each message has at most one parent — so any pure cycle consists entirely of members whose
+`replyTo` points at another *in-set* cycle member, meaning every member of a cycle fails the "is
+this a root" test by construction (a root is `replyTo == null`, or a `replyTo` pointing outside the
+known set). A cycle can therefore never be reached by a downward walk starting from a legitimate
+root: reachability follows `replyTo`-defined child edges strictly outward from a root, and nothing
+in a cycle has such an ancestor. The consequence, deliberately different from a literal
+"truncate-mid-walk" reading and tested explicitly as a "cascading exclusion" case: the entire cycle
+— *and anything that transitively replies only into it* — is silently absent from the assembled
+forest, never a crash, never an infinite loop, always bounded `O(known.size)` work. The mid-walk
+`visited`-set guard inside the per-tree DFS is kept anyway as defense-in-depth for a future
+relaxation of the single-parent-pointer model, mirroring `VeritasGrantResolver`'s own
+belt-and-braces cycle guard — under today's data model it is structurally unreachable, for a
+different underlying reason than in the trust module (there, no cycle can exist at all; here,
+cycles can exist but are excluded before any walk starts).
+
+**Receipt-order independence is a tested convergence property, not an incidental one.** Each
+parent's children are sorted exactly once — by an unsigned, byte-lexicographic comparator over the
+child's `contentCid` bytes, mirroring `VeritasGrantResolver`'s own `GrantContentIdBytesComparator`
+tie-break — before any walk begins, and root selection itself is built purely from set membership
+(a `HashMap` keyed by `contentCid`), never from the input list's position. Two nodes that eventually
+hold the identical `known` *set*, however differently the underlying `List<InboxMessage>` argument
+was ordered, therefore produce byte-for-byte identical `ThreadNode` trees. `ThreadBuilderTest`
+asserts this directly: the same envelope set fed through `build()` in several different orders
+(including `.shuffled()`) yields structurally identical forests.
+
+**Attachment encryption: always a fresh key, never the body's `HYBRID_ECIES` content key.**
+`MailAttachmentCipher.encrypt` generates an independent, random AES-256-GCM key at encrypt time for
+every attachment, regardless of the enclosing message's own `EncryptionMode` — the design decision
+is stated prominently in that object's own class doc comment, with four reasons: (1) attachment
+encryption is explicitly *orthogonal* to body encryption (the product requirement is "an
+unencrypted newsletter with one encrypted PDF attachment" to be representable), and a design that
+reuses the body key only helps the `HYBRID_ECIES` case, needing an entirely separate mechanism for
+`EncryptionMode.NONE` anyway — one uniform mechanism has a single code path and a single test
+surface for both; (2) reusing `HybridEcies`'s content key would require plumbing a short-lived,
+sensitive symmetric key across a module boundary it currently never crosses (`HybridEcies.open`
+already zero-fills that key immediately after use) — pure coupling cost for no benefit; (3)
+attachment fetch (`GET /api/mail/attachment/{cid}`) is architecturally separate from, and may happen
+much later than or never after, the body fetch/decrypt — `AttachmentRef.encryptionKey` already
+travels *inside* the (possibly sealed) `MessageBody`, so it is trivially available the moment the
+recipient has decrypted the body once, with no extra derivation step; (4) confidentiality is
+identical either way for `HYBRID_ECIES` messages — the attachment key is only ever visible after a
+successful `HybridEcies.open`, exactly the boundary a reused key would offer, with none of the
+coupling cost.
+
+**Known, accepted asymmetry for `EncryptionMode.NONE` messages.** An attachment's
+`AttachmentRef.encryptionKey` travels in the clear inside the plaintext gossip frame — visible to
+anyone who computes and subscribes to the recipient's `InboxTopics.forRecipient` topic, i.e. anyone
+already inside that narrow, already-weak `NONE`-mode confidentiality boundary that subject/body
+already have. Independent attachment encryption in a `NONE`-mode message therefore protects only
+against a passive bystander who never fetches/decrypts that specific attachment — not against anyone
+already observing the frame. Stated here as a documented, accepted property, not a defect.
+
+**AAD choice: a fixed, non-secret, domain-separating constant, not a message-specific binding.**
+`MailAttachmentCipher` uses a single tag (`"LapisNet:mail-attachment:v1"`) for every attachment's
+AEAD, unlike `HybridEcies`'s wrap/body AEADs, which must resist a cross-envelope "wrap transplant"
+because a wrap is a *separate, reusable* artifact carried at envelope level (see `MailAadContext`
+above). An attachment's `(cid, encryptionKey)` pair instead lives *inside the same signed
+`MessageBody`* as every other `AttachmentRef` field — the envelope signature already transitively
+authenticates the pairing, exactly as it already does for `MessageBody.subject`/`MessageBody.body`.
+There is no cross-envelope transplant surface here to close with a context-specific AAD; a fixed
+domain tag is sufficient and simpler.
+
+**`EncryptedAttachmentBlob`/`EncryptedAttachmentBlobCodec`: a 32-bit, not 16-bit, ciphertext-length
+field.** Unlike `SealedBody`, which rides inside the gossiped `MailFrameCodec` frame and is therefore
+capped by that frame's practical size ceiling, an encrypted attachment blob is stored under its
+*own* Nabu CID and never embedded in a gossip frame at all — so it can legitimately exceed
+`MessageBodyCodec.MAX_BODY_BLOB_SIZE`. `MAX_CIPHERTEXT_BYTES` reuses `AttachmentRef`/
+`MessageBodyCodec`'s own already-accepted 1 GiB declared-size ceiling (`MAX_ATTACHMENT_SIZE_BYTES`)
+as this codec's ciphertext ceiling plus the 16-byte GCM tag, rather than inventing a new arbitrary
+number. Unlike every other `decode()` in this module, this codec's check-before-allocate discipline
+is defense-in-depth/consistency rather than closing a gossip-reachable amplification vector: this
+path is only ever reached from `GET /api/mail/attachment/{cid}`'s explicit, local-caller-triggered
+fetch, never from `InboxGossip`'s validator.
+
+**`AttachmentRef`/`MessageBodyCodec` wire-format change is additive, `VERSION` stays `1`.** A new,
+previously-reserved flags bit (`FLAG_ATTACHMENTS_MAY_HAVE_KEY = 0x01`) gates an optional
+`keyPresent(1) | key(32)` sub-record appended to each attachment entry, mirroring
+`MessageEnvelopeCodec`'s own V0.9.2 wrap-section justification structure exactly: (1) a body with
+zero keyed attachments encodes byte-identical to V0.9.1/V0.9.2 — the flag is only set when at least
+one attachment carries a key; (2) the new sub-fields are gated by an already-reserved, now-used flag
+bit, never silent structural drift; (3) a pre-V0.9.3 decoder cleanly rejects (never misparses) a
+body that sets the new bit, via its own pre-existing `if (flags != 0) throw ...` reserved-bits
+check. Worst-case body-blob arithmetic grows by 528 bytes (16 attachments × 33 new bytes each) over
+the pre-V0.9.3 figure — still comfortably under `MAX_BODY_BLOB_SIZE`; no cap changes needed.
+
+**`SentFolder`: deliberately one evicting cap, not `InboxIndex`'s two — a stated departure, not a
+silent one.** `InboxIndex`'s *separate*, non-evicting persistence-reservation cap exists to gate
+`NabuStorage.put()` against an attacker's unbounded gossip flood — a real defensive purpose.
+`SentFolder.add` is only ever called *after* `MailSender.send` has already unconditionally,
+successfully persisted both the envelope and the body; by the time `add` runs, persistence has
+already happened and cannot be retroactively gated. A second cap here would bound nothing real — it
+would only track which content ids this class itself considers "reserved," with zero actual gating
+effect on any storage call. `SentFolder` therefore implements a single evicting tracking cap
+(`MAX_TRACKED_SENT_MESSAGES = 8,000`, mirroring `InboxIndex.MAX_TRACKED_MESSAGES`'s sizing
+rationale unchanged), the honest mechanism for the one real thing this class needs to bound: its own
+in-memory footprint. This mirrors `MailFrameCodec`'s own established precedent for stating a
+deliberate spec departure explicitly in the code, rather than silently deviating from it.
+Population is the *caller's* responsibility — `MailSender.send` has no reference to any particular
+`SentFolder` instance and never populates one implicitly; `lapis-net-browser`'s `POST /api/mail`
+route handler is that caller, via `SentFolder.add(sent)` immediately after `MailSender.send`
+returns.
+
+**Browser routes: `MailApi.kt`, installed into the same routing tree as every other route.** Five
+new routes (`GET /api/mail`, `GET /api/mail/sent`, `GET /api/mail/thread/{cid}`, `POST /api/mail`,
+`GET /api/mail/attachment/{cid}`) live in a dedicated `MailApi.kt` file purely for readability given
+their combined size — `installBrowserApi` calls a single `Route.installMailRoutes(deps)` extension
+from inside the exact same `routing { }` block every other route (timeline, trust, Karma, connect)
+is installed into. There is no separate mail-specific routing mechanism to learn: this repo's other
+domains (e.g. Karma's `POST /api/karma`) wire their routes the identical way, directly inline in
+`BrowserApi.kt` — mail routes are installed the same way, just via one extra indirection for file
+size. `BrowserApiDependencies` gains `mailInbox: InboxGossip`, `mailSender: MailSender`,
+`sentFolder: SentFolder`; `BrowserServer.start`/`stop` construct/tear these down in the same
+attach/stop-order pattern already established for Veritas/Virtus/Karma/posts.
+
+`GET /api/mail` and `GET /api/mail/sent` return `MailSummaryResponse`s — subject, a bounded
+plaintext body preview (`MAIL_BODY_PREVIEW_CHARS = 280` characters of the *verbatim* Markdown
+source, never rendered), attachment metadata (name/mime/size/`encrypted` — the key itself never
+serialized into any response), and a `decryptionFailed` flag. For a `HYBRID_ECIES` inbox entry,
+`HybridEcies.open` is attempted with the local identity and any failure degrades to
+`decryptionFailed = true` with a placeholder subject/body and an empty attachment list — never a
+500, never fabricated attachment data from a body that failed to decrypt. A `SentMessage` (adapted
+via `SentFolder.kt`'s `toInboxMessage()` extension) always takes the plaintext branch — the local
+sender already holds its own plaintext regardless of the message's `EncryptionMode` — so
+`decryptionFailed` is always `false` for `folder = "sent"`.
+
+`POST /api/mail` validates every field and 400s cleanly *before* any side effect (mirroring
+`/api/posts`/`/api/self-link`'s established byte-length-then-400 pattern): empty/malformed
+recipient hex, an unrecognized encryption string (`MLS_ARCHIVE` explicitly rejected with its own
+message, not lumped in with "unknown"), oversized subject/body, too many attachments, oversized
+attachment name/mime, malformed `replyToCid`/`threadRootCid`, and — before any base64 decoding
+happens — an attachment's declared upload size checked cheaply against
+`MAX_MAIL_ATTACHMENT_UPLOAD_BYTES` (25 MiB, a route-level practical cap deliberately much stricter
+than `MessageBodyCodec.MAX_ATTACHMENT_SIZE_BYTES`'s 1 GiB wire-format ceiling, because this route
+buffers the whole base64 JSON request body in memory before any wire-format check ever runs). Each
+attachment marked `encrypt = true` is routed through `MailAttachmentCipher.encrypt` and its
+ciphertext blob stored under its own CID before `AttachmentRef`/`MessageBody`/`MessageEnvelope` are
+built; the route then calls `MailSender.send` and, on success, `SentFolder.add`.
+
+`GET /api/mail/thread/{cid}` builds a fresh `ThreadForest` from the current inbox+sent set on every
+call — `ThreadBuilder.build` is cheap and `O(known.size)`, and this codebase's other in-memory
+indexes are already documented as "provisional, revisit against real usage" at this same
+personal-node scale, so no caching is attempted this wave. `GET /api/mail/attachment/{cid}` performs
+a linear scan over the same known set (same scale caveat), locates the `AttachmentRef` by CID,
+fetches its blob via `NabuStorage.get` (local blockstore only — see below), and — if
+`encryptionKey` is present — decrypts it via `MailAttachmentCipher.decrypt` before responding with a
+`Content-Disposition: attachment` header and the attachment's declared MIME type (defensively
+`ContentType.parse`d with a safe fallback to `application/octet-stream`).
+
+**`GET /api/mail/attachment/{cid}`'s cross-node fetch is limited by the same pre-existing
+`NabuStorage.get()`/`Kademlia.dialPeer` gap documented since V0.1.4.** A node can only reliably
+retrieve an attachment blob it already has locally — the sender's own node, or a node that fetched
+it some other way. This is not a new limitation this wave introduces; it is the same gap every other
+cross-node fetch in this codebase already carries, simply now visible through a new route. Reflected
+directly in `TwoNodeMailBrowserIntegrationTest`'s own scoping: it asserts attachment *metadata*
+(name/mime/size/`encrypted`) propagates correctly to the recipient via real gossip, and separately
+that the *sender* — the node that actually has the blob — can fetch its own just-sent attachment via
+its own `GET /api/mail/attachment/{cid}`; it does not assert the recipient can fetch the blob
+cross-node, because that would not currently succeed.
+
+**Browser UI: a second, self-contained static page, no new JS framework.** `mail.html`/`mail.js`
+mirror V0.2.2's Minimal-Browser's own established discipline exactly — `fetch()` + `<template>` +
+`cloneNode`/`querySelector` + `.textContent`, zero dependencies, no build step. The only change to
+the existing timeline page is one new nav line in `index.html`'s header linking to `/mail.html`;
+`app.js` is untouched. `mail.js` is deliberately Promise/`.then()`-based throughout, not
+`async`/`await` — this codebase's own headless-browser XSS regression test
+(`MailXssRenderingTest.kt`, `org.htmlunit:htmlunit`, a new test-only dependency added specifically
+for this wave's mandatory security requirement below) runs on an embedded Rhino-derived JavaScript
+engine that fully parses `Promise`/`fetch()` (with HtmlUnit's bundled fetch polyfill enabled)/arrow
+functions/template literals, but does not parse `async function`/`await` syntax at all — confirmed
+empirically, not assumed. Rather than special-case the test target or accept an untested rendering
+path, `mail.js` itself is written in the dialect this codebase can actually verify end-to-end against
+a real DOM. Message bodies render as their **verbatim Markdown source** inside a `white-space:
+pre-wrap` `<pre>` element — no Markdown-to-HTML rendering in this wave, a deliberate, conservative
+scope cut resolving `MessageBody`'s own V0.9.1 forward reference ("that is a browser-UI concern for
+a later wave") given the mandatory XSS-escaping requirement immediately below; a future wave may add
+real Markdown rendering with its own, separately-audited escaping discipline.
+
+**Mandatory, non-negotiable XSS-escaping discipline.** Message subjects, bodies, attachment names,
+and sender-derived display strings returned by `MailApi.kt` are entirely user-controlled content
+this validator never sanitizes or interprets — `InboxGossip`'s validator accepts and indexes
+whatever signed `MessageBody` a sender constructs, and `MailSummaryResponse.bodyPreview` is the
+verbatim Markdown source, never rendered to HTML server-side either. Every DOM-insertion site in
+`mail.js` goes through exactly one named helper, `setText(el, value)` (`el.textContent = value`) —
+never `innerHTML`, never a template string interpolated into `innerHTML`, anywhere in the file. The
+one place a value feeds an HTML *attribute-shaped* context — an attachment's download `<a href>` —
+uses a DOM property assignment (`linkEl.href = ...`) rather than string concatenation into markup,
+and the value in question (a server-generated, already CID-validated attachment CID) is not raw user
+text to begin with, making this defense-in-depth on top of an already-safe value. This is a
+mandatory security-audit checklist item for this wave, not a style preference, and it is verified —
+not merely asserted — by `MailXssRenderingTest.kt`: a `<script>`/`onerror=` payload is sent as a real
+message's subject and body via the real `POST /api/mail` HTTP API, the real `mail.html`/`mail.js`
+page is loaded into a real, JS/DOM-executing headless browser (`org.htmlunit.WebClient`), and the
+test asserts (a) the injected script/handler never executes (`window.__xssFired` reads back as JS
+`undefined`, verified via `ScriptResult.isUndefined`, not a Java `null`), (b) the rendered DOM node's
+`textContent` is the literal, unexecuted payload string, and (c) the serialized page contains the
+payload HTML-entity-escaped (`&lt;script&gt;`) with no injected `<script>` element beyond `mail.js`'s
+own `<script src>` tag. The test targets `GET /api/mail/sent`'s rendering path specifically (via
+`mail.html`'s "Sent" toggle) rather than `GET /api/mail`'s, because GossipSub never self-delivers (a
+gap documented since V0.9.1) — `/sent` is populated synchronously by the same `POST /api/mail` call
+with zero gossip round trip needed, and `mail.js`'s rendering function for an inbox item and a sent
+item is the exact same function (`renderMailItem`/`fillSummaryInto`, both consuming a
+`MailSummaryResponse`), so this is a fully faithful test of the identical code path a received
+message would go through.
+
+**Deliberately accepted gaps, stated as such:**
+
+* **No encrypted full-text search, no SMTP import gateway, no newsletter/subscription model.** Still
+  cut, as documented since V0.9.1/V0.9.2 — no target wave assigned yet.
+* **No address book, no pubkey-to-name mapping.** Explicitly carved out of this sub-wave's actual
+  implemented scope (an earlier roadmap draft had listed it under V0.9.3) — no target wave assigned
+  yet; recipients remain raw compressed secp256k1 keys everywhere in the UI and API.
+* **`threadRoot` remains structurally unused.** Only `replyTo` is walked into a thread this wave —
+  see `ThreadBuilder`'s own reasoning above.
+* **Attachment cross-node fetch remains limited**, as above — inherited from `NabuStorage`, not a
+  new gap this wave introduces.
+* **No Markdown-to-HTML rendering in the browser UI**, as above — a deliberate, conservative scope
+  cut given the mandatory XSS-escaping requirement.
+* **No real pinning economy.** "Pinning" remains a no-op, unaffected by this wave, already documented
+  in the V0.8/V0.9 arc planning notes.
+
 == Diagrams
 
 Diagrams for this repository are authored in kUML and embedded via the

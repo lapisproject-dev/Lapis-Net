@@ -20,6 +20,12 @@ zxing = "3.5.4"
 # release instead. See lapis-net-virtus/build.gradle.kts's header comment for the version-skew
 # note on this artifact's own bitcoin-kmp/secp256k1-kmp transitive dependency pins.
 lightning-kmp = "1.8.4"
+# V0.9.3 - pure-Java headless browser (executes real JS/DOM, no native browser binary), added
+# test-only to lapis-net-browser so MailXssRenderingTest.kt can prove mail.js's rendering function
+# actually escapes an injected <script>/onerror payload, not just describe the intent. Verified
+# current on Maven Central as of this wave (2026-08-04) via maven-metadata.xml - re-verify at a
+# later implementation time, versions drift.
+htmlunit = "5.3.0"
 
 [libraries]
 jvm-libp2p = { group = "io.libp2p", name = "jvm-libp2p", version.ref = "jvm-libp2p" }
@@ -44,6 +50,7 @@ electrum-client = { group = "net.osslabz", name = "electrum-client", version.ref
 bitcoin-kmp = { group = "fr.acinq.bitcoin", name = "bitcoin-kmp-jvm", version.ref = "bitcoin-kmp" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
 lightning-kmp = { group = "fr.acinq.lightning", name = "lightning-kmp-jvm", version.ref = "lightning-kmp" }
+htmlunit = { group = "org.htmlunit", name = "htmlunit", version.ref = "htmlunit" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

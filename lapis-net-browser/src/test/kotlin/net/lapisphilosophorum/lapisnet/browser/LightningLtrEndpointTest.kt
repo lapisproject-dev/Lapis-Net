@@ -29,6 +29,9 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.karma.BitcoinTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
 import net.lapisphilosophorum.lapisnet.karma.TimeAnchorLookupResult
+import net.lapisphilosophorum.lapisnet.mail.InboxGossip
+import net.lapisphilosophorum.lapisnet.mail.MailSender
+import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -77,6 +80,9 @@ private class LightningTestHarness(
     val karma: KarmaGossip
     val posts: PostAnnouncementGossip
     val karmaAnchorCache: KarmaAnchorCache
+    val mailInbox: InboxGossip
+    val mailSender: MailSender
+    val sentFolder: SentFolder
     val deps: BrowserApiDependencies
 
     init {
@@ -88,10 +94,27 @@ private class LightningTestHarness(
         karma = KarmaGossip.attach(pubsub, storage)
         posts = PostAnnouncementGossip.attach(pubsub, storage)
         karmaAnchorCache = KarmaAnchorCache(LightningTestNoAnchorSource)
-        deps = BrowserApiDependencies(identity, node, storage, veritas, virtus, karma, posts, karmaAnchorCache)
+        mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+        mailSender = MailSender(pubsub, storage)
+        sentFolder = SentFolder()
+        deps =
+            BrowserApiDependencies(
+                identity,
+                node,
+                storage,
+                veritas,
+                virtus,
+                karma,
+                posts,
+                karmaAnchorCache,
+                mailInbox,
+                mailSender,
+                sentFolder,
+            )
     }
 
     fun stop() {
+        mailInbox.stop()
         posts.stop()
         karma.stop()
         virtus.stop()

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lapis Net - Mail</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  #mail-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  #mail-nav a:hover { text-decoration: underline; }
+  main#mail-main { max-width: 900px; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.5rem; }
+  section.mail-panel { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  section.mail-panel h2 { margin-top: 0; }
+  #compose-form { display: flex; flex-direction: column; gap: 0.6rem; }
+  #compose-form label { font-size: 0.85rem; color: var(--muted); }
+  #compose-form input[type="text"], #compose-form textarea, #compose-form select {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0.5rem; font-family: inherit;
+  }
+  #compose-form textarea { min-height: 8rem; resize: vertical; }
+  #compose-count { font-size: 0.8rem; color: var(--muted); }
+  #compose-attachments { display: flex; flex-direction: column; gap: 0.5rem; }
+  .mail-attachment-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .mail-attachment-row label { display: flex; gap: 0.3rem; align-items: center; font-size: 0.85rem; }
+  #compose-status { font-size: 0.85rem; color: var(--muted); }
+  #folder-toggle { display: flex; gap: 0.5rem; }
+  #folder-toggle button.active { outline: 2px solid var(--accent); }
+  ul#mail-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.75rem; }
+  .mail-item { border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; background: var(--bg); }
+  .mail-item-header { display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; font-size: 0.85rem; color: var(--muted); }
+  .mail-subject { font-weight: 600; margin: 0.3rem 0; }
+  .mail-body-preview { white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0; font-family: inherit; }
+  .mail-attachments { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.4rem; }
+  .mail-attachment-item { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; }
+  .mail-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  .mail-decryption-failed { color: var(--badge-low-text); font-style: italic; }
+  #thread-view { display: none; flex-direction: column; gap: 0.5rem; }
+  #thread-view.visible { display: flex; }
+  .thread-node { border-left: 2px solid var(--border); padding-left: 0.6rem; }
+</style>
+</head>
+<body>
+<header id="identity-header">
+  <div class="brand">
+    <h1>Lapis Net Mail</h1>
+    <p id="tagline">Threaded, optionally-encrypted mail over gossip.</p>
+  </div>
+  <div id="identity-info">
+    <span id="identity-label">You:</span>
+    <span id="identity-fingerprint">loading identity&hellip;</span>
+  </div>
+  <nav id="mail-nav">
+    <a href="/index.html">&larr; Timeline</a>
+  </nav>
+</header>
+
+<main id="mail-main">
+  <section class="mail-panel" id="compose-panel">
+    <h2>Compose</h2>
+    <form id="compose-form">
+      <div>
+        <label for="compose-recipients">Recipients (comma or newline separated hex public keys)</label>
+        <textarea id="compose-recipients" rows="2" placeholder="03ab...ef, 02cd...12"></textarea>
+      </div>
+      <div>
+        <label for="compose-subject">Subject</label>
+        <input type="text" id="compose-subject" />
+      </div>
+      <div>
+        <label for="compose-body">Body (Markdown)</label>
+        <textarea id="compose-body"></textarea>
+        <span id="compose-count">0 / 32768</span>
+      </div>
+      <div>
+        <label for="compose-encryption">Encryption</label>
+        <select id="compose-encryption">
+          <option value="NONE">None</option>
+          <option value="HYBRID_ECIES">Hybrid-ECIES (encrypted)</option>
+        </select>
+      </div>
+      <div id="compose-attachments">
+        <label>Attachments</label>
+        <div id="compose-attachment-rows"></div>
+        <button type="button" id="compose-add-attachment" class="btn-secondary">Add attachment</button>
+      </div>
+      <input type="hidden" id="compose-reply-to" />
+      <input type="hidden" id="compose-thread-root" />
+      <div id="compose-reply-banner" hidden>
+        Replying to <span id="compose-reply-target"></span>
+        <button type="button" id="compose-reply-clear" class="btn-secondary">Cancel reply</button>
+      </div>
+      <button type="submit" id="compose-submit">Send</button>
+      <span id="compose-status"></span>
+    </form>
+  </section>
+
+  <section class="mail-panel" id="mail-list-panel">
+    <h2>Mail</h2>
+    <div id="folder-toggle">
+      <button type="button" id="folder-inbox-button" class="btn-secondary active">Inbox</button>
+      <button type="button" id="folder-sent-button" class="btn-secondary">Sent</button>
+      <button type="button" id="mail-refresh-button" class="btn-secondary">Refresh</button>
+    </div>
+    <ul id="mail-list"></ul>
+  </section>
+
+  <section class="mail-panel" id="thread-panel">
+    <h2>Thread</h2>
+    <div id="thread-view"></div>
+  </section>
+</main>
+
+<template id="mail-item-template">
+  <li class="mail-item">
+    <div class="mail-item-header">
+      <span class="mail-item-sender"></span>
+      <span class="mail-item-time"></span>
+      <span class="mail-item-encryption"></span>
+    </div>
+    <p class="mail-subject"></p>
+    <pre class="mail-body-preview"></pre>
+    <div class="mail-attachments"></div>
+    <div class="mail-actions">
+      <button type="button" class="btn-secondary mail-view-thread-button">View thread</button>
+      <button type="button" class="btn-secondary mail-reply-button">Reply</button>
+    </div>
+  </li>
+</template>
+
+<template id="mail-attachment-item-template">
+  <div class="mail-attachment-item">
+    <span class="mail-attachment-lock"></span>
+    <a class="mail-attachment-link" href="#" target="_blank" rel="noopener"></a>
+    <span class="mail-attachment-meta"></span>
+  </div>
+</template>
+
+<template id="mail-attachment-row-template">
+  <div class="mail-attachment-row">
+    <input type="file" class="mail-attachment-file" />
+    <input type="text" class="mail-attachment-mime" placeholder="mime type (optional)" />
+    <label><input type="checkbox" class="mail-attachment-encrypt" /> encrypt</label>
+    <button type="button" class="btn-secondary mail-attachment-remove">Remove</button>
+  </div>
+</template>
+
+<template id="thread-node-template">
+  <div class="thread-node">
+    <div class="mail-item-header">
+      <span class="mail-item-sender"></span>
+      <span class="mail-item-time"></span>
+      <span class="mail-item-encryption"></span>
+    </div>
+    <p class="mail-subject"></p>
+    <pre class="mail-body-preview"></pre>
+    <div class="mail-attachments"></div>
+    <button type="button" class="btn-secondary mail-reply-button">Reply</button>
+    <div class="thread-node-children"></div>
+  </div>
+</template>
+
+<script src="/mail.js"></script>
+</body>
+</html>

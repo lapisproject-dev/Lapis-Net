@@ -24,6 +24,9 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
 import net.lapisphilosophorum.lapisnet.karma.KarmaVote
 import net.lapisphilosophorum.lapisnet.karma.KarmaVoteCodec
+import net.lapisphilosophorum.lapisnet.mail.InboxGossip
+import net.lapisphilosophorum.lapisnet.mail.MailSender
+import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.MAX_TRUST_MICROS
@@ -194,6 +197,10 @@ class BrowserApiDependencies(
     val karma: KarmaGossip,
     val posts: PostAnnouncementGossip,
     val karmaAnchorCache: KarmaAnchorCache,
+    /** V0.9.3 - see `MailApi.kt`'s `installMailRoutes` for the routes wired against these three. */
+    val mailInbox: InboxGossip,
+    val mailSender: MailSender,
+    val sentFolder: SentFolder,
 )
 
 /**
@@ -620,6 +627,13 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
             call.respond(SelfLinkResponse(target = target.fingerprint(), trustMicros = MAX_TRUST_MICROS))
         }
 
+        // V0.9.3 mail routes - kept in their own file (MailApi.kt) for readability given their
+        // size, with installBrowserApi calling this thin extension so BrowserApi.kt itself stays a
+        // dispatcher. installMailRoutes is a Route.() extension, called from inside this same
+        // `routing { }` block so it shares the exact route tree the routes above are installed
+        // into.
+        installMailRoutes(deps)
+
         // Serves src/main/resources/static/ (index.html, style.css, app.js) at the site root -
         // e.g. /index.html, /style.css, /app.js. Mapped LAST relative to the /api/* routes above
         // only for readability; Ktor's routing tree dispatches by exact path match, so ordering
@@ -631,7 +645,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
 /** Parses [hex] as a 33-byte compressed secp256k1 public key, or `null` for any malformed input
  * (wrong length, non-hex characters, or bytes that don't represent a valid curve point) - never
  * throws, so route handlers can turn this straight into a 400 response instead of crashing. */
-private fun parseHexPublicKeyOrNull(hex: String): Secp256k1PublicKey? {
+internal fun parseHexPublicKeyOrNull(hex: String): Secp256k1PublicKey? {
     if (hex.length != 66 || hex.any { it !in HEX_CHARS }) return null
     val bytes = ByteArray(33) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
     return runCatching { Secp256k1PublicKey(bytes) }.getOrNull()
@@ -654,7 +668,7 @@ private fun parseHexBytesOrNull(
 
 private val HEX_CHARS = "0123456789abcdefABCDEF"
 
-private fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
+internal fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
 
 /** Cheap upper bound on an incoming CID string's length, checked BEFORE it ever reaches
  * [Cid.decode] - mirrors [parseHexPublicKeyOrNull]'s exact-length precondition check, just looser
@@ -669,7 +683,7 @@ private val MAX_CID_STRING_LENGTH = KarmaVoteCodec.MAX_CID_BYTES * 4
 /** Parses [value] as a [Cid], or `null` for any malformed input - never throws, so route handlers
  * can turn this straight into a 400 response instead of crashing, mirroring
  * [parseHexPublicKeyOrNull]'s established pattern for this file. */
-private fun parseCidOrNull(value: String): Cid? {
+internal fun parseCidOrNull(value: String): Cid? {
     if (value.length > MAX_CID_STRING_LENGTH) return null
     return runCatching { Cid.decode(value) }.getOrNull()
 }

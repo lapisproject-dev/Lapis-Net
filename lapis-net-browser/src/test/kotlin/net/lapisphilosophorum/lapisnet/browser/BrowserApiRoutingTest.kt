@@ -18,6 +18,9 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.karma.BitcoinTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
 import net.lapisphilosophorum.lapisnet.karma.TimeAnchorLookupResult
+import net.lapisphilosophorum.lapisnet.mail.InboxGossip
+import net.lapisphilosophorum.lapisnet.mail.MailSender
+import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -49,6 +52,9 @@ private class TestHarness(
     val karma: KarmaGossip
     val posts: PostAnnouncementGossip
     val karmaAnchorCache: KarmaAnchorCache
+    val mailInbox: InboxGossip
+    val mailSender: MailSender
+    val sentFolder: SentFolder
     val deps: BrowserApiDependencies
 
     init {
@@ -63,10 +69,27 @@ private class TestHarness(
         // test identity with no real Bitcoin history should resolve to (NoAnchorClaim), mirroring
         // KarmaAnchorCache's own doc comment on that being the correct, non-error outcome.
         karmaAnchorCache = KarmaAnchorCache(NoAnchorSource)
-        deps = BrowserApiDependencies(identity, node, storage, veritas, virtus, karma, posts, karmaAnchorCache)
+        mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+        mailSender = MailSender(pubsub, storage)
+        sentFolder = SentFolder()
+        deps =
+            BrowserApiDependencies(
+                identity,
+                node,
+                storage,
+                veritas,
+                virtus,
+                karma,
+                posts,
+                karmaAnchorCache,
+                mailInbox,
+                mailSender,
+                sentFolder,
+            )
     }
 
     fun stop() {
+        mailInbox.stop()
         posts.stop()
         karma.stop()
         virtus.stop()
@@ -359,7 +382,23 @@ class BrowserApiRoutingTest :
             val karma = KarmaGossip.attach(pubsub, storage)
             val posts = PostAnnouncementGossip.attach(pubsub, storage)
             val karmaAnchorCache = KarmaAnchorCache(FailingAnchorSource)
-            val deps = BrowserApiDependencies(identity, node, storage, veritas, virtus, karma, posts, karmaAnchorCache)
+            val mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+            val mailSender = MailSender(pubsub, storage)
+            val sentFolder = SentFolder()
+            val deps =
+                BrowserApiDependencies(
+                    identity,
+                    node,
+                    storage,
+                    veritas,
+                    virtus,
+                    karma,
+                    posts,
+                    karmaAnchorCache,
+                    mailInbox,
+                    mailSender,
+                    sentFolder,
+                )
             try {
                 testApplication {
                     application { installBrowserApi(deps) }
@@ -382,6 +421,7 @@ class BrowserApiRoutingTest :
                     body.error.isNotBlank() shouldBe true
                 }
             } finally {
+                mailInbox.stop()
                 posts.stop()
                 karma.stop()
                 virtus.stop()
