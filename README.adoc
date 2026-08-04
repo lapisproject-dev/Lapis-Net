@@ -84,7 +84,7 @@ end-to-end/asynchronous messaging (planned next waves).
 ./gradlew :lapis-net-cli:run
 ----
 
-Requires JDK 21.
+Requires JDK 25.
 
 == Development conventions
 

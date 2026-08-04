@@ -11,7 +11,7 @@ cd Lapis-Net
 
 == Code standards
 
-* Kotlin/JVM, JDK 21 toolchain.
+* Kotlin/JVM, JDK 25 toolchain.
 * Style enforced by ktlint — run `./gradlew ktlintFormat` to auto-fix, `./gradlew clean check` to verify.
 * Logging via kotlin-logging: `private val logger = KotlinLogging.logger {}` per file that logs. Do not add a
   concrete SLF4J backend (e.g. logback) to library modules — only `lapis-net-cli` ships one.
