@@ -240,23 +240,111 @@ already covered by the incremental browser growth documented in V0.2–V0.5 abov
 
 == V0.8 — Direct messages and calls
 
-Target: X3DH/Double Ratchet for 1:1 chats, MLS for groups, WebRTC for voice/video/conferencing —
-full spec in the vault concept note "Direktnachrichten und Anrufe" (not yet mirrored into this
-repo's `docs/`).
+Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec in the vault concept
+note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
+on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
+remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1 has
+landed.
 
-=== Progress
+[cols="1,3"]
+|===
+| Sub-wave | Content
 
-**Not started.** Fully specified at the concept level (layering model, 1:1 call flow,
-multi-participant conferencing, addressing/peer-discovery, multi-device support), zero code exists
-in this repository — no `lapis-net-*` module implements X3DH, Double Ratchet, MLS, or WebRTC.
-Proposed as an Opus-planned wave (cryptographically novel, Double-Ratchet/MLS implementation is
-highly security-critical) in the 2026-07-17 gap analysis; not yet started pending explicit
-go-ahead.
+| V0.8.1
+| Signed peer/presence directory records (`lapis-net-directory`) — the foundational layer every
+later V0.8 sub-wave resolves recipients' prekey bundles / current network addresses through
+(implemented — see below).
+
+| V0.8.2+
+| X3DH prekey-bundle exchange, Double Ratchet 1:1 sessions, online DM delivery, and calling — not
+yet started, not sub-wave-planned in fine-grained detail here; see the vault's 2026-08-04 sub-wave
+plan for the intended breakdown.
+|===
 
 **Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
-see V0.9's own section above) does **not** implement this wave's MLS target — V0.9.2's
+see V0.9's own section above) does **not** implement this arc's Double-Ratchet/X3DH target — V0.9.2's
 `EncryptionMode.MLS_ARCHIVE` stays reserved and rejected outright, with no implementation plan in
-that arc. The two MLS references are unrelated until this wave actually starts.
+that arc, and MLS itself is now out of scope for V0.8 as well (see above). The two MLS references
+are unrelated regardless.
+
+=== V0.8.1 — Peer/presence directory records
+
+Target: a signed, gossiped record binding an identity to its current network addresses and
+transport-layer (libp2p) peer identity, with a monotonic per-identity sequence number and a
+heartbeat TTL — the foundational discovery layer V0.8.2 (X3DH prekey bundles) and V0.8.4 (online DM
+addressing) build on. New module `lapis-net-directory`.
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.8.1
+| `PeerRecord` — identity (secp256k1), a reused (not reinvented) `IdentityBinding` proof of the
+libp2p transport key, a capped `Multiaddr` list, a `PeerCapability` bitmask (`DM`/`CALL`/`MAILBOX` —
+deliberately no `SFU_CAPABLE`, no consumer in the reduced arc), a monotonic sequence number, a
+`notValidAfterEpochSecond` heartbeat TTL, its own outer signature, AND (added in this sub-wave's
+round-2 security-audit fix) `possessionProof` — a NEW Ed25519 counter-signature by the transport
+key's OWN private key over the identity's bytes, making the identity<->transport-key binding
+genuinely MUTUAL. THREE independently-verified signatures per record, not two, see
+`docs/architecture.adoc`'s equivalent section for why `IdentityBinding` alone (a ONE-WAY vouch) left
+a cross-binding/peerId-spoofing gap open. `PeerRecordCodec` — length-prefixed binary layout
+mirroring `VeritasGrantCodec`/`MessageEnvelopeCodec`'s discipline exactly; carries no
+`io.ipfs.cid.Cid` field at all, so `CidBytesValidation` is never invoked by this module.
+`PeerRecordIndex` — latest-wins per identity by sequence number (a genuinely new ordering rule for
+this codebase, not copied from any sibling index — see that class's doc comment), the established
+two-cap eviction/persistence structure plus a THIRD, independently-sized, LRU-evicting anti-rollback
+high-water-mark cap (`highestSequenceByIdentity`, hardened in round 2 after round 1's non-evicting
+version reopened an equivalent rollback path). `PeerDirectoryGossip` — a new GossipSub topic
+(`LapisNet:peer-record-gossip:v1`), gossip-only (no DHT publication — `Kademlia.dialPeer` documented
+broken since V0.1.4, same accepted limitation as every V0.9 mail sub-wave). `PeerPresenceAnnouncer`
+— the enforced minimum-republish-interval (300s default) PARTIALLY mitigating this record type's
+metadata-exposure tension with the spec's own Metadaten-Minimierung principle (bounds only this
+node's own outbound republish rate — `PeerDirectoryGossip.announce` is unrate-limited and
+`onGossipMessage` applies no inbound rate limit, see `docs/architecture.adoc`) — deliberately a
+caller-side wrapper, not built into `PeerDirectoryGossip.announce()` itself, and hardened in round 2
+so a backward wall-clock jump cannot stall the heartbeat indefinitely.
+
+Test suite: `PeerRecordTest`, `PeerRecordCodecTest` (round-trip, truncation, reserved-bits,
+length-validated-before-allocation, malformed multiaddr bytes, sequence-number edge values, a
+garbage non-curve-point ed25519 public key), `PeerRecordIndexTest` (latest-wins by sequence,
+rollback rejection surviving tracking-cap eviction via a separate high-water mark, deterministic
+tie-break, eviction, persistence-cap decoupling, and a round-2 regression proving a victim arriving
+AFTER the high-water-mark cap first fills by a flood still gets rollback protection),
+`PeerDirectoryGossipOnGossipMessageTest`, `TwoNodePeerDirectoryGossipIntegrationTest` (real two-node
+loopback, address/peerId round-trip against the announcing node's own real
+`LapisNode.listenAddresses()`/`peerId`), `PeerPresenceAnnouncerTest` (minimum-republish-interval
+enforcement, boundary-inclusive timing, and a round-2 clock-rewind regression), and the mandatory
+adversarial `PeerRecordSpoofingTest` — its central cases: (a) a record whose embedded
+`IdentityBinding` OBJECT is reused verbatim from a victim does not actually verify against the
+record's own signing identity (rejected by `verifyBinding`); (h) (round-2 regression) a record
+embedding a FRESHLY RE-SIGNED `IdentityBinding` over the victim's public Ed25519 key passes BOTH
+`verify` and `verifyBinding` genuinely and is only caught by the new `verifyPossession` — proving
+this codebase's FIRST case where a signature-valid, binding-valid record must still be rejected on a
+THIRD, independent cryptographic check.
+|===
+
+==== Progress
+
+V0.8.1 is implemented (see `docs/architecture.adoc`'s "Peer/presence directory records (V0.8.1)"
+section), including its round-2 security-audit hardening (mutual possession-proof binding,
+LRU-evicting anti-rollback high-water mark, clock-rewind-safe presence announcer). Deliberate scope
+cuts, stated as such in the code's own doc comments rather than silently omitted:
+
+* **No DHT publication.** Gossip-only, same accepted limitation as every V0.9 mail sub-wave.
+* **No `SFU_CAPABLE` capability flag.** MLS/conferencing/SFU cut from the V0.8 arc entirely on
+  2026-08-04 — no consumer exists.
+* **No bandwidth-class measurement.**
+* **No reachability verification of advertised addresses** — mirrors V0.4's own, still-open gap: an
+  attacker or a stale node can advertise unreachable addresses and nothing currently detects this.
+* **A network-wide gossip topic is itself a metadata-exposure decision** — every subscriber learns
+  every published identity's current addresses and online-status heartbeat. Accepted (2026-08-04):
+  no worse than V0.4's own `lapisnet://connect` QR/deep-link multiaddr exposure, and
+  `PeerPresenceAnnouncer`'s enforced minimum-republish-interval keeps this from being a fine-grained
+  real-time presence oracle.
+* **No opt-in Veritas-distance admission filter**, unlike `lapis-net-mail`'s V0.9.4 addition —
+  `lapis-net-directory` takes no dependency on `lapis-net-trust` this wave; acceptance is purely
+  structural (signature + identity-binding + sequence-number ordering). A future wave MAY add one,
+  mirroring `MailAcceptancePolicy`.
 
 == V0.9 — Asynchronous messages (email replacement)
 

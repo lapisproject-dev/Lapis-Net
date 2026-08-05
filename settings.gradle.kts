@@ -9,6 +9,7 @@ include(
     "lapis-net-karma",
     "lapis-net-madli",
     "lapis-net-mail",
+    "lapis-net-directory",
     "lapis-net-networking",
     "lapis-net-test",
     "lapis-net-cli",

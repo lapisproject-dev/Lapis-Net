@@ -25,8 +25,10 @@ asynchronous-messaging arc — a signed, addressed mail envelope bound to its ow
 propagated over one GossipSub topic per recipient identity (V0.9.1), `HYBRID_ECIES` encryption
 (V0.9.2), threading/attachment encryption/sent folder/browser UI (V0.9.3), and an opt-in
 Veritas/Karma/Lightning-deposit spam-acceptance filter (V0.9.4, see below — the V0.9 arc is
-complete) — are implemented. Remaining modules are still skeletons. This document grows
-as modules gain real implementations.
+complete), and a signed peer/presence directory record propagated over GossipSub with a monotonic
+per-identity sequence number and a heartbeat TTL — the foundational discovery layer for the V0.8
+direct-messages-and-calls arc (V0.8.1, see below) — are implemented. Remaining modules are still
+skeletons. This document grows as modules gain real implementations.
 
 == Layering
 
@@ -82,6 +84,15 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   it DOES depend on `lapis-net-trust` to *consume* Veritas as an opt-in spam filter, a documented
   exception mirroring `lapis-net-madli`'s own precedent (see the V0.9.4 section below and this
   module's `build.gradle.kts` comment)
+* `lapis-net-directory` — the first sub-wave of the V0.8 (direct messages and calls) arc: a signed
+  peer/presence directory record (`PeerRecord`) binding an identity to its current network addresses
+  and libp2p transport peer identity, propagated over a dedicated GossipSub topic
+  (`PeerDirectoryGossip`, V0.8.1, see below) — the foundational discovery layer later V0.8 sub-waves
+  resolve recipients' prekey bundles/current addresses through. Gossip-only, same
+  `Kademlia.dialPeer`-broken limitation as every V0.9 mail sub-wave. Deliberately takes NO
+  dependency on `lapis-net-trust` this wave (acceptance is purely structural, not Veritas-gated,
+  unlike `lapis-net-mail`'s V0.9.4 addition) and NO dependency on `java-cid` (`PeerRecord` carries no
+  `io.ipfs.cid.Cid` field at all)
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-test` — shared test fixtures and helpers (not yet consumed by other modules' tests)
@@ -1928,6 +1939,346 @@ proof.
 With V0.9.4 landed, the entire V0.9 arc (envelope/body format, `HYBRID_ECIES` encryption, threading/
 attachment-encryption/sent-folder/browser-UI, and this spam-acceptance filter) is complete on
 `master` — see `docs/roadmap.adoc`'s "V0.9 arc complete" section for the full closing summary.
+
+== Peer/presence directory records (V0.8.1)
+
+`lapis-net-directory` (new module) — the first sub-wave of the V0.8 (direct messages and calls)
+arc, reduced in scope on 2026-08-04 (MLS/conferencing/SFU cut entirely, no group-calling target
+remains). Gives every identity a signed, self-published way to say "I can currently be reached at
+these addresses, my libp2p transport identity is X, I claim these capabilities, and this statement
+is valid until T" — the foundational discovery layer V0.8.2 (X3DH prekey-bundle exchange) resolves
+recipients' prekey bundles through, and V0.8.4 (online DM) resolves recipients' current network
+addresses through.
+
+**Gossip-only, no DHT publication — the same accepted limitation as every V0.9 mail sub-wave.**
+`org.peergos.protocol.dht.Kademlia.dialPeer` has been documented broken since V0.1.4 (see the
+Storage section above) — propagation is entirely via `PeerDirectoryGossip`'s dedicated GossipSub
+topic (`LapisNet:peer-record-gossip:v1`), mirroring `InboxGossip`'s identical precedent. A node
+offline during the gossip window has no catch-up path.
+
+**THREE independently-verified signatures per record, not two — this wave's central design
+decision, verified via the mandatory adversarial test rather than merely assumed correct, and
+hardened once already (round 2 of this wave's own security audit).** `PeerRecord` embeds
+`identity`'s own pre-existing `IdentityBinding` (from its `DualKeyIdentity`, computed once at
+identity-generation time and reused verbatim, not a second, PeerRecord-specific binding scheme) —
+this proves "`identity` vouches for `binding.ed25519PublicKey` being its own transport key"
+(`IdentityBinding`'s own `"LapisNet:identity-binding:v1"` tag). The record's OWN outer signature (a
+SEPARATE ECDSA signature over a SEPARATE, `"LapisNet:peer-record:v1"`-tagged digest of the full
+record body, including the embedded binding's bytes) proves "`identity` signed THIS EXACT record" —
+addresses, capabilities, sequence number, and TTL included.
+
+**`verify` + `verifyBinding` alone are NOT sufficient — V0.8.1 sub-wave audit round 2, major finding
+1, a gap this wave's ORIGINAL docs claimed was closed but was not.** `IdentityBinding` is a ONE-WAY
+vouch: it proves `identity` signed `binding.ed25519PublicKey`, but an Ed25519 PUBLIC key is public
+by definition, so ANYONE can mint a FRESH, self-consistent
+`IdentityBinding.create(attackerSecp256k1KeyPair, victimEd25519PublicKey)` — this passes
+`verifyBinding` (the attacker's own key correctly signed it) while `peerId` resolves to the VICTIM's
+real, derivable `PeerId`. Both `PeerRecord.verify` (genuinely signed by the attacker) and
+`verifyBinding` (genuinely self-consistent) then pass — exactly the "signature-valid record must
+still be rejected on a second, independent check" property this wave's round-1 design claimed to
+prove, except the round-2 auditor's PROBE A ran this EXACT construction through the real gossip
+validator and it was accepted, indexed, persisted, and re-propagated
+(`outerSignatureValid=true, verifyBinding=true, recordPeerId==victimRealPeerId=true,
+validatorResult=Valid`). The root cause: neither check requires PROOF-OF-POSSESSION of the Ed25519
+PRIVATE key — `IdentityBinding` only ever requires possessing the PUBLIC half. Round-1's own
+regression test (`PeerRecordSpoofingTest`'s case (a)) did not catch this because it only tests
+REUSING a victim's OWN binding OBJECT verbatim (whose embedded signature was made by the victim's
+key and therefore cannot verify against the attacker's identity) — it never tests RE-SIGNING a
+fresh binding over the victim's public key, which is exactly what makes the forged binding
+self-consistent from the attacker's own perspective.
+
+**Fix: `PeerRecord.possessionProof`, a NEW, fourth 64-byte field — a genuinely MUTUAL binding.** A
+SEPARATE Ed25519 signature, by `binding.ed25519PublicKey`'s own PRIVATE key
+(`"LapisNet:peer-record-possession:v1"`-tagged, deliberately its own domain tag, distinct from both
+`"LapisNet:peer-record:v1"` and `"LapisNet:identity-binding:v1"`), over `identity`'s raw bytes —
+computed once, fresh, inside `PeerRecord.create` at record-signing time, using the caller's
+`DualKeyIdentity.ed25519KeyPair` (never touching or changing `IdentityBinding` itself, so every
+OTHER module that embeds an `IdentityBinding` — `lapis-net-karma`, `lapis-net-madli`,
+`lapis-net-mail`, `lapis-net-trust`, `lapis-net-virtus`, `lapis-net-browser` — is completely
+unaffected; this fix is scoped entirely to `lapis-net-directory`). Something only the genuine
+holder of the Ed25519 PRIVATE key can produce, and the auditor's forged-binding construction above
+cannot, since it never had access to the victim's Ed25519 private key, only the public key copied
+off an earlier, legitimately-published record. **All three checks are now load-bearing and no pair
+alone is sufficient** — `PeerDirectoryGossip.onGossipMessage` calls `PeerRecord.verify`,
+`verifyBinding`, AND the new `verifyPossession` as three independent steps before trusting
+`peerId`/`addresses`. `PeerRecordSpoofingTest`'s case (a) remains the ORIGINAL (already-closed)
+exploit shape — reusing a victim's own binding object verbatim; its NEW case (h) is the round-2
+regression — re-signing a FRESH binding over the victim's public Ed25519 key, proving `verify` and
+`verifyBinding` both genuinely pass while `verifyPossession` alone catches it, end to end through
+the real validator.
+
+**`from` (the GossipSub sender) is deliberately NOT used in this decision.** `onGossipMessage`
+already receives a transport-level `from: PeerId` parameter; using it as a proof-of-possession
+anchor was considered (round-2 audit, minor finding 5) and rejected for THIS codebase as currently
+wired: `GossipPubSub.attach` builds its `GossipRouterBuilder` with the library's DEFAULT
+`messageValidator` (`io.libp2p.pubsub.PubsubRouterKt.NOP_ROUTER_VALIDATOR`, confirmed directly
+against the real jvm-libp2p 1.3.5 jar), not the `SIGNATURE_ROUTER_VALIDATOR` that would actually
+authenticate `from` against the message's embedded key/signature — so `from` carries no
+cryptographic guarantee at the transport layer here today, and comparing `record.peerId == from`
+would be a false sense of security rather than a real check. `possessionProof` sidesteps this
+entirely by proving possession INSIDE the record itself, independent of whatever pubsub transport
+or relay chain carried it.
+
+**A THIRD, structural check closes a gap the two signature checks above do not cover — bytes of the
+right length are not necessarily a valid point on the curve (V0.8.1 sub-wave audit round 1, major
+finding, fixed before this wave's commit landed).** `Ed25519PublicKey`'s constructor now validates
+that its 32 bytes decode to a genuine Ed25519 curve point (`Ed25519PublicKeyParameters(bytes, 0)`,
+wrapped in `runCatching` exactly like `Secp256k1PublicKey`'s own constructor-time curve check this
+mirrors — see that class's doc comment for the precedent). Before this fix, an attacker could sign
+32 GARBAGE bytes as their OWN `binding.ed25519PublicKey` with their OWN secp256k1 key — the binding
+is self-consistent (`IdentityBinding.verify` only checks that `identity` vouches for WHATEVER bytes
+sit in `ed25519PublicKey`, not that those bytes are a valid key), so both `PeerRecord.verify()` AND
+`verifyBinding()` passed, the record was indexed/persisted/re-propagated to every subscriber, and
+only THEN did `record.peerId`/`record.toString()` throw `IllegalArgumentException` — a single gossip
+message permanently poisoning an index slot and a persistence reservation on every subscribed node
+with a record that is structurally valid, cryptographically valid, and functionally
+undereferenceable, exactly where V0.8.2's prekey resolution and V0.8.4's online-DM address
+resolution are documented to call `index.current(identity)?.peerId`. `PeerRecordCodec.decode` is the
+only site in the module that constructs an `Ed25519PublicKey` from wire bytes, so the fix at the
+root (`Ed25519PublicKey`'s own constructor) closes it there and for every future caller alike — see
+`Ed25519KeyPairTest`'s, `PeerRecordCodecTest`'s, and `PeerRecordSpoofingTest`'s case (f) regression
+tests.
+
+**Module map / dependency shape.** `lapis-net-directory` takes `lapis-net-identity`/
+`lapis-net-storage`/`lapis-net-networking` as `api` (each has a type appearing directly in
+`PeerRecord`'s or `PeerDirectoryGossip`'s public signatures — `Secp256k1PublicKey`/`DualKeyIdentity`/
+`IdentityBinding`, `NabuStorage`, and `GossipPubSub`/`Multiaddr`/`PeerId` respectively), following
+`lapis-net-mail`'s more recently established "explicit-not-transitive" house rule rather than
+`lapis-net-trust`'s older transitive-reliance-on-storage's-own-`api`-edge approach. Deliberately
+**NO dependency on `lapis-net-trust`** this wave — unlike `lapis-net-mail`'s V0.9.4 addition,
+`PeerRecord` acceptance is purely structural (signature + identity-binding + sequence-number
+ordering), not Veritas-distance-gated; a future wave MAY add an opt-in admission filter mirroring
+`MailAcceptancePolicy`. Deliberately **NO dependency on `java-cid`** either — `PeerRecord` carries no
+`io.ipfs.cid.Cid` field anywhere, so `lapis-net-core`'s `CidBytesValidation` is never invoked by this
+module; its class doc comment states this explicitly so a reviewer does not go looking for a missing
+guard. A parallel, independently-verified finding covers the `Multiaddr` address section instead of
+`CidBytesValidation`: `Multiaddr.deserialize(bytes)` parses via a Netty `ByteBuf` wrapping the
+already length-capped `addrBytes` array, and every `ByteBuf.readBytes(length)` call inside
+`Protocol.readAddressBytes` bounds-checks against the buffer's remaining readable bytes BEFORE
+allocating (Netty's `checkReadableBytes`) — unlike `io.ipfs.multihash.Multihash`'s raw
+`new byte[len]`-before-bounds-check pattern `CidBytesValidation` exists to guard against, verified
+directly against the real `jvm-libp2p` sources, not assumed safe. Every exception a malformed
+multiaddr can throw is a plain `RuntimeException`, caught by `PeerRecordCodec.decode`'s existing
+blanket catch clause.
+
+**`PeerRecordCodec` — length-prefixed binary layout, magic `"LNPR"`, mirroring
+`VeritasGrantCodec`/`MessageEnvelopeCodec`'s discipline exactly.** All integers big-endian:
+
+----
+magic(4) | version(1) | flags(1, reserved, must be zero) |
+identity(33) | edPublicKey(32) | bindingSignature(64) | possessionProof(64) |
+addressCount(2) | ( addrLen(2) | addr(addrLen) ) * addressCount |
+capabilityBits(1) | sequenceNumber(8) | notValidAfterEpochSecond(8)
+----
+
+`possessionProof` (round 2 audit fix, see above) sits right after `bindingSignature` so every
+64-byte signature-shaped field is grouped at the front of the layout. `encode()` appends the
+record's own 64-byte outer signature after that body — a THIRD, DIFFERENT 64 bytes from both
+`bindingSignature` and `possessionProof` above, both of which already sit inside the signed body
+itself. `MAX_ADDRESSES` (16) and `MAX_MULTIADDR_BYTES` (256) per address bound the worst-case body
+at 4,346 bytes (64 bytes larger than round 1's 4,282, from the new field), comfortably under the
+same `MAX_BODY_SIZE = 0xFFFF` cap every sibling codec uses. Every
+variable-length field (address count, each address's own length, capability bits) is validated
+BEFORE the corresponding allocation, exactly like `VeritasGrantCodec`'s discipline — `addressCount >
+MAX_ADDRESSES` is rejected immediately, before attempting to read a single address's bytes, proven
+by a dedicated test that declares an oversized count and supplies zero actual address bytes after
+it.
+
+**`PeerRecordIndex` — latest-wins per identity by sequence number, a genuinely new ordering rule for
+this codebase, not copied from any sibling index verbatim.** Every prior index
+(`VeritasGrantIndex`, `InboxIndex`, `MadliVectorIndex`) resolves "which record wins" either by
+chain-linking or by arrival order; `PeerRecordIndex` is the first whose winner is decided by
+comparing an ATTACKER-SUPPLIED monotonic counter (`sequenceNumber`) instead. `currentByIdentity`
+holds the record with the highest `sequenceNumber` seen per identity so far, ties broken
+deterministically (unsigned lexicographic byte comparison over `contentId()`, not arrival order —
+every honest node converges on the SAME winner regardless of gossip delivery order). A record with a
+LOWER sequence number than the currently-tracked one is rejected outright by both `canAccept` and
+`add` — never even considered for tracking, let alone persistence (`PeerRecordSpoofingTest`'s case
+(b)). Superseded records are actively dropped from the tracking map, not merely un-linked, keeping
+`currentByIdentity` and the tracking map in lockstep at every step — mirroring `MadliVectorIndex`'s
+"every secondary index MUST be cleaned in lockstep" discipline. The established two-cap structure
+(an evicting LRU tracking cap, `MAX_TRACKED_RECORDS = 64,000`, plus a SEPARATE, non-evicting,
+hard-capped persistence-reservation cap, `MAX_PERSISTED_RECORDS = 64,000`) is otherwise unchanged
+from `VeritasGrantIndex`'s round-2/round-3 precedent — a flood of many distinct, freshly-fabricated
+identities is bounded by the tracking cap exactly like every sibling index's flood defense
+(`PeerRecordSpoofingTest`'s case (d)).
+
+**The anti-rollback property above does NOT hold if checked only against `currentByIdentity` — a
+V0.8.1 sub-wave audit round 1 major finding, fixed before this wave's commit landed, then hardened
+again in round 2 (major finding 2) once the round-1 fix's own equivalent gap was found.**
+`removeEldestEntry` clears an identity's `currentByIdentity` entry the moment its record is evicted
+from the tracking map (e.g. a flood of freshly-fabricated identities pushing it out past
+`MAX_TRACKED_RECORDS`), and once that happens `canAccept`/`add` had no high-water mark left to
+compare a replayed record against — ANY sequence number was then accepted for that identity,
+including one already superseded: a genuine downgrade of a victim's advertised
+addresses/capabilities/TTL to any older signed state an attacker has ever observed, requiring only
+`MAX_TRACKED_RECORDS` freshly-fabricated identities (cheap: one secp256k1 keygen plus signatures
+per identity) or, without an attacker at all, ordinary mesh churn re-delivering a stale record once
+its victim's slot has aged out. Round 1 fixed the ORIGINAL scenario with `highestSequenceByIdentity`,
+a SEPARATE `HashMap<Secp256k1PublicKey, Long>` that `canAccept`/`add` consult in addition to
+`currentByIdentity`.
+
+**Round 1's `highestSequenceByIdentity` was itself a plain, non-evicting `HashMap`, admission-gated
+at a fixed size (`MAX_TRACKED_RECORDS`) — this reopened an EQUIVALENT rollback path, PROBE C in the
+round-2 audit.** Because the map never evicted and was gated at a fixed cap, once
+`MAX_TRACKED_RECORDS` DISTINCT identities had EVER been observed by a node (attacker-driven, or
+simply organic growth on a long-running one), every identity arriving AFTER that point never
+received a high-water mark AT ALL, for the rest of the process's lifetime — not a temporary
+degradation but a PERMANENT one. PROBE C demonstrated this end to end through the real gossip
+validator: flood first to fill the cap, THEN the genuine victim's record arrives and is accepted/
+indexed but never high-water-marked, a later flood evicts it from `currentByIdentity` too, and a
+replayed OLD record for that identity is then accepted — `ROLLBACK SUCCEEDS`.
+
+**Fix: `highestSequenceByIdentity` is now an access-order, LRU-evicting `LinkedHashMap`, on its OWN
+cap (`MAX_HIGH_WATER_MARKS = 128,000`) deliberately DECOUPLED (and sized DOUBLE) from
+`MAX_TRACKED_RECORDS`.** Once full, a NEW identity's arrival now evicts the LEAST-recently-touched
+existing entry (typically a dormant, one-off flood identity) rather than being refused a slot
+outright — so a victim arriving after a flood still gets high-water-mark protection, closing PROBE
+C's admission-side gap directly. The deliberately-larger, independent cap gives the high-water map
+genuine reserve capacity beyond `recordsByContentId`'s own churn, so a flood sized to overwhelm one
+does not automatically overwhelm the other in lockstep. This does NOT make protection
+unconditionally permanent for every identity ever seen — a genuinely dormant identity can still
+eventually be evicted by a SUSTAINED-enough flood exceeding `MAX_HIGH_WATER_MARKS` — but this is an
+accepted, documented, and now bounded-by-effort tradeoff rather than a one-time,
+`MAX_TRACKED_RECORDS`-sized flood permanently disabling the property for the rest of the process
+lifetime; an identity that keeps receiving fresh records (a normal `PeerPresenceAnnouncer` heartbeat)
+keeps refreshing its own recency and stays protected far longer than a one-off entry would. See
+`PeerRecordIndex`'s own class doc comment and `highestSequenceByIdentity`'s field doc comment for
+the full reasoning, `PeerRecordIndexTest`'s and `PeerRecordSpoofingTest`'s case (g) regression tests
+for the ORIGINAL flood-past-cap-then-replay scenario (victim tracked BEFORE the flood), and
+`PeerRecordIndexTest`'s new PROBE-C regression (flood BEFORE the victim ever arrives) for the round-2
+fix.
+
+**`persistedContentIds` (the SEPARATE, durability-only persistence-reservation cap) was evaluated
+against the same reasoning and deliberately left as a hard, non-evicting cap (round 2, minor finding
+4, non-blocking).** Unlike `highestSequenceByIdentity`, evicting here would remove the one property
+this set exists to bound — total `NabuStorage.put()` calls over the node's lifetime — since an
+evicted-then-replayed content id would simply be re-persisted (`storage.put` is idempotent, so no
+corruption, but a sustained flood could then keep evicting and re-admitting forever, reintroducing
+unbounded disk writes). The current permanent cap is the safer failure mode: this node stops
+accepting new durable writes once exhausted rather than accepting unboundedly many over time. See
+`persistedContentIds`'s field doc comment for the full reasoning.
+
+**`PeerDirectoryGossip` — GossipSub wiring on the new `LapisNet:peer-record-gossip:v1` topic,
+mirroring `VeritasGossip`'s shape (full record bytes over the wire, not a CID pointer — same
+`Kademlia.dialPeer`-broken reasoning) refined with `InboxGossip`'s more recently established
+validator step ordering.** `announce()` is `storage.put()` -> `index.add()` -> `pubsub.publish()`,
+publish always last — the same publish-last invariant every sibling `Gossip` class enforces, so a
+crash mid-sequence never leaves the network believing this node durably committed to something it
+did not. `onGossipMessage`'s validator runs decode -> verify signature -> verify identity/peerId
+binding -> verify possession proof (round 2 addition, see above) -> dedup/staleness check
+(`PeerRecordIndex.canAccept`, which here predicts BOTH exact content-id duplication AND
+stale/rollback sequence numbers, unlike every sibling index's purely-dedup `canAccept`) -> persist
+(behind the separate `tryReservePersistence` cap) -> index, cheapest and most-selective checks
+first. **Zero clock and zero network calls in the validator — absolute, not an optimization.**
+`notValidAfterEpochSecond` is attacker-controlled and is NEVER consulted for an accept/reject
+decision inside `onGossipMessage`; TTL is checked ONLY at `lookup()` read time. An expired record is
+not actively evicted by expiry — it stays stored, and would still be returned by a `lookup()` call
+using an earlier `nowEpochSecond` — only the real-time read-time filter hides it from a normal
+caller (`PeerRecordSpoofingTest`'s case (c)).
+
+**`PeerPresenceAnnouncer` — the enforced minimum-republish-interval PARTIALLY mitigating a known,
+accepted tension with the original spec's own Metadaten-Minimierung ("metadata minimization") design
+principle.** Broadcasting presence/address records over a network-wide GossipSub topic means every
+subscribed node learns every published identity's current addresses and online-status heartbeat —
+documented rather than papered over. Accepted resolution (decided 2026-08-04): this is no worse than
+the multiaddr already published in V0.4's `lapisnet://connect` QR/deep-link flow, and a 300-second
+default minimum-republish-interval bounds how often a caller going through this wrapper republishes
+its OWN presence. **This is a partial mitigation, not a network-wide guarantee — audit round 1,
+minor finding, corrected here.** `PeerDirectoryGossip.announce` itself is public and entirely
+unrate-limited (nothing forces a caller to go through the wrapper), and `onGossipMessage` applies NO
+inbound per-identity rate limit at all — a remote peer running a modified client can publish a fresh
+record every second and this node will accept, persist, and re-propagate every one of them. The
+floor therefore only bounds this node's own outbound republish rate, not how finely `PeerRecord` can
+be turned into a presence oracle network-wide. **Deliberately NOT built into
+`PeerDirectoryGossip.announce()` itself** — `announce()`
+mirrors `VeritasGossip.announce`/`InboxGossip`'s established "retrying the SAME call is always safe"
+property, which `TwoNodePeerDirectoryGossipIntegrationTest`'s bounded-polling-against-one-deadline
+loop relies on exactly like the equivalent Veritas/mail integration tests already do — baking a
+multi-minute floor into `announce()` itself would silently break that retry pattern. Rate limiting
+therefore lives one layer up, in `PeerPresenceAnnouncer.announceIfDue`, wrapping whichever caller
+decides WHEN a fresh `PeerRecord` should be built and announced.
+
+**A backward wall-clock jump must not stall the heartbeat — V0.8.1 sub-wave audit round 2, minor
+finding 3, fixed.** `Instant.now()` is wall-clock, not monotonic: an NTP correction, VM snapshot
+restore, or container clock skew can step time BACKWARDS between calls. Before the fix,
+`nowEpochSecond - last < minRepublishIntervalSeconds` stayed `true` for a NEGATIVE delta (a rewind
+always looks "less than" any positive floor), so a rewind silently suppressed every subsequent call
+until wall-clock caught back up past `last + minRepublishIntervalSeconds` — for a large enough jump,
+hours or days during which this node's OWN `PeerRecord` TTL lapses and it becomes undiscoverable via
+`lookup()`, a fail-CLOSED presence outage from what is meant to be only a soft rate limit.
+`announceIfDue` now additionally requires `nowEpochSecond >= last` before applying the floor, so a
+rewind is treated exactly like a first call rather than stalling indefinitely — see
+`PeerPresenceAnnouncerTest`'s clock-rewind regression.
+
+**Test suite.** `PeerRecordTest`/`PeerRecordCodecTest` — round-trip (0, 1, and `MAX_ADDRESSES`
+addresses; every capability combination), truncation at several points, trailing bytes, reserved
+top-level and capability flag bits, the oversized-address-count-before-allocation regression, a
+malformed-multiaddr-bytes regression proving no raw third-party exception escapes `decode()`,
+sequence-number edge values (`0`, `Long.MAX_VALUE`, a hand-crafted `-1` on the wire rejected), and
+(audit round 1 regression) a garbage (non-curve-point) ed25519 public key rejected by `decode()`
+before any signature/binding check runs — every `encodeSignedBody`/`fromDecoded` call site updated
+for the round-2 `possessionProof` field, including the byte-offset arithmetic in the hand-crafted
+malformed-wire tests. `PeerRecordIndexTest` — latest-wins by sequence, rollback rejection,
+deterministic order-independent tie-break, eviction, persistence-cap decoupling from the tracking
+cap, (audit round 1 regression) a stale record still rejected after its victim's entry is evicted
+from the tracking cap by a flood of fresh identities, and (audit round 2 regression, PROBE C) a
+victim arriving AFTER the high-water-mark cap is already full by a flood still gets rollback
+protection, proving the LRU-evicting replacement fixes the admission-side gap while the
+independently-sized cap still lets the victim's high-water mark survive a SECOND, more modest flood
+that evicts it from `currentByIdentity`.
+`PeerDirectoryGossipOnGossipMessageTest` — the same unit-level validator-call pattern
+`VeritasGossipOnGossipMessageTest` established, including the persistence-cap-reached-still-returns-
+`Valid` regression. `TwoNodePeerDirectoryGossipIntegrationTest` — real two-node loopback, proving the
+looked-up record's `addresses`/`peerId` round-trip byte-for-byte against the announcing node's own
+real `LapisNode.listenAddresses()`/`peerId`, and that two identities' records (one self-announced on
+the receiving node, one received via gossip) coexist in `PeerRecordIndex` without clobbering each
+other. `PeerPresenceAnnouncerTest` — minimum-republish-interval enforcement including the inclusive
+boundary case, a custom small interval across a fast-moving sequence, and (audit round 2 regression)
+a backward clock jump is treated as immediately due rather than suppressed indefinitely.
+`PeerRecordSpoofingTest` — the mandatory adversarial spec, originally five cases plus two audit
+round 1 regressions plus one audit round 2 regression: (a) the ORIGINAL peerId-spoofing shape —
+reusing a victim's own `IdentityBinding` object verbatim, caught by `verifyBinding`; (b)
+sequence-number rollback never overwrites a newer, already-indexed record; (c) an expired record is
+never returned by `lookup()` even though it is still stored; (d) a flood of many distinct fabricated
+identities is bounded by the index's tracking cap; (e) a degenerate all-zero or all-`0xFF` outer
+signature is rejected cleanly by both `PeerRecord.verify` and the gossip validator, never thrown —
+the same regression class an earlier wave's review round already found and fixed for
+`Secp256k1PublicKey.verify`'s own hardened `runCatching`-wrapped native-call path, re-exercised here
+for this record type specifically; (f) a garbage (non-curve-point) ed25519 binding key is rejected
+end to end through the real gossip validator, never indexed; (g) a stale sequence-number replay is
+still rejected end to end through the real gossip validator even after the victim's tracked entry
+has been evicted by a flood of fresh identities; (h) (audit round 2 regression, PROBE A) the
+RE-SIGNED cross-binding attack — a FRESH `IdentityBinding.create(attackerKeyPair,
+victimEd25519PublicKey)`, not the victim's own binding object — passes both `verify` and
+`verifyBinding` genuinely, and is only caught by the new `verifyPossession`, proven end to end
+through the real gossip validator. `Ed25519KeyPairTest` (`lapis-net-identity`) — (audit round 1
+regression) an all-`0xFF` public key of the right length is rejected as not a valid curve point, and
+a genuinely generated public key still round-trips through the new validation.
+
+**Known, deliberately accepted gaps:**
+
+* **No DHT publication.** Gossip-only, same accepted limitation as every V0.9 mail sub-wave.
+* **No `SFU_CAPABLE` capability flag.** MLS/conferencing/SFU cut from the V0.8 arc entirely on
+  2026-08-04 — no consumer exists in this reduced arc; a future wave that reintroduces group calling
+  can add a new bit without touching this codec's version or invalidating any V0.8.1 record already
+  on the wire.
+* **No bandwidth-class measurement.**
+* **No reachability verification of advertised addresses** — mirrors V0.4's own, still-open gap: an
+  attacker or a stale node can advertise unreachable addresses and nothing currently detects this.
+* **A network-wide gossip topic is itself a metadata-exposure decision**, documented above rather
+  than papered over — PARTIALLY mitigated via `PeerPresenceAnnouncer`'s enforced minimum-republish-
+  interval (this node's own outbound rate only), not eliminated: `PeerDirectoryGossip.announce` is
+  unrate-limited and `onGossipMessage` applies no inbound per-identity rate limit (audit round 1,
+  minor finding).
+* **`tryReservePersistence` has no per-identity share of `MAX_PERSISTED_RECORDS`** (audit round 1,
+  minor finding) — one identity incrementing its own `sequenceNumber` can, in the worst case,
+  consume the entire global 64,000-slot persistence budget by itself (measured worst case ≈3.7 KB
+  per encoded record, ≈224 MB of disk), after which this node silently stops persisting ANY peer
+  record from ANY identity for the rest of the process lifetime — `onGossipMessage` still returns
+  `Valid` and keeps tracking in that case, so the failure is silent rather than fatal. Not fixed in
+  this sub-wave; a future fix could add a per-identity persistence sub-cap or reuse
+  `highestSequenceByIdentity` so superseding a record releases its predecessor's reservation.
 
 == Diagrams
 

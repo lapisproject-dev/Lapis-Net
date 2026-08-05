@@ -50,6 +50,21 @@ class Ed25519PublicKey(
 
     init {
         require(storedBytes.size == ED25519_KEY_SIZE) { "Ed25519 public key must be $ED25519_KEY_SIZE bytes" }
+        // Bytes of the right length are not necessarily a valid point on the curve. Without this
+        // check, constructing an Ed25519PublicKey from untrusted/decoded bytes (e.g.
+        // PeerRecordCodec.decode reading a gossip-supplied binding key off the wire) would
+        // silently succeed, and a *later* caller - jvm-libp2p's `unmarshalEd25519PublicKey` via
+        // `PeerRecord.peerId`, or BouncyCastle's own `Ed25519Signer` via `verify` below - would
+        // throw an uncaught IllegalArgumentException instead of this constructor rejecting the key
+        // up front. That is exactly the bug class `Secp256k1PublicKey`'s own constructor-time
+        // curve-validation guard (see its doc comment) was hardened against, and the same fix
+        // applies here at the same root cause: a record that passes both `PeerRecord.verify()` and
+        // `verifyBinding()` (both of which are satisfied by an attacker legitimately signing their
+        // OWN garbage ed25519 bytes into their own binding) must never end up indexed/persisted
+        // with a `peerId`/`toString()` that throws.
+        require(runCatching { Ed25519PublicKeyParameters(storedBytes, 0) }.isSuccess) {
+            "Ed25519 public key bytes do not represent a valid point on the curve"
+        }
     }
 
     /** Short hex fingerprint safe to log or display - never applies to private key material. */

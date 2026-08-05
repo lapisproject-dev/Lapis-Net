@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.identity
 
+import io.kotest.assertions.throwables.shouldNotThrowAny
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
@@ -64,5 +65,22 @@ class Ed25519KeyPairTest :
             shouldThrow<IllegalArgumentException> {
                 Ed25519PublicKey(ByteArray(31))
             }
+        }
+
+        // Security fix (V0.8.1 sub-wave audit round 1, major finding 1): bytes of the right length
+        // are not necessarily a valid point on the curve. Before this fix, ByteArray(32){0xFF}
+        // constructed successfully and only failed LATER at a completely different call site
+        // (jvm-libp2p's unmarshalEd25519PublicKey, transitively PeerRecord.peerId/toString) with an
+        // uncaught IllegalArgumentException - see PeerRecordCodecTest's and
+        // PeerRecordSpoofingTest's companion regression tests for the end-to-end attack this closed.
+        test("rejects an all-0xFF public key - right length, not a valid point on the curve") {
+            shouldThrow<IllegalArgumentException> {
+                Ed25519PublicKey(ByteArray(32) { 0xFF.toByte() })
+            }
+        }
+
+        test("a genuinely generated public key round-trips through the curve-point validation") {
+            val keyPair = Ed25519KeyPair.generate()
+            shouldNotThrowAny { Ed25519PublicKey(keyPair.publicKey.bytes) }
         }
     })
