@@ -8,6 +8,7 @@ import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
+import java.time.Instant
 
 private fun testAddress(port: Int): Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/$port")
 
@@ -15,7 +16,19 @@ private fun record(
     identity: DualKeyIdentity,
     sequenceNumber: Long,
 ): PeerRecord =
-    PeerRecord.create(identity, listOf(testAddress(4001)), setOf(PeerCapability.DM), sequenceNumber, 9_999_999_999L)
+    PeerRecord.create(
+        identity,
+        listOf(testAddress(4001)),
+        setOf(PeerCapability.DM),
+        sequenceNumber,
+        Instant.now().epochSecond + 3600,
+    )
+
+/** [PeerPresenceAnnouncer.announceIfDue]'s interval decision is monotonic-nanosecond-based (see
+ * that class's doc comment for the round-4 fix), so every test here deals in synthetic
+ * [System.nanoTime]-shaped tick counts, never epoch seconds - this helper makes that conversion
+ * explicit and readable at every call site rather than scattering raw `* 1_000_000_000L` literals. */
+private fun secondsToNanos(seconds: Long): Long = seconds * 1_000_000_000L
 
 /** A stub [PeerDirectoryGossip]-shaped call counter is unnecessary here - a REAL, attached,
  * never-connected-to-peers [PeerDirectoryGossip] is used instead (mirrors this module's other
@@ -28,7 +41,7 @@ class PeerPresenceAnnouncerTest :
             PeerPresenceAnnouncer.MIN_REPUBLISH_INTERVAL_SECONDS shouldBe 300L
         }
 
-        test("the first call is always due, even though lastAnnouncedAtEpochSecond starts unset") {
+        test("the first call is always due, even though lastAnnouncedAtNanos starts unset") {
             val identity = DualKeyIdentity.generate()
             val node = LapisNode.create(identity)
             node.start(bootstrapPeers = emptyList())
@@ -37,7 +50,7 @@ class PeerPresenceAnnouncerTest :
                 val gossip = PeerDirectoryGossip.attach(GossipPubSub.attach(node), storage)
                 val announcer = PeerPresenceAnnouncer(gossip)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 1000L) shouldBe true
+                announcer.announceIfDue(record(identity, 0), nowNanos = secondsToNanos(1000)) shouldBe true
             } finally {
                 node.stop()
             }
@@ -52,8 +65,8 @@ class PeerPresenceAnnouncerTest :
                 val gossip = PeerDirectoryGossip.attach(GossipPubSub.attach(node), storage)
                 val announcer = PeerPresenceAnnouncer(gossip)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 1000L) shouldBe true
-                announcer.announceIfDue(record(identity, 1), nowEpochSecond = 1050L) shouldBe false
+                announcer.announceIfDue(record(identity, 0), nowNanos = secondsToNanos(1000)) shouldBe true
+                announcer.announceIfDue(record(identity, 1), nowNanos = secondsToNanos(1050)) shouldBe false
             } finally {
                 node.stop()
             }
@@ -68,9 +81,9 @@ class PeerPresenceAnnouncerTest :
                 val gossip = PeerDirectoryGossip.attach(GossipPubSub.attach(node), storage)
                 val announcer = PeerPresenceAnnouncer(gossip)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 1000L) shouldBe true
-                announcer.announceIfDue(record(identity, 1), nowEpochSecond = 1299L) shouldBe false
-                announcer.announceIfDue(record(identity, 2), nowEpochSecond = 1300L) shouldBe true
+                announcer.announceIfDue(record(identity, 0), nowNanos = secondsToNanos(1000)) shouldBe true
+                announcer.announceIfDue(record(identity, 1), nowNanos = secondsToNanos(1299)) shouldBe false
+                announcer.announceIfDue(record(identity, 2), nowNanos = secondsToNanos(1300)) shouldBe true
             } finally {
                 node.stop()
             }
@@ -85,11 +98,11 @@ class PeerPresenceAnnouncerTest :
                 val gossip = PeerDirectoryGossip.attach(GossipPubSub.attach(node), storage)
                 val announcer = PeerPresenceAnnouncer(gossip, minRepublishIntervalSeconds = 5)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 0L) shouldBe true
-                announcer.announceIfDue(record(identity, 1), nowEpochSecond = 3L) shouldBe false
-                announcer.announceIfDue(record(identity, 2), nowEpochSecond = 5L) shouldBe true
-                announcer.announceIfDue(record(identity, 3), nowEpochSecond = 6L) shouldBe false
-                announcer.announceIfDue(record(identity, 4), nowEpochSecond = 10L) shouldBe true
+                announcer.announceIfDue(record(identity, 0), nowNanos = secondsToNanos(0)) shouldBe true
+                announcer.announceIfDue(record(identity, 1), nowNanos = secondsToNanos(3)) shouldBe false
+                announcer.announceIfDue(record(identity, 2), nowNanos = secondsToNanos(5)) shouldBe true
+                announcer.announceIfDue(record(identity, 3), nowNanos = secondsToNanos(6)) shouldBe false
+                announcer.announceIfDue(record(identity, 4), nowNanos = secondsToNanos(10)) shouldBe true
             } finally {
                 node.stop()
             }
@@ -105,13 +118,13 @@ class PeerPresenceAnnouncerTest :
                 val gossip = PeerDirectoryGossip.attach(pubsub, storage)
                 val announcer = PeerPresenceAnnouncer(gossip)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 1000L) shouldBe true
-                val before = gossip.lookup(identity.secp256k1KeyPair.publicKey, nowEpochSecond = 1000L)
+                announcer.announceIfDue(record(identity, 0), nowNanos = secondsToNanos(1000)) shouldBe true
+                val before = gossip.lookup(identity.secp256k1KeyPair.publicKey)
 
                 val suppressed = record(identity, 1)
-                announcer.announceIfDue(suppressed, nowEpochSecond = 1010L) shouldBe false
+                announcer.announceIfDue(suppressed, nowNanos = secondsToNanos(1010)) shouldBe false
 
-                val after = gossip.lookup(identity.secp256k1KeyPair.publicKey, nowEpochSecond = 1010L)
+                val after = gossip.lookup(identity.secp256k1KeyPair.publicKey)
                 after shouldBe before
                 (after?.sequenceNumber ?: -1) shouldBe 0L // still the first record, not the suppressed one
             } finally {
@@ -119,31 +132,49 @@ class PeerPresenceAnnouncerTest :
             }
         }
 
-        // Security/liveness regression (V0.8.1 sub-wave audit round 2, minor finding 3): a
-        // backward wall-clock jump (NTP correction, VM snapshot restore, container clock skew)
-        // must not stall the heartbeat. Before the fix, `nowEpochSecond - last < floor` stayed true
-        // for a NEGATIVE delta (a rewind), so every call after a rewind was suppressed until
-        // wall-clock caught back up past `last + minRepublishIntervalSeconds` - for a large enough
-        // jump, a silent, fail-closed presence outage lasting hours or days.
-        test("a backward clock jump is treated as immediately due, not suppressed indefinitely") {
+        // Security/liveness regression (V0.8.1 sub-wave audit round 4, major finding): replaces
+        // round 2's wall-clock-rewind regression entirely, because round 4 removed wall-clock time
+        // from this decision altogether rather than special-casing a backward jump within it.
+        // Round 2's fix (treat nowEpochSecond < last as "immediately due") closed a fail-CLOSED
+        // stall but reopened a fail-OPEN bypass: anything able to make Instant.now() read
+        // backward before every single call - a misbehaving local NTP daemon, a VM host adjusting
+        // guest time, or a deliberately misconfigured local clock - permanently disabled the floor,
+        // since every call would then satisfy the "was a rewind" branch. announceIfDue no longer
+        // accepts an epoch-second parameter at all: the ONLY lever a caller has is nowNanos, a
+        // System.nanoTime()-shaped monotonic tick count that is, by the JVM's own guarantee, never
+        // able to move backward within a process's lifetime - there is no way to feed this
+        // real API an input shaped like the round-2 attack at all. This test proves the decision
+        // genuinely only depends on the elapsed MONOTONIC delta between calls: an arbitrarily large
+        // simulated wall-clock disruption (which this call never even receives, by construction) has
+        // zero effect on it, and normal rate limiting keeps working either side of that gap.
+        test(
+            "the interval decision depends only on elapsed monotonic nanos - " +
+                "no wall-clock rewind can stall or bypass it, because none is ever consulted",
+        ) {
             val identity = DualKeyIdentity.generate()
             val node = LapisNode.create(identity)
             node.start(bootstrapPeers = emptyList())
             try {
-                val storage = NabuStorage.attach(node, Files.createTempDirectory("announcer-clock-rewind"))
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("announcer-monotonic"))
                 val gossip = PeerDirectoryGossip.attach(GossipPubSub.attach(node), storage)
                 val announcer = PeerPresenceAnnouncer(gossip)
 
-                announcer.announceIfDue(record(identity, 0), nowEpochSecond = 1300L) shouldBe true
+                // An arbitrary, large absolute nowNanos value - deliberately NOT epoch-scale, to
+                // underline that only DIFFERENCES between successive readings matter here, unlike
+                // wall-clock time where the absolute value itself was previously significant.
+                val firstTick = secondsToNanos(1_000_000)
+                announcer.announceIfDue(record(identity, 0), nowNanos = firstTick) shouldBe true
 
-                // Wall clock jumps BACKWARDS by 400 seconds - well within what would otherwise be
-                // "suppressed" territory (negative delta is always < the 300s floor).
-                announcer.announceIfDue(record(identity, 1), nowEpochSecond = 900L) shouldBe true
+                // Only 1 second of MONOTONIC elapsed time has passed - still well under the 300s
+                // floor. A wall-clock rewind of any size happening concurrently (which this call
+                // never receives as a parameter at all) cannot change this outcome.
+                announcer.announceIfDue(record(identity, 1), nowNanos = firstTick + secondsToNanos(1)) shouldBe false
 
-                // A second call shortly after the rewind (still under the floor relative to the
-                // NEW last-announced time) is suppressed normally - proving the fix didn't disable
-                // rate limiting altogether, only the indefinite-stall failure mode.
-                announcer.announceIfDue(record(identity, 2), nowEpochSecond = 901L) shouldBe false
+                // Once the monotonic floor genuinely elapses, it is due again - proving the fix
+                // didn't disable rate limiting altogether, only removed wall-clock time from the
+                // decision.
+                val floorNanos = secondsToNanos(PeerPresenceAnnouncer.MIN_REPUBLISH_INTERVAL_SECONDS)
+                announcer.announceIfDue(record(identity, 2), nowNanos = firstTick + floorNanos) shouldBe true
             } finally {
                 node.stop()
             }

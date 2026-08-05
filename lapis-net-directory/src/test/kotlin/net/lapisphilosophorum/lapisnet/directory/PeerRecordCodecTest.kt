@@ -7,15 +7,20 @@ import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.time.Instant
 
 private fun testAddress(port: Int): Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/$port")
 
+/** [notValidAfterEpochSecond] defaults to a near-future (not far-future) value - since
+ * [PeerRecord.create]'s round-4 [PeerRecord.MAX_TTL_WINDOW_SECONDS] cap rejects anything claiming
+ * validity more than 24h beyond "now", the old `9_999_999_999L` (year 2286) placeholder this file
+ * used before that fix would now throw at construction time. */
 private fun freshRecord(
     identity: DualKeyIdentity = DualKeyIdentity.generate(),
     addresses: List<Multiaddr> = listOf(testAddress(4001)),
     capabilities: Set<PeerCapability> = setOf(PeerCapability.DM),
     sequenceNumber: Long = 0,
-    notValidAfterEpochSecond: Long = 9_999_999_999L,
+    notValidAfterEpochSecond: Long = Instant.now().epochSecond + 3600,
 ): PeerRecord = PeerRecord.create(identity, addresses, capabilities, sequenceNumber, notValidAfterEpochSecond)
 
 /** Hand-builds a structurally-minimal (magic/version/flags/identity/edPublicKey/bindingSignature/

@@ -7,14 +7,20 @@ import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.IdentityBinding
+import java.time.Instant
 
 private fun testAddress(port: Int): Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/$port")
 
+/** [notValidAfterEpochSecond] defaults to a near-future (not far-future) value - since
+ * [PeerRecord.create]'s round-4 [PeerRecord.MAX_TTL_WINDOW_SECONDS] cap rejects anything claiming
+ * validity more than 24h beyond "now", the old `9_999_999_999L` (year 2286) placeholder this file
+ * used before that fix would now throw at construction time. */
 private fun record(
     identity: DualKeyIdentity,
     sequenceNumber: Long,
     addresses: List<Multiaddr> = listOf(testAddress(4000 + sequenceNumber.toInt())),
-): PeerRecord = PeerRecord.create(identity, addresses, setOf(PeerCapability.DM), sequenceNumber, 9_999_999_999L)
+): PeerRecord =
+    PeerRecord.create(identity, addresses, setOf(PeerCapability.DM), sequenceNumber, Instant.now().epochSecond + 3600)
 
 /** Genuinely self-signed by [signingIdentity] (so [PeerRecord.verify] is true), but embedding a
  * DIFFERENT identity's [IdentityBinding] - so [PeerRecord.verifyBinding] is false. Bypasses
@@ -332,5 +338,78 @@ class PeerRecordIndexTest :
             index.canAccept(stale) shouldBe false
             index.add(stale) shouldBe false
             index.current(victim.secp256k1KeyPair.publicKey).shouldBeNull()
+        }
+
+        // Regression (V0.8.1 sub-wave audit round 4, minor finding 1 - the "no expiry-driven
+        // eviction" half; see PeerRecord.create's MAX_TTL_WINDOW_SECONDS cap for the complementary
+        // half of the same finding). Before evictExpired existed, an expired record stayed resident
+        // in recordsByContentId/currentByIdentity forever - only PeerDirectoryGossip.lookup's
+        // read-time filter hid it, this index itself never reclaimed the memory.
+        test("evictExpired removes an expired current record from tracking, but a still-valid one survives") {
+            val now = Instant.now().epochSecond
+            val index = PeerRecordIndex()
+
+            val expiredIdentity = DualKeyIdentity.generate()
+            // notValidAfterEpochSecond in the PAST is never rejected by create()'s cap (which only
+            // bounds how far into the FUTURE a claimed TTL may reach) - this is exactly the
+            // ordinary, non-adversarial shape of "a record that was valid once and has since
+            // expired", the case evictExpired exists to reclaim.
+            val expired =
+                PeerRecord.create(
+                    expiredIdentity,
+                    emptyList(),
+                    emptySet(),
+                    sequenceNumber = 0,
+                    notValidAfterEpochSecond = now - 3600,
+                )
+            index.add(expired) shouldBe true
+
+            val liveIdentity = DualKeyIdentity.generate()
+            val live = record(liveIdentity, 0)
+            index.add(live) shouldBe true
+
+            index.size() shouldBe 2
+
+            val evictedCount = index.evictExpired(now)
+
+            evictedCount shouldBe 1
+            index.current(expiredIdentity.secp256k1KeyPair.publicKey).shouldBeNull()
+            index.current(liveIdentity.secp256k1KeyPair.publicKey) shouldBe live
+            index.size() shouldBe 1
+        }
+
+        // Regression: evictExpired must NOT touch highestSequenceByIdentity - anti-rollback
+        // protection for an identity whose current record just expired must survive this sweep
+        // exactly as it survives capacity-driven eviction (removeEldestEntry's identical contract).
+        test("evictExpired does not weaken anti-rollback protection - a stale replay is still rejected afterward") {
+            val now = Instant.now().epochSecond
+            val index = PeerRecordIndex()
+            val identity = DualKeyIdentity.generate()
+
+            val newer =
+                PeerRecord.create(
+                    identity,
+                    listOf(testAddress(5002)),
+                    setOf(PeerCapability.DM),
+                    sequenceNumber = 5,
+                    notValidAfterEpochSecond = now - 3600,
+                )
+            index.add(newer) shouldBe true
+
+            index.evictExpired(now) shouldBe 1
+            index.current(identity.secp256k1KeyPair.publicKey).shouldBeNull()
+
+            val rollback = record(identity, 3, addresses = listOf(testAddress(5001)))
+            index.canAccept(rollback) shouldBe false
+            index.add(rollback) shouldBe false
+        }
+
+        test("evictExpired evicts nothing when every tracked record is still valid") {
+            val index = PeerRecordIndex()
+            val identities = (1..3).map { DualKeyIdentity.generate() }
+            identities.forEach { index.add(record(it, 0)) shouldBe true }
+
+            index.evictExpired(Instant.now().epochSecond) shouldBe 0
+            index.size() shouldBe 3
         }
     })

@@ -94,9 +94,17 @@ private object PeerRecordContentIdBytesComparator : Comparator<ByteArray> {
  * LRU-evicting shape and the accepted, bounded tradeoff once even ITS separate, larger cap is
  * reached.
  *
- * TTL ([PeerRecord.notValidAfterEpochSecond]) is NEVER consulted here - this index makes zero
- * clock calls anywhere, add/canAccept/current all included. Expiry is a pure READ-time filter, see
- * [PeerDirectoryGossip.lookup].
+ * TTL ([PeerRecord.notValidAfterEpochSecond]) is NEVER consulted by [add]/[canAccept]/[current] -
+ * admission and lookup decisions in this index make zero clock calls, full stop. Expiry as an
+ * ACCEPT/REJECT decision is a pure READ-time filter, see [PeerDirectoryGossip.lookup].
+ *
+ * **[evictExpired] is a deliberate, narrow exception to that, added in the V0.8.1 sub-wave audit
+ * round 4 hardening pass - an opt-in memory-hygiene sweep, not a change to any accept/reject
+ * decision above.** It still makes no clock call ITSELF - the caller supplies `nowEpochSecond`,
+ * mirroring [PeerDirectoryGossip.lookup]'s own identical caller-supplies-the-clock pattern - so
+ * this index's own "zero clock calls" property is preserved in the sense that matters: nothing in
+ * this class ever reads the wall clock on its own. See [evictExpired]'s own doc comment for why it
+ * exists and what it deliberately does NOT do.
  */
 class PeerRecordIndex internal constructor(
     private val maxTracked: Int = MAX_TRACKED_RECORDS,
@@ -144,7 +152,39 @@ class PeerRecordIndex internal constructor(
      * the exact risk this cap exists to prevent. The current hard, permanent cap is the safer
      * failure mode of the two: this node stops accepting NEW durable writes rather than accepting
      * unboundedly many over time. See [tryReservePersistence]'s doc comment for the mirrored
-     * `VeritasGrantIndex` precedent this follows. */
+     * `VeritasGrantIndex` precedent this follows.
+     *
+     * **No per-identity share of [maxPersisted] - considered and deliberately left as a global,
+     * flat cap (V0.8.1 sub-wave audit round 4, minor finding 5, evaluated and left as-is).** A
+     * single identity CAN, in principle, consume this entire reservation budget on its own: every
+     * distinct [PeerRecord.sequenceNumber] it ever signs is a distinct content id, so an identity
+     * that keeps incrementing its own sequence number (whether that is its genuine owner
+     * republishing very often, or an attacker who obtained its private key once and now mints many
+     * successive records) reserves a NEW slot here each time, entirely independent of
+     * [currentByIdentity]'s "one live record per identity" invariant, which bounds TRACKING, not
+     * PERSISTENCE. **This is not a new class of tradeoff this index introduces** - the identical
+     * shape already exists, unaddressed, in `VeritasGrantIndex.persistedContentIds`: a single
+     * (truster, target) pair there can equally accumulate an unbounded number of superseding grants
+     * against the SAME shared cap (see that class's own doc comment, "a single (truster, target)
+     * pair can accumulate an unbounded number of superseding grants... before
+     * `VeritasGrantResolver` ever collapses it down to one"), and neither `InboxIndex` nor
+     * `MadliVectorIndex` has a per-key sub-cap either - every sibling index in this codebase
+     * accepts a flat, shared persistence budget with no per-identity/per-pair/per-sender quota.
+     * Adding one only here would be a bespoke divergence from that established, mirrored structure,
+     * not a fix that brings this index in line with its siblings.
+     *
+     * The consequence, should one identity exhaust the cap, is durability-only, matching this set's
+     * own accepted-tradeoff framing above: every OTHER identity's records remain fully served while
+     * this node is running - still tracked in [recordsByContentId] (a SEPARATE, evicting cap this
+     * greedy identity cannot exhaust the same way, since only its OWN [currentByIdentity] slot ever
+     * grows past one entry) and still re-propagated over gossip - the crowded-out identities merely
+     * do not survive THIS node's own restart. A per-identity sub-cap would not even close the root
+     * cause: [PeerDirectoryGossip.onGossipMessage] already "applies no inbound per-identity rate
+     * limit at all" (see [PeerPresenceAnnouncer]'s class doc comment) - a remote identity is free to
+     * publish new sequence numbers as fast as it wants regardless of any cap on this ONE downstream
+     * resource. If a future wave adds that inbound rate limit, it is the more root-cause-appropriate
+     * place to bound this, rather than bolting a parallel per-identity sub-cap onto persistence
+     * alone here. */
     private val persistedContentIds = HashSet<PeerRecordContentId>()
 
     /** The highest [PeerRecord.sequenceNumber] ever ACCEPTED (via [add]) for each identity - the
@@ -280,14 +320,39 @@ class PeerRecordIndex internal constructor(
         }.getOrDefault(false)
 
     /**
-     * Cheap, non-mutating, no-I/O admission pre-check. `true` iff [record] is (a) not already
-     * tracked by content id AND (b) not stale/tie-break-losing against whatever is currently
-     * tracked for [record].identity - see this class's doc comment for why (b) is a NEW predicate
-     * this index's `canAccept` needs that no sibling index's `canAccept` does (their winner is
-     * decided purely by arrival order, so their `canAccept` only ever needs to predict exact
-     * content-id duplication). Gating [PeerDirectoryGossip.onGossipMessage]'s persistence attempt
-     * on this means a stale/rollback record costs this node no `NabuStorage.put()` call, not just
-     * no index slot - see `PeerRecordSpoofingTest`'s case (b).
+     * Cheap, no-I/O admission pre-check. `true` iff [record] is (a) not already tracked by content
+     * id AND (b) not stale/tie-break-losing against whatever is currently tracked for
+     * [record].identity - see this class's doc comment for why (b) is a NEW predicate this index's
+     * `canAccept` needs that no sibling index's `canAccept` does (their winner is decided purely by
+     * arrival order, so their `canAccept` only ever needs to predict exact content-id duplication).
+     * Gating [PeerDirectoryGossip.onGossipMessage]'s persistence attempt on this means a
+     * stale/rollback record costs this node no `NabuStorage.put()` call, not just no index slot -
+     * see `PeerRecordSpoofingTest`'s case (b).
+     *
+     * **NOT non-mutating, despite reading that way at a glance - V0.8.1 sub-wave audit round 4,
+     * minor finding, evaluated and left as-is (a doc fix, not a behavior fix).** Unlike
+     * [recordsByContentId]'s `containsKey` check just above (which never touches that map's
+     * access-order bookkeeping - only `get`/`put`-style operations do), the
+     * `highestSequenceByIdentity[record.identity]` lookup a few lines down IS a `get()` against an
+     * access-order [LinkedHashMap], and per that map's own contract every `get()` counts as an
+     * access that bumps [record].identity's recency, exactly like a `put()` would. So a call to
+     * this function alone - even one that goes on to return `false`, and even if the caller never
+     * follows up with [add] at all - already refreshes that identity's position in
+     * [highestSequenceByIdentity]'s eviction order. **This is judged consistent with, not
+     * contradicting, that map's actual design intent, not a bug worth chasing out.** The whole
+     * point of [highestSequenceByIdentity] being LRU-evicting rather than a permanent lockout (see
+     * its own doc comment) is that an identity anyone keeps sending traffic ABOUT should stay
+     * protected longer than a one-off entry - a plain lookup counting as "this identity is still
+     * active" is the ordinary meaning of an LRU cache, not a special case. Critically, it can only
+     * ever make protection last LONGER for the identity in question, never shorter and never for a
+     * DIFFERENT identity - there is no path by which this mutation lets an attacker evict or spoof
+     * anything; the worst case is a replayed-but-rejected stale record keeping its own victim's
+     * high-water mark alive a little longer than a purist "canAccept never mutates" contract would.
+     * Making this genuinely non-mutating would mean maintaining a second, plain shadow map in
+     * lockstep with every write to [highestSequenceByIdentity] purely so this read-only pre-check
+     * could bypass the access-order map - real added complexity and a new place for the two maps to
+     * drift, in exchange for closing a gap that is not actually a gap. Left as a documented,
+     * intentional divergence from "textbook non-mutating admission check" instead.
      *
      * Narrow race, same shape and same acceptance as every sibling index: [canAccept] and [add] are
      * two separate `@Synchronized` lock acquisitions, so a concurrent gossip delivery of an even
@@ -348,6 +413,63 @@ class PeerRecordIndex internal constructor(
      * accessor, mirrors `net.lapisphilosophorum.lapisnet.mail.InboxIndex.size`. */
     @Synchronized
     internal fun size(): Int = recordsByContentId.size
+
+    /**
+     * Actively removes every tracked record whose [PeerRecord.notValidAfterEpochSecond] is
+     * strictly before [nowEpochSecond] from [recordsByContentId] and [currentByIdentity] - the
+     * "no expiry-driven eviction" half of the V0.8.1 sub-wave audit round 4 finding this closes
+     * (see [PeerRecord.create]'s doc comment for the complementary max-TTL-window half of that same
+     * finding). Before this method existed, an expired record was invisible to
+     * [PeerDirectoryGossip.lookup] but stayed resident in this index FOREVER - a long-running node
+     * would accumulate memory for identities whose records will never again resolve to anything
+     * useful. Returns the number of records evicted.
+     *
+     * **On its own, this does NOT bound how long a maliciously-long-TTL record poisons this
+     * index** - a record's OWN claimed [PeerRecord.notValidAfterEpochSecond] is exactly what this
+     * method trusts to decide "expired"; a record claiming validity until the year 2286 is, by
+     * definition, never swept by this method no matter how often it runs. That is
+     * [PeerRecord.create]'s [PeerRecord.MAX_TTL_WINDOW_SECONDS] cap's job, not this method's - the
+     * two are complementary, not substitutes for each other: the cap bounds how long a NEWLY
+     * (honestly) signed record's poison window can be, this method reclaims memory for records
+     * that already, legitimately expired.
+     *
+     * **Never touches [highestSequenceByIdentity]** - exactly mirroring [removeEldestEntry]'s
+     * (`recordsByContentId`'s own capacity-driven eviction) identical choice: anti-rollback
+     * protection for an identity whose current record just expired must survive this sweep exactly
+     * as it survives capacity eviction, so a later replay of an old, stale record for that identity
+     * is still rejected by [add]/[canAccept] after this method runs.
+     *
+     * **Never touches [persistedContentIds] either** - persistence reservations are a separate,
+     * deliberately permanent, one-shot resource (see [tryReservePersistence]'s and
+     * [persistedContentIds]'s own doc comments); freeing a reservation on expiry would let the SAME
+     * already-evicted content id be redundantly re-persisted later if replayed, reopening exactly
+     * the unbounded-total-disk-writes risk that field's non-eviction policy exists to prevent.
+     *
+     * **Not wired to any periodic/background scheduler in this sub-wave** - this module (like every
+     * sibling `Gossip`/`Index` pair in this codebase) has no existing scheduling infrastructure to
+     * hook into. Exposed as a directly callable primitive a future maintenance task can invoke on
+     * whatever cadence it likes; calling it is entirely optional, and this index remains CORRECT
+     * (if unbounded in memory footprint over an arbitrarily long process lifetime) even if a caller
+     * never calls it at all - exactly the same "documented, accepted limitation, not silently
+     * omitted" stance this codebase takes elsewhere (see [PeerRecord]'s class doc comment).
+     *
+     * [nowEpochSecond] is caller-injectable purely for deterministic testing, mirroring
+     * [PeerDirectoryGossip.lookup]'s identical pattern.
+     */
+    @Synchronized
+    fun evictExpired(nowEpochSecond: Long): Int {
+        var evictedCount = 0
+        val iterator = recordsByContentId.entries.iterator()
+        while (iterator.hasNext()) {
+            val record = iterator.next().value
+            if (record.notValidAfterEpochSecond < nowEpochSecond) {
+                iterator.remove()
+                if (currentByIdentity[record.identity] == record) currentByIdentity.remove(record.identity)
+                evictedCount++
+            }
+        }
+        return evictedCount
+    }
 
     companion object {
         /** Upper bound on distinct records tracked from gossip. A [PeerRecord]'s encoded size is

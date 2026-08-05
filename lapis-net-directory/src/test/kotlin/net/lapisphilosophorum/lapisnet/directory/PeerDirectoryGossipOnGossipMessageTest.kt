@@ -12,14 +12,20 @@ import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
+import java.time.Instant
 
 private fun testAddress(port: Int): Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/$port")
 
+/** [notValidAfterEpochSecond] defaults to a near-future (not far-future) value - since
+ * [PeerRecord.create]'s round-4 [PeerRecord.MAX_TTL_WINDOW_SECONDS] cap rejects anything claiming
+ * validity more than 24h beyond "now", the old `9_999_999_999L` (year 2286) placeholder this file
+ * used before that fix would now throw at construction time. */
 private fun record(
     identity: DualKeyIdentity,
     sequenceNumber: Long,
     addresses: List<Multiaddr> = listOf(testAddress(4000 + sequenceNumber.toInt())),
-): PeerRecord = PeerRecord.create(identity, addresses, setOf(PeerCapability.DM), sequenceNumber, 9_999_999_999L)
+): PeerRecord =
+    PeerRecord.create(identity, addresses, setOf(PeerCapability.DM), sequenceNumber, Instant.now().epochSecond + 3600)
 
 /** As [record], but genuinely self-signed by [signingIdentity] while embedding a DIFFERENT
  * identity's [IdentityBinding] - see [PeerRecordIndexTest]'s identical helper. */

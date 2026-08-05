@@ -8,6 +8,7 @@ import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.IdentityBinding
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.verify
+import java.time.Instant
 
 /** Domain-separation tag for a [PeerRecord]'s OWN outer signature - see
  * [net.lapisphilosophorum.lapisnet.identity.IdentityBinding]'s own tag for the established
@@ -107,6 +108,11 @@ private fun possessionDigest(identity: Secp256k1PublicKey): ByteArray =
  *    `MessageEnvelope.recipients` (which requires at least one), a [PeerRecord] with zero
  *    [addresses] is structurally valid: it is a legitimate way for an identity to say "no known
  *    reachable address right now" while still renewing its [notValidAfterEpochSecond] heartbeat.
+ *  - **[create]'s [MAX_TTL_WINDOW_SECONDS] cap on [notValidAfterEpochSecond] only binds the
+ *    honest-signing path, not gossip ingestion** - a custom/modified attacker client can still
+ *    hand-craft wire bytes claiming an unbounded TTL, bypassing [create] entirely; see [create]'s
+ *    own doc comment for why this cap deliberately does not extend into
+ *    [PeerDirectoryGossip.onGossipMessage]/[PeerRecordIndex].
  *
  * **A known, accepted tension with the original spec's "Metadaten-Minimierung" design principle,
  * documented rather than papered over:** broadcasting presence/address records over a network-wide
@@ -172,11 +178,13 @@ class PeerRecord private constructor(
         require(this.addresses.size <= PeerRecordCodec.MAX_ADDRESSES) {
             "at most ${PeerRecordCodec.MAX_ADDRESSES} addresses allowed, was ${this.addresses.size}"
         }
-        // Deliberately NO range check on notValidAfterEpochSecond - this field is
+        // Deliberately NO range check on notValidAfterEpochSecond HERE - this field is
         // attacker-controlled (PeerDirectoryGossip.onGossipMessage must never trust it for an
         // accept/reject decision - see that function's doc comment) and this constructor runs for
         // both locally-created AND gossip-decoded records. Mirrors MessageEnvelope's identical
-        // decision about sentAtEpochSecond.
+        // decision about sentAtEpochSecond. [create]'s OWN require(), one layer up, DOES cap how
+        // far into the future a LOCALLY-signed record's claimed TTL may be (MAX_TTL_WINDOW_SECONDS)
+        // - see [create]'s doc comment for why that boundary lives there and not here.
     }
 
     /** SHA-256 over this record's full canonical bytes (signed body + signature, see
@@ -215,6 +223,19 @@ class PeerRecord private constructor(
             "notValidAfterEpochSecond=$notValidAfterEpochSecond)"
 
     companion object {
+        /** Upper bound on how far beyond "now" [create] will let a freshly-signed record's
+         * [notValidAfterEpochSecond] claim validity - see [create]'s doc comment for the round-4
+         * audit finding this closes. 24 hours: generous enough that a legitimate node does not need
+         * to be online continuously to stay discoverable (mirrors this record type's own "a node
+         * offline during the gossip window has no catch-up path" accepted limitation - a full day
+         * of slack tolerates a node being briefly offline without instantly going stale), yet short
+         * enough that [PeerPresenceAnnouncer]'s 300-second default heartbeat renews it roughly 288
+         * times within a single window - a live node's own re-announcements always keep it fresh
+         * long before this cap would ever bind for a genuine, continuously-operated identity. Not
+         * derived from any protocol requirement, same provisional-magnitude caveat as every other
+         * cap in this module. */
+        const val MAX_TTL_WINDOW_SECONDS = 86_400L
+
         private fun signingDigest(body: ByteArray): ByteArray = domainSeparatedDigest(PEER_RECORD_DOMAIN_TAG, body)
 
         /**
@@ -228,9 +249,33 @@ class PeerRecord private constructor(
          * current record - the caller (typically [PeerPresenceAnnouncer]'s caller) owns tracking
          * "what sequence number did I last use".
          *
+         * **Refuses to sign a [notValidAfterEpochSecond] further than [MAX_TTL_WINDOW_SECONDS] into
+         * the future - V0.8.1 sub-wave audit round 4, major finding 2 fix.** Before this fix, a
+         * one-time-compromised private key (used through this, the standard, signing path) could
+         * mint a single record with an effectively unbounded TTL (e.g. `Long.MAX_VALUE`-scale) that
+         * [PeerDirectoryGossip.lookup] would then keep treating as the valid, current record for
+         * that identity for as long as this node runs, permanently poisoning that identity's
+         * directory entry with no natural expiry to recover from - see [PeerRecordIndex.evictExpired]
+         * for the complementary (but, on its own, insufficient - see that function's doc comment)
+         * fix for records that DO eventually expire. Capping this HERE, at the honest-signing
+         * boundary, is a deliberately narrower fix than capping it in
+         * [PeerDirectoryGossip.onGossipMessage] or [PeerRecordIndex.add]/[PeerRecordIndex.canAccept]
+         * would be - see this class's own doc comment and [PeerRecordIndex]'s class doc comment for
+         * why those two make "zero clock calls, absolute, not an optimization" a load-bearing
+         * invariant, one this fix deliberately does not disturb. **Accepted, explicitly disclosed
+         * limitation: this does NOT stop a fully custom/modified attacker client from hand-crafting
+         * out-of-spec wire bytes with an arbitrary claimed TTL and broadcasting them directly,
+         * bypassing [create] entirely** - exactly the same shape of gap as this class's own
+         * already-documented "no reachability verification of advertised addresses" limitation. It
+         * DOES bound the common, realistic shape of "one-time compromised key" this finding
+         * describes: a compromised key used through the standard client (the same client every
+         * honest peer runs) can never mint a record whose claimed validity outlives compromise
+         * detection by more than [MAX_TTL_WINDOW_SECONDS].
+         *
          * @throws IllegalArgumentException if [identity].verifyBinding() is false - i.e. if the
          * caller handed in a [DualKeyIdentity] whose own binding is broken, this function refuses
-         * to sign and publish a record built on top of it.
+         * to sign and publish a record built on top of it - or if [notValidAfterEpochSecond] claims
+         * validity more than [MAX_TTL_WINDOW_SECONDS] beyond [nowEpochSecond].
          */
         fun create(
             identity: DualKeyIdentity,
@@ -238,9 +283,15 @@ class PeerRecord private constructor(
             capabilities: Set<PeerCapability>,
             sequenceNumber: Long,
             notValidAfterEpochSecond: Long,
+            nowEpochSecond: Long = Instant.now().epochSecond,
         ): PeerRecord {
             require(identity.verifyBinding()) {
                 "identity's own IdentityBinding does not verify - refusing to embed it in a signed PeerRecord"
+            }
+            require(notValidAfterEpochSecond <= nowEpochSecond + MAX_TTL_WINDOW_SECONDS) {
+                "notValidAfterEpochSecond ($notValidAfterEpochSecond) claims validity more than " +
+                    "$MAX_TTL_WINDOW_SECONDS seconds beyond now ($nowEpochSecond) - refusing to sign " +
+                    "an unreasonably long-lived peer record"
             }
             val possessionProof =
                 identity.ed25519KeyPair.sign(possessionDigest(identity.secp256k1KeyPair.publicKey))

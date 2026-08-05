@@ -8,15 +8,20 @@ import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.crypto.keys.unmarshalEd25519PublicKey
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.IdentityBinding
+import java.time.Instant
 
 private fun testAddress(port: Int): Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/$port")
 
+/** [notValidAfterEpochSecond] defaults to a near-future (not far-future) value - since
+ * [PeerRecord.create]'s round-4 [PeerRecord.MAX_TTL_WINDOW_SECONDS] cap rejects anything claiming
+ * validity more than 24h beyond "now", the old `9_999_999_999L` (year 2286) placeholder this file
+ * used before that fix would now throw at construction time. */
 private fun freshRecord(
     identity: DualKeyIdentity = DualKeyIdentity.generate(),
     addresses: List<Multiaddr> = listOf(testAddress(4001)),
     capabilities: Set<PeerCapability> = setOf(PeerCapability.DM),
     sequenceNumber: Long = 0,
-    notValidAfterEpochSecond: Long = 9_999_999_999L,
+    notValidAfterEpochSecond: Long = Instant.now().epochSecond + 3600,
 ): PeerRecord = PeerRecord.create(identity, addresses, capabilities, sequenceNumber, notValidAfterEpochSecond)
 
 class PeerRecordTest :
@@ -186,6 +191,58 @@ class PeerRecordTest :
 
             shouldThrow<IllegalArgumentException> {
                 PeerRecord.create(broken, emptyList(), emptySet(), 0, 0)
+            }
+        }
+
+        // Security regression (V0.8.1 sub-wave audit round 4, major finding 2): create() must
+        // refuse to sign a record whose claimed TTL reaches unreasonably far into the future - see
+        // create()'s own doc comment for the "one-time compromised key poisons the directory
+        // forever" scenario this closes for the honest-signing path.
+        test("create() throws when notValidAfterEpochSecond claims validity beyond MAX_TTL_WINDOW_SECONDS") {
+            val identity = DualKeyIdentity.generate()
+            val now = 1_000_000L
+
+            shouldThrow<IllegalArgumentException> {
+                PeerRecord.create(
+                    identity,
+                    emptyList(),
+                    emptySet(),
+                    sequenceNumber = 0,
+                    notValidAfterEpochSecond = now + PeerRecord.MAX_TTL_WINDOW_SECONDS + 1,
+                    nowEpochSecond = now,
+                )
+            }
+        }
+
+        test("create() accepts notValidAfterEpochSecond exactly at the MAX_TTL_WINDOW_SECONDS boundary") {
+            val identity = DualKeyIdentity.generate()
+            val now = 1_000_000L
+
+            val record =
+                PeerRecord.create(
+                    identity,
+                    emptyList(),
+                    emptySet(),
+                    sequenceNumber = 0,
+                    notValidAfterEpochSecond = now + PeerRecord.MAX_TTL_WINDOW_SECONDS,
+                    nowEpochSecond = now,
+                )
+            record.notValidAfterEpochSecond shouldBe now + PeerRecord.MAX_TTL_WINDOW_SECONDS
+        }
+
+        test(
+            "create()'s far-future TTL rejection is a real, effective cap - the historical " +
+                "placeholder value used to be legal",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val now = Instant.now().epochSecond
+
+            // 9_999_999_999L (year ~2286) is the far-future placeholder every test file in this
+            // module used before this fix - proving it is now rejected demonstrates the cap has
+            // real teeth against exactly the shape of value this finding was about, not just the
+            // synthetic boundary above.
+            shouldThrow<IllegalArgumentException> {
+                PeerRecord.create(identity, emptyList(), emptySet(), 0, 9_999_999_999L, nowEpochSecond = now)
             }
         }
 
