@@ -4,6 +4,7 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.string.shouldContain
 import java.security.SecureRandom
 
 /** Deterministically fills every requested buffer with zero bytes - used to exercise
@@ -64,11 +65,16 @@ class MailAttachmentCipherTest :
         }
 
         test("encrypt rejects plaintext above EncryptedAttachmentBlobCodec.MAX_PLAINTEXT_BYTES") {
-            // A real allocation of MAX_PLAINTEXT_BYTES + 1 (~1 GiB) is impractical for a unit test -
-            // this proves the guard exists via a stand-in that is cheap to fabricate: the same
-            // check EncryptedAttachmentBlob's own constructor would apply to the resulting
-            // ciphertext, exercised directly against the boundary constant.
-            EncryptedAttachmentBlobCodec.MAX_PLAINTEXT_BYTES shouldBe
-                EncryptedAttachmentBlobCodec.MAX_CIPHERTEXT_BYTES - GCM_TAG_SIZE
+            // A real allocation of MAX_PLAINTEXT_BYTES + 1 (~1 GiB) is a single, one-off allocation -
+            // affordable for a unit test, and the only way to actually exercise the require() guard
+            // in MailAttachmentCipher.encrypt rather than merely re-deriving its boundary constant.
+            val oversizedPlaintext = ByteArray(EncryptedAttachmentBlobCodec.MAX_PLAINTEXT_BYTES + 1)
+
+            val exception =
+                shouldThrow<IllegalArgumentException> {
+                    MailAttachmentCipher.encrypt(oversizedPlaintext)
+                }
+
+            exception.message shouldContain "exceeds"
         }
     })

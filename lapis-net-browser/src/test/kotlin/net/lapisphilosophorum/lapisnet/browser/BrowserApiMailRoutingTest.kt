@@ -1,12 +1,14 @@
 package net.lapisphilosophorum.lapisnet.browser
 
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.shouldBe
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
@@ -103,6 +105,37 @@ private object MailTestNoAnchorSource : BitcoinTimeAnchorSource {
 private fun recipientHexFor(identity: DualKeyIdentity): String =
     identity.secp256k1KeyPair.publicKey.bytes
         .joinToString("") { "%02x".format(it) }
+
+/** RFC 2616 §2.2 separator set that [io.ktor.http.HeaderValueWithParameters]'s private
+ * `needQuotes()`/`quoteTo()` pair uses to decide whether a header parameter value must be
+ * quoted-and-escaped. Reproduced here (Ktor 3.5.1's `HeaderValueWithParameters.kt`) purely to
+ * compute the INDEPENDENTLY expected `Content-Disposition` header string for a crafted attachment
+ * name - not to test Ktor itself, but to pin down exactly what "correctly escaped" means for the
+ * assertion below, so a future Ktor upgrade that silently changed this escaping would fail this
+ * test loudly instead of leaving the header-injection question unverified. */
+private val HEADER_VALUE_SEPARATORS =
+    setOf('(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', ' ', '\t', '\n', '\r')
+
+private fun expectedContentDispositionFileNameParameter(rawName: String): String {
+    val needsQuotes = rawName.isEmpty() || rawName.any { it in HEADER_VALUE_SEPARATORS }
+    if (!needsQuotes) return "attachment; filename=$rawName"
+    val escaped =
+        buildString {
+            append('"')
+            for (ch in rawName) {
+                when (ch) {
+                    '\\' -> append("\\\\")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    '"' -> append("\\\"")
+                    else -> append(ch)
+                }
+            }
+            append('"')
+        }
+    return "attachment; filename=$escaped"
+}
 
 class BrowserApiMailRoutingTest :
     FunSpec({
@@ -715,6 +748,90 @@ class BrowserApiMailRoutingTest :
                     val fetchResponse = client.get("/api/mail/attachment/${attachment.cid}")
                     fetchResponse.status shouldBe HttpStatusCode.OK
                     fetchResponse.bodyAsText() shouldBe "top secret attachment"
+                }
+            } finally {
+                harness.stop()
+            }
+        }
+
+        test(
+            "GET /api/mail/attachment/{cid} escapes a crafted attachment name in Content-Disposition " +
+                "instead of allowing header injection",
+        ) {
+            val harness = MailTestHarness()
+            try {
+                testApplication {
+                    application { installBrowserApi(harness.deps) }
+                    val recipient = DualKeyIdentity.generate()
+                    val contentBase64 = Base64.getEncoder().encodeToString("attacker-controlled name".toByteArray())
+
+                    // Contains every character MailApi.kt's own doc comment flags as unvalidated
+                    // (name is byte-length-checked only, never character-restricted): a double
+                    // quote and a backslash (both would let a naively-concatenated header value
+                    // "escape" the filename="..." parameter), and a CRLF pair immediately followed
+                    // by a syntactically valid extra header line and a Set-Cookie line - the classic
+                    // HTTP response-splitting/header-injection shape. Comfortably under
+                    // MessageBodyCodec.MAX_ATTACHMENT_NAME_BYTES (128 UTF-8 bytes).
+                    val craftedName =
+                        "evil\".txt\\backslash\r\nX-Injected-Header: hacked\r\nSet-Cookie: sess=hijacked\r\n"
+
+                    val sendResponse =
+                        client.post("/api/mail") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                json.encodeToString(
+                                    NewMailRequest(
+                                        recipientsHex = listOf(recipientHexFor(recipient)),
+                                        subject = "attachment header-injection regression",
+                                        body = "see attached",
+                                        attachments =
+                                            listOf(
+                                                NewMailAttachmentRequest(
+                                                    name = craftedName,
+                                                    mime = "text/plain",
+                                                    contentBase64 = contentBase64,
+                                                ),
+                                            ),
+                                    ),
+                                ),
+                            )
+                        }
+                    sendResponse.status shouldBe HttpStatusCode.OK
+
+                    val sentEntries =
+                        json.decodeFromString<List<MailSummaryResponse>>(client.get("/api/mail/sent").bodyAsText())
+                    val attachment = sentEntries.single().attachments.single()
+                    attachment.name shouldBe craftedName
+
+                    val fetchResponse = client.get("/api/mail/attachment/${attachment.cid}")
+                    fetchResponse.status shouldBe HttpStatusCode.OK
+
+                    // 1. Exactly one Content-Disposition header - if the CRLF pairs above had
+                    // survived into the raw response unescaped, this would instead have produced
+                    // either a malformed/split response or additional (possibly duplicated) headers.
+                    val contentDispositionValues = fetchResponse.headers.getAll(HttpHeaders.ContentDisposition)
+                    contentDispositionValues?.size shouldBe 1
+                    val contentDispositionValue = contentDispositionValues!!.single()
+
+                    // 2. The header value contains no raw CR or LF byte at all - the crafted CRLFs
+                    // were consumed into escape sequences, not carried through verbatim. This is the
+                    // actual injection-blocking property: a raw CR/LF here is what would let an
+                    // attacker start a new header (or a new response) inside this single header write.
+                    contentDispositionValue.contains('\r') shouldBe false
+                    contentDispositionValue.contains('\n') shouldBe false
+
+                    // 3. The injected header/cookie lines never became real, separate response
+                    // headers.
+                    fetchResponse.headers["X-Injected-Header"].shouldBeNull()
+                    fetchResponse.headers["Set-Cookie"].shouldBeNull()
+
+                    // 4. The header is exactly what Ktor's own quoting discipline is documented to
+                    // produce for this input (see expectedContentDispositionFileNameParameter's doc
+                    // comment) - not merely "harmless", but byte-for-byte the correctly escaped form:
+                    // the quote and backslash are backslash-escaped in place, and both CRLF pairs are
+                    // rewritten to the literal two-character `\r\n` mnemonic sequences rather than
+                    // surviving as raw bytes.
+                    contentDispositionValue shouldBe expectedContentDispositionFileNameParameter(craftedName)
                 }
             } finally {
                 harness.stop()

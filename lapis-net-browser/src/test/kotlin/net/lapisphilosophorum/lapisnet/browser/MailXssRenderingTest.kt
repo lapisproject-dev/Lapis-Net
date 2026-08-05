@@ -25,6 +25,7 @@ import org.htmlunit.html.HtmlPage
 import java.nio.file.Files
 import java.time.Duration
 import java.time.Instant
+import java.util.Base64
 import kotlin.time.Duration.Companion.seconds
 
 private val json = Json { ignoreUnknownKeys = true }
@@ -152,6 +153,108 @@ class MailXssRenderingTest :
                 // confirms escaping happened at the DOM layer, not just "the browser engine
                 // happened not to run it this time".
                 page.asXml() shouldContain "&lt;script&gt;"
+            } finally {
+                webClient.close()
+                httpClient.close()
+                runCatching { server.stop() }
+            }
+        }
+
+        test(
+            "an XSS payload in a sent message's attachment name renders as escaped, inert text - never executes",
+        ).config(
+            timeout = 60.seconds,
+        ) {
+            // Mirrors the subject/body test above exactly, but targets renderAttachmentsInto's
+            // setText(linkEl, attachment.name) call in mail.js - a DIFFERENT rendering call site
+            // from fillSummaryInto's subject/body setText calls, reached via a different response
+            // field (MailSummaryResponse.attachments[].name), so proving subject/body is inert says
+            // nothing about whether this call site was also written correctly.
+            val identity = DualKeyIdentity.generate()
+            val server =
+                BrowserServer.start(
+                    identity = identity,
+                    httpPort = 0,
+                    dataDirectory = Files.createTempDirectory("mail-xss-rendering-attachment-test"),
+                    karmaAnchorSource = XssTestNoAnchorSource,
+                )
+            val httpClient = HttpClient(CIO)
+            val webClient = WebClient(BrowserVersion.CHROME)
+
+            try {
+                val xssAttachmentName = "<img src=x onerror=\"window.__xssFiredAttachment = true\">.txt"
+                val attachmentContentBase64 =
+                    Base64.getEncoder().encodeToString("attachment payload".toByteArray(Charsets.UTF_8))
+
+                val recipient = DualKeyIdentity.generate()
+                runBlocking {
+                    val sendResponse =
+                        httpClient.post("http://127.0.0.1:${server.boundPort}/api/mail") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                json.encodeToString(
+                                    NewMailRequest(
+                                        recipientsHex =
+                                            listOf(
+                                                recipient.secp256k1KeyPair.publicKey.bytes.joinToString("") {
+                                                    "%02x".format(it)
+                                                },
+                                            ),
+                                        subject = "attachment XSS regression",
+                                        body = "see attached",
+                                        attachments =
+                                            listOf(
+                                                NewMailAttachmentRequest(
+                                                    name = xssAttachmentName,
+                                                    mime = "text/plain",
+                                                    contentBase64 = attachmentContentBase64,
+                                                ),
+                                            ),
+                                    ),
+                                ),
+                            )
+                        }
+                    sendResponse.status.value shouldBe 200
+                }
+
+                webClient.options.isThrowExceptionOnScriptError = true
+                webClient.options.isThrowExceptionOnFailingStatusCode = false
+                webClient.options.isCssEnabled = false
+                webClient.options.isFetchPolyfillEnabled = true
+
+                val page = webClient.getPage<HtmlPage>("http://127.0.0.1:${server.boundPort}/mail.html")
+                webClient.waitForBackgroundJavaScript(5_000)
+
+                val sentButton = page.getElementById("folder-sent-button")
+                sentButton.click<HtmlPage>()
+
+                val deadline = Instant.now().plus(Duration.ofSeconds(20))
+                var attachmentNameText: String? = null
+                while (Instant.now().isBefore(deadline)) {
+                    webClient.waitForBackgroundJavaScript(500)
+                    val linkElement = page.querySelector<DomNode>(".mail-item .mail-attachment-link")
+                    val candidate = linkElement?.textContent
+                    if (!candidate.isNullOrBlank()) {
+                        attachmentNameText = candidate
+                        break
+                    }
+                    runBlocking { delay(200) }
+                }
+
+                // 1. The injected onerror handler never ran.
+                val xssFiredResult = page.executeJavaScript("window.__xssFiredAttachment")
+                ScriptResult.isUndefined(xssFiredResult) shouldBe true
+
+                // 2. The rendered anchor's own text content is the LITERAL payload string.
+                attachmentNameText shouldBe xssAttachmentName
+
+                // 3. No injected <img> element exists anywhere in the page - if the name had been
+                // innerHTML'd instead of textContent'd, the browser would have parsed and inserted
+                // a real <img onerror> element here.
+                page.getElementsByTagName("img").size shouldBe 0
+
+                // 4. The serialized DOM shows the payload HTML-entity-escaped, not raw markup.
+                page.asXml() shouldContain "&lt;img src=x onerror="
             } finally {
                 webClient.close()
                 httpClient.close()

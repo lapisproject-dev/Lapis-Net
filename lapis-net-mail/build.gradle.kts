@@ -68,3 +68,12 @@ dependencies {
     implementation(rootProject.libs.lightning.kmp)
     implementation(rootProject.libs.bitcoin.kmp)
 }
+
+// MailAttachmentCipherTest's "encrypt rejects plaintext above MAX_PLAINTEXT_BYTES" test allocates a
+// single real ~1 GiB ByteArray to actually exercise MailAttachmentCipher.encrypt's size guard
+// (rather than merely re-deriving the boundary constant) - the root project's default test-worker
+// heap is too small for that one-off allocation. Scoped to this module only, not the root build,
+// since no other module's tests need it.
+tasks.test {
+    maxHeapSize = "2g"
+}
