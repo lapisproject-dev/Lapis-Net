@@ -344,4 +344,57 @@ class MailSpamResistanceTest :
                 node.stop()
             }
         }
+
+        // --- ROUND-2 SECURITY AUDIT FINDING: policy-level minimum deposit floor -------------------
+        // Pinned at the real gossip-integration level (not just MailAcceptancePolicyTest's pure-unit
+        // level): a genuinely, structurally self-consistent deposit for a laughably small amount
+        // (1 msat) must NOT admit an otherwise-rejected stranger through InboxGossip.onGossipMessage.
+        test(
+            "a self-consistent but below-floor deposit does not admit an untrusted sender " +
+                "(gossip-integration level, round-2 audit finding)",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val localIdentity = identity.secp256k1KeyPair.publicKey
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-spam-deposit-floor"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+
+                val sender = Secp256k1KeyPair.generate()
+                val body = encodedBody(1)
+                val contentCid = MessageBodyCodec.cidFor(body)
+                val envelope = MessageEnvelope.create(sender, listOf(localIdentity), contentCid)
+
+                val belowFloorAmountMsat = 1L
+                val preimage = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                val paymentHash = sha256(preimage)
+                val memo =
+                    FirstContactDepositVerifier.canonicalMemo(envelope.contentId(), sender.publicKey, localIdentity)
+                val invoice =
+                    signedInvoice(identity.secp256k1KeyPair.privateKey.bytes, paymentHash, belowFloorAmountMsat, memo)
+                val belowFloorDeposit = FirstContactDeposit(preimage, paymentHash, invoice, belowFloorAmountMsat)
+
+                // Sanity: the deposit alone is genuinely, structurally self-consistent.
+                FirstContactDepositVerifier.verify(envelope, localIdentity, belowFloorDeposit) shouldBe true
+
+                val depositLookup: (MessageEnvelope) -> FirstContactDeposit? = { belowFloorDeposit }
+                val acceptance =
+                    MailAcceptanceCheck(
+                        gates = listOf(MailAcceptanceGate.VeritasPath),
+                        trustGraph = TrustGraph.fromEdges(emptyList()),
+                        karmaScoreOf = KarmaScoreLookup { 0.0 },
+                        depositLookup = depositLookup,
+                    )
+
+                val frame = MailFrameCodec.encode(MessageEnvelopeCodec.encode(envelope), body)
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, localIdentity, acceptance)
+
+                result shouldBe ValidationResult.Invalid
+                index.latest() shouldBe emptyList()
+            } finally {
+                node.stop()
+            }
+        }
     })

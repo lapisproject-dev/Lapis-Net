@@ -66,6 +66,27 @@ class InboxMessage(
  * would be a roughly 25x larger disk/heap budget. [MAX_TRACKED_MESSAGES]/[MAX_PERSISTED_MESSAGES]
  * are provisional, chosen for a personal-node inbox scale, and should be revisited against real
  * usage - the same "provisional magnitude" caveat `LtrRecordIndex.MAX_TRACKED_RECORDS` documents.
+ *
+ * **Informational, round-2 security audit finding (V0.9.4 hardening) - post-eviction
+ * re-admission of a verbatim-replayed identical message is possible and accepted.**
+ * [messagesByContentId] evicts its oldest entry once [maxTracked] ([MAX_TRACKED_MESSAGES]) is
+ * exceeded (see that field's doc comment). Once a message's entry has been evicted, an exact,
+ * byte-for-byte replay of the SAME already-delivered envelope (identical signature, identical
+ * `contentId`, gossiped again verbatim - not a forgery, not a different message from the same
+ * sender) passes [canAccept] again (the content id is no longer tracked) and is re-admitted:
+ * re-persisted via [tryReservePersistence] (idempotent - a no-op if [persistedContentIds] still
+ * has it) and re-added to the live index. **Confirmed correct characterization: this is
+ * RE-DELIVERY of a message this node already legitimately accepted once, not admission of a NEW
+ * or DIFFERENT message** - the sender did nothing to earn a second acceptance, the same signature
+ * that was valid the first time is simply valid again, and any spam-acceptance gate
+ * ([MailAcceptancePolicy]/[MailAcceptanceCheck]) that would have accepted this sender once
+ * continues to hold. This applies uniformly to every already-trusted sender (Veritas-gated,
+ * Karma-gated, or deposit-admitted) - it is not a way to bypass any gate, only a way to see one
+ * already-accepted message a second time after the tracking cap has rotated it out. No functional
+ * fix is planned for this item: it is an accepted consequence of [messagesByContentId] being a
+ * BOUNDED, evicting index rather than a permanent record of every content id ever seen, the same
+ * tradeoff `VeritasGrantIndex.grantsByContentId` already accepts (see this class's own doc comment
+ * on why the eviction/persistence split mirrors that class precisely).
  */
 class InboxIndex internal constructor(
     private val maxTracked: Int = MAX_TRACKED_MESSAGES,

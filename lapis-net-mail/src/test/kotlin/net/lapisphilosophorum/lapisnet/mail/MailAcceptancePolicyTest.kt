@@ -72,7 +72,6 @@ class MailAcceptancePolicyTest :
             val stranger = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(stranger),
                     hasVeritasPath = { false },
@@ -87,7 +86,6 @@ class MailAcceptancePolicyTest :
             val stranger = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(stranger),
                     hasVeritasPath = { false },
@@ -102,7 +100,6 @@ class MailAcceptancePolicyTest :
             val trusted = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = trusted.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(trusted),
                     hasVeritasPath = { true },
@@ -178,7 +175,6 @@ class MailAcceptancePolicyTest :
             val sender = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = sender.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(sender),
                     hasVeritasPath = { false },
@@ -193,7 +189,6 @@ class MailAcceptancePolicyTest :
             val sender = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = sender.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(sender),
                     hasVeritasPath = { false },
@@ -208,7 +203,6 @@ class MailAcceptancePolicyTest :
             val sender = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = sender.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(sender),
                     hasVeritasPath = { false },
@@ -223,7 +217,6 @@ class MailAcceptancePolicyTest :
             val sender = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = sender.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(sender),
                     hasVeritasPath = { false },
@@ -238,7 +231,6 @@ class MailAcceptancePolicyTest :
             val sender = Secp256k1KeyPair.generate()
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = sender.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(sender),
                     hasVeritasPath = { false },
@@ -271,7 +263,6 @@ class MailAcceptancePolicyTest :
             // Sanity: without the deposit, every configured gate genuinely rejects this stranger.
             val withoutDeposit =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipientKeyPair.publicKey,
                     envelope = envelope,
                     hasVeritasPath = { false },
@@ -284,7 +275,6 @@ class MailAcceptancePolicyTest :
             // bypassed entirely.
             val withDeposit =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipientKeyPair.publicKey,
                     envelope = envelope,
                     hasVeritasPath = { false },
@@ -307,7 +297,6 @@ class MailAcceptancePolicyTest :
 
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(stranger),
                     hasVeritasPath = { false },
@@ -331,7 +320,6 @@ class MailAcceptancePolicyTest :
 
             val decision =
                 MailAcceptancePolicy.shouldAccept(
-                    sender = stranger.publicKey,
                     recipient = recipient,
                     envelope = envelopeFrom(stranger),
                     hasVeritasPath = { false },
@@ -341,5 +329,136 @@ class MailAcceptancePolicyTest :
                 )
 
             decision shouldBe MailAcceptanceDecision.Accept
+        }
+
+        // --- ROUND-2 SECURITY AUDIT FINDING: policy-level minimum deposit floor ------------------
+        // FirstContactDepositVerifier.verify only proves SELF-CONSISTENCY (the invoice amount
+        // matches deposit.requiredAmountMsat exactly) - it says nothing about whether that amount
+        // is economically meaningful. Pre-fix, a self-consistent 1-msat deposit verified and was
+        // accepted, exactly like a 1_000_000-msat one. These three tests pin the fix:
+        // MailAcceptancePolicy.DEFAULT_MIN_DEPOSIT_MSAT (and the caller-overridable minDepositMsat
+        // parameter) now reject a below-floor deposit even when it is genuinely self-consistent.
+
+        test(
+            "a self-consistent deposit below the default minimum floor does not bypass a failing " +
+                "gate (round-2 audit finding: '1-msat deposit currently verifies and is accepted')",
+        ) {
+            val stranger = Secp256k1KeyPair.generate()
+            val bodyBytes = MessageBodyCodec.encode(MessageBody(subject = "s", body = "b"))
+            val contentCid = MessageBodyCodec.cidFor(bodyBytes)
+            val envelope = MessageEnvelope.create(stranger, listOf(recipient), contentCid)
+
+            val recipientKeyPair = Secp256k1KeyPair.generate()
+            val belowFloorAmountMsat = 1L
+            val preimage = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val paymentHash = sha256(preimage)
+            val memo =
+                FirstContactDepositVerifier.canonicalMemo(
+                    envelope.contentId(),
+                    stranger.publicKey,
+                    recipientKeyPair.publicKey,
+                )
+            val invoice = signedInvoice(recipientKeyPair.privateKey.bytes, paymentHash, belowFloorAmountMsat, memo)
+            val belowFloorDeposit = FirstContactDeposit(preimage, paymentHash, invoice, belowFloorAmountMsat)
+
+            // Sanity: the deposit is genuinely, structurally self-consistent -
+            // FirstContactDepositVerifier itself accepts it. The rejection asserted below must
+            // therefore come from the policy-level floor, not from a verification failure.
+            FirstContactDepositVerifier.verify(envelope, recipientKeyPair.publicKey, belowFloorDeposit) shouldBe true
+
+            val decision =
+                MailAcceptancePolicy.shouldAccept(
+                    recipient = recipientKeyPair.publicKey,
+                    envelope = envelope,
+                    hasVeritasPath = { false },
+                    karmaScoreOf = zeroKarma,
+                    gates = listOf(MailAcceptanceGate.VeritasPath),
+                    deposit = belowFloorDeposit,
+                )
+
+            decision.shouldBeInstanceOf<MailAcceptanceDecision.Reject>()
+        }
+
+        test("a deposit exactly at the default minimum floor bypasses a failing gate") {
+            val stranger = Secp256k1KeyPair.generate()
+            val bodyBytes = MessageBodyCodec.encode(MessageBody(subject = "s", body = "b"))
+            val contentCid = MessageBodyCodec.cidFor(bodyBytes)
+            val envelope = MessageEnvelope.create(stranger, listOf(recipient), contentCid)
+
+            val recipientKeyPair = Secp256k1KeyPair.generate()
+            val atFloorAmountMsat = MailAcceptancePolicy.DEFAULT_MIN_DEPOSIT_MSAT
+            val preimage = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val paymentHash = sha256(preimage)
+            val memo =
+                FirstContactDepositVerifier.canonicalMemo(
+                    envelope.contentId(),
+                    stranger.publicKey,
+                    recipientKeyPair.publicKey,
+                )
+            val invoice = signedInvoice(recipientKeyPair.privateKey.bytes, paymentHash, atFloorAmountMsat, memo)
+            val atFloorDeposit = FirstContactDeposit(preimage, paymentHash, invoice, atFloorAmountMsat)
+
+            val decision =
+                MailAcceptancePolicy.shouldAccept(
+                    recipient = recipientKeyPair.publicKey,
+                    envelope = envelope,
+                    hasVeritasPath = { false },
+                    karmaScoreOf = zeroKarma,
+                    gates = listOf(MailAcceptanceGate.VeritasPath),
+                    deposit = atFloorDeposit,
+                )
+
+            decision shouldBe MailAcceptanceDecision.Accept
+        }
+
+        test("a caller-supplied minDepositMsat overrides the default floor, both up and down") {
+            val stranger = Secp256k1KeyPair.generate()
+            val bodyBytes = MessageBodyCodec.encode(MessageBody(subject = "s", body = "b"))
+            val contentCid = MessageBodyCodec.cidFor(bodyBytes)
+            val envelope = MessageEnvelope.create(stranger, listOf(recipient), contentCid)
+
+            val recipientKeyPair = Secp256k1KeyPair.generate()
+            val customFloor = 50_000_000L
+            val aboveDefaultButBelowCustomFloor = customFloor - 1
+            val preimage = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val paymentHash = sha256(preimage)
+            val memo =
+                FirstContactDepositVerifier.canonicalMemo(
+                    envelope.contentId(),
+                    stranger.publicKey,
+                    recipientKeyPair.publicKey,
+                )
+            val invoice =
+                signedInvoice(recipientKeyPair.privateKey.bytes, paymentHash, aboveDefaultButBelowCustomFloor, memo)
+            val deposit = FirstContactDeposit(preimage, paymentHash, invoice, aboveDefaultButBelowCustomFloor)
+
+            // Comfortably above the DEFAULT floor - would pass it.
+            (aboveDefaultButBelowCustomFloor >= MailAcceptancePolicy.DEFAULT_MIN_DEPOSIT_MSAT) shouldBe true
+
+            // ...but a node operator who raised their own floor above it still rejects it.
+            val rejectedByRaisedFloor =
+                MailAcceptancePolicy.shouldAccept(
+                    recipient = recipientKeyPair.publicKey,
+                    envelope = envelope,
+                    hasVeritasPath = { false },
+                    karmaScoreOf = zeroKarma,
+                    gates = listOf(MailAcceptanceGate.VeritasPath),
+                    minDepositMsat = customFloor,
+                    deposit = deposit,
+                )
+            rejectedByRaisedFloor.shouldBeInstanceOf<MailAcceptanceDecision.Reject>()
+
+            // ...and a node operator who lowered their own floor below it accepts the same deposit.
+            val acceptedByLoweredFloor =
+                MailAcceptancePolicy.shouldAccept(
+                    recipient = recipientKeyPair.publicKey,
+                    envelope = envelope,
+                    hasVeritasPath = { false },
+                    karmaScoreOf = zeroKarma,
+                    gates = listOf(MailAcceptanceGate.VeritasPath),
+                    minDepositMsat = 1L,
+                    deposit = deposit,
+                )
+            acceptedByLoweredFloor shouldBe MailAcceptanceDecision.Accept
         }
     })

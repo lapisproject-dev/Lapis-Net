@@ -78,6 +78,28 @@ object MailAcceptancePolicy {
     val ACCEPT_ALL: List<MailAcceptanceGate> = emptyList()
 
     /**
+     * The default floor for [shouldAccept]'s [minDepositMsat] parameter - **a policy-level minimum
+     * on top of [FirstContactDepositVerifier.verify]'s purely structural self-consistency check**
+     * (round-2 security audit finding, V0.9.4 hardening). Without this floor, [verify] only proves
+     * the invoice amount matches [FirstContactDeposit.requiredAmountMsat] byte-for-byte - it says
+     * nothing about whether that amount is economically meaningful as an anti-spam deterrent. A
+     * self-consistent, genuinely-settled 1-msat deposit passes [verify] just as validly as a
+     * 1_000_000-msat one, so without a floor a spammer can mint a first-contact bypass for a cost
+     * indistinguishable from free.
+     *
+     * `1_000_000` msat (1000 sat) is comfortably above the Lightning Network's conventional ~546-sat
+     * dust limit (the smallest amount most nodes will even forward/settle) while remaining a modest,
+     * genuinely-affordable cost for a legitimate stranger's first contact - the same "cheap for a
+     * real sender, real friction for automated spam at scale" tradeoff the whole first-contact-
+     * deposit mechanism is built on (see [FirstContactDeposit]'s class doc comment). Provisional, a
+     * node operator's own economic call: exposed as a normal parameter (and, per-node, via
+     * [MailAcceptanceCheck.minDepositMsat]) specifically so it can be tuned without touching this
+     * object's code, mirroring [MailAcceptanceGate.KarmaThreshold.minScore]'s "policy is
+     * configuration, not a hardcoded constant" precedent.
+     */
+    const val DEFAULT_MIN_DEPOSIT_MSAT: Long = 1_000_000L
+
+    /**
      * `true` iff [candidate] has a POSITIVE Veritas trust score from [localIdentity] - the one
      * place [TrustGraph]/[TrustPathFinder] are referenced directly, mirroring
      * `MadliAggregator.veritasObserverWeight`'s identical "thin adapter, trust-free core" split
@@ -105,33 +127,55 @@ object MailAcceptancePolicy {
         { candidate -> TrustPathFinder.trustMicros(graph, localIdentity, candidate) > MIN_TRUST_MICROS }
 
     /**
-     * The accept/reject decision for [envelope] from [sender], addressed to [recipient] (the
-     * local identity running this check - see [FirstContactDepositVerifier.verify]'s `recipient`
-     * binding). Evaluated in this exact order:
+     * The accept/reject decision for [envelope], addressed to [recipient] (the local identity
+     * running this check - see [FirstContactDepositVerifier.verify]'s `recipient` binding). The
+     * sender is always [envelope].[MessageEnvelope.sender] - **deliberately not a separate
+     * parameter** (round-2 security audit finding, V0.9.4 hardening): every real call site already
+     * has the sender only by way of an [envelope] (`InboxGossip.onGossipMessage` derives it from
+     * the decoded envelope, never from anywhere else), so a second, independently-suppliable
+     * `sender: Secp256k1PublicKey` parameter sitting next to the equally-typed [recipient] was pure
+     * footgun surface - nothing in the type system stops a future caller from transposing the two,
+     * and the compiler cannot catch `shouldAccept(recipient, sender, ...)` written where
+     * `shouldAccept(sender, recipient, ...)` was meant, silently checking gates against the WRONG
+     * identity. Deriving the sender from [envelope] instead removes the swap entirely by removing
+     * one of the two swappable parameters.
+     *
+     * Evaluated in this exact order:
      *
      *  1. **Empty [gates] ([ACCEPT_ALL]) always accepts** - the protocol-mandated default, checked
      *     first so a node running no filters pays no cost at all (no deposit verification, no
      *     Veritas/Karma lookups) for messages it was always going to accept anyway.
-     *  2. **A [deposit] that verifies (see [FirstContactDepositVerifier.verify]) always accepts,
-     *     bypassing every configured gate** - that is the whole point of the first-contact deposit
-     *     mechanism: an unknown sender who paid gets through even with every gate configured and
-     *     failing.
-     *  3. Otherwise, accepted iff [sender] passes AT LEAST ONE configured gate - see
+     *  2. **A [deposit] whose [FirstContactDeposit.requiredAmountMsat] is at least [minDepositMsat]
+     *     AND that verifies (see [FirstContactDepositVerifier.verify]) always accepts, bypassing
+     *     every configured gate** - that is the whole point of the first-contact deposit mechanism:
+     *     an unknown sender who paid ENOUGH gets through even with every gate configured and
+     *     failing. The amount floor is checked first, before the (comparatively expensive) real
+     *     BOLT-11 parse+signature verification - see [DEFAULT_MIN_DEPOSIT_MSAT]'s doc comment for
+     *     why [verify]'s purely structural self-consistency check alone is not sufficient: a
+     *     genuinely-settled, self-consistent 1-msat deposit passes [verify] exactly as validly as a
+     *     economically-meaningful one, so without this floor a spammer could mint a bypass for a
+     *     cost indistinguishable from free.
+     *  3. Otherwise, accepted iff the sender passes AT LEAST ONE configured gate - see
      *     [MailAcceptanceGate]'s class doc comment for the OR-across-gates reasoning. Rejection
      *     reports every gate that failed.
      */
     fun shouldAccept(
-        sender: Secp256k1PublicKey,
         recipient: Secp256k1PublicKey,
         envelope: MessageEnvelope,
         hasVeritasPath: (Secp256k1PublicKey) -> Boolean,
         karmaScoreOf: KarmaScoreLookup,
         gates: List<MailAcceptanceGate> = ACCEPT_ALL,
+        minDepositMsat: Long = DEFAULT_MIN_DEPOSIT_MSAT,
         deposit: FirstContactDeposit? = null,
     ): MailAcceptanceDecision {
         if (gates.isEmpty()) return MailAcceptanceDecision.Accept
 
-        if (deposit != null && FirstContactDepositVerifier.verify(envelope, recipient, deposit)) {
+        val sender = envelope.sender
+
+        if (deposit != null &&
+            deposit.requiredAmountMsat >= minDepositMsat &&
+            FirstContactDepositVerifier.verify(envelope, recipient, deposit)
+        ) {
             return MailAcceptanceDecision.Accept
         }
 

@@ -9,6 +9,7 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import net.lapisphilosophorum.lapisnet.trust.TrustGraph
 import java.nio.file.Files
 
 private fun freshFrame(
@@ -299,6 +300,88 @@ class InboxGossipOnGossipMessageTest :
 
                 result shouldBe ValidationResult.Invalid
                 index.latest() shouldBe emptyList()
+            } finally {
+                node.stop()
+            }
+        }
+
+        // --- ROUND-2 SECURITY AUDIT FINDING: depositLookup eagerness cost model -------------------
+        // Pre-fix, MailAcceptanceCheck.depositLookup was invoked as a plain Kotlin call argument
+        // (`deposit = acceptance.depositLookup(envelope)`) EVERY time acceptance was non-null,
+        // regardless of whether acceptance.gates was empty - contradicting the documented "zero
+        // cost for accept-all" property, since Kotlin evaluates call arguments before the callee
+        // (MailAcceptancePolicy.shouldAccept's own internal gates.isEmpty() short-circuit) ever
+        // runs. These two tests pin the fix: depositLookup is only invoked when gates is genuinely
+        // non-empty, i.e. only when a configured gate could actually need it.
+        test(
+            "V0.9.4: with acceptance.gates empty (ACCEPT_ALL), depositLookup is never invoked",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-ongossip-lazy-deposit-empty"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+
+                val sender = Secp256k1KeyPair.generate()
+                val recipient = identity.secp256k1KeyPair
+
+                var depositLookupCalls = 0
+                val acceptance =
+                    MailAcceptanceCheck(
+                        gates = MailAcceptancePolicy.ACCEPT_ALL,
+                        trustGraph = TrustGraph.fromEdges(emptyList()),
+                        karmaScoreOf = KarmaScoreLookup { 0.0 },
+                        depositLookup = {
+                            depositLookupCalls++
+                            null
+                        },
+                    )
+
+                val frame = freshFrame(sender, listOf(recipient.publicKey))
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, recipient.publicKey, acceptance)
+
+                result shouldBe ValidationResult.Valid
+                depositLookupCalls shouldBe 0
+            } finally {
+                node.stop()
+            }
+        }
+
+        test(
+            "V0.9.4: with at least one configured gate, depositLookup IS still invoked as before",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("mail-ongossip-lazy-deposit-nonempty"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val index = InboxIndex()
+
+                val sender = Secp256k1KeyPair.generate()
+                val recipient = identity.secp256k1KeyPair
+
+                var depositLookupCalls = 0
+                val acceptance =
+                    MailAcceptanceCheck(
+                        gates = listOf(MailAcceptanceGate.VeritasPath),
+                        trustGraph = TrustGraph.fromEdges(emptyList()),
+                        karmaScoreOf = KarmaScoreLookup { 0.0 },
+                        depositLookup = {
+                            depositLookupCalls++
+                            null
+                        },
+                    )
+
+                val frame = freshFrame(sender, listOf(recipient.publicKey))
+                val result = InboxGossip.onGossipMessage(frame, from, storage, index, recipient.publicKey, acceptance)
+
+                // No Veritas path and no deposit - rejected, but only after depositLookup was
+                // genuinely consulted (there IS a configured gate that could have needed it).
+                result shouldBe ValidationResult.Invalid
+                depositLookupCalls shouldBe 1
             } finally {
                 node.stop()
             }

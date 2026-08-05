@@ -141,15 +141,27 @@ class InboxGossip private constructor(
          * [index] as plain parameters, so a test can exercise this function directly against a real
          * (single-node, unconnected) [NabuStorage] and small-cap [InboxIndex]s.
          *
-         * **V0.9.4: [acceptance], when non-null, runs [MailAcceptancePolicy.shouldAccept] AFTER
-         * the signature/addressing/CID-binding checks below (those are cheap and must reject
-         * first) and BEFORE payload decode/dedup/persistence** - a rejected sender costs this node
-         * no payload allocation and no index/storage work. The check itself makes zero network
-         * calls and zero clock calls, same as every other check in this function: [MailAcceptanceCheck.trustGraph]
-         * is an already-built local snapshot, [MailAcceptanceCheck.karmaScoreOf] is a pure local
-         * lookup the caller supplies, and [MailAcceptanceCheck.depositLookup] is a pure local
-         * lookup too (see that class's doc comment on why the deposit itself is not yet carried
-         * on the wire this wave).
+         * **V0.9.4: [acceptance], when non-null AND [MailAcceptanceCheck.gates] is non-empty, runs
+         * [MailAcceptancePolicy.shouldAccept] AFTER the signature/addressing/CID-binding checks
+         * below (those are cheap and must reject first) and BEFORE payload decode/dedup/
+         * persistence** - a rejected sender costs this node no payload allocation and no
+         * index/storage work. The check itself makes zero network calls and zero clock calls, same
+         * as every other check in this function: [MailAcceptanceCheck.trustGraph] is an
+         * already-built local snapshot (queried through [MailAcceptanceCheck.cachedVeritasPathCheck]
+         * - see that method's doc comment for the round-2 audit's BFS-cost finding and the
+         * per-`(localIdentity, candidate)` memoization this wave added to address it),
+         * [MailAcceptanceCheck.karmaScoreOf] is a pure local lookup the caller supplies, and
+         * [MailAcceptanceCheck.depositLookup] is a pure local lookup too (see that class's doc
+         * comment on why the deposit itself is not yet carried on the wire this wave).
+         *
+         * **`acceptance.gates.isEmpty()` (a non-null [MailAcceptanceCheck] configured with
+         * [MailAcceptancePolicy.ACCEPT_ALL]) is checked HERE, not left to
+         * [MailAcceptancePolicy.shouldAccept]'s own internal short-circuit** - round-2 security
+         * audit finding, V0.9.4 hardening: `shouldAccept`'s short-circuit runs too late to keep
+         * this branch's documented "zero cost for accept-all" property, because
+         * [MailAcceptanceCheck.depositLookup] is evaluated as a plain Kotlin call argument BEFORE
+         * `shouldAccept` is even entered, regardless of what `shouldAccept` does with it. See the
+         * guard below for the fix.
          */
         internal fun onGossipMessage(
             bytes: ByteArray,
@@ -205,15 +217,25 @@ class InboxGossip private constructor(
                 return ValidationResult.Invalid
             }
 
-            if (acceptance != null) {
+            // acceptance.gates.isEmpty() is checked HERE, before calling shouldAccept, not just
+            // inside it - see MailAcceptanceCheck's doc comment and the round-2 security audit
+            // finding it documents: shouldAccept(...)'s own internal gates.isEmpty() short-circuit
+            // is too late to keep this branch's "zero cost for accept-all" property, because Kotlin
+            // evaluates every call argument (in particular acceptance.depositLookup(envelope),
+            // which a real deployment's application layer may back with actual lookup work) BEFORE
+            // the call happens - an empty-gates node running a non-null MailAcceptanceCheck used to
+            // pay depositLookup's cost on every single message despite never being able to reject
+            // one. Guarding here means an empty-gates check now costs exactly what a `null`
+            // acceptance costs: one boolean check, no depositLookup call, no cache lookup.
+            if (acceptance != null && acceptance.gates.isNotEmpty()) {
                 val decision =
                     MailAcceptancePolicy.shouldAccept(
-                        sender = envelope.sender,
                         recipient = localIdentity,
                         envelope = envelope,
-                        hasVeritasPath = MailAcceptancePolicy.veritasPathCheck(acceptance.trustGraph, localIdentity),
+                        hasVeritasPath = acceptance.cachedVeritasPathCheck(localIdentity),
                         karmaScoreOf = acceptance.karmaScoreOf,
                         gates = acceptance.gates,
+                        minDepositMsat = acceptance.minDepositMsat,
                         deposit = acceptance.depositLookup(envelope),
                     )
                 if (decision is MailAcceptanceDecision.Reject) {
