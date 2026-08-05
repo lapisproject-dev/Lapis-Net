@@ -27,7 +27,10 @@ propagated over one GossipSub topic per recipient identity (V0.9.1), `HYBRID_ECI
 Veritas/Karma/Lightning-deposit spam-acceptance filter (V0.9.4, see below — the V0.9 arc is
 complete), and a signed peer/presence directory record propagated over GossipSub with a monotonic
 per-identity sequence number and a heartbeat TTL — the foundational discovery layer for the V0.8
-direct-messages-and-calls arc (V0.8.1, see below) — are implemented. Remaining modules are still
+direct-messages-and-calls arc (V0.8.1, see below) — are implemented, and an X25519 encryption
+sub-key bound to each identity plus the X3DH handshake (Signal's Extended Triple Diffie-Hellman,
+reimplemented from the public specification) — the second V0.8 sub-wave, new module
+`lapis-net-ratchet` (V0.8.2, see below) — is also implemented. Remaining modules are still
 skeletons. This document grows as modules gain real implementations.
 
 == Layering
@@ -92,7 +95,15 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   `Kademlia.dialPeer`-broken limitation as every V0.9 mail sub-wave. Deliberately takes NO
   dependency on `lapis-net-trust` this wave (acceptance is purely structural, not Veritas-gated,
   unlike `lapis-net-mail`'s V0.9.4 addition) and NO dependency on `java-cid` (`PeerRecord` carries no
-  `io.ipfs.cid.Cid` field at all)
+  `io.ipfs.cid.Cid` field at all). As of V0.8.2, also carries `PrekeyBundleIndex`/
+  `PrekeyBundleGossip` — publication of `lapis-net-ratchet`'s `PrekeyBundle` over its own dedicated
+  GossipSub topic, reusing this module's own two-cap-index + gossip-validator machinery
+* `lapis-net-ratchet` — the second sub-wave of the V0.8 arc: an X25519 encryption sub-key bound to
+  each identity, and X3DH (Signal's Extended Triple Diffie-Hellman), reimplemented from the public
+  specification because libsignal is AGPL-3.0-licensed (V0.8.2, see below). `PrekeyBundle`/
+  `PrekeyBundleCodec`/`PrekeyStore` and the `X3dh` handshake itself. Deliberately ZERO network/
+  libp2p/Nabu dependencies — publication over GossipSub lives in `lapis-net-directory` instead (see
+  above)
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-test` — shared test fixtures and helpers (not yet consumed by other modules' tests)
@@ -2279,6 +2290,264 @@ a genuinely generated public key still round-trips through the new validation.
   `Valid` and keeps tracking in that case, so the failure is silent rather than fatal. Not fixed in
   this sub-wave; a future fix could add a per-identity persistence sub-cap or reuse
   `highestSequenceByIdentity` so superseding a record releases its predecessor's reservation.
+
+== X25519 encryption sub-key and the X3DH handshake (V0.8.2)
+
+`lapis-net-identity` gains an X25519 encryption sub-key (`X25519Keys.kt`, `X25519Agreement.kt`,
+`EncryptionKeyBinding.kt`), and a new module, `lapis-net-ratchet`, implements X3DH (Signal's
+Extended Triple Diffie-Hellman) directly from the public specification — **not** adapted from
+libsignal, which is AGPL-3.0-licensed and therefore incompatible with this Apache-2.0 project
+(a closed licensing question decided during this arc's planning pass, not re-litigated here). This
+is the highest-risk cryptographic primitive in the codebase to date: every prior wave reused
+already-established primitives (AES-256-GCM, HKDF-SHA256, secp256k1 ECDH/ECDSA, Ed25519) in new
+combinations; the X3DH handshake itself — its multi-DH construction, its associated-data
+construction, its HKDF info-string derivation — has no precedent anywhere in this codebase.
+
+**Module split, and why `lapis-net-ratchet` is network-free.** `lapis-net-ratchet` carries
+`PrekeyBundle`/`PrekeyBundleCodec`/`PrekeyStore` and the `X3dh` object itself, with DELIBERATELY
+ZERO network/libp2p/Nabu/`java-cid` dependencies — a security property, not a packaging preference:
+a reviewer auditing the handshake in this module never has to reason about untrusted network input
+and crypto correctness in the same file. Publication of `PrekeyBundle`s over GossipSub
+(`PrekeyBundleIndex`/`PrekeyBundleGossip`) instead lives in `lapis-net-directory`, which already
+owns this codebase's "signed record over its own gossip topic with a two-cap index" machinery
+(established for `PeerRecord` in V0.8.1) and reuses it here verbatim rather than duplicating it.
+
+=== The X25519 sub-key: three constructor-time rejections
+
+`X25519PublicKey`'s constructor rejects untrusted wire bytes on three independent grounds, mirroring
+exactly why `Secp256k1PublicKey`/`Ed25519PublicKey` run their own curve-validation checks at
+construction: (1) wrong length; (2) a NON-CANONICAL encoding (bit 255 of the last byte set, or the
+encoded integer `>= p = 2^255 - 19`); (3) one of twelve published low-order/degenerate
+u-coordinates. `PrekeyBundleCodec.decode` is the only site in the project that builds an
+`X25519PublicKey` from wire bytes, so a low-order key anywhere in a `PrekeyBundle` (signed prekey,
+one-time prekey, or X25519 identity key) is rejected structurally, before any DH computation ever
+runs.
+
+**"Verified against the resolved jar rather than assumed" — the low-order table, and the finding
+that the SPEC's implicit "either mitigation is fine" framing is not safe.** Measured against
+`bcprov-jdk18on:1.85`:
+
+[cols="3,2"]
+|===
+| u-coordinate (hex, little-endian) | X25519 agreement result (BouncyCastle)
+
+| `00…00` (u = 0) | rejected (all-zero output)
+| `01 00…00` (u = 1) | rejected
+| `e0eb7a7c…9b800` (order 8) | rejected
+| `5f9c95bc…f1157` (order 8) | rejected
+| `ec ff…ff 7f` (p − 1, order 2) | rejected
+| `ed ff…ff 7f` (p, ≡ 0) | rejected
+| `ee ff…ff 7f` (p + 1, ≡ 1) | rejected
+| `cd eb7a7c…9b880` (non-canonical) | **ACCEPTED**, non-zero secret
+| `4c 9c95bc…f11d7` (non-canonical) | **ACCEPTED**, non-zero secret
+| `d9 ff…ff` (non-canonical) | **ACCEPTED**, non-zero secret
+| `da ff…ff` (non-canonical) | **ACCEPTED**, non-zero secret
+| `db ff…ff` (non-canonical) | **ACCEPTED**, non-zero secret
+|===
+
+The five ACCEPTED values are non-canonical (bit-255-set or `u >= p`) re-encodings of small-order
+points: RFC 7748's mandatory masking of bit 255 before scalar multiplication turns them into
+ordinary, full-order points, so BouncyCastle's own all-zero-agreement-output defence does not catch
+them at all. **Relying on that defence alone — the reading a literal "either mitigation is fine"
+instruction would suggest — would leave these five silently accepted.** Both mitigations are
+therefore implemented: the canonical-encoding rules (bit 255 clear, `u < p`) reject all five
+non-canonical values structurally, at construction time, and the explicit blacklist of all twelve
+values is defence in depth against a future BouncyCastle version silently changing its own internal
+behaviour (pinned by `X25519KeyPairTest`'s BouncyCastle-pinning regression).
+
+**X25519's output is raw, unlike `ecdhSharedSecret`'s.** `ecdhSharedSecret` (secp256k1 ECDH) already
+returns `SHA-256(compressed shared point)` — a uniformly distributed 32-byte string, safe to use
+directly as HKDF input keying material. `x25519SharedSecret` returns the RAW shared u-coordinate,
+confirmed byte-for-byte against RFC 7748 §6.1's published vector. **Consequence: HKDF-Extract over
+the assembled IKM in `X3dh`'s key schedule is genuinely load-bearing for entropy-smoothing, the
+exact opposite of the situation `ecdhSharedSecret`'s own doc comment describes.**
+
+=== `EncryptionKeyBinding` — a one-way vouch, deliberately without a mutual counter-signature
+
+`EncryptionKeyBinding` is structurally identical to `IdentityBinding` — the same secp256k1-signs-a-
+domain-separated-digest shape, its own domain tag (`"LapisNet:x25519-encryption-key:v1"`) — but
+unlike `PeerRecord.possessionProof` (V0.8.1's fix for an analogous gap), it deliberately carries NO
+mutual counter-signature. An X25519 key cannot sign; XEdDSA (Signal's own answer — converting an
+X25519 key to Ed25519 to sign with it) is an explicit scope cut for this wave, because adding a
+second from-scratch cryptographic construction inside a wave that already builds X3DH from scratch
+would compound, not contain, the risk. An Ed25519 counter-signature by the identity's OWN transport
+key was also considered and rejected: it would prove the SIGNER's Ed25519 key vouches for the X25519
+public key, not that the signer holds the corresponding X25519 PRIVATE key — security theatre. The
+equivalent protection lives in X3DH's associated-data construction instead (see below).
+
+=== The possession-proof question — the unknown-key-share attack, and why AD-in-`info` closes it
+
+**The attack.** An X25519 public key is public by definition. Mallory harvests Bob's published
+`x25519IdentityKey`/`signedPrekey`/`oneTimePrekeys` off the gossip topic and mints a FRESH,
+self-consistent `EncryptionKeyBinding.create(malloryKeyPair, bobX25519IdentityKey)`, re-signs Bob's
+signed prekey under her own secp256k1 key (the wider `signedPrekeyDigest` construction below still
+verifies — it only requires the SIGNER's identity to match, which it genuinely does), and publishes
+a fully self-consistent bundle under her own identity. ALL THREE of `PrekeyBundle.verify`/
+`verifyEncryptionBinding`/`verifySignedPrekey` genuinely pass — there is no way to detect this attack
+at bundle-validation time.
+
+**Why it is not, by itself, a confidentiality break.** This is an "unknown key share" attack, not a
+direct key compromise: `DH2 = X25519(EK_A, IK_B)` and `DH4 = X25519(EK_A, OPK_B)` both require BOB's
+private keys, which Mallory does not have. Alice believes she is establishing a session with
+Mallory; the party who can actually complete the matching handshake is Bob. If the resulting session
+key were used naively (i.e. if the downstream layer ignored the associated data), Alice's first
+message — composed believing the recipient is Mallory — would decrypt cleanly for Bob: a genuine
+confidentiality break.
+
+**What closes it: AD built from the secp256k1 IDENTITIES, not the X25519 sub-keys.** Alice computes
+`AD = "LNX3" ‖ v1 ‖ IK_Alice ‖ IK_Mallory`. Bob, using his real private keys, computes `AD = "LNX3" ‖
+v1 ‖ IK_Alice ‖ IK_Bob`. These DIFFER, because the two parties disagree about who the responder is —
+and they differ ONLY in the secp256k1 identity component, because in this specific attack the X25519
+keys are IDENTICAL on both sides (they are Bob's real keys, copied). This is precisely why the AD is
+built from the secp256k1 identities and not the X25519 sub-keys: an AD built from the X25519 keys
+would match on both sides, and the attack would land.
+
+**Why AD is folded into HKDF `info`, not left only to a downstream AEAD's associated-data slot (a
+deliberate deviation from X3DH §2.2's literal fixed `info` string).** If AD lived only in a FUTURE
+Double-Ratchet AEAD's own AD parameter, the protection above would depend on that future layer
+remembering to use it — a layer that forgets still derives IDENTICAL session keys on both sides,
+silently reintroducing the confidentiality break. Folding AD into HKDF `info` here means the two
+parties derive DIFFERENT shared secrets the moment their views of "who is the responder" diverge,
+unconditionally, with no future wiring required to benefit from it. Direct precedent for this
+reasoning already exists in this codebase: `HybridEcies`'s class doc comment makes almost exactly
+this argument for its own wrap-key derivation ("HKDF-Expand IS load-bearing... so a transplanted
+wrap fails for two independent reasons... not merely one"). HKDF `info` is public, non-secret
+domain-separation input to a PRF; adding fixed-length public context to it cannot weaken the
+derivation. `X3dhAdversarialTest`'s case (e2) is the executable proof: all three cryptographic
+checks genuinely pass, yet Alice's and Bob's derived shared secrets provably differ.
+
+**Residual risk, stated explicitly.** The attack is not detectable at bundle-validation time — a
+verifier presented with Mallory's bundle in isolation cannot tell it apart from a legitimate one.
+It fails only at session establishment, when the two sides' derived secrets diverge — both parties
+observe a failed handshake, not a clear "you were attacked" signal. The consequence is a
+denial-of-service/confusion attack against Alice, plus cross-identity key-material pollution of the
+directory — neither is a confidentiality break, both are accepted for this wave. A future wave could
+close this fully via XEdDSA (restoring Signal's own structural possession proof) or a first-use
+identity/key pinning (TOFU) layer above the directory; both are out of scope here.
+
+=== The exact byte-level construction
+
+All integers big-endian; every constant pinned by `X3dhKnownAnswerTest`:
+
+----
+DH1 = X25519(IK_A, SPK_B)      // initiator identity   x responder signed prekey
+DH2 = X25519(EK_A, IK_B)       // initiator ephemeral   x responder identity
+DH3 = X25519(EK_A, SPK_B)      // initiator ephemeral   x responder signed prekey
+DH4 = X25519(EK_A, OPK_B)      // initiator ephemeral   x responder one-time prekey [omitted if none]
+
+IKM  = F (32 x 0xFF) || DH1 || DH2 || DH3 [|| DH4]     // 128 or 160 bytes
+salt = 32 zero bytes
+info = "LapisNet:x3dh:v1:X25519:SHA-256" (31 bytes) || AD (71 bytes)     // 102 bytes
+AD   = "LNX3" (4) || 0x01 (1) || IK_A (33, secp256k1 compressed) || IK_B (33, secp256k1 compressed)
+SK   = HKDF-SHA256-Expand(HKDF-SHA256-Extract(salt, IKM), info, L = 32)
+----
+
+`DH4` is appended at the end when a one-time prekey is used and entirely OMITTED otherwise — never
+zero-filled, never reordered; the presence/absence of `DH4` changes the IKM length (128 vs 160
+bytes), so the two cases are trivially domain-separated by HKDF-Extract itself. `AD` is
+initiator-first ALWAYS, never sorted, never symmetric. The responder-side DH mirror
+(`DH1 = X25519(SPK_B, IK_A)`, etc.) produces byte-identical outputs, proven by `X3dhTest`'s
+initiator/responder round-trip.
+
+**`signedPrekeyDigest` is deliberately WIDER than the Signal spec's own `Sig(IK_B, Encode(SPK_B))`.**
+Signal's signature covers the signed prekey alone because in Signal `IK_B` IS the X25519 identity
+key, and signing with it is itself a proof of possession. Here the signature is produced by the
+secp256k1 identity key instead, so a bare `Sig(SPK)` would be freely transplantable between
+different bundles of the same identity; binding
+`identity ‖ x25519IdentityKey ‖ signedPrekey ‖ signedPrekeyId` into one domain-separated digest
+makes every component of the bundle's key material a single, non-separable unit.
+
+=== `PrekeyStore` — the durability contract for one-time-prekey consumption
+
+`consumeOneTimePrekey` executes in this order, and the ordering is load-bearing: (1) acquire
+exclusive access to the store file and re-read+re-decode its CURRENT on-disk contents — never this
+instance's own cached in-memory state, see below for why; (2) look up the entry in that freshly-read
+state — unknown id or already-`CONSUMED` is a hard failure that NEVER falls back to a
+signed-prekey-only handshake; (3) copy the private key bytes; (4) build the NEW state image in
+memory (entry marked `CONSUMED`, its 32 key bytes zeroed), based on the freshly-read state; (5)
+encode and write the new state to a temp file, `FileChannel.force(true)` it, then atomically
+`Files.move` it over the store file; (6) ONLY after the move succeeds, assign the new state to the
+live field and release the exclusive lock; (7) return the copied private key, paired with its id in
+a `ConsumedOneTimePrekey`.
+
+**Why re-read on-disk truth instead of trusting the cached in-memory state.** `PrekeyStore.open` is
+public, and nothing stops a caller from opening a SECOND handle against the same file while a first
+handle is still live — each handle then holds its OWN cached state snapshot, taken at its own
+`open`/`create` time. If `consumeOneTimePrekey` mutated from that cached snapshot, two
+concurrently-open handles could each independently believe a different one-time prekey is still
+available and each successfully consume one; because each write persists that handle's ENTIRE
+(stale) entry list, the second write would silently ERASE the first handle's already-persisted
+tombstone too, resurrecting an already-consumed id as available again — precisely the reuse this
+class exists to prevent. Two independent layers of mutual exclusion make step (1) safe: a per-file
+JVM monitor (so two handles in the SAME process block on each other, rather than crashing with
+`OverlappingFileLockException` — `FileChannel.lock()` does not block a second same-JVM acquisition,
+it throws), and an OS-level `FileChannel.lock()` on a dedicated `<file>.lock` sidecar (so a second OS
+PROCESS also serializes against the critical section). The OS lock is deliberately NOT taken on the
+store file itself: POSIX advisory locks are held on the underlying inode, not the path, and
+`persistAtomically`'s atomic `Files.move` re-points the path at a brand-new inode on every write — a
+lock held on the store file's own (pre-rename) inode would silently stop protecting anything the
+moment the first writer's rename completes, letting a second process's `channel.lock()` on the new
+inode succeed immediately while the first process's critical section is still running. The sidecar
+file is never renamed, so its inode — and the lock on it — stays valid across every rename.
+`PrekeyStore.create` takes the same sidecar lock around its own initial existence-check-then-write,
+closing the identical race for two concurrent `create` calls against the same label.
+
+**Why persist-before-mutate.** If the write fails, nothing has changed on disk or in memory — the
+prekey stays available and the handshake simply does not happen, a clean, safe failure. If the
+process crashes between steps 5 and 6, the prekey is durably consumed and its private half is gone —
+the pending handshake is lost, the SAFE direction. The reverse order (mutate then persist) has a
+failure mode where in-memory state says consumed but on-disk state says available, so a restart
+resurrects a prekey a peer may already have used — precisely the reuse this ordering prevents.
+Consumed entries are retained as tombstones (zeroed key bytes, not removed) so a replay names an id
+that is KNOWN-CONSUMED rather than UNKNOWN; `generateOneTimePrekeys` prunes only the oldest
+tombstones when the (bounded, 4,096-entry) store fills, never a live `AVAILABLE` entry, and this is
+safe only because `nextOneTimePrekeyId` is strictly monotonic and never rewinds (enforced by
+`PrekeyStoreState`'s own init block) — a pruned id can never be reallocated.
+
+After the atomic `Files.move`, the parent directory is also `fsync`'d on a best-effort basis (POSIX
+only): the temp file's own `force(true)` makes ITS bytes durable, but the rename itself is a
+separate directory-metadata operation that a crash immediately after the move can still lose on some
+filesystems, leaving the directory entry pointing at the pre-consumption file. This is best-effort
+because some POSIX filesystems (notably certain FUSE/network mounts) refuse to open a directory as a
+`FileChannel` at all; a failure here is logged, not thrown, since the file's own bytes are already
+durable regardless.
+
+`consumeOneTimePrekey` returns a `ConsumedOneTimePrekey(id, privateKey)` rather than a bare private
+key, so `X3dh.respond` can assert the consumed id actually matches the initiator's header
+(`header.oneTimePrekeyId`) — closing a caller-wiring-bug class where the wrong id is consumed and a
+silently-mismatched secret is derived, surfacing only much later at first AEAD use.
+
+No new crypto is invented for persistence: `PrekeyStoreFileFormat` reuses
+`KeystoreEncryption`/`KeystoreFileFormat`'s Argon2id + AES-256-GCM v1-plaintext/v2-encrypted duality
+verbatim, including the same V0.4-learned Argon2-cost-parameter sanity caps checked BEFORE Argon2
+ever runs on untrusted header bytes.
+
+=== Explicit, deliberate scope cuts for this wave
+
+* **No PQXDH / post-quantum hybrid key exchange.** X25519 only.
+* **No formal deniability analysis** beyond X3DH's own published security properties.
+* **No DHT publication.** Gossip-only (`PrekeyBundleGossip`), same `Kademlia.dialPeer`-broken
+  limitation as every prior wave.
+* **No wire codec for the X3DH initial-message header (`X3dhPreKeyMessageHeader`).** This wave's
+  deliverable is the handshake primitive and prekey publication/consumption machinery, callable and
+  independently testable — not yet wired into a live message-send path. V0.8.3 (Double Ratchet) and
+  V0.8.4 (online DM) own that wiring.
+* **No replay protection for a repeated identical initial message naming NO one-time prekey.**
+  Explicitly deferred to V0.8.3's Double Ratchet session layer, the correct architectural home for
+  per-session replay state (a session store keyed by the initiator's ephemeral key, or the ratchet's
+  own message-number window) — `X3dh` is a stateless pure function by design. A replay naming a
+  one-time prekey IS refused, durably, at the `PrekeyStore` layer.
+* **One-time-prekey collisions are inherent to gossip publication** — unlike Signal's server (which
+  hands each one-time prekey to exactly one requester), a gossip-published `PrekeyBundle` is seen in
+  full by every subscriber, so two initiators can independently pick the same one-time prekey; the
+  second responder-side consumption then fails and that initiator must retry with
+  `preferredOneTimePrekeyId = null`, falling back to signed-prekey-only X3DH.
+* **No XEdDSA, no signed-prekey rotation scheduler.** `PrekeyStore.rotateSignedPrekey` is exposed as
+  a directly callable primitive; nothing in this wave calls it periodically, mirroring
+  `PeerRecordIndex.evictExpired`'s identical "not wired to any scheduler in this sub-wave" stance.
+* **`CidBytesValidation` is not invoked by this wave** — no `io.ipfs.cid.Cid` field exists anywhere
+  in `PrekeyBundle`, `PrekeyBundleCodec`, `PrekeyStoreFileFormat`, or `X3dh`; both codecs' class doc
+  comments state this explicitly, mirroring `PeerRecordCodec`'s own equivalent N/A note.
 
 == Diagrams
 

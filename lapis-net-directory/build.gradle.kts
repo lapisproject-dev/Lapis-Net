@@ -33,9 +33,16 @@
 // wave's PeerRecord acceptance is purely structural (signature + identity-binding + sequence-
 // number ordering), not policy-gated - no Veritas-distance concept is needed. A future wave MAY
 // add an opt-in Veritas-distance admission filter mirroring MailAcceptancePolicy; V0.8.1 does not.
+//
+// V0.8.2 addition: PrekeyBundleGossip/PrekeyBundleIndex publish and index lapis-net-ratchet's
+// PrekeyBundle over a dedicated GossipSub topic, reusing this module's established codec + gossip +
+// two/three-cap-index machinery rather than duplicating it inside lapis-net-ratchet (which is
+// deliberately network-free - see that module's own build.gradle.kts). `api` because PrekeyBundle
+// appears directly in PrekeyBundleGossip.announce()/lookup()'s public signatures.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
+    api(project(":lapis-net-ratchet"))
     api(project(":lapis-net-storage"))
     api(project(":lapis-net-networking"))
 }

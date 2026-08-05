@@ -243,8 +243,8 @@ already covered by the incremental browser growth documented in V0.2–V0.5 abov
 Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec in the vault concept
 note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
 on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
-remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1 has
-landed.
+remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1 and
+V0.8.2 have landed.
 
 [cols="1,3"]
 |===
@@ -255,10 +255,15 @@ landed.
 later V0.8 sub-wave resolves recipients' prekey bundles / current network addresses through
 (implemented — see below).
 
-| V0.8.2+
-| X3DH prekey-bundle exchange, Double Ratchet 1:1 sessions, online DM delivery, and calling — not
-yet started, not sub-wave-planned in fine-grained detail here; see the vault's 2026-08-04 sub-wave
-plan for the intended breakdown.
+| V0.8.2
+| X25519 encryption sub-key + X3DH handshake (new module `lapis-net-ratchet`) — the handshake
+primitive and prekey publication/consumption machinery, callable and independently testable, not
+yet wired into a live message-send path (implemented — see below).
+
+| V0.8.3+
+| Double Ratchet 1:1 sessions, online DM delivery, and calling — not yet started, not sub-wave-
+planned in fine-grained detail here; see the vault's 2026-08-04 sub-wave plan for the intended
+breakdown.
 |===
 
 **Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
@@ -345,6 +350,109 @@ cuts, stated as such in the code's own doc comments rather than silently omitted
   `lapis-net-directory` takes no dependency on `lapis-net-trust` this wave; acceptance is purely
   structural (signature + identity-binding + sequence-number ordering). A future wave MAY add one,
   mirroring `MailAcceptancePolicy`.
+
+=== V0.8.2 — X25519 encryption sub-key + X3DH handshake
+
+Target: an X25519 encryption sub-key bound to each identity's secp256k1 key, and X3DH (Signal's
+Extended Triple Diffie-Hellman), reimplemented from the public specification — not adapted from
+libsignal, which is AGPL-3.0-licensed and therefore incompatible with this Apache-2.0 project. The
+highest-risk primitive in this codebase to date: every prior wave reused already-established
+primitives (AES-256-GCM, HKDF-SHA256, secp256k1 ECDH/ECDSA, Ed25519) in new combinations; X3DH
+itself has no precedent anywhere in this codebase. New module `lapis-net-ratchet`.
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.8.2
+| `X25519Keys.kt` (`lapis-net-identity`) — `X25519PrivateKey`/`X25519PublicKey`/`X25519KeyPair`,
+mirroring `Ed25519Keys.kt`'s defensive-copy/redaction discipline. `X25519PublicKey`'s constructor
+rejects all twelve published low-order/non-canonical Curve25519 u-coordinates (seven canonical
+small-order points AND five non-canonical bit-255-set re-encodings that BouncyCastle's own
+all-zero-agreement check does NOT catch — verified against the resolved `bcprov-jdk18on:1.85` jar)
+— so a low-order key is rejected structurally, before any DH ever runs. `X25519Agreement.kt` —
+`x25519SharedSecret`, confirmed to return the RAW shared u-coordinate (not hashed, unlike
+`ecdhSharedSecret`'s secp256k1 output), with a redundant explicit all-zero check as defence in
+depth. `EncryptionKeyBinding.kt` — a secp256k1-identity → X25519-encryption-sub-key vouch,
+structurally identical to `IdentityBinding` (own domain tag
+`"LapisNet:x25519-encryption-key:v1"`), deliberately with NO mutual counter-signature (an X25519 key
+cannot sign) — the equivalent protection lives in X3DH's associated-data construction instead (see
+below).
+
+`lapis-net-ratchet` (new module, deliberately ZERO network/libp2p/Nabu dependencies — a security
+reviewer of the handshake never has to reason about untrusted network input and crypto correctness
+in the same file): `PrekeyBundle`/`PrekeyBundleCodec` — identity, X25519 identity key (a
+read-through alias into its `EncryptionKeyBinding`, never a second stored copy), a signed prekey
+(signed by the secp256k1 identity key over `identity ‖ x25519IdentityKey ‖ signedPrekey ‖
+signedPrekeyId` — deliberately WIDER than the Signal spec's own `Sig(IK_B, Encode(SPK_B))`, since a
+bare `Sig(SPK)` would be transplantable between bundles of the same identity), and a capped
+(≤100) one-time-prekey list. THREE independently-verified signatures per bundle, mirroring
+`PeerRecord`'s three-signature design. `PrekeyStore`/`PrekeyStoreFileFormat` — local storage of the
+PRIVATE halves, reusing `KeystoreEncryption`/`FileIdentityRepository`'s Argon2id/AES-256-GCM/atomic-
+write pattern verbatim; `consumeOneTimePrekey` durably tombstones a consumed one-time prekey
+(persist-before-mutate-before-return ordering, `FileChannel.force(true)` before the atomic move) so
+a restart can never resurrect an already-used prekey. `X3dh.kt` — `initiate`/`respond` implementing
+the actual multi-DH handshake: `DH1 = X25519(IK_A, SPK_B)`, `DH2 = X25519(EK_A, IK_B)`, `DH3 =
+X25519(EK_A, SPK_B)`, `DH4 = X25519(EK_A, OPK_B)` if a one-time prekey was used;
+`SK = HKDF-SHA256-Expand(HKDF-SHA256-Extract(32-zero-byte salt, 32×0xFF ‖ DH1 ‖ DH2 ‖ DH3 [‖ DH4]),
+"LapisNet:x3dh:v1:X25519:SHA-256" ‖ AD, 32)`, where `AD = "LNX3" ‖ 0x01 ‖ IK_A ‖ IK_B` (the
+secp256k1 IDENTITY keys, initiator-first, never the X25519 sub-keys — see below for why).
+`PrekeyBundleIndex`/`PrekeyBundleGossip` (`lapis-net-directory`, Part B — this module is deliberately
+network-free) — a dedicated GossipSub topic (`LapisNet:prekey-bundle-gossip:v1`), reusing
+`PeerRecordIndex`/`PeerDirectoryGossip`'s established two-cap-index + gossip-validator machinery.
+
+Test suite: `X25519KeyPairTest`/`X25519AgreementTest`/`EncryptionKeyBindingTest`
+(`lapis-net-identity`); `PrekeyBundleTest`/`PrekeyBundleCodecTest`/`PrekeyStoreTest`/`X3dhTest`/
+`X3dhKnownAnswerTest` (RFC 7748 and RFC 5869 known-answer vectors pinned against this project's own
+call paths, not BouncyCastle directly) (`lapis-net-ratchet`); and the mandatory adversarial
+`X3dhAdversarialTest`, whose central case (e2) is the wave's most important test: a `PrekeyBundle`
+whose `EncryptionKeyBinding` is a FRESHLY RE-SIGNED vouch over a victim's public X25519 keys (an
+"unknown key share" attack — see below) passes ALL THREE cryptographic checks genuinely, yet the
+initiator's and the real key-holder's derived shared secrets provably differ, closing the attack
+without any possession-proof field. `PrekeyBundleIndexTest`/`PrekeyBundleGossipOnGossipMessageTest`/
+`TwoNodePrekeyBundleGossipIntegrationTest` (`lapis-net-directory`).
+|===
+
+==== The possession-proof question, and why X3DH's associated data is the answer
+
+Unlike `PeerRecord.possessionProof` (V0.8.1's Ed25519 counter-signature fix for an analogous gap),
+no possession-proof field was added to `PrekeyBundle`. An X25519 key cannot sign, so anyone can mint
+a FRESH, self-consistent `EncryptionKeyBinding` over a victim's PUBLIC X25519 identity key/signed
+prekey/one-time prekeys and publish it, genuinely self-signed, under their OWN secp256k1 identity —
+all three of `PrekeyBundle.verify`/`verifyEncryptionBinding`/`verifySignedPrekey` then pass. This is
+an "unknown key share" attack, not a direct key compromise: the attacker cannot compute the DH terms
+that need the victim's private keys, so only the victim — never the attacker — can complete the
+matching handshake. What stops this from becoming a genuine confidentiality break is X3DH's
+associated data: it is built from the secp256k1 IDENTITY keys (`AD = "LNX3" ‖ v1 ‖ IK_initiator ‖
+IK_responder`), never the X25519 sub-keys, and folded into BOTH the associated data AND the HKDF
+`info` string — so the initiator (who believes the attacker is the responder) and the real key
+holder (who knows himself to be the responder) derive genuinely DIFFERENT shared secrets, even
+though every DH term they each compute matches. See `docs/architecture.adoc`'s V0.8.2 section for
+the full analysis.
+
+==== Progress
+
+V0.8.2 is implemented (see `docs/architecture.adoc`'s "X25519 encryption sub-key and the X3DH
+handshake (V0.8.2)" section). Deliberate scope cuts, stated as such in the code's own doc comments:
+
+* **No PQXDH / post-quantum hybrid key exchange.** X25519 only.
+* **No formal deniability analysis** beyond X3DH's own published security properties.
+* **No DHT publication.** Gossip-only (`PrekeyBundleGossip`), same `Kademlia.dialPeer`-broken
+  limitation as every prior wave.
+* **No wire codec for the X3DH initial-message header.** This wave's deliverable is the handshake
+  primitive and prekey publication/consumption machinery, callable and independently testable — not
+  yet wired into a live message-send path. V0.8.3 (Double Ratchet) and V0.8.4 (online DM) own that.
+* **No replay protection for a repeated identical initial message naming NO one-time prekey.**
+  Explicitly deferred to V0.8.3's Double Ratchet session layer, the correct architectural home for
+  per-session replay state — `X3dh` is a stateless pure function by design. A replay naming a
+  one-time prekey IS refused, at the `PrekeyStore` layer (durable, one-shot consumption).
+* **One-time-prekey collisions are inherent to gossip publication** (unlike Signal's server, which
+  hands each prekey to exactly one requester) — mitigated by uniform-random selection and a
+  documented retry-without-one-time-prekey fallback.
+* **No XEdDSA, no signed-prekey rotation scheduler.** `PrekeyStore.rotateSignedPrekey` is exposed as
+  a directly callable primitive; nothing in this wave calls it periodically.
+* **`CidBytesValidation` is not invoked anywhere in this wave** — no `io.ipfs.cid.Cid` field exists
+  in any new wire format, mirroring V0.8.1's own equivalent note.
 
 == V0.9 — Asynchronous messages (email replacement)
 
