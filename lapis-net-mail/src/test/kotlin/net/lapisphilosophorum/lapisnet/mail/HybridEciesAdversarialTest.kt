@@ -8,13 +8,21 @@ import io.libp2p.core.pubsub.ValidationResult
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
+import net.lapisphilosophorum.lapisnet.identity.ecdhSharedSecret
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import org.bouncycastle.crypto.digests.SHA256Digest
+import org.bouncycastle.crypto.generators.HKDFBytesGenerator
+import org.bouncycastle.crypto.params.HKDFParameters
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.nio.file.Files
+import java.security.SecureRandom
 import javax.crypto.AEADBadTagException
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /** Offset of the wrap section's first byte (`wrapCount`) inside a [MessageEnvelopeCodec.encode]
  * output for an envelope with NO replyTo/threadRoot - mirrors the `encryptionByteOffset` arithmetic
@@ -481,6 +489,80 @@ class HybridEciesAdversarialTest :
                         body
                 }
             }
+        }
+
+        test(
+            "(i) HOSTILE SENDER FORGERY: a self-authored wrap/body pair that authenticates cleanly but decodes " +
+                "to garbage throws MalformedMessageBodyException UNCHANGED - never MailDecryptionException, " +
+                "never any other type. Security-audit follow-up (V0.9.2 hardening item 1): reimplements " +
+                "seal()'s ECDH/HKDF/AES-GCM steps entirely OUTSIDE HybridEcies, exactly as this class's and " +
+                "MailAadContext's own doc comments say an attacker can - zero secret material beyond what any " +
+                "real sender legitimately owns (their own signing key + the victim's PUBLIC key).",
+        ) {
+            val attacker = Secp256k1KeyPair.generate() // signs with THEIR OWN key - envelope verifies genuinely
+            val victim = Secp256k1KeyPair.generate()
+            val context = MailAadContext.forNewMessage(attacker.publicKey, listOf(victim.publicKey), 9_000)
+
+            // 1. Forge the body: an attacker-chosen content key encrypts an arbitrary plaintext that is
+            // NOT a valid MessageBodyCodec encoding.
+            val contentKey = ByteArray(CONTENT_KEY_SIZE).also(SecureRandom()::nextBytes)
+            val garbagePlaintext = "not a MessageBody at all".toByteArray(Charsets.UTF_8)
+            val bodyNonce = ByteArray(GCM_NONCE_SIZE).also(SecureRandom()::nextBytes)
+            val bodyCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            bodyCipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(contentKey, "AES"), GCMParameterSpec(128, bodyNonce))
+            bodyCipher.updateAAD(context.aadForBody())
+            val garbageCiphertext = bodyCipher.doFinal(garbagePlaintext)
+            val garbageSealedBody = SealedBody(bodyNonce, garbageCiphertext)
+            val contentCid = MessageBodyCodec.cidFor(SealedBodyCodec.encode(garbageSealedBody))
+
+            // 2. Forge both wraps (victim's slot 0, attacker's own self-wrap slot 1) with one ephemeral
+            // keypair, mirroring HybridEcies.seal's private deriveWrapKeyAndNonce construction exactly:
+            // HKDF-SHA256(ecdh-shared-secret, salt=ephemeralPublicKey.bytes, info=LABEL||aad, L=44).
+            val ephemeral = Secp256k1KeyPair.generate()
+
+            fun forgeWrap(
+                slotIndex: Int,
+                slotPublicKey: Secp256k1PublicKey,
+            ): EciesWrap {
+                val shared = ecdhSharedSecret(ephemeral.privateKey, slotPublicKey)
+                val aad = context.aadForWrap(slotIndex, slotPublicKey, ephemeral.publicKey, contentCid)
+                val info = "LapisNet:mail-hybrid-ecies:v1:wrap-key".toByteArray(Charsets.US_ASCII) + aad
+                val generator = HKDFBytesGenerator(SHA256Digest())
+                generator.init(HKDFParameters(shared, ephemeral.publicKey.bytes, info))
+                val okm = ByteArray(CONTENT_KEY_SIZE + GCM_NONCE_SIZE)
+                generator.generateBytes(okm, 0, okm.size)
+                val wrapKey = okm.copyOfRange(0, CONTENT_KEY_SIZE)
+                val wrapNonce = okm.copyOfRange(CONTENT_KEY_SIZE, okm.size)
+                val wrapCipher = Cipher.getInstance("AES/GCM/NoPadding")
+                wrapCipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(wrapKey, "AES"), GCMParameterSpec(128, wrapNonce))
+                wrapCipher.updateAAD(aad)
+                val wrappedKey = wrapCipher.doFinal(contentKey)
+                return EciesWrap(ephemeral.publicKey, wrappedKey)
+            }
+            val wrapForVictim = forgeWrap(0, victim.publicKey)
+            val wrapForSelf = forgeWrap(1, attacker.publicKey)
+
+            val envelope =
+                MessageEnvelope.create(
+                    sender = attacker,
+                    recipients = listOf(victim.publicKey),
+                    contentCid = contentCid,
+                    sentAtEpochSecond = 9_000,
+                    encryption = EncryptionMode.HYBRID_ECIES,
+                    wraps = listOf(wrapForVictim, wrapForSelf),
+                )
+
+            // 3. The forged envelope is genuinely, cryptographically valid - the signature check alone
+            // cannot catch this.
+            MessageEnvelope.verify(envelope) shouldBe true
+
+            // 4. LOAD-BEARING PROOF: open() still funnels the failure into exactly one type, and it is
+            // NOT MailDecryptionException.
+            val exception =
+                shouldThrow<MalformedMessageBodyException> {
+                    HybridEcies.open(envelope, garbageSealedBody, victim)
+                }
+            exception.message?.contains("bad magic") shouldBe true
         }
     })
 

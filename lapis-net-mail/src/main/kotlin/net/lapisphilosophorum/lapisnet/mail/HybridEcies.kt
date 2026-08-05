@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.mail
 
 import io.ipfs.cid.Cid
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1PrivateKey
 import net.lapisphilosophorum.lapisnet.identity.ecdhSharedSecret
 import org.bouncycastle.crypto.digests.SHA256Digest
 import org.bouncycastle.crypto.generators.HKDFBytesGenerator
@@ -152,6 +153,35 @@ object HybridEcies {
         sender: Secp256k1KeyPair,
         context: MailAadContext,
         random: SecureRandom = SecureRandom(),
+    ): SealedMessage = sealWithEphemeralKeyHook(body, sender, context, random, onEphemeralPrivateKeyForTest = null)
+
+    /** Test seam - lets a test observe the exact ephemeral [Secp256k1PrivateKey] object [seal]
+     * generates and destroys for each call, mirroring `openWithContext`'s own documented test-seam
+     * visibility reasoning. `internal`, deliberately NOT a parameter on the public [seal] above: a
+     * non-null [onEphemeralPrivateKeyForTest] would hand the caller the ephemeral private key
+     * before it is destroyed, and that key plus any recipient's already-public key is sufficient
+     * (via ECDH commutativity) to derive every wrap key in the message - i.e. a lambda parameter on
+     * a public function would be a compiler-unenforced way to defeat this message's confidentiality
+     * from outside this module. Gating it behind `internal` instead means the compiler, not just a
+     * doc comment, prevents that. `null` for every production caller.
+     *
+     * The per-call ephemeral private key generated below is destroyed via
+     * [Secp256k1PrivateKey.destroy] - which zeroes its actual backing scalar **in place**, not a
+     * disposable copy of it (see that method's doc comment for why plain `privateKey.bytes.fill(0)`
+     * cannot achieve this) - before this function returns. If non-null,
+     * [onEphemeralPrivateKeyForTest] is invoked with the ephemeral private key object itself, right
+     * after it is generated and before [destroy][Secp256k1PrivateKey.destroy] is called on it. A
+     * test can then, once this function has returned, call `.bytes` on that SAME captured object
+     * and observe it come back all-zero - proving [destroy][Secp256k1PrivateKey.destroy] mutated
+     * the real backing array, not merely some throwaway snapshot of it - see `HybridEciesTest`'s
+     * ephemeral-key-destruction case. Never call this from production code - [seal] is the only
+     * sound public entry point. */
+    internal fun sealWithEphemeralKeyHook(
+        body: MessageBody,
+        sender: Secp256k1KeyPair,
+        context: MailAadContext,
+        random: SecureRandom = SecureRandom(),
+        onEphemeralPrivateKeyForTest: ((Secp256k1PrivateKey) -> Unit)? = null,
     ): SealedMessage {
         require(context.encryption == EncryptionMode.HYBRID_ECIES) {
             "MailAadContext.encryption must be HYBRID_ECIES to seal, was ${context.encryption}"
@@ -183,26 +213,38 @@ object HybridEcies {
             val contentCid = MessageBodyCodec.cidFor(sealedBytes)
 
             val ephemeral = Secp256k1KeyPair.generate(random)
-            val wraps =
-                (0 until context.wrapCount).map { slotIndex ->
-                    val slotKey = context.slotKey(slotIndex)
-                    val shared = ecdhSharedSecret(ephemeral.privateKey, slotKey)
-                    try {
-                        val aad = context.aadForWrap(slotIndex, slotKey, ephemeral.publicKey, contentCid)
-                        val (wrapKey, wrapNonce) = deriveWrapKeyAndNonce(shared, ephemeral.publicKey.bytes, aad)
+            onEphemeralPrivateKeyForTest?.invoke(ephemeral.privateKey)
+            try {
+                val wraps =
+                    (0 until context.wrapCount).map { slotIndex ->
+                        val slotKey = context.slotKey(slotIndex)
+                        val shared = ecdhSharedSecret(ephemeral.privateKey, slotKey)
                         try {
-                            val wrappedKey = aesGcmEncrypt(wrapKey, wrapNonce, aad, contentKey)
-                            EciesWrap(ephemeral.publicKey, wrappedKey)
+                            val aad = context.aadForWrap(slotIndex, slotKey, ephemeral.publicKey, contentCid)
+                            val (wrapKey, wrapNonce) = deriveWrapKeyAndNonce(shared, ephemeral.publicKey.bytes, aad)
+                            try {
+                                val wrappedKey = aesGcmEncrypt(wrapKey, wrapNonce, aad, contentKey)
+                                EciesWrap(ephemeral.publicKey, wrappedKey)
+                            } finally {
+                                wrapKey.fill(0)
+                                wrapNonce.fill(0)
+                            }
                         } finally {
-                            wrapKey.fill(0)
-                            wrapNonce.fill(0)
+                            shared.fill(0)
                         }
-                    } finally {
-                        shared.fill(0)
                     }
-                }
 
-            return SealedMessage(sealed, sealedBytes, contentCid, wraps)
+                return SealedMessage(sealed, sealedBytes, contentCid, wraps)
+            } finally {
+                // Every other secret this function touches (contentKey, plaintext, shared,
+                // wrapKey, wrapNonce below) is already zeroized on every exit path via
+                // ByteArray.fill(0) on a copy it owns; the ephemeral private key generated above
+                // was the one gap, because Secp256k1PrivateKey.bytes always hands out a fresh
+                // defensive copy - filling THAT copy (the previous approach here) never touched
+                // the real backing scalar. destroy() mutates the actual backing array in place -
+                // see its doc comment.
+                ephemeral.privateKey.destroy()
+            }
         } finally {
             contentKey.fill(0)
             plaintext.fill(0)
@@ -306,6 +348,17 @@ object HybridEcies {
             throw MailDecryptionException("decryption failed: tampered or mismatched ciphertext/AAD", e)
         } catch (e: GeneralSecurityException) {
             throw MailDecryptionException("decryption failed: ${e.message}", e)
+        } catch (e: OutOfMemoryError) {
+            // Defense in depth, mirroring MessageBodyCodec.decode/MessageEnvelopeCodec.decode/
+            // SealedBodyCodec.decode's identical narrow OutOfMemoryError catch (see those objects'
+            // doc comments): not currently reachable given today's bounded allocations on this
+            // path (the wrap/body sizes here are all fixed-width or already capped upstream by the
+            // codecs), but this function is the crypto entry point those codecs' callers ultimately
+            // reach through, so it should not be the one link in the chain without this narrow
+            // safety net if that ever changes. Deliberately narrow - only OutOfMemoryError, not a
+            // blanket Throwable/Error catch, which would risk masking a real JVM problem unrelated
+            // to this decrypt call.
+            throw MailDecryptionException("decryption failed: oversized allocation", e)
         } catch (e: RuntimeException) {
             // Covers fr.acinq.secp256k1.Secp256k1Exception and any other third-party exception -
             // open() must never leak an arbitrary exception type to callers, mirroring

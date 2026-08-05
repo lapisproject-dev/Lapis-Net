@@ -20,7 +20,10 @@ class Secp256k1PrivateKey(
 ) {
     private val storedBytes: ByteArray = bytes.copyOf()
 
-    /** Returns a fresh copy on every access - the caller cannot mutate the stored key through it. */
+    /** Returns a fresh copy on every access - the caller cannot mutate the stored key through it.
+     * If [destroy] has been called on this instance, [storedBytes] is genuinely all-zero at that
+     * point (see [destroy]'s doc comment), so this correctly - and honestly - hands back a
+     * zeroed copy rather than lying about still holding live key material. */
     val bytes: ByteArray get() = storedBytes.copyOf()
 
     init {
@@ -28,6 +31,30 @@ class Secp256k1PrivateKey(
         require(Secp256k1.secKeyVerify(storedBytes)) {
             "invalid secp256k1 private key (zero, out of curve order, or otherwise degenerate)"
         }
+    }
+
+    /**
+     * Zeroes the actual backing 32-byte scalar **in place** - not merely a copy of it. Unlike
+     * [bytes], which by design always hands out a fresh defensive copy (so a caller filling that
+     * copy with zeroes, e.g. `privateKey.bytes.fill(0)`, only ever scrubs a disposable snapshot
+     * and never touches [storedBytes] itself), this method mutates [storedBytes] directly, so the
+     * secret does not linger in heap memory for as long as this object happens to remain
+     * reachable.
+     *
+     * Intended for short-lived, single-use keys with a clear end of scope and no further
+     * legitimate use - the canonical caller is `HybridEcies.seal`'s per-message ephemeral
+     * keypair, generated fresh for one call and destroyed before that call returns. **Never call
+     * this on a long-term identity key** (e.g. an identity's own [Secp256k1KeyPair]): doing so
+     * would permanently destroy the identity, since there is no recovery mechanism (see this
+     * class's own doc comment). This is exactly why [ecdhSharedSecret] deliberately does NOT call
+     * this method on the caller-supplied private key it is given - it only zeroes its own
+     * throwaway `privateKey.bytes` copy - leaving that choice to the caller who actually owns the
+     * key's lifetime.
+     *
+     * Idempotent: calling this more than once is safe and a no-op after the first call.
+     */
+    fun destroy() {
+        storedBytes.fill(0)
     }
 
     override fun equals(other: Any?): Boolean =

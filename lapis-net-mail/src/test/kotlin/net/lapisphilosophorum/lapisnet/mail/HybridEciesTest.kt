@@ -6,6 +6,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1PrivateKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -236,5 +237,54 @@ class HybridEciesTest :
 
             val sealed = HybridEcies.seal(maxBody, sender, context)
             sealed.sealedBodyBytes.size shouldNotBe 0
+        }
+
+        test(
+            "security-audit follow-up (V0.9.2 hardening item 2): seal() destroys the ephemeral " +
+                "private key it generates - mutating its real backing scalar in place via " +
+                "Secp256k1PrivateKey.destroy(), not merely a disposable copy of it",
+        ) {
+            val sender = Secp256k1KeyPair.generate()
+            val recipient = Secp256k1KeyPair.generate()
+            val body = MessageBody(subject = "s", body = "b")
+            val context =
+                MailAadContext.forNewMessage(sender.publicKey, listOf(recipient.publicKey), sentAtEpochSecond = 1_000)
+
+            // Secp256k1PrivateKey.bytes always hands out a fresh defensive copy of its backing
+            // storedBytes field (see that class's own doc comment), so filling a copy obtained via
+            // `.bytes` proves nothing about whether the real backing array was ever touched - that
+            // was exactly the V0.9.2-hardening-round-2 review finding against the previous version
+            // of this test. The only way to genuinely prove seal() destroys the real scalar is to
+            // capture the ephemeral Secp256k1PrivateKey OBJECT itself via the test seam, and after
+            // seal() has returned, read `.bytes` on that SAME object again through its ordinary
+            // public accessor - no reflection, no test-only field access.
+            var capturedKey: Secp256k1PrivateKey? = null
+            var snapshotBeforeDestruction: ByteArray? = null
+
+            HybridEcies.sealWithEphemeralKeyHook(
+                body,
+                sender,
+                context,
+                onEphemeralPrivateKeyForTest = { key ->
+                    capturedKey = key
+                    snapshotBeforeDestruction = key.bytes
+                },
+            )
+
+            // Sanity: a real, non-degenerate 32-byte ephemeral private key was actually captured -
+            // not already zero before seal() had a chance to destroy it.
+            val snapshot = snapshotBeforeDestruction
+            snapshot shouldNotBe null
+            snapshot!!.size shouldBe 32
+            snapshot.all { it == 0.toByte() } shouldBe false
+
+            // LOAD-BEARING PROOF: reading `.bytes` again on the SAME captured object, through its
+            // ordinary public accessor, now returns all-zero - because seal()'s finally block called
+            // destroy() on this exact object, which mutates its real storedBytes field in place, not
+            // some throwaway snapshot. If seal() had merely filled a `.bytes` copy (the bug this test
+            // now guards against), this second read would still show the original, non-zero scalar.
+            val key = capturedKey
+            key shouldNotBe null
+            key!!.bytes.all { it == 0.toByte() } shouldBe true
         }
     })
