@@ -4,6 +4,16 @@
 // PrekeyBundle it consumes, that bundle's canonical codec, and the local PrekeyStore holding the
 // private halves with genuine one-time-prekey consumption semantics.
 //
+// V0.8.3 (this wave) extends the SAME module with the Double Ratchet itself: RatchetKdf (the
+// HKDF-SHA256 root-chain / HMAC-SHA256 symmetric-chain KDF ladder, isolated for auditability),
+// RatchetMessage/RatchetMessageCodec (the wire format, AAD-bound header), SkippedMessageKeyStore
+// (bounded, evicting, insertion-order out-of-order-delivery buffer), DoubleRatchetSession (the live
+// state machine consuming an X3dhSharedSecret and turning it into an ongoing forward-secret,
+// post-compromise-secure 1:1 session), and DoubleRatchetSessionCodec (encrypted-at-rest session
+// persistence, reusing KeystoreEncryption verbatim). Still PURE CRYPTO, still zero network
+// dependencies - not yet wired into a live message-send path, see DoubleRatchetSession's own class
+// doc comment for the full list of this wave's deliberate scope cuts.
+//
 // DELIBERATELY ZERO network/libp2p/Nabu/java-cid dependencies, and this isolation is a security
 // property, not a packaging preference: a reviewer auditing the handshake in this module never has
 // to reason about untrusted network input and crypto correctness in the same file. Publication of

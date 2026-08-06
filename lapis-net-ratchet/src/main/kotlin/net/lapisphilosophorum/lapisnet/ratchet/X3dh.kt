@@ -51,6 +51,14 @@ private const val AD_VERSION: Byte = 1
 /** `4 (magic) + 1 (version) + 33 (initiator identity) + 33 (responder identity)`. */
 private const val AD_SIZE = 4 + 1 + 33 + 33
 
+/** The exact, fixed size of [X3dh.associatedData]'s output - 71 bytes. `internal` (and not merely
+ * a private constant) so [DoubleRatchetSession] and [DoubleRatchetSessionCodec] can VALIDATE the
+ * associated data they are handed and persist/reload, rather than trusting a length. Fixedness is
+ * load-bearing downstream, not cosmetic: the Double Ratchet concatenates its own fixed-length HKDF
+ * info labels with this value without a length prefix, which is injective only because BOTH parts
+ * have a fixed length - see [RatchetKdf]'s class doc comment. */
+internal const val X3DH_ASSOCIATED_DATA_SIZE = AD_SIZE
+
 /** Thrown for every X3DH handshake failure - a bundle/header that fails one of the mandatory
  * pre-DH checks, a mismatched key, or an internal invariant violation. Deliberately a single,
  * undifferentiated type for the pre-DH validation failures (mirroring
@@ -216,15 +224,21 @@ class X3dhInitiation internal constructor(
  * - No PQXDH / post-quantum hybrid key exchange.
  * - No formal deniability analysis beyond X3DH's own published security properties.
  * - No wire codec for [X3dhPreKeyMessageHeader] - see that class's own doc comment.
- * - **No replay protection for a repeated identical initial message.** Explicitly deferred to
- *   V0.8.3's Double Ratchet session layer, the correct architectural home: replay detection needs
- *   per-session state (a session store keyed by the initiator's ephemeral key, or the ratchet's own
- *   message-number window), and [X3dh] is a stateless pure function by design. What THIS wave DOES
- *   provide toward it: a one-time prekey, once consumed via [PrekeyStore.consumeOneTimePrekey], is
- *   durably consumed, so a replayed initiation naming a one-time prekey is refused at the store
- *   layer, before [respond] is ever reached. A replay naming NO one-time prekey (an exhausted bundle,
- *   or an initiator that chose none) is NOT detected by anything in this wave - see
- *   [X3dhAdversarialTest]'s case (f) for the explicit, tested boundary this leaves.
+ * - **No replay protection for a repeated identical initial message - and V0.8.3's Double Ratchet
+ *   session layer only PARTIALLY closes this, corrected from an earlier overstatement.** Replay
+ *   detection needs per-session state, and [X3dh] is a stateless pure function by design. What THIS
+ *   wave DOES provide toward it: a one-time prekey, once consumed via
+ *   [PrekeyStore.consumeOneTimePrekey], is durably consumed, so a replayed initiation naming a
+ *   one-time prekey is refused at the store layer, before [respond] is ever reached. A replay
+ *   naming NO one-time prekey (an exhausted bundle, or an initiator that chose none) is NOT detected
+ *   by anything in this wave - see [X3dhAdversarialTest]'s case (f) for the explicit, tested
+ *   boundary this leaves. **V0.8.3's `DoubleRatchetSession` closes only the per-message half of this
+ *   gap** (delete-on-use of skipped message keys, and rejection of a message number already
+ *   consumed, within ONE already-established session) - it does NOT close the other half: a
+ *   replayed X3DH initial message naming no one-time prekey still lets a responder derive the same
+ *   `SK` twice and construct TWO INDEPENDENT `DoubleRatchetSession` objects, and nothing in either
+ *   session's own state machine can see across to the other. Closing that needs a durable session
+ *   registry keyed by the initiator's ephemeral public key, which remains V0.8.4's to build.
  * - **One-time prekey collisions are inherent to gossip publication**, unlike Signal's server (which
  *   hands each one-time prekey to exactly one requester): a gossip-published [PrekeyBundle] is seen
  *   in full by every subscriber, so two initiators can independently pick the same one-time prekey;

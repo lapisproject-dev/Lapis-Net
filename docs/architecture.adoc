@@ -30,8 +30,13 @@ per-identity sequence number and a heartbeat TTL — the foundational discovery 
 direct-messages-and-calls arc (V0.8.1, see below) — are implemented, and an X25519 encryption
 sub-key bound to each identity plus the X3DH handshake (Signal's Extended Triple Diffie-Hellman,
 reimplemented from the public specification) — the second V0.8 sub-wave, new module
-`lapis-net-ratchet` (V0.8.2, see below) — is also implemented. Remaining modules are still
-skeletons. This document grows as modules gain real implementations.
+`lapis-net-ratchet` (V0.8.2, see below) — is also implemented. **The Double Ratchet itself** — the
+ongoing, forward-secret, post-compromise-secure 1:1 session an X3DH handshake's output bootstraps
+into (`DoubleRatchetSession`, its message codec, its bounded skipped-key store, and encrypted-at-rest
+session persistence) — the third V0.8 sub-wave, extending the same `lapis-net-ratchet` module
+(V0.8.3, see below) — is also implemented, still deliberately network-free and not yet wired into a
+live message-send path. Remaining modules are still skeletons. This document grows as modules gain
+real implementations.
 
 == Layering
 
@@ -2530,13 +2535,18 @@ ever runs on untrusted header bytes.
   limitation as every prior wave.
 * **No wire codec for the X3DH initial-message header (`X3dhPreKeyMessageHeader`).** This wave's
   deliverable is the handshake primitive and prekey publication/consumption machinery, callable and
-  independently testable — not yet wired into a live message-send path. V0.8.3 (Double Ratchet) and
-  V0.8.4 (online DM) own that wiring.
-* **No replay protection for a repeated identical initial message naming NO one-time prekey.**
-  Explicitly deferred to V0.8.3's Double Ratchet session layer, the correct architectural home for
-  per-session replay state (a session store keyed by the initiator's ephemeral key, or the ratchet's
-  own message-number window) — `X3dh` is a stateless pure function by design. A replay naming a
-  one-time prekey IS refused, durably, at the `PrekeyStore` layer.
+  independently testable — not yet wired into a live message-send path. V0.8.4 (online DM) owns
+  that wiring.
+* **No replay protection for a repeated identical initial message naming NO one-time prekey — and
+  V0.8.3's Double Ratchet session layer only PARTIALLY closes this (correction from this bullet's
+  original text, see "The Double Ratchet (V0.8.3)" section below for the full analysis).** `X3dh` is
+  a stateless pure function by design; a replay naming a one-time prekey IS refused, durably, at the
+  `PrekeyStore` layer. `DoubleRatchetSession` closes only the PER-MESSAGE half of what remains
+  (delete-on-use of skipped keys, rejection of an already-consumed message number, WITHIN one
+  already-established session) — a replayed initial message naming NO one-time prekey still lets a
+  responder derive the same `SK` twice and construct TWO INDEPENDENT sessions, invisible to each
+  other. Closing that needs a durable session registry keyed by the initiator's ephemeral public
+  key, still V0.8.4's to build.
 * **One-time-prekey collisions are inherent to gossip publication** — unlike Signal's server (which
   hands each one-time prekey to exactly one requester), a gossip-published `PrekeyBundle` is seen in
   full by every subscriber, so two initiators can independently pick the same one-time prekey; the
@@ -2548,6 +2558,268 @@ ever runs on untrusted header bytes.
 * **`CidBytesValidation` is not invoked by this wave** — no `io.ipfs.cid.Cid` field exists anywhere
   in `PrekeyBundle`, `PrekeyBundleCodec`, `PrekeyStoreFileFormat`, or `X3dh`; both codecs' class doc
   comments state this explicitly, mirroring `PeerRecordCodec`'s own equivalent N/A note.
+
+== The Double Ratchet (V0.8.3)
+
+The ongoing encrypted session an X3DH handshake's `X3dhSharedSecret`/`associatedData` output
+bootstraps into — Signal's Double Ratchet, reimplemented from the public specification (no
+libsignal, AGPL-3.0-incompatible, same reasoning as V0.8.2). Extends `lapis-net-ratchet` (same
+module, still deliberately network-free). The second of this arc's two highest-risk sub-waves:
+unlike V0.8.2's stateless handshake, this wave carries real STATE — a live session persists across
+many messages over potentially a long time, so a correctness failure here is an ongoing, silent
+compromise of an entire conversation, not a one-shot handshake bug.
+
+**Bootstrap asymmetry.** The X3DH INITIATOR becomes the ratchet SENDER
+(`DoubleRatchetSession.initializeSender`) — it already has the responder's initial ratchet public
+key (the responder's SIGNED PREKEY public key IS that key), generates its own fresh ratchet keypair,
+and performs one DH ratchet step immediately, so it has a sending chain from message zero. The X3DH
+RESPONDER becomes the ratchet RECEIVER (`initializeReceiver`) — its initial ratchet keypair IS the
+signed prekey keypair it already holds (not freshly generated), and it has no sending chain and no
+receiving chain until it decrypts its first inbound message.
+
+=== The KDF ladder, byte for byte
+
+Three layers, isolated in `RatchetKdf.kt` so the whole key schedule is auditable in one place:
+
+----
+Root chain (RatchetKdf.rootKdf, once per DH ratchet step):
+  info = "LapisNet:double-ratchet:v1:root" (31 bytes) || associatedData (71 bytes)   = 102 bytes
+  okm  = HKDF-SHA256(ikm = dhOutput, salt = currentRootKey, info, L = 64)
+  newRootKey  = okm[ 0..31]
+  newChainKey = okm[32..63]
+
+Symmetric chain (RatchetKdf.chainKdf, once per message):
+  messageKeyMaterial = HMAC-SHA256(chainKey, 0x01)
+  nextChainKey       = HMAC-SHA256(chainKey, 0x02)
+
+Message key (RatchetKdf.messageKeyKdf, once per message):
+  info   = "LapisNet:double-ratchet:v1:message" (34 bytes) || associatedData (71 bytes) = 105 bytes
+  aesKey = HKDF-SHA256(ikm = messageKeyMaterial, salt = 32 zero bytes, info, L = 32)
+----
+
+**`rootKdf`: `ikm = dhOutput`, `salt = rootKey` — the right way round, and genuinely load-bearing.**
+`x25519SharedSecret` returns the RAW shared u-coordinate, not a hash of it (confirmed against the
+resolved BouncyCastle jar, see V0.8.2's own section above) — not uniformly distributed. HKDF-Extract
+over it is therefore load-bearing for entropy-smoothing, the identical contrast `x25519SharedSecret`'s
+and `X3dh`'s own doc comments already draw against `ecdhSharedSecret`. `associatedData` is folded
+into `info` here too, not left to the AEAD alone — the same argument `X3dh`'s and `HybridEcies`'s own
+`info` constructions make: two sessions between different identity pairs whose DH values somehow
+coincided would still derive different root chains, so cross-session confusion fails at the KDF, one
+full layer before the AEAD's AAD check even runs — two independent reasons, not one.
+
+**`chainKdf`: HMAC-SHA256 only, no HKDF** — Signal's own published chain-KDF shape. Two DIFFERENT
+one-byte inputs (`0x01`/`0x02`) under the SAME HMAC key make the message key and the next chain key
+computationally independent: possession of `CK_(n+1)` yields nothing about `MK_n`, the property
+forward secrecy actually rests on. `chainKdf` never zeroes its own `chainKey` argument — the caller
+owns it and must zero it after installing the next chain key, mirroring `x25519SharedSecret`'s
+identical caller-owns-the-lifetime rule.
+
+**`messageKeyKdf`: HKDF-Extract is NOT load-bearing here** (the input is already an HMAC-SHA256
+output, i.e. uniform) — **HKDF-Expand IS**, for the identical reason `HybridEcies`'s own wrap-key
+derivation states: it makes the AEAD key a distinct function of `associatedData`, so a message
+transplanted between sessions fails for two independent reasons (wrong derived key AND wrong GCM
+AAD), not merely one. `L = 32`, key only — deliberately no nonce derived here, see below.
+
+`hmacSha256`/`hkdfSha256` inside `RatchetKdf` are LOCAL duplicates of `X3dh`'s own private helper,
+not calls into it — `X3dh`'s helper is `internal` purely so its own known-answer test can pin it;
+coupling the Double Ratchet's whole key schedule through that seam would mean a future change to
+X3DH's helper silently changes this ladder too. `DoubleRatchetKnownAnswerTest` independently pins
+BOTH copies against the same RFC 5869/RFC 4231 vectors.
+
+=== The AEAD nonce question
+
+AES-256-GCM with an EXPLICIT, uniformly random, transmitted 12-byte nonce — NOT a derived nonce,
+unlike `HybridEcies`'s (V0.9.2) wrap key. `HybridEcies`'s derived-nonce safety rests on: the wrap key
+is single-use by construction (a fresh `SecureRandom` ephemeral per `seal` call — stateless, nothing
+can rewind it), and if that ephemeral ever repeated, a transmitted random nonce would not have saved
+the scheme either, since the same `SecureRandom` produced both. **That escape hatch is checked here,
+not assumed to transfer — and it does not hold.** A Double Ratchet message key is single-use by
+construction too, but the construction is a PERSISTED COUNTER (`Ns`/`Nr` plus the chain key), which
+CAN rewind: a restored backup, a crashed write that left a stale file in place, a copied state
+directory, or a caller violating the persist-before-send ordering below all resurrect an
+already-used `(chainKey, N)` pair, and the next `encrypt` call re-derives the IDENTICAL message key.
+
+Under a DERIVED nonce, that would be a genuine AES-GCM `(key, nonce)` reuse — the catastrophic case,
+where the GHASH authentication subkey becomes recoverable and the two plaintexts' XOR leaks. Under
+the EXPLICIT RANDOM nonce this wave actually uses, it degrades to "two ciphertexts under one key
+with distinct nonces", which GCM tolerates with no confidentiality loss at all — what remains is a
+protocol-level DUPLICATE the peer rejects as a replay (see below). Crucially, the mail wave's own
+escape hatch — "a random nonce would not save it either, same RNG" — is FALSE here: the rewind is a
+STORAGE fault, not an RNG fault, and the `SecureRandom` producing the nonce is unaffected by it.
+
+The symmetric question — does the explicit nonce cost anything a derived nonce would have bought? —
+resolves in the random nonce's favour: if `SecureRandom` were ever broken and returned all-zero bytes
+for every call, every message would get nonce = 0, and that is HARMLESS, because the KEY still
+differs per message (from the HMAC chain ladder, not this `SecureRandom`). So the random nonce is
+safe under RNG failure AND under state rollback; a derived nonce would only ever have been safe
+under the first. This is the identical choice `HybridEcies`'s OWN body layer already makes, for a
+structurally analogous reason: the body's content key is chosen by the sender, not tied to a
+freshly-generated asymmetric key, so its AEAD nonce is explicit and random too. The Double Ratchet's
+message key is derivation-wise like the mail wave's wrap, but freshness-wise like its body — it
+follows the body.
+
+=== The message header and its AAD binding
+
+`RatchetMessageCodec`'s 60-byte header, byte for byte:
+
+----
+off   len   field
+  0     4   magic  "LNDR"
+  4     1   version = 1
+  5     1   flags   - reserved, must be zero
+  6    32   ratchetPublicKey     (X25519, sender's current DHs public half)
+ 38     4   previousChainLength  (PN)
+ 42     4   messageNumber        (N)
+ 46    12   nonce                (AES-256-GCM, random per message)
+ 58     2   ciphertextLength     (unsigned short)
+--- HEADER_SIZE = 60 ---
+ 60     N   ciphertext           (AES-256-GCM output, includes the 16-byte tag)
+----
+
+`AAD = headerBytes[0..59] || associatedData[0..70]` — 131 bytes, both parts fixed length so the
+concatenation is injective with no length prefix, the same argument `X3dh`'s and `HybridEcies`'s own
+`info` constructions make. **The header bytes are read VERBATIM off the wire (or freshly assembled,
+on `encrypt`) and NEVER re-serialised from the parsed `RatchetMessageHeader`'s fields** — `headerBytes`
+is a field on `RatchetMessage` itself, enforced by the type, not merely a discipline a call site must
+remember to follow. This is the rule this codebase's own history credits with getting V0.4's
+keystore encryption through security review in a single round; the opposite mistake elsewhere in
+this codebase's own history is exactly what motivates stating it here again.
+
+**No header encryption in this wave** — message numbers and the ratchet public key travel in the
+clear; only the payload is confidential. A real, published Signal-protocol-standard limitation
+carried forward knowingly, not an oversight.
+
+=== Two independent gates against the skipped-key DoS
+
+`RatchetMessageCodec.MAX_CHAIN_LENGTH` (1,000,000) rejects `previousChainLength`/`messageNumber` at
+`decode()` — before `DoubleRatchetSession` is ever entered. `DoubleRatchetSession.MAX_SKIP` (1,000)
+rejects an excessive skip DISTANCE relative to the session's own current position, at `decrypt()` —
+before any chain-KDF loop or allocation proportional to the claimed distance runs. Both are checked
+BEFORE any derivation, never inside a loop. This codebase's CID-length OOM history (`Fix CID
+multihash-length OOM DoS`, commit `0c56dbb`) is why both gates exist rather than one — the first
+gate alone would still let a header claiming `messageNumber = 999,999` drive a ~1M-iteration
+derivation loop; only the second, session-relative gate closes that.
+`DoubleRatchetSession.derivedMessageKeyCount()` (test-only) exists specifically so
+`DoubleRatchetAdversarialTest`'s DoS case can PROVE a rejection happened before any derivation, not
+merely assert the exception type.
+
+=== Skipped message keys: insertion-order eviction, and why not access-order
+
+`SkippedMessageKeyStore` is a bounded, evicting `LinkedHashMap` — but INSERTION-order
+(`accessOrder = false`), deliberately NOT the access-order shape every gossip index in this codebase
+uses (`PeerRecordIndex`/`PrekeyBundleIndex`'s own high-water-mark and content-id maps are all
+access-order). Those indexes treat recency-of-access as a liveness signal a legitimate re-query
+should refresh. Here the opposite holds: an attacker can trigger arbitrary lookups against this store
+by replaying arbitrary headers, so access-order would let them pin a chosen key alive and evict
+everyone else's. A skipped key's value decays purely with AGE, so age is the correct eviction order —
+exactly what "the oldest skipped keys must be evicted" means. `MAX_SKIPPED_KEYS_STORED = 2 *
+MAX_SKIP` (2,000) deliberately: a single `decrypt()` crossing a DH ratchet boundary can legitimately
+need to store up to `MAX_SKIP` keys for the OLD chain plus up to `MAX_SKIP` for the NEW one in ONE
+call, and sizing the store at exactly that sum means one legitimate worst-case burst fills the store
+without evicting anything it just stored in the same call — **provided the store was empty when that
+call began**; `removeEldestEntry` evicts strictly by insertion order, so a call against an
+already-partially-full store can evict entries it inserted earlier in that SAME call once the 2,000
+cap is crossed. The memory bound (well under 250 KB per session) holds regardless; the "one call never
+evicts its own insertions" property specifically does not, once the store is non-empty going in.
+
+=== State is committed only after the AEAD tag verifies
+
+The single most important design decision in `DoubleRatchetSession.decrypt`. Every derivation it
+performs — skipped message keys (old chain and new chain), a DH ratchet step's new root/chain keys,
+a fresh ratchet keypair — is built into SCRATCH locals first. Only after the AEAD tag verifies are
+those installed into live fields, the superseded live arrays zeroed, and the skipped-key store
+updated; if the tag fails, every scratch array is zeroed and the session is byte-for-byte what it was
+before the call. Without this, the session would be trivially destroyable by an unauthenticated
+attacker: a single garbage frame carrying a random (but validly-encoded) ratchet public key would
+drive a DH ratchet step, discard the real receiving chain key, and permanently desynchronise the
+session — a one-packet remote DoS. It also makes the stale-old-chain case degrade cleanly: a
+genuinely old message whose key was never stored as skipped falls through to the "unknown ratchet
+key" branch and provokes a spurious ratchet step whose results are simply discarded when the tag
+fails, instead of corrupting the session.
+
+=== Persist and destroy ordering — where forward secrecy actually dies
+
+Five rules, stated in `DoubleRatchetSession`'s own class doc comment verbatim:
+
+1. **Destruction happens INSIDE the state transition, so the persist/destroy question never arises
+   at persist time.** Every superseded key is zeroed and unreachable from the session object BEFORE
+   `encrypt`/`decrypt` returns — never deferred to a later cleanup call. At every instant a caller
+   could possibly call `DoubleRatchetSessionCodec.encode`, the session holds ONLY current,
+   still-needed key material. There is no window in which a snapshot could capture a superseded key —
+   the window is removed rather than sequenced.
+2. **`DoubleRatchetSessionCodec.encode` is a pure read** — mutates and destroys nothing.
+3. **The ordering that DOES matter is the CALLER's** (this wave performs no file I/O of its own):
+   persist the post-`encrypt` state BEFORE putting the ciphertext on the wire, and persist the
+   post-`decrypt` state BEFORE acting on the plaintext. Getting this backwards and crashing mid-window
+   rewinds `Ns`/`Nr` on restart — which, because this wave transmits a random rather than derived
+   nonce, degrades to a rejectable protocol-level replay rather than a catastrophic key-recovery-grade
+   AES-GCM nonce reuse. **This rule is stated as a correctness requirement, not yet as a viable
+   implementation plan.** As written it means one full `DoubleRatchetSessionCodec.encode` call — a
+   fresh Argon2id derivation at the default cost parameters (64 MiB / 3 passes, order 10^2 ms) plus a
+   full re-serialisation of up to `MAX_SKIPPED_KEYS_STORED` (2,000) skipped entries — PER MESSAGE, in
+   both directions. That per-message cost is not viable for a live network message-send path.
+   Deliberately deferred to the online-DM wave that will actually own the persistence call sites
+   (candidates: cache the Argon2id-derived key for the session's lifetime instead of re-deriving it
+   per `encode` call, or wrap a cheap session-scoped key once under the Argon2id-derived one) rather
+   than left as a silent surprise for that wave to discover.
+4. **Loading a stale blob is the residual, accepted, documented gap** nothing in this class alone can
+   prevent — mitigated by rule 3's atomic durable writes plus the random-nonce choice, which converts
+   a rollback from a key-recovery-grade break into a benign, rejectable duplicate.
+5. **The ONE place "persist then destroy" is correct: closing a session** —
+   `DoubleRatchetSessionCodec.encode(session, passphrase)` then `session.destroy()`. Correct precisely
+   because what `destroy()` erases is CURRENT state a persisted blob legitimately carries — not
+   superseded material. Do not blur this with rule 1.
+
+`DoubleRatchetSessionCodec` reuses `KeystoreEncryption` (Argon2id + AES-256-GCM) verbatim, mirroring
+`PrekeyStoreFileFormat`'s stance of inventing no new at-rest crypto. Two deliberate divergences from
+`PrekeyStoreFileFormat`: no plaintext variant (no legitimate reason a Double Ratchet session's state
+should ever hit disk unencrypted, so `encode` takes a non-null passphrase and there is no
+`decodeAuto`), and the inner body carries its OWN distinct magic (`"LNRB"`) rather than reusing the
+outer file magic (`"LNRS"`) — `PrekeyStoreFileFormat` can safely reuse one magic for both because its
+v1 body genuinely IS a whole file; here the body is never standalone, so a distinct magic makes
+"someone fed me a decrypted body as if it were a file" a loud, immediate rejection rather than a
+silent structural coincidence.
+
+=== What a JVM-level test can actually prove about forward secrecy and post-compromise security
+
+Stated with the same honesty this codebase already applies to secure erase generally.
+`DoubleRatchetAdversarialTest`'s forward-secrecy case proves exactly two things, no more: (i) the
+SPECIFIC `ByteArray` objects the session held were mutated to all-zero in place (via a test-only hook
+invoked with the actual soon-to-be-zeroed array, mirroring `HybridEcies.sealWithEphemeralKeyHook`'s
+identical visibility reasoning), and (ii) the LIVE session refuses to re-decrypt an early message,
+throwing `RatchetMessageRejectedException`. It does **not** — and, from ordinary JVM/Kotlin code,
+**cannot** — assert that the early message's chain key or message key is absent from every entry
+`DoubleRatchetSession.keyMaterialSnapshotForTest()` returns, nor that no copy of those bytes survives
+elsewhere on the JVM heap: a garbage collector may have relocated an array before `fill(0)` ran, and
+there is no way to reach the abandoned original. This project makes only the same best-effort claim
+`X25519PrivateKey.destroy`'s own doc comment already makes; this wave adds nothing to it. It likewise
+cannot prove the COMPUTATIONAL half of forward secrecy — that `CK_(n+1)` does not yield `CK_n` — an
+assumption resting on HMAC-SHA256's one-wayness that no test can verify.
+
+Post-compromise security is not instantaneous — the adversarial test asserts this explicitly rather
+than hiding it: a snapshot taken at time T still decrypts the very NEXT message (the one whose DH
+ratchet step the snapshot's own state can still compute), and only fails starting with the message
+AFTER that ratchet step completes, once a genuinely fresh `X25519KeyPair.generate(random)` the
+snapshot never saw has been mixed into the root chain.
+
+=== Explicit, deliberate scope cuts for this wave
+
+* **No header encryption** — see above.
+* **No sealed sender.**
+* **No post-quantum ratchet.** No PQXDH, no PQ KEM in the root chain — consistent with V0.8.2's own
+  cut.
+* **No secure-erase guarantee beyond best-effort `ByteArray.fill(0)`** — the same limitation V0.4/
+  V0.8.2 already state; this wave adds nothing to it and claims nothing more.
+* **Not wired into a live network message-send path.** `DoubleRatchetSession` is a standalone,
+  independently testable state machine; gossip/libp2p plumbing is V0.8.4's.
+* **No file I/O.** `DoubleRatchetSessionCodec` is a pure bytes<->object codec; the durable-write
+  discipline (atomic temp-file + `force(true)` + `ATOMIC_MOVE` + sidecar lock) is the caller's, and
+  `PrekeyStore` is the reference implementation to copy.
+* **No session registry, and therefore the X3DH initial-message replay gap is only PARTIALLY
+  closed** — see the corrected V0.8.2 scope-cut bullet above.
+* **No multi-device / no session migration between devices.**
+* **No automatic signed-prekey-driven session re-establishment**, no session expiry, no periodic
+  re-keying scheduler.
 
 == Diagrams
 
