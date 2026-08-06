@@ -14,6 +14,7 @@ import net.lapisphilosophorum.lapisnet.ratchet.OneTimePrekey
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundleCodec
 import net.lapisphilosophorum.lapisnet.ratchet.verifyEncryptionBinding
+import net.lapisphilosophorum.lapisnet.ratchet.verifySignedPrekey
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
 
@@ -34,6 +35,17 @@ private fun bundle(
         nowEpochSecond = 0,
     )
 }
+
+/** Big-endian 4-byte encoding, mirroring `PrekeyBundle`'s own private `intToBigEndian4` helper
+ * (internal to `lapis-net-ratchet`, not visible from this module) - needed to reproduce
+ * [PrekeyBundle.signedPrekeyDigest]'s exact byte layout from outside that module. */
+private fun intToBigEndian4(value: Int): ByteArray =
+    byteArrayOf(
+        (value ushr 24).toByte(),
+        (value ushr 16).toByte(),
+        (value ushr 8).toByte(),
+        value.toByte(),
+    )
 
 /**
  * Unit-level tests of [PrekeyBundleGossip.onGossipMessage] - mirrors
@@ -118,13 +130,28 @@ class PrekeyBundleGossipOnGossipMessageTest :
 
                 val victimBundle = bundle(victim, 0)
                 val signedPrekey = X25519KeyPair.generate()
+                val signedPrekeyId = 0
+                // A GENUINE signed-prekey signature by the attacker's own key over the transplanted
+                // (victim's) X25519 identity key - not an all-zero placeholder, which would make
+                // verifySignedPrekey() fail too and leave unproven whether verifyEncryptionBinding()
+                // specifically is what rejects this bundle. Mirrors
+                // PrekeyBundleIndexTest.spoofedBundle's identical isolation technique.
+                val signedPrekeyDigest =
+                    domainSeparatedDigest(
+                        "LapisNet:x3dh-signed-prekey:v1",
+                        attacker.secp256k1KeyPair.publicKey.bytes,
+                        victimBundle.encryptionBinding.x25519PublicKey.bytes,
+                        signedPrekey.publicKey.bytes,
+                        intToBigEndian4(signedPrekeyId),
+                    )
+                val signedPrekeySignature = attacker.secp256k1KeyPair.sign(signedPrekeyDigest)
                 val body =
                     PrekeyBundleCodec.encodeSignedBody(
                         identity = attacker.secp256k1KeyPair.publicKey,
                         encryptionBinding = victimBundle.encryptionBinding, // victim's binding, verbatim
-                        signedPrekeyId = 0,
+                        signedPrekeyId = signedPrekeyId,
                         signedPrekey = signedPrekey.publicKey,
-                        signedPrekeySignature = ByteArray(64),
+                        signedPrekeySignature = signedPrekeySignature,
                         oneTimePrekeys = emptyList(),
                         sequenceNumber = 0,
                         notValidAfterEpochSecond = 500_000L,
@@ -139,6 +166,8 @@ class PrekeyBundleGossipOnGossipMessageTest :
                 val bytes = body + signature
                 val spoofed = PrekeyBundleCodec.decode(bytes)
                 PrekeyBundle.verify(spoofed) shouldBe true // genuinely signed, proving this isn't a signature failure
+                spoofed.verifySignedPrekey() shouldBe true // genuinely signed too - not a signed-prekey failure either
+                spoofed.verifyEncryptionBinding() shouldBe false // THIS is the check that actually rejects it
 
                 val result = PrekeyBundleGossip.onGossipMessage(bytes, from, storage, index)
 

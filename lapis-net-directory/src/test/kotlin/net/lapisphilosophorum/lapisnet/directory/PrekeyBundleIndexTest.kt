@@ -10,6 +10,7 @@ import net.lapisphilosophorum.lapisnet.ratchet.OneTimePrekey
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundleCodec
 import net.lapisphilosophorum.lapisnet.ratchet.verifyEncryptionBinding
+import net.lapisphilosophorum.lapisnet.ratchet.verifySignedPrekey
 
 private fun bundle(
     identity: DualKeyIdentity,
@@ -32,27 +33,45 @@ private fun bundle(
 
 /** As [bundle], but genuinely self-signed by [signingIdentity] while embedding a DIFFERENT
  * identity's [EncryptionKeyBinding] - a verbatim binding transplant, mirroring
- * `PeerRecordIndexTest`'s identical `spoofedRecord` helper shape. */
+ * `PeerRecordIndexTest`'s identical `spoofedRecord` helper shape.
+ *
+ * **The signed-prekey signature is a GENUINE signature, not a placeholder** - computed by
+ * [signingIdentity]'s own secp256k1 key over the correct [PrekeyBundleCodec] digest for the
+ * TRANSPLANTED (victim's) X25519 identity key, exactly the shape a real attacker who controls their
+ * own signing key would produce. This is deliberate: an all-zero placeholder signature would make
+ * `verifySignedPrekey()` fail too, for an unrelated reason, so a caller could never tell from the
+ * test alone whether `verifyEncryptionBinding()` specifically is what index.add rejects on - the
+ * same isolation technique the sibling "signed-prekey-signature-invalid" test below already applies
+ * to `verifySignedPrekey`, applied here to the OTHER binding-transplant scenario. */
 private fun spoofedBundle(
     signingIdentity: DualKeyIdentity,
     victimBinding: EncryptionKeyBinding,
 ): PrekeyBundle {
     val signedPrekey = X25519KeyPair.generate()
+    val signedPrekeyId = 0
+    val signedPrekeyDigest =
+        domainSeparatedDigest(
+            "LapisNet:x3dh-signed-prekey:v1",
+            signingIdentity.secp256k1KeyPair.publicKey.bytes,
+            victimBinding.x25519PublicKey.bytes,
+            signedPrekey.publicKey.bytes,
+            intToBigEndian4(signedPrekeyId),
+        )
+    val signedPrekeySignature = signingIdentity.secp256k1KeyPair.sign(signedPrekeyDigest)
     val body =
         PrekeyBundleCodec.encodeSignedBody(
             identity = signingIdentity.secp256k1KeyPair.publicKey,
             encryptionBinding = victimBinding,
-            signedPrekeyId = 0,
+            signedPrekeyId = signedPrekeyId,
             signedPrekey = signedPrekey.publicKey,
-            signedPrekeySignature = ByteArray(64),
+            signedPrekeySignature = signedPrekeySignature,
             oneTimePrekeys = emptyList(),
             sequenceNumber = 0,
             notValidAfterEpochSecond = 500_000L,
         )
     val signature =
         signingIdentity.secp256k1KeyPair.sign(
-            net.lapisphilosophorum.lapisnet.core.crypto
-                .domainSeparatedDigest("LapisNet:x3dh-prekey-bundle:v1", body),
+            domainSeparatedDigest("LapisNet:x3dh-prekey-bundle:v1", body),
         )
     // PrekeyBundle.fromDecoded is internal to lapis-net-ratchet (a different Gradle module from
     // this test), so this test - like PrekeyBundleGossip's own gossip validator - constructs the
@@ -60,6 +79,17 @@ private fun spoofedBundle(
     // real network would have to.
     return PrekeyBundleCodec.decode(body + signature)
 }
+
+/** Big-endian 4-byte encoding, mirroring `PrekeyBundle`'s own private `intToBigEndian4` helper
+ * (internal to `lapis-net-ratchet`, not visible from this module) - needed to reproduce
+ * [PrekeyBundle.signedPrekeyDigest]'s exact byte layout from outside that module. */
+private fun intToBigEndian4(value: Int): ByteArray =
+    byteArrayOf(
+        (value ushr 24).toByte(),
+        (value ushr 16).toByte(),
+        (value ushr 8).toByte(),
+        value.toByte(),
+    )
 
 class PrekeyBundleIndexTest :
     FunSpec({
@@ -168,9 +198,15 @@ class PrekeyBundleIndexTest :
             index.add(tampered) shouldBe false
 
             // (2) encryption-binding-invalid: verbatim transplant of the victim's binding into an
-            // attacker-signed bundle.
+            // attacker-signed bundle. Both verify() and verifySignedPrekey() are proven to PASS
+            // below, isolating verifyEncryptionBinding() as the specific check that rejects this
+            // bundle - see spoofedBundle's own doc comment for why its signed-prekey signature is a
+            // genuine one, not a placeholder that would fail verifySignedPrekey() too and leave this
+            // isolation unproven.
             val spoofed = spoofedBundle(signingIdentity = attacker, victimBinding = victimBundle.encryptionBinding)
             PrekeyBundle.verify(spoofed) shouldBe true // genuinely signed - proves this isn't caught by signature alone
+            spoofed.verifySignedPrekey() shouldBe true // genuinely signed too - not a signed-prekey failure either
+            spoofed.verifyEncryptionBinding() shouldBe false // THIS is the check that actually rejects it
             index.add(spoofed) shouldBe false
 
             // Confirm the genuine bundle is still accepted for comparison.

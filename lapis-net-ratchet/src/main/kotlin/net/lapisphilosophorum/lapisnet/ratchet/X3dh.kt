@@ -445,37 +445,50 @@ object X3dh {
      *    here instead turns that class of bug into an immediate, obvious [X3dhException].
      * 4. `header.initiatorIdentity` must not equal [responderIdentity] (mirrors [initiate]'s
      *    self-handshake refusal).
+     * 5. [responderEncryptionBinding] must verify against [responderIdentity] - the responder-side
+     *    mirror of [initiate]'s check 6, now applied to the RESPONDER's own material.
+     * 6. [responderX25519IdentityPrivateKey] must actually derive to [responderEncryptionBinding]'s
+     *    public key - the responder-side mirror of [initiate]'s check 7.
+     * 7. [responderSignedPrekeyPrivateKey] must actually derive to [responderSignedPrekeyPublicKey] -
+     *    a responder-specific self-check with no [initiate]-side analogue, closing the gap where
+     *    check 1 above only compares the signed-prekey ID integer, not the key material itself.
      *
      * The responder-side DH mirror produces byte-IDENTICAL outputs to the initiator's:
      * `DH1 = X25519(SPK_B, IK_A)`, `DH2 = X25519(IK_B, EK_A)`, `DH3 = X25519(SPK_B, EK_A)`,
      * `DH4 = X25519(OPK_B, EK_A)` if consumed.
      *
-     * **Deliberate asymmetry with [initiate], stated here rather than left silent: this function has
-     * no mirror of [initiate]'s checks 6 and 7.** [initiate] verifies both that the INITIATOR's own
-     * [EncryptionKeyBinding] verifies against `initiatorIdentity` (check 6) and that
-     * `initiatorX25519IdentityPrivateKey` actually derives to that binding's public key (check 7).
-     * [respond] verifies the initiator's binding (check 2, this function's mirror of check 6) but
-     * performs NO equivalent of check 7 on the RESPONDER's own key material: it never confirms that
-     * [responderX25519IdentityPrivateKey] derives to the X25519 identity key this responder actually
-     * published, nor that [responderSignedPrekeyPrivateKey] derives to the signed prekey published
-     * under [responderSignedPrekeyId] - only the id integer is compared against [header]. A caller
-     * that passes a `signedPrekeyId`/`signedPrekeyPrivateKey` pair pulled from two different
-     * snapshots (e.g. a stale [PrekeyStore] handle after another handle's `rotateSignedPrekey` - see
-     * [PrekeyStore.signedPrekeyId]'s own doc comment for exactly this hazard) is NOT caught here: the
-     * id comparison at check 1 passes, DH1/DH3 are silently computed against the WRONG scalar, and
-     * the resulting [X3dhSharedSecret] diverges from the initiator's with no diagnostic pointing at
-     * the cause - only surfacing much later, at first AEAD use. This is the same failure shape
-     * check 3's `ConsumedOneTimePrekey` id-pairing assertion exists to eliminate for one-time
-     * prekeys, left open here for the responder's own long-term keys. Left unclosed in this wave
-     * because doing so symmetrically would require this function to also accept the responder's own
-     * [EncryptionKeyBinding] and published signed-prekey public key purely to self-check against
-     * them - API surface with no caller yet (V0.8.4's wiring layer is the first real caller of either
-     * [initiate] or [respond]) - rather than because the risk is considered acceptable long-term.
+     * **Mirrors [initiate]'s checks 6 and 7 for the RESPONDER's own key material (checks 5-7
+     * above).** [initiate] verifies both that the INITIATOR's own [EncryptionKeyBinding] verifies
+     * against `initiatorIdentity` (check 6) and that `initiatorX25519IdentityPrivateKey` actually
+     * derives to that binding's public key (check 7). [respond] verifies the initiator's binding
+     * (check 2, this function's mirror of [initiate]'s check 6) and - as of this hardening pass -
+     * ALSO verifies [responderEncryptionBinding] against [responderIdentity] (check 5, the mirror of
+     * [initiate]'s check 6 for the responder's own material) and that
+     * [responderX25519IdentityPrivateKey] actually derives to [responderEncryptionBinding]'s public
+     * key (check 6, the mirror of [initiate]'s check 7). A THIRD, responder-specific self-check
+     * (check 7, with no [initiate]-side analogue, since an initiator has no equivalent "signed
+     * prekey it published under an id") additionally confirms [responderSignedPrekeyPrivateKey]
+     * actually derives to [responderSignedPrekeyPublicKey] - the public key this responder actually
+     * published under [responderSignedPrekeyId] - not merely that the id INTEGER matches [header]
+     * (check 1). Before this hardening pass, a caller that passed a `signedPrekeyId`/
+     * `signedPrekeyPrivateKey` pair pulled from two different snapshots (e.g. a stale [PrekeyStore]
+     * handle after another handle's `rotateSignedPrekey` - see [PrekeyStore.signedPrekeyId]'s own doc
+     * comment for exactly this hazard) was NOT caught: the id comparison at check 1 passed, DH1/DH3
+     * were silently computed against the WRONG scalar, and the resulting [X3dhSharedSecret] diverged
+     * from the initiator's with no diagnostic pointing at the cause - only surfacing much later, at
+     * first AEAD use. This was the same failure shape check 3's `ConsumedOneTimePrekey` id-pairing
+     * assertion already closes for one-time prekeys; checks 5-7 below close the equivalent gap for
+     * the responder's own long-term keys, at the cost of two new required parameters
+     * ([responderEncryptionBinding], [responderSignedPrekeyPublicKey]) that a caller must now supply
+     * - both are values a real caller already has on hand from its own [PrekeyStore]/
+     * [EncryptionKeyBinding], so this is pure additional validation, not new state to track.
      */
     fun respond(
         responderIdentity: Secp256k1PublicKey,
+        responderEncryptionBinding: EncryptionKeyBinding,
         responderX25519IdentityPrivateKey: X25519PrivateKey,
         responderSignedPrekeyId: Int,
+        responderSignedPrekeyPublicKey: X25519PublicKey,
         responderSignedPrekeyPrivateKey: X25519PrivateKey,
         header: X3dhPreKeyMessageHeader,
         consumedOneTimePrekey: ConsumedOneTimePrekey?,
@@ -502,6 +515,24 @@ object X3dh {
         }
         if (header.initiatorIdentity == responderIdentity) {
             throw X3dhException("refusing to respond to an X3DH handshake initiated by one's own identity")
+        }
+        if (!EncryptionKeyBinding.verify(responderIdentity, responderEncryptionBinding)) {
+            throw X3dhException("responder's own encryption key binding does not verify against responderIdentity")
+        }
+        // publicKeyFor, not fromPrivateKeyBytes - same "no second, separately-owned X25519PrivateKey
+        // copy" reasoning as initiate()'s own check 7.
+        val derivedResponderX25519Public = X25519KeyPair.publicKeyFor(responderX25519IdentityPrivateKey)
+        if (derivedResponderX25519Public != responderEncryptionBinding.x25519PublicKey) {
+            throw X3dhException(
+                "responderX25519IdentityPrivateKey does not match responderEncryptionBinding's public key",
+            )
+        }
+        val derivedResponderSignedPrekeyPublic = X25519KeyPair.publicKeyFor(responderSignedPrekeyPrivateKey)
+        if (derivedResponderSignedPrekeyPublic != responderSignedPrekeyPublicKey) {
+            throw X3dhException(
+                "responderSignedPrekeyPrivateKey does not match responderSignedPrekeyPublicKey - the caller's " +
+                    "signedPrekeyId/signedPrekeyPrivateKey/signedPrekeyPublicKey are from inconsistent snapshots",
+            )
         }
 
         val ad = associatedData(header.initiatorIdentity, responderIdentity)

@@ -4,12 +4,20 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.types.shouldBeInstanceOf
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 class PrekeyStoreTest :
     FunSpec({
@@ -126,7 +134,6 @@ class PrekeyStoreTest :
             val bundle =
                 store.publishBundle(
                     identity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 100_000L,
                     nowEpochSecond = 0,
                 )
@@ -160,7 +167,6 @@ class PrekeyStoreTest :
             val bundle =
                 store.publishBundle(
                     identity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 100_000L,
                     nowEpochSecond = 0,
                 )
@@ -212,6 +218,33 @@ class PrekeyStoreTest :
             val permissions = Files.getPosixFilePermissions(file)
             permissions shouldBe
                 setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)
+        }
+
+        test("open refuses a store file with loosened permissions") {
+            val dir = Files.createTempDirectory("prekeystore-test")
+            val identity = DualKeyIdentity.generate()
+            PrekeyStore.create(dir, identity, oneTimePrekeyCount = 1)
+            val file = dir.resolve("default.lnpk")
+            if ("posix" !in file.fileSystem.supportedFileAttributeViews()) return@test
+
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r--r--"))
+            shouldThrow<IllegalStateException> { PrekeyStore.open(dir) }
+        }
+
+        test("publishBundle owns and persists a monotonic sequence number, durable across a reopen") {
+            val dir = Files.createTempDirectory("prekeystore-test")
+            val identity = DualKeyIdentity.generate()
+            val store = PrekeyStore.create(dir, identity, oneTimePrekeyCount = 1)
+
+            val first = store.publishBundle(identity, notValidAfterEpochSecond = 100_000L, nowEpochSecond = 0)
+            val second = store.publishBundle(identity, notValidAfterEpochSecond = 100_000L, nowEpochSecond = 0)
+            first.sequenceNumber shouldBe 1L
+            second.sequenceNumber shouldBe 2L
+
+            // Durable: a freshly reopened handle continues the SAME counter, never resets or repeats.
+            val reopened = PrekeyStore.open(dir)!!
+            val third = reopened.publishBundle(identity, notValidAfterEpochSecond = 100_000L, nowEpochSecond = 0)
+            third.sequenceNumber shouldBe 3L
         }
 
         test("encrypted store: wrong passphrase throws KeystoreDecryptionException") {
@@ -305,5 +338,145 @@ class PrekeyStoreTest :
                 PrekeyStoreFileFormat.FORMAT_VERSION_2
             val reopened = PrekeyStore.open(dir, passphraseProvider = passphraseProvider)!!
             reopened.availableOneTimePrekeyIds() shouldBe listOf(0)
+        }
+
+        test(
+            "canonicalize(): a PrekeyStore opened via a symlink-aliased path serializes through the SAME " +
+                "in-JVM monitor as one opened via the real path, instead of racing into " +
+                "OverlappingFileLockException - the regression test for the symlink-aliasing fix. Reverting " +
+                "canonicalize() to a plain toAbsolutePath().normalize() (no toRealPath()) makes this test " +
+                "fail: monitorFor() would then key the real path and the symlinked path to two DIFFERENT " +
+                "monitor objects even though the OS itself already resolves both to the same inode, so the " +
+                "second handle would no longer block on the shared monitor - it would race straight into " +
+                "FileChannel.lock() on the still-locked inode and crash with OverlappingFileLockException " +
+                "instead of gracefully waiting and then failing with PrekeyConsumptionException",
+        ) {
+            val realDir = Files.createTempDirectory("prekeystore-symlink-real")
+            val symlinkParent = Files.createTempDirectory("prekeystore-symlink-alias")
+            val symlinkDir = symlinkParent.resolve("alias")
+            try {
+                Files.createSymbolicLink(symlinkDir, realDir)
+            } catch (e: UnsupportedOperationException) {
+                return@test // this filesystem does not support symbolic links - skip gracefully
+            } catch (e: IOException) {
+                return@test // symlink creation not permitted in this environment (e.g. sandboxed CI)
+            }
+
+            val identity = DualKeyIdentity.generate()
+            PrekeyStore.create(realDir, identity, oneTimePrekeyCount = 1)
+
+            // A blocking PassphraseProvider pins storeA deep inside withExclusiveFileAccess's critical
+            // section - AFTER it has acquired BOTH the in-JVM monitor and the OS-level file lock, BEFORE
+            // it has finished consuming the prekey - so there is a real, deterministic window in which a
+            // second handle's access genuinely contends. Call #1 happens inside PrekeyStore.open()
+            // (decoding); call #2 happens inside the consumeOneTimePrekey() call further below.
+            val blockCallCount = AtomicInteger(0)
+            val storeAHoldsLock = CountDownLatch(1)
+            val releaseStoreA = CountDownLatch(1)
+            val blockingProvider =
+                PassphraseProvider {
+                    if (blockCallCount.incrementAndGet() == 2) {
+                        storeAHoldsLock.countDown()
+                        releaseStoreA.await(10, TimeUnit.SECONDS)
+                    }
+                    null
+                }
+
+            // storeA via the REAL path, storeB via the SYMLINK path - two independent handles on the
+            // SAME underlying file, exactly the aliasing scenario canonicalize() exists to close.
+            val storeA = PrekeyStore.open(realDir, passphraseProvider = blockingProvider)!!
+            val storeB = PrekeyStore.open(symlinkDir)!!
+
+            val resultA = AtomicReference<Any>()
+            val threadA =
+                thread(start = true) {
+                    resultA.set(
+                        try {
+                            storeA.consumeOneTimePrekey(0)
+                        } catch (e: Throwable) {
+                            e
+                        },
+                    )
+                }
+            storeAHoldsLock.await(10, TimeUnit.SECONDS) shouldBe true
+
+            val resultB = AtomicReference<Any>()
+            val threadB =
+                thread(start = true) {
+                    resultB.set(
+                        try {
+                            storeB.consumeOneTimePrekey(0)
+                        } catch (e: Throwable) {
+                            e
+                        },
+                    )
+                }
+            // Give threadB ample time to reach (and, WITHOUT the fix, fail at) its own
+            // lockChannel.lock() call while storeA still holds the OS-level lock on the same inode.
+            Thread.sleep(300)
+            // With the fix, threadB is genuinely blocked on the JVM intrinsic monitor storeA is still
+            // holding - this is NOT a timing guess, `synchronized` blocking is deterministic for as
+            // long as storeA has not exited its critical section.
+            threadB.isAlive shouldBe true
+
+            releaseStoreA.countDown()
+            threadA.join(10_000)
+            threadB.join(10_000)
+            threadA.isAlive shouldBe false
+            threadB.isAlive shouldBe false
+
+            // storeA durably consumed id 0.
+            val consumedByA = resultA.get()
+            consumedByA.shouldBeInstanceOf<ConsumedOneTimePrekey>()
+            consumedByA.id shouldBe 0
+
+            // storeB, admitted only AFTER storeA released the shared monitor, re-read disk truth and
+            // found id 0 already consumed - a clean, expected PrekeyConsumptionException. Without the
+            // fix, storeB would instead have raced storeA's still-held OS lock the moment threadB
+            // started (long before releaseStoreA.countDown() above) and crashed with
+            // OverlappingFileLockException.
+            resultB.get().shouldBeInstanceOf<PrekeyConsumptionException>()
+        }
+
+        test(
+            "consumeOneTimePrekey: a persistAtomically failure never durably consumes the one-time prekey - " +
+                "the entry stays AVAILABLE and a later successful attempt still returns the SAME original " +
+                "private key, proving persist-before-mutate held even on this failure path. This exercises " +
+                "the try/finally that destroys the already-constructed ConsumedOneTimePrekey's private key " +
+                "on a persistAtomically failure (see consumeOneTimePrekey's doc comment) end-to-end; the " +
+                "destroy() call itself is not independently observable from a black-box test, since the " +
+                "instance it destroys is never returned to a caller on this failure path - that is exactly " +
+                "the property the fix relies on to make the destroy safe to add unconditionally",
+        ) {
+            val dir = Files.createTempDirectory("prekeystore-test")
+            val identity = DualKeyIdentity.generate()
+            val callCount = AtomicInteger(0)
+            val failOnThirdCall =
+                PassphraseProvider {
+                    // Call #1: create()'s own initial persistAtomically. Call #2: consumeOneTimePrekey's
+                    // withExclusiveFileAccess decode. Call #3: consumeOneTimePrekey's OWN nested
+                    // persistAtomically call, AFTER the ConsumedOneTimePrekey's private key has already
+                    // been constructed from the entry's bytes but BEFORE the tombstone is written - fail
+                    // exactly there.
+                    if (callCount.incrementAndGet() >= 3) {
+                        throw RuntimeException("simulated I/O failure during persistAtomically")
+                    }
+                    null
+                }
+            val store = PrekeyStore.create(dir, identity, oneTimePrekeyCount = 1, passphraseProvider = failOnThirdCall)
+
+            val failure = shouldThrow<RuntimeException> { store.consumeOneTimePrekey(0) }
+            failure.message shouldBe "simulated I/O failure during persistAtomically"
+
+            // Nothing was durably consumed - persist-before-mutate held even on this failure path.
+            store.availableOneTimePrekeyIds() shouldBe listOf(0)
+
+            // A subsequent successful attempt (a working provider) still consumes the SAME original
+            // key - disk truth was never touched by the failed attempt above.
+            val workingProvider = PassphraseProvider { null }
+            val reopened = PrekeyStore.open(dir, passphraseProvider = workingProvider)!!
+            val consumed = reopened.consumeOneTimePrekey(0)
+            consumed.id shouldBe 0
+            reopened.availableOneTimePrekeyIds() shouldBe emptyList()
         }
     })

@@ -3,6 +3,7 @@ package net.lapisphilosophorum.lapisnet.identity
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest
 import java.security.MessageDigest
 
@@ -16,17 +17,27 @@ class EncryptionKeyBindingTest :
         }
 
         test(
-            "verify fails when the bound X25519 public key is tampered - either at construction " +
-                "(not a valid/canonical point) or at verification",
+            "verify fails when the bound X25519 public key differs from the one actually signed",
         ) {
             val secp256k1KeyPair = Secp256k1KeyPair.generate()
             val x25519PublicKey = X25519KeyPair.generate().publicKey
             val binding = EncryptionKeyBinding.create(secp256k1KeyPair, x25519PublicKey)
 
-            val tamperedBytes = x25519PublicKey.bytes.copyOf().also { it[0] = (it[0] + 1).toByte() }
-            val tamperedKey = runCatching { X25519PublicKey(tamperedBytes) }.getOrNull() ?: return@test
+            // A genuinely different, independently-generated X25519 public key - substituting it for
+            // the one actually signed must fail verification. Deliberately NOT a byte-flipped
+            // mutation of x25519PublicKey: X25519PublicKey's own constructor rejects low-order/
+            // non-canonical byte patterns (see that class's doc comment), so flipping an arbitrary
+            // byte risks constructing an invalid key for an UNRELATED reason - a former version of
+            // this test caught that with `runCatching { X25519PublicKey(tamperedBytes) }.getOrNull()
+            // ?: return@test`, an escape hatch that would have silently skipped this test entirely,
+            // exercising nothing, the one time the flip happened to land on a rejected byte pattern.
+            // X25519KeyPair.generate() is guaranteed to construct successfully (see X25519PublicKey's
+            // own "why this can never reject a legitimate key" doc comment), so this test always
+            // actually exercises verify()'s tamper-detection path.
+            val differentKey = X25519KeyPair.generate().publicKey
+            differentKey shouldNotBe x25519PublicKey
 
-            val tamperedBinding = EncryptionKeyBinding(tamperedKey, binding.signature)
+            val tamperedBinding = EncryptionKeyBinding(differentKey, binding.signature)
             EncryptionKeyBinding.verify(secp256k1KeyPair.publicKey, tamperedBinding) shouldBe false
         }
 

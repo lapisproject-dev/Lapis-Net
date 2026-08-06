@@ -234,8 +234,10 @@ class X3dhKnownAnswerTest :
             val responderSession =
                 X3dh.respond(
                     responderIdentity = bobSecp256k1.publicKey,
+                    responderEncryptionBinding = bobEncryptionBinding,
                     responderX25519IdentityPrivateKey = bobX25519Identity,
                     responderSignedPrekeyId = 0,
+                    responderSignedPrekeyPublicKey = X25519KeyPair.publicKeyFor(bobSignedPrekey),
                     responderSignedPrekeyPrivateKey = bobSignedPrekey,
                     header = initiation.header,
                     consumedOneTimePrekey = ConsumedOneTimePrekey(0, bobOneTimePrekey),

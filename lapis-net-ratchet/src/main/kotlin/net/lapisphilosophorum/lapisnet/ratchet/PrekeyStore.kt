@@ -16,6 +16,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
 import java.time.Instant
@@ -46,11 +47,26 @@ class PrekeyConsumptionException(
  * initiator's header names - see [X3dh.respond]'s doc comment for why that assertion matters. A
  * bare [X25519PrivateKey] carries no id, so a caller wiring bug that consumes the wrong id would
  * otherwise silently derive a mismatched secret that only fails much later, at first AEAD use.
+ *
+ * **`internal` constructor, deliberately NOT a `data class`** - a caller-visible public constructor
+ * (plus a `data class`'s synthesized `copy()`) would let ANY caller mint a `ConsumedOneTimePrekey`
+ * for an id/key pair that was never actually run through [PrekeyStore.consumeOneTimePrekey],
+ * undermining exactly the ordering contract [X3dh.respond]'s check 3 relies on this type to
+ * enforce: "the one-time prekey named in the header was durably consumed via [PrekeyStore] BEFORE
+ * [X3dh.respond] is called". Restricting construction to this module (only [PrekeyStore] actually
+ * constructs one, in [PrekeyStore.consumeOneTimePrekey]) makes that ordering a property the type
+ * system enforces, not merely a caller-discipline convention stated in a doc comment - the same
+ * reasoning [PrekeyBundle.fromDecoded]'s own `internal` visibility already applies to a different
+ * caller-discipline contract in this module.
  */
-data class ConsumedOneTimePrekey(
+class ConsumedOneTimePrekey internal constructor(
     val id: Int,
     val privateKey: X25519PrivateKey,
-)
+) {
+    /** Never exposes [privateKey] - mirrors [X3dhSharedSecret.toString]'s identical REDACTED
+     * discipline for the same reason: this is key material, never fit to log. */
+    override fun toString(): String = "ConsumedOneTimePrekey(id=$id, privateKey=REDACTED)"
+}
 
 /**
  * Local storage for the PRIVATE halves of an identity's X3DH key material: the X25519 identity
@@ -149,11 +165,31 @@ class PrekeyStore private constructor(
      * already-consumed id here (because a second live handle durably consumed it via
      * [consumeOneTimePrekey] after this handle's own cache was last refreshed) causes every initiator
      * that picks it to hit an unavoidable [X3dh]-layer failure at the responder, per [X3dh.respond]'s
-     * mandatory-abort contract - a self-inflicted, entirely avoidable handshake-failure loop. */
+     * mandatory-abort contract - a self-inflicted, entirely avoidable handshake-failure loop.
+     *
+     * **Owns and persists [sequenceNumber] itself - no longer a caller-supplied parameter.** An
+     * earlier version of this method took `sequenceNumber` as a plain argument, trusting every
+     * caller to track a strictly-monotonic-per-identity counter correctly across process restarts
+     * and multiple call sites - exactly the kind of state an identity's own store should own,
+     * mirroring how [signedPrekeyId]/[nextOneTimePrekeyId] are already this store's own responsibility
+     * rather than caller-supplied. [PrekeyStoreState.nextBundleSequenceNumber] is the persisted
+     * counter this method claims-then-increments, atomically, under the same exclusive critical
+     * section [consumeOneTimePrekey] uses - so two concurrently-open handles on the same file can
+     * never publish two bundles with the same sequence number (the exact property
+     * `PrekeyBundleIndex`, in `lapis-net-directory`, relies on for its latest-wins-by-sequence-number
+     * ordering).
+     *
+     * **The counter is claimed and persisted AFTER [PrekeyBundle.create] has already built and signed
+     * the bundle, not before** - so a bundle-creation failure (e.g. [notValidAfterEpochSecond] too
+     * far beyond [nowEpochSecond], see [PrekeyBundle.create]'s own `require`) never burns a sequence
+     * number. Unlike a one-time prekey (irreplaceable once consumed), a "gap" in the bundle sequence
+     * is completely harmless - `PrekeyBundleIndex` only requires strict monotonicity, never
+     * consecutive values - so this ordering is purely a courtesy against needless gaps, not a
+     * correctness requirement the way persist-before-mutate is for [consumeOneTimePrekey].
+     */
     @Synchronized
     fun publishBundle(
         identity: DualKeyIdentity,
-        sequenceNumber: Long,
         notValidAfterEpochSecond: Long,
         maxOneTimePrekeys: Int = PrekeyBundleCodec.MAX_ONE_TIME_PREKEYS,
         nowEpochSecond: Long = Instant.now().epochSecond,
@@ -161,31 +197,46 @@ class PrekeyStore private constructor(
         require(identity.secp256k1KeyPair.publicKey == ownerIdentity) {
             "identity does not match this prekey store's owner"
         }
-        val currentState =
-            withExclusiveFileAccess { onDiskState ->
-                state = onDiskState
-                onDiskState
-            }
-        val x25519PublicKey = X25519KeyPair.fromPrivateKeyBytes(currentState.x25519IdentityPrivateKeyBytes).publicKey
-        val encryptionBinding = EncryptionKeyBinding.create(identity.secp256k1KeyPair, x25519PublicKey)
-        val signedPrekeyPublic = X25519KeyPair.fromPrivateKeyBytes(currentState.signedPrekeyPrivateKeyBytes).publicKey
-        val offeredOneTimePrekeys =
-            currentState.entries
-                .filter { it.state == OneTimePrekeyState.AVAILABLE }
-                .sortedBy { it.id }
-                .take(maxOneTimePrekeys)
-                .map { OneTimePrekey(it.id, X25519KeyPair.fromPrivateKeyBytes(it.privateKeyBytes).publicKey) }
+        return withExclusiveFileAccess { onDiskState ->
+            state = onDiskState
+            val x25519PublicKey =
+                X25519KeyPair.fromPrivateKeyBytes(onDiskState.x25519IdentityPrivateKeyBytes).publicKey
+            val encryptionBinding = EncryptionKeyBinding.create(identity.secp256k1KeyPair, x25519PublicKey)
+            val signedPrekeyPublic =
+                X25519KeyPair.fromPrivateKeyBytes(onDiskState.signedPrekeyPrivateKeyBytes).publicKey
+            val offeredOneTimePrekeys =
+                onDiskState.entries
+                    .filter { it.state == OneTimePrekeyState.AVAILABLE }
+                    .sortedBy { it.id }
+                    .take(maxOneTimePrekeys)
+                    .map { OneTimePrekey(it.id, X25519KeyPair.fromPrivateKeyBytes(it.privateKeyBytes).publicKey) }
 
-        return PrekeyBundle.create(
-            identity = identity,
-            encryptionBinding = encryptionBinding,
-            signedPrekeyId = currentState.signedPrekeyId,
-            signedPrekey = signedPrekeyPublic,
-            oneTimePrekeys = offeredOneTimePrekeys,
-            sequenceNumber = sequenceNumber,
-            notValidAfterEpochSecond = notValidAfterEpochSecond,
-            nowEpochSecond = nowEpochSecond,
-        )
+            val bundle =
+                PrekeyBundle.create(
+                    identity = identity,
+                    encryptionBinding = encryptionBinding,
+                    signedPrekeyId = onDiskState.signedPrekeyId,
+                    signedPrekey = signedPrekeyPublic,
+                    oneTimePrekeys = offeredOneTimePrekeys,
+                    sequenceNumber = onDiskState.nextBundleSequenceNumber,
+                    notValidAfterEpochSecond = notValidAfterEpochSecond,
+                    nowEpochSecond = nowEpochSecond,
+                )
+
+            val newState =
+                PrekeyStoreState(
+                    ownerIdentity = onDiskState.ownerIdentity,
+                    x25519IdentityPrivateKeyBytes = onDiskState.x25519IdentityPrivateKeyBytes,
+                    signedPrekeyId = onDiskState.signedPrekeyId,
+                    signedPrekeyPrivateKeyBytes = onDiskState.signedPrekeyPrivateKeyBytes,
+                    nextOneTimePrekeyId = onDiskState.nextOneTimePrekeyId,
+                    nextBundleSequenceNumber = onDiskState.nextBundleSequenceNumber + 1,
+                    entries = onDiskState.entries,
+                )
+            persistAtomically(newState)
+            state = newState
+            bundle
+        }
     }
 
     /**
@@ -238,6 +289,18 @@ class PrekeyStore private constructor(
      * removed, so a replay names an id that is KNOWN-CONSUMED rather than UNKNOWN - both are hard
      * failures at step 2, but the distinction matters for [generateOneTimePrekeys]'s pruning
      * discipline, see that method's doc comment.
+     *
+     * **On a [persistAtomically] failure, the already-constructed [X25519PrivateKey] from step 3 is
+     * explicitly [X25519PrivateKey.destroy]ed before the exception propagates - it never lingers on
+     * the heap unzeroed with no caller ever having received a handle to destroy it themselves.**
+     * Building that object BEFORE persisting is deliberate and stays that way (see the numbered
+     * steps above: it is what lets a degenerate stored scalar be caught before the tombstone is
+     * burned) - but a caller can only clean up key material it actually received, and on this
+     * failure path it never does, since the exception propagates before this method returns
+     * anything. Nothing else about the failure mode changes: per step 5's persist-before-mutate
+     * discipline, a [persistAtomically] failure here means NOTHING was durably consumed - the
+     * one-time prekey remains available and the handshake simply does not happen - so destroying
+     * this in-memory copy is pure heap hygiene, not a change to that contract.
      */
     @Synchronized
     fun consumeOneTimePrekey(id: Int): ConsumedOneTimePrekey =
@@ -259,28 +322,38 @@ class PrekeyStore private constructor(
                 // BEFORE the entry is burned, rather than after - this call's documented contract is
                 // that a failure never consumes the id.
                 val consumedPrivateKey = X25519PrivateKey(privateKeyCopy)
-                val newEntries =
-                    onDiskState.entries.map {
-                        if (it.id ==
-                            id
-                        ) {
-                            OneTimePrekeyStoreEntry(it.id, OneTimePrekeyState.CONSUMED, ByteArray(32))
-                        } else {
-                            it
+                var persisted = false
+                try {
+                    val newEntries =
+                        onDiskState.entries.map {
+                            if (it.id ==
+                                id
+                            ) {
+                                OneTimePrekeyStoreEntry(it.id, OneTimePrekeyState.CONSUMED, ByteArray(32))
+                            } else {
+                                it
+                            }
                         }
-                    }
-                val newState =
-                    PrekeyStoreState(
-                        ownerIdentity = onDiskState.ownerIdentity,
-                        x25519IdentityPrivateKeyBytes = onDiskState.x25519IdentityPrivateKeyBytes,
-                        signedPrekeyId = onDiskState.signedPrekeyId,
-                        signedPrekeyPrivateKeyBytes = onDiskState.signedPrekeyPrivateKeyBytes,
-                        nextOneTimePrekeyId = onDiskState.nextOneTimePrekeyId,
-                        entries = newEntries,
-                    )
-                persistAtomically(newState)
-                state = newState
-                ConsumedOneTimePrekey(id, consumedPrivateKey)
+                    val newState =
+                        PrekeyStoreState(
+                            ownerIdentity = onDiskState.ownerIdentity,
+                            x25519IdentityPrivateKeyBytes = onDiskState.x25519IdentityPrivateKeyBytes,
+                            signedPrekeyId = onDiskState.signedPrekeyId,
+                            signedPrekeyPrivateKeyBytes = onDiskState.signedPrekeyPrivateKeyBytes,
+                            nextOneTimePrekeyId = onDiskState.nextOneTimePrekeyId,
+                            nextBundleSequenceNumber = onDiskState.nextBundleSequenceNumber,
+                            entries = newEntries,
+                        )
+                    persistAtomically(newState)
+                    state = newState
+                    persisted = true
+                    ConsumedOneTimePrekey(id, consumedPrivateKey)
+                } finally {
+                    // See this method's doc comment for why this is pure heap hygiene, not a
+                    // correctness change: a persist failure already means nothing was durably
+                    // consumed, regardless of whether this in-memory copy is zeroed.
+                    if (!persisted) consumedPrivateKey.destroy()
+                }
             } finally {
                 privateKeyCopy.fill(0)
             }
@@ -316,6 +389,7 @@ class PrekeyStore private constructor(
                     signedPrekeyId = newId,
                     signedPrekeyPrivateKeyBytes = newKeyPair.privateKey.bytes,
                     nextOneTimePrekeyId = onDiskState.nextOneTimePrekeyId,
+                    nextBundleSequenceNumber = onDiskState.nextBundleSequenceNumber,
                     entries = onDiskState.entries,
                 )
             persistAtomically(newState)
@@ -376,6 +450,7 @@ class PrekeyStore private constructor(
                     signedPrekeyId = onDiskState.signedPrekeyId,
                     signedPrekeyPrivateKeyBytes = onDiskState.signedPrekeyPrivateKeyBytes,
                     nextOneTimePrekeyId = startId + count,
+                    nextBundleSequenceNumber = onDiskState.nextBundleSequenceNumber,
                     entries = allEntries,
                 )
             persistAtomically(newState)
@@ -501,19 +576,56 @@ class PrekeyStore private constructor(
         const val DEFAULT_ONE_TIME_PREKEY_COUNT = 100
         const val PREKEY_STORE_FILE_EXTENSION = "lnpk"
 
+        /** The first sequence number [publishBundle] ever claims for a freshly [create]d store -
+         * mirrors [PrekeyBundle]'s/[PrekeyStoreState]'s own `>= 1` (never `0`) convention for this
+         * counter; see [PrekeyStoreState]'s doc comment for why `0` is reserved as "never issued". */
+        internal const val INITIAL_BUNDLE_SEQUENCE_NUMBER = 1L
+
         /** Backs [withExclusiveFileAccess]'s same-JVM mutual-exclusion layer - see that method's doc
          * comment for why a plain monitor is needed in addition to [FileChannel.lock]. Keyed by
-         * canonical path so two [PrekeyStore] instances opened via different (but equivalent, e.g.
-         * relative vs. absolute) [Path]s to the same file still share one monitor. */
+         * [canonicalize]d path so two [PrekeyStore] instances opened via different (but equivalent,
+         * e.g. relative vs. absolute, OR symlink-aliased) [Path]s to the same file still share one
+         * monitor - see [canonicalize]'s doc comment for the symlink-aliasing gap this closes. */
         private val perFileMonitors = ConcurrentHashMap<Path, Any>()
 
-        private fun monitorFor(path: Path): Any = perFileMonitors.getOrPut(path.toAbsolutePath().normalize()) { Any() }
+        private fun monitorFor(path: Path): Any = perFileMonitors.getOrPut(canonicalize(path)) { Any() }
+
+        /** Resolves [path]'s PARENT directory to its real, symlink-free form (via [Path.toRealPath])
+         * and re-appends the file name, falling back to plain [Path.toAbsolutePath]/[Path.normalize]
+         * if the parent does not exist yet (every real caller - [create] via
+         * `Files.createDirectories`, every other caller via an already-successful prior [create] -
+         * ensures the parent exists first, so this fallback is only ever exercised by a caller that
+         * skipped that precondition, and is no worse than not resolving symlinks at all).
+         *
+         * **The same-JVM aliasing gap this closes.** [monitorFor]'s in-JVM monitor and
+         * [lockChannelFor]'s OS-level [FileChannel] lock must agree on which real file they are
+         * protecting. [FileChannel.lock] resolves symlinks transparently when the OS opens the file,
+         * so two [PrekeyStore]s opened via two DIFFERENT but symlink-equivalent [Path]s to the SAME
+         * real file already end up holding an OS-level lock on the SAME inode - but the JDK tracks
+         * same-JVM file locks by that real-file identity, not by the [Path] string used to open the
+         * channel, so a second `channel.lock()` call from within this JVM throws
+         * `OverlappingFileLockException` instead of blocking, per [withExclusiveFileAccess]'s own doc
+         * comment on why the plain monitor layer exists at all. Canonicalizing BOTH [monitorFor]'s
+         * key AND the path [lockFileFor] derives the sidecar name from - by routing both through this
+         * function - makes the two symlink-aliased [Path]s collapse onto the SAME monitor object too,
+         * so the in-JVM `synchronized` layer actually serializes the two handles instead of both
+         * reaching `channel.lock()` and one of them crashing. */
+        private fun canonicalize(path: Path): Path {
+            val parent = path.parent ?: return path.toAbsolutePath().normalize()
+            return try {
+                parent.toRealPath().resolve(path.fileName)
+            } catch (e: IOException) {
+                path.toAbsolutePath().normalize()
+            }
+        }
 
         /** The sidecar file whose OS-level lock [withExclusiveFileAccess] and [create] actually
          * hold - see [withExclusiveFileAccess]'s doc comment for why the lock cannot be taken on
          * the store file itself. `<file>.lock`, sitting beside the store file it guards - never
-         * renamed, never replaced, never cleaned up (mirroring the store file's own lifetime). */
-        private fun lockFileFor(storeFile: Path): Path = storeFile.resolveSibling("${storeFile.fileName}.lock")
+         * renamed, never replaced, never cleaned up (mirroring the store file's own lifetime).
+         * [storeFile] is [canonicalize]d first - see that function's doc comment for why. */
+        private fun lockFileFor(storeFile: Path): Path =
+            canonicalize(storeFile).resolveSibling("${storeFile.fileName}.lock")
 
         /** Opens (creating on first use) the sidecar lock file for [storeFile] - read/write so
          * [FileChannel.lock] can take an exclusive lock on it. Applies this class's usual 0600
@@ -537,6 +649,31 @@ class PrekeyStore private constructor(
                 "invalid prekey store label '$label' - must match ${VALID_LABEL.pattern} (no path separators or traversal)"
             }
             return baseDirectory.resolve("$label.$PREKEY_STORE_FILE_EXTENSION")
+        }
+
+        /** Rejects [file] if group/other permission bits are set - the load-time tamper-evidence
+         * mirror of `FileIdentityRepository.checkPermissionsAreHardened`'s identical check for
+         * `.lnid` keystores, applied here to `.lnpk` prekey stores for the same reason: [create]/
+         * [PrekeyStore.persistAtomically] always write 0600 files, so anything looser found at
+         * [open] time is evidence of tampering or a misconfigured host, not a state this method
+         * should silently trust with X3DH private key material. No-op on filesystems without POSIX
+         * permission support (e.g. Windows) - mirrors every other permission check in this class. */
+        private fun checkPermissionsAreHardened(file: Path) {
+            if ("posix" !in file.fileSystem.supportedFileAttributeViews()) return
+            val actual = Files.getPosixFilePermissions(file)
+            val tooPermissive =
+                actual.any {
+                    it == PosixFilePermission.GROUP_READ ||
+                        it == PosixFilePermission.GROUP_WRITE ||
+                        it == PosixFilePermission.GROUP_EXECUTE ||
+                        it == PosixFilePermission.OTHERS_READ ||
+                        it == PosixFilePermission.OTHERS_WRITE ||
+                        it == PosixFilePermission.OTHERS_EXECUTE
+                }
+            check(!tooPermissive) {
+                "refusing to load prekey store file with loose permissions: $file (expected rw------- / 0600; " +
+                    "run `chmod 600 $file`)"
+            }
         }
 
         /** Creates a brand-new prekey store for [identity] under `<baseDirectory>/<label>.lnpk`.
@@ -588,6 +725,7 @@ class PrekeyStore private constructor(
                                 signedPrekeyId = 0,
                                 signedPrekeyPrivateKeyBytes = signedPrekeyKeyPair.privateKey.bytes,
                                 nextOneTimePrekeyId = oneTimePrekeyCount,
+                                nextBundleSequenceNumber = INITIAL_BUNDLE_SEQUENCE_NUMBER,
                                 entries = entries,
                             )
                         val store = PrekeyStore(file, passphraseProvider, initialState)
@@ -612,7 +750,15 @@ class PrekeyStore private constructor(
          * over the file, silently erasing a tombstone a concurrently-open handle's
          * [consumeOneTimePrekey] persisted in the meantime - exactly the reuse that method's own doc
          * comment promises is impossible, via a sibling write path that promise didn't originally
-         * cover. */
+         * cover.
+         *
+         * **Load-time POSIX permission tamper-evidence check, mirroring
+         * `FileIdentityRepository.load`'s identical `checkPermissionsAreHardened` call for `.lnid`
+         * keystores.** [create]/[persistAtomically] always write this file 0600 - so anything looser
+         * found here is evidence of tampering, a misconfigured host, or a file that was copied/
+         * restored without preserving permissions, none of which this method should silently trust
+         * with X3DH private key material. Runs BEFORE [Files.readAllBytes], for the same
+         * fail-loud-before-touching-the-bytes reasoning `FileIdentityRepository.load` applies. */
         fun open(
             baseDirectory: Path,
             label: String = IdentityRepository.DEFAULT_LABEL,
@@ -620,6 +766,7 @@ class PrekeyStore private constructor(
         ): PrekeyStore? {
             val file = fileFor(baseDirectory, label)
             if (!file.exists()) return null
+            checkPermissionsAreHardened(file)
             val bytes = Files.readAllBytes(file)
             val passphrase = passphraseProvider.get()
             try {

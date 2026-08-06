@@ -23,10 +23,9 @@ private class Party(
             store.x25519IdentityPublicKey,
         )
 
-    fun publishBundle(sequenceNumber: Long = 1): PrekeyBundle =
+    fun publishBundle(): PrekeyBundle =
         store.publishBundle(
             identity,
-            sequenceNumber = sequenceNumber,
             notValidAfterEpochSecond = 500_000L,
             nowEpochSecond = 0,
         )
@@ -53,8 +52,10 @@ class X3dhTest :
             val responderSession =
                 X3dh.respond(
                     responderIdentity = bob.identity.secp256k1KeyPair.publicKey,
+                    responderEncryptionBinding = bob.encryptionBinding,
                     responderX25519IdentityPrivateKey = bob.store.x25519IdentityPrivateKey(),
                     responderSignedPrekeyId = bob.store.signedPrekeyId,
+                    responderSignedPrekeyPublicKey = bob.store.signedPrekeyPublicKey,
                     responderSignedPrekeyPrivateKey = bob.store.signedPrekeyPrivateKey(),
                     header = initiation.header,
                     consumedOneTimePrekey = consumedPrivateKey,
@@ -88,8 +89,10 @@ class X3dhTest :
             val responderSession =
                 X3dh.respond(
                     responderIdentity = bob.identity.secp256k1KeyPair.publicKey,
+                    responderEncryptionBinding = bob.encryptionBinding,
                     responderX25519IdentityPrivateKey = bob.store.x25519IdentityPrivateKey(),
                     responderSignedPrekeyId = bob.store.signedPrekeyId,
+                    responderSignedPrekeyPublicKey = bob.store.signedPrekeyPublicKey,
                     responderSignedPrekeyPrivateKey = bob.store.signedPrekeyPrivateKey(),
                     header = initiation.header,
                     consumedOneTimePrekey = null,
@@ -104,7 +107,6 @@ class X3dhTest :
             val bundleWithoutOtp =
                 bob.store.publishBundle(
                     bob.identity,
-                    sequenceNumber = 2,
                     notValidAfterEpochSecond = 500_000L,
                     nowEpochSecond = 0,
                     maxOneTimePrekeys = 0,
@@ -213,8 +215,10 @@ class X3dhTest :
             shouldThrow<X3dhException> {
                 X3dh.respond(
                     bob.identity.secp256k1KeyPair.publicKey,
+                    bob.encryptionBinding,
                     bob.store.x25519IdentityPrivateKey(),
                     responderSignedPrekeyId = 999,
+                    responderSignedPrekeyPublicKey = bob.store.signedPrekeyPublicKey,
                     responderSignedPrekeyPrivateKey = bob.store.signedPrekeyPrivateKey(),
                     header = initiation.header,
                     consumedOneTimePrekey = consumed,
@@ -239,8 +243,10 @@ class X3dhTest :
             shouldThrow<X3dhException> {
                 X3dh.respond(
                     bob.identity.secp256k1KeyPair.publicKey,
+                    bob.encryptionBinding,
                     bob.store.x25519IdentityPrivateKey(),
                     bob.store.signedPrekeyId,
+                    bob.store.signedPrekeyPublicKey,
                     bob.store.signedPrekeyPrivateKey(),
                     header = initiation.header,
                     consumedOneTimePrekey = null,
@@ -254,7 +260,6 @@ class X3dhTest :
             val bundle =
                 bob.store.publishBundle(
                     bob.identity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 100L,
                     nowEpochSecond = 0,
                 )
@@ -333,8 +338,10 @@ class X3dhTest :
             val responderSession =
                 X3dh.respond(
                     bob.identity.secp256k1KeyPair.publicKey,
+                    bob.encryptionBinding,
                     bob.store.x25519IdentityPrivateKey(),
                     bob.store.signedPrekeyId,
+                    bob.store.signedPrekeyPublicKey,
                     bob.store.signedPrekeyPrivateKey(),
                     initiation.header,
                     consumed,

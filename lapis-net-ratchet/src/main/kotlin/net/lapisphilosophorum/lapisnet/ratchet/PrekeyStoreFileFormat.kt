@@ -62,6 +62,7 @@ internal class PrekeyStoreState(
     val signedPrekeyId: Int,
     signedPrekeyPrivateKeyBytes: ByteArray,
     val nextOneTimePrekeyId: Int,
+    val nextBundleSequenceNumber: Long,
     val entries: List<OneTimePrekeyStoreEntry>,
 ) {
     val x25519IdentityPrivateKeyBytes: ByteArray = x25519IdentityPrivateKeyBytes.copyOf()
@@ -72,6 +73,13 @@ internal class PrekeyStoreState(
         require(this.signedPrekeyPrivateKeyBytes.size == 32) { "signed prekey private key must be 32 bytes" }
         require(signedPrekeyId >= 0) { "signedPrekeyId must be >= 0" }
         require(nextOneTimePrekeyId >= 0) { "nextOneTimePrekeyId must be >= 0" }
+        // >= 1, never 0: PrekeyBundle.sequenceNumber only requires >= 0, but this counter is the
+        // NEXT value PrekeyStore.publishBundle will claim, and 0 is reserved to mean "no bundle has
+        // ever been published by this store yet" is not a distinction this counter needs to make
+        // (every store starts at 1, mirroring PrekeyStore.INITIAL_BUNDLE_SEQUENCE_NUMBER) - so a
+        // stored value of 0 can only mean a corrupted/tampered/pre-this-fix file, never a
+        // legitimately-reached state.
+        require(nextBundleSequenceNumber >= 1) { "nextBundleSequenceNumber must be >= 1" }
         require(entries.size <= PrekeyStoreFileFormat.MAX_ONE_TIME_PREKEY_ENTRIES) {
             "at most ${PrekeyStoreFileFormat.MAX_ONE_TIME_PREKEY_ENTRIES} one-time prekey entries allowed"
         }
@@ -104,10 +112,10 @@ internal class PrekeyStoreState(
  * ```
  * magic(4) "LNPS" | version(1) | flags(1, reserved) | ownerIdentity(33) |
  * x25519IdentityPrivateKey(32) | signedPrekeyId(4) | signedPrekeyPrivateKey(32) |
- * nextOneTimePrekeyId(4) | oneTimePrekeyEntryCount(2) |
+ * nextOneTimePrekeyId(4) | nextBundleSequenceNumber(8) | oneTimePrekeyEntryCount(2) |
  * ( id(4) | state(1) | privateKey(32) ) * oneTimePrekeyEntryCount
  * ```
- * Worst case: `113 + 4096 * 37 = 151,665` bytes.
+ * Worst case: `121 + 4096 * 37 = 151,673` bytes.
  */
 object PrekeyStoreFileFormat {
     private val MAGIC = "LNPS".toByteArray(Charsets.US_ASCII)
@@ -122,7 +130,8 @@ object PrekeyStoreFileFormat {
      * that keeps this bounded while never reopening one-time-prekey reuse. */
     const val MAX_ONE_TIME_PREKEY_ENTRIES = 4_096
 
-    private const val BODY_HEADER_SIZE = 4 + 1 + 1 + PUBLIC_KEY_SIZE + X25519_KEY_SIZE + 4 + X25519_KEY_SIZE + 4 + 2
+    private const val BODY_HEADER_SIZE =
+        4 + 1 + 1 + PUBLIC_KEY_SIZE + X25519_KEY_SIZE + 4 + X25519_KEY_SIZE + 4 + 8 + 2
     const val MAX_BODY_SIZE = BODY_HEADER_SIZE + MAX_ONE_TIME_PREKEY_ENTRIES * ENTRY_SIZE
 
     // --- v2 (encrypted-at-rest) header layout - byte-identical shape to KeystoreFileFormat's v2
@@ -141,7 +150,7 @@ object PrekeyStoreFileFormat {
     /** Hard cap on total file size BEFORE ever attempting decryption - unlike
      * `KeystoreFileFormat`'s fixed-size v1/v2 files, this format's ciphertext is variable length
      * (the one-time-prekey list grows), so a total-size cap is genuinely needed rather than a fixed
-     * equality check. `43` (header) `+ 151,665` (worst-case body) `+ 16` (GCM tag). */
+     * equality check. `43` (header) `+ 151,673` (worst-case body) `+ 16` (GCM tag). */
     const val MAX_STORE_FILE_BYTES = V2_HEADER_SIZE + MAX_BODY_SIZE + GCM_TAG_SIZE
 
     /** Public aliases so callers outside this file (e.g. [PrekeyStore]'s v1-to-v2 migration check)
@@ -169,6 +178,7 @@ object PrekeyStoreFileFormat {
             writeInt(state.signedPrekeyId)
             write(state.signedPrekeyPrivateKeyBytes)
             writeInt(state.nextOneTimePrekeyId)
+            writeLong(state.nextBundleSequenceNumber)
             writeShort(state.entries.size)
             state.entries.forEach { entry ->
                 writeInt(entry.id)
@@ -210,6 +220,13 @@ object PrekeyStoreFileFormat {
                 throw CorruptedPrekeyStoreException("nextOneTimePrekeyId must be >= 0: $nextOneTimePrekeyId")
             }
 
+            val nextBundleSequenceNumber = input.readLong()
+            if (nextBundleSequenceNumber < 1) {
+                throw CorruptedPrekeyStoreException(
+                    "nextBundleSequenceNumber must be >= 1: $nextBundleSequenceNumber",
+                )
+            }
+
             val entryCount = input.readUnsignedShort()
             if (entryCount > MAX_ONE_TIME_PREKEY_ENTRIES) {
                 throw CorruptedPrekeyStoreException("too many one-time prekey entries: $entryCount")
@@ -236,6 +253,7 @@ object PrekeyStoreFileFormat {
                 signedPrekeyId = signedPrekeyId,
                 signedPrekeyPrivateKeyBytes = signedPrekeyPrivateKeyBytes,
                 nextOneTimePrekeyId = nextOneTimePrekeyId,
+                nextBundleSequenceNumber = nextBundleSequenceNumber,
                 entries = entries,
             )
         } catch (e: EOFException) {

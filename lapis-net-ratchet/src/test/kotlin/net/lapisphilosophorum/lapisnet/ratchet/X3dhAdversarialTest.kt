@@ -50,10 +50,8 @@ private class AdversarialParty(
             store.x25519IdentityPublicKey,
         )
 
-    fun publishBundle(
-        sequenceNumber: Long = 1,
-        notValidAfterEpochSecond: Long = 500_000L,
-    ): PrekeyBundle = store.publishBundle(identity, sequenceNumber, notValidAfterEpochSecond, nowEpochSecond = 0)
+    fun publishBundle(notValidAfterEpochSecond: Long = 500_000L): PrekeyBundle =
+        store.publishBundle(identity, notValidAfterEpochSecond, nowEpochSecond = 0)
 }
 
 /**
@@ -226,10 +224,11 @@ class X3dhAdversarialTest :
                     bobIdentity,
                     oneTimePrekeyCount = 0,
                 )
+            val bobEncryptionBinding =
+                EncryptionKeyBinding.create(bobIdentity.secp256k1KeyPair, bobStore.x25519IdentityPublicKey)
             val bundle =
                 bobStore.publishBundle(
                     bobIdentity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 500_000L,
                     nowEpochSecond = 0,
                 )
@@ -248,8 +247,10 @@ class X3dhAdversarialTest :
             val responderSession =
                 X3dh.respond(
                     bobIdentity.secp256k1KeyPair.publicKey,
+                    bobEncryptionBinding,
                     bobStore.x25519IdentityPrivateKey(),
                     bobStore.signedPrekeyId,
+                    bobStore.signedPrekeyPublicKey,
                     bobStore.signedPrekeyPrivateKey(),
                     initiation.header,
                     consumedOneTimePrekey = null,
@@ -267,7 +268,6 @@ class X3dhAdversarialTest :
             val bobWithOtpBundle =
                 bobWithOtpStore.publishBundle(
                     bobWithOtpIdentity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 500_000L,
                     nowEpochSecond = 0,
                 )
@@ -302,7 +302,6 @@ class X3dhAdversarialTest :
             val malloryBundleTemplate =
                 malloryStore.publishBundle(
                     mallory,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 500_000L,
                     nowEpochSecond = 0,
                 )
@@ -434,8 +433,10 @@ class X3dhAdversarialTest :
             val bobSession =
                 X3dh.respond(
                     bob.identity.secp256k1KeyPair.publicKey,
+                    bob.encryptionBinding,
                     bob.store.x25519IdentityPrivateKey(),
                     bob.store.signedPrekeyId,
+                    bob.store.signedPrekeyPublicKey,
                     bob.store.signedPrekeyPrivateKey(),
                     aliceInitiation.header,
                     consumed,
@@ -476,10 +477,11 @@ class X3dhAdversarialTest :
                     bobIdentity,
                     oneTimePrekeyCount = 0,
                 )
+            val bobEncryptionBinding =
+                EncryptionKeyBinding.create(bobIdentity.secp256k1KeyPair, bobStore.x25519IdentityPublicKey)
             val bundle =
                 bobStore.publishBundle(
                     bobIdentity,
-                    sequenceNumber = 1,
                     notValidAfterEpochSecond = 500_000L,
                     nowEpochSecond = 0,
                 )
@@ -495,8 +497,10 @@ class X3dhAdversarialTest :
             val firstResponse =
                 X3dh.respond(
                     bobIdentity.secp256k1KeyPair.publicKey,
+                    bobEncryptionBinding,
                     bobStore.x25519IdentityPrivateKey(),
                     bobStore.signedPrekeyId,
+                    bobStore.signedPrekeyPublicKey,
                     bobStore.signedPrekeyPrivateKey(),
                     initiation.header,
                     consumedOneTimePrekey = null,
@@ -506,8 +510,10 @@ class X3dhAdversarialTest :
             val secondResponse =
                 X3dh.respond(
                     bobIdentity.secp256k1KeyPair.publicKey,
+                    bobEncryptionBinding,
                     bobStore.x25519IdentityPrivateKey(),
                     bobStore.signedPrekeyId,
+                    bobStore.signedPrekeyPublicKey,
                     bobStore.signedPrekeyPrivateKey(),
                     initiation.header,
                     consumedOneTimePrekey = null,
