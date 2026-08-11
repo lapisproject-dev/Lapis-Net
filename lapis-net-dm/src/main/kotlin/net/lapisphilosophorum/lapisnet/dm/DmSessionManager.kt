@@ -6,10 +6,12 @@ import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.EncryptionKeyBinding
+import net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException
 import net.lapisphilosophorum.lapisnet.identity.KeystoreEncryption
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.ratchet.CorruptedRatchetSessionException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSession
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSessionCodec
@@ -34,6 +36,9 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 private val logger = KotlinLogging.logger {}
 
@@ -175,6 +180,37 @@ class DmSessionManager private constructor(
 ) {
     private lateinit var dmProtocol: DmProtocol
 
+    /** Guards [cachedKey] against the race between [stop]'s `cachedKey.fill(0)` and an IN-FLIGHT
+     * [persistSession]/[loadPersisted] call reading it - follow-up hardening item 2 (2026-08-11).
+     * Traced, not assumed: [withPeerLock]'s per-peer stripe lock (held by every [persistSession]/
+     * [loadPersisted] call site, both only ever called from within [send]/[handleInboundEnvelope]'s
+     * `withPeerLock` blocks) gives NO protection here, because [stop] never acquires a stripe lock at
+     * all before zeroing [cachedKey] - it only takes `synchronized(liveSessionCache)` (a DIFFERENT
+     * monitor) for the live-session-destroy loop, then calls `cachedKey.fill(0)` completely
+     * unguarded. Without this lock, a concurrent [stop] could zero [cachedKey] WHILE
+     * [DoubleRatchetSessionCodec.encodeWithKey]/`decodeWithKey` is mid-read of it on another thread -
+     * not a data race in the memory-safety sense (`ByteArray.fill` and a sequential read are
+     * `synchronized`-free but each individual byte write/read is still atomic on the JVM), but a
+     * genuine CORRECTNESS race: the in-flight call could observe a PARTIALLY-zeroed key (some bytes
+     * already overwritten, others not), silently persisting a session file encrypted under neither
+     * the real key nor a all-zero key - undecryptable by ANY key, including a future correctly-
+     * re-derived one, unlike the fully-zeroed case this class's own [stop] doc comment already
+     * accepts and documents ("persisting or loading a session would silently use an all-zero key").
+     *
+     * A [ReentrantReadWriteLock] makes the two well-defined outcomes exact: [persistSession]/
+     * [loadPersisted] (readers, [read]) may run concurrently with each other exactly as they always
+     * could ([withPeerLock]'s stripe locks already serialize same-peer access; DIFFERENT peers'
+     * encode/decode calls were never serialized against each other and still are not - this lock adds
+     * no new contention on that path). [stop] (the sole writer, [write]) either waits for every
+     * CURRENTLY in-flight reader to finish before zeroing (so that read observes the real key, start
+     * to finish, never a half-zeroed one), or - if it wins the race - fully zeroes [cachedKey] BEFORE
+     * a reader that arrives after can start, so that reader deterministically observes the documented
+     * all-zero key, not a torn intermediate state. Never contends with [withPeerLock]'s stripe locks
+     * or the `liveSessionCache` monitor (disjoint lock ordering: stripe lock, if any, is always
+     * acquired OUTSIDE/BEFORE this lock, and [stop] never holds a stripe lock at all) - no deadlock
+     * risk. */
+    private val cachedKeyLock = ReentrantReadWriteLock()
+
     private val dialSemaphore = Semaphore(MAX_CONCURRENT_OUTBOUND_DIALS)
 
     /** Bounds concurrent [PrekeyStore.consumeOneTimePrekey] calls triggered by inbound `X3DH_INITIAL`
@@ -303,11 +339,33 @@ class DmSessionManager private constructor(
             liveSessionCache[peer]
         }
 
+    /** Destroys any session PREVIOUSLY cached for [peer] before installing [session] in its place -
+     * follow-up hardening item 1 (2026-08-11). [LinkedHashMap.removeEldestEntry] is only ever
+     * consulted when a NEW key is inserted, never when an EXISTING key's value is overwritten
+     * (verified against the JDK's own `LinkedHashMap`/`HashMap.putVal` source: the `afterNodeInsertion`
+     * hook `removeEldestEntry` hangs off only runs on the "created a new node" branch) - so a plain
+     * `liveSessionCache[peer] = session` overwrite previously left the SUPERSEDED session's
+     * root/chain/ratchet-private key material un-zeroed on the heap until GC, unlike every other path
+     * that removes an entry from this cache ([removeEldestEntry] itself, [stop]). This matters
+     * concretely for [handleInboundEnvelope]'s `X3DH_INITIAL` branch: a second, legitimate
+     * `X3DH_INITIAL` from a `claimedSender` that already had a live cached session (the residual gap
+     * this class's own doc comment already discloses under "No session registry beyond...") bootstraps
+     * a brand-new [DoubleRatchetSession] and calls this function to install it - the OLD session for
+     * that same peer must be destroyed here, not merely dropped. Safe to call on a peer with no prior
+     * entry (`get` returns `null`, [DoubleRatchetSession.destroy] is simply skipped) and safe even if
+     * [session] and the previously-cached value happen to be THE SAME instance (the normal
+     * re-persist-and-recache path after a successful decrypt/encrypt, see [send] and
+     * [handleInboundEnvelope]'s `TEXT` branch) - [DoubleRatchetSession.destroy] on a session then
+     * immediately continuing to use that same live instance would be a correctness bug, so this
+     * function deliberately does NOT destroy when the previous and new values are reference-identical. */
     private fun putCached(
         peer: Secp256k1PublicKey,
         session: DoubleRatchetSession,
     ) {
-        synchronized(liveSessionCache) { liveSessionCache[peer] = session }
+        synchronized(liveSessionCache) {
+            val previous = liveSessionCache.put(peer, session)
+            if (previous != null && previous !== session) previous.destroy()
+        }
     }
 
     private fun getCachedOrLoad(peer: Secp256k1PublicKey): DoubleRatchetSession? {
@@ -515,6 +573,59 @@ class DmSessionManager private constructor(
                                 }
                                 return@withPeerLock
                             }
+                            // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
+                            // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
+                            // null` (a "signed-prekey-only" X3DH_INITIAL, no one-time prekey named) -
+                            // deliberately, not an oversight. Traced, not assumed:
+                            // [prekeyConsumptionRateLimiter]/[prekeyConsumptionSemaphore] exist to
+                            // bound ONE SPECIFIC expensive operation - [PrekeyStore.consumeOneTimePrekey]'s
+                            // Argon2id derivation (64 MiB/3 passes) behind [PrekeyStore]'s single
+                            // shared per-file lock (see [prekeyConsumptionSemaphore]'s own doc comment).
+                            // When `oneTimePrekeyId` is null, this `?.let` block never runs AT ALL -
+                            // `consumeOneTimePrekey` is never called, so that specific expensive,
+                            // lock-contending operation these two mitigations exist to protect is
+                            // categorically untouched by this path, not merely under-protected.
+                            //
+                            // What a no-OTPK X3DH_INITIAL costs INSTEAD (traced through
+                            // [X3dh.respond] and [DoubleRatchetSession.initializeReceiver]): the SAME
+                            // [EncryptionKeyBinding.create] self-sign this class always performs one
+                            // line below regardless of this branch, 3 X25519 Diffie-Hellman agreements
+                            // plus one HKDF derivation (`dh4`/the one-time-prekey DH term is simply
+                            // never computed), and one AES-GCM ratchet-message decrypt attempt further
+                            // down - ordinary constant-time symmetric/EC-curve arithmetic, microseconds
+                            // each, NO Argon2id anywhere in that chain. This is the SAME order of
+                            // magnitude of per-envelope work every OTHER inbound envelope already
+                            // costs unconditionally (e.g. a `TEXT` envelope's own ratchet decrypt) -
+                            // not a novel unbounded-resource-per-request the way Argon2id-guarded
+                            // [PrekeyStore] access is, so reusing (or duplicating) either mitigation
+                            // here would bound a resource that was never actually at risk.
+                            //
+                            // **Also the one wire shape a genuinely LEGITIMATE initiator produces**:
+                            // [X3dh.initiate]'s own `oneTimePrekey` selection (see that function) is
+                            // `null` exactly when the RESPONDER's own currently-published
+                            // [net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle] has an EMPTY
+                            // `oneTimePrekeys` list - i.e. this exact node's own pool was already
+                            // exhausted (transiently, between [replenishOneTimePrekeysIfLow] triggering
+                            // and the republished bundle propagating). Applying the OTPK-consumption
+                            // rate limit here too would throttle honest first-contact attempts reacting
+                            // to THIS node's own degraded-but-still-working fallback, on top of a
+                            // resource ([PrekeyStore]) that fallback doesn't even touch.
+                            //
+                            // Residual risk this leaves accepted, not eliminated: a flood of
+                            // structurally-valid, genuinely self-signed (real ECDSA sign, one throwaway
+                            // identity per attempt - the same "costs an attacker microseconds of local
+                            // CPU" cost [prekeyConsumptionSemaphore]'s own doc comment already accepts
+                            // as unavoidable at this layer) no-OTPK X3DH_INITIAL envelopes could still
+                            // force many cheap-but-nonzero handshake attempts. That volume is bounded
+                            // by the connection/stream-level defenses ABOVE this layer instead -
+                            // [MAX_CONCURRENT_STREAMS_PER_PEER], [DmProtocolHandler]'s frame-size cap
+                            // and slowloris/absolute-lifetime timeouts, and [MAX_LIVE_SESSIONS]'s
+                            // LRU-eviction cap on how many resulting sessions can pile up in
+                            // [liveSessionCache] - plus a global connection cap at the [LapisNode] level
+                            // (see [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]'s own
+                            // `MAX_CONCURRENT_CONNECTIONS`, follow-up hardening item 5, same 2026-08-11
+                            // wave), none of which are specific to the one-time-prekey resource these
+                            // two fields guard.
                             val consumed =
                                 header.oneTimePrekeyId?.let { id ->
                                     // See prekeyConsumptionRateLimiter's own doc comment for why a
@@ -768,12 +879,16 @@ class DmSessionManager private constructor(
 
     /** Atomic temp-file-then-[Files.move] write - durable against a crash mid-write. See this
      * class's own doc comment for why this stops short of [PrekeyStore]'s full cross-process
-     * sidecar-lock discipline. */
+     * sidecar-lock discipline. The [cachedKey] read itself is wrapped in [cachedKeyLock]'s read lock -
+     * see that field's own doc comment for exactly which race this closes. */
     private fun persistSession(
         peer: Secp256k1PublicKey,
         session: DoubleRatchetSession,
     ) {
-        val bytes = DoubleRatchetSessionCodec.encodeWithKey(session, cachedKey, kdfParams, random)
+        val bytes =
+            cachedKeyLock.read {
+                DoubleRatchetSessionCodec.encodeWithKey(session, cachedKey, kdfParams, random)
+            }
         val target = sessionFilePath(peer)
         val tempFile =
             if (supportsPosixPermissions(sessionStoreDirectory)) {
@@ -790,11 +905,53 @@ class DmSessionManager private constructor(
         Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
 
+    /** Returns `null` - "no persisted session, start fresh" - not just when no file exists, but also
+     * when a file DOES exist but fails to decode: either [CorruptedRatchetSessionException]
+     * (structural corruption - wrong size, bad header, an out-of-range/inconsistent field) or
+     * [KeystoreDecryptionException] (AEAD authentication failure - a wrong key, or ANY tampered byte
+     * anywhere in the header or ciphertext). Deliberately DIFFERENT from
+     * [net.lapisphilosophorum.lapisnet.identity.FileIdentityRepository]'s own "corrupted keystore
+     * file fails loudly, never silently recovers" discipline - that distinction is intentional, not
+     * an oversight: an identity keystore is this node's ONE irreplaceable secret, so silently
+     * treating a corrupt one as "absent" could mask real tampering or lose an unrecoverable key. A
+     * persisted DM session, by contrast, is a disposable, ALWAYS-re-derivable cache - this class's own
+     * doc comment already documents that a second, legitimate `X3DH_INITIAL` from a peer who lost
+     * local state simply bootstraps a brand-new session, no special handling needed. Recovering from
+     * a corrupt session file exactly the same way (treat as absent, let the next [send]/inbound
+     * `X3DH_INITIAL` re-handshake) is consistent with that already-accepted design, not a new gap:
+     * before this fix, [decodeWithKey][DoubleRatchetSessionCodec.decodeWithKey]'s exception simply
+     * propagated up through [getCachedOrLoad] into [send]/[handleInboundEnvelope] uncaught -
+     * [handleInboundEnvelope]'s own top-level `catch (e: RuntimeException)` happened to keep the node
+     * alive, but every inbound message for that peer would then be silently dropped by that
+     * catch-all forever (no re-handshake could ever succeed either, since the SAME corrupt file
+     * would be hit again on every subsequent [getCachedOrLoad] call) - and [send] had no such
+     * catch-all at all, so a corrupt session file would surface as an opaque crash to the caller
+     * instead of the documented "unknown recipient"/"handshake failed" exception taxonomy. Also
+     * covered by [cachedKeyLock]'s read lock - see that field's own doc comment. */
     private fun loadPersisted(peer: Secp256k1PublicKey): DoubleRatchetSession? {
         val target = sessionFilePath(peer)
         if (!Files.exists(target)) return null
         val bytes = Files.readAllBytes(target)
-        return DoubleRatchetSessionCodec.decodeWithKey(bytes, cachedKey, random)
+        return cachedKeyLock.read {
+            try {
+                DoubleRatchetSessionCodec.decodeWithKey(bytes, cachedKey, random)
+            } catch (e: CorruptedRatchetSessionException) {
+                logger.warn(e) {
+                    "persisted DM session file for ${peer.fingerprint()} at $target is structurally " +
+                        "corrupt - treating as no persisted session; a fresh X3DH handshake will " +
+                        "bootstrap a new one on the next send/inbound X3DH_INITIAL"
+                }
+                null
+            } catch (e: KeystoreDecryptionException) {
+                logger.warn(e) {
+                    "persisted DM session file for ${peer.fingerprint()} at $target failed to " +
+                        "decrypt (wrong key or tampered ciphertext) - treating as no persisted " +
+                        "session; a fresh X3DH handshake will bootstrap a new one on the next " +
+                        "send/inbound X3DH_INITIAL"
+                }
+                null
+            }
+        }
     }
 
     private fun supportsPosixPermissions(path: Path): Boolean = "posix" in path.fileSystem.supportedFileAttributeViews()
@@ -826,7 +983,11 @@ class DmSessionManager private constructor(
      * call more than once ([ByteArray.fill] on an already-zeroed array is a no-op); this manager is
      * not usable again afterward regardless (persisting or loading a session would silently use an
      * all-zero key), matching every other `stop()` in this codebase being a one-way shutdown, not a
-     * pause/resume. */
+     * pause/resume.
+     *
+     * **[cachedKey.fill(0)][cachedKey] runs under [cachedKeyLock]'s WRITE lock** - see that field's
+     * own doc comment for the exact race this closes against a concurrent, in-flight
+     * [persistSession]/[loadPersisted] call on another thread. */
     fun stop() {
         synchronized(liveSessionCache) {
             liveSessionCache.values.forEach { it.destroy() }
@@ -834,7 +995,7 @@ class DmSessionManager private constructor(
         }
         if (::dmProtocol.isInitialized) dmProtocol.stop()
         replenishmentExecutor.shutdownNow()
-        cachedKey.fill(0)
+        cachedKeyLock.write { cachedKey.fill(0) }
     }
 
     companion object {

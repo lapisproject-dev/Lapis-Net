@@ -69,8 +69,26 @@ import java.nio.ByteBuffer
  *    137-byte section's sub-fields must be exactly all-zero/0 - a non-zero "absent" slot is tamper
  *    evidence, rejected.
  * 8. `ratchetMessageLength` - range-checked (`1..RatchetMessageCodec.MAX_MESSAGE_BYTES`) BEFORE the
- *    corresponding `ByteArray(ratchetMessageLength)` allocation - the load-bearing "length validated
- *    before allocation" gate for the one genuinely variable-length field in this format.
+ *    corresponding `ByteArray(ratchetMessageLength)` allocation, for the one genuinely
+ *    variable-length field in this format. **Tightened doc, follow-up hardening item 4
+ *    (2026-08-11): this check's UPPER bound is not what actually caps the allocation size, and
+ *    calling it "the load-bearing gate" (an earlier revision of this comment did) overstated what it
+ *    does.** `ratchetMessageLength` comes from `readUnsignedShort()`, whose result range is
+ *    `0..65535` by construction (a fixed 2-byte wire field) - and
+ *    `RatchetMessageCodec.MAX_MESSAGE_BYTES` is exactly `65_535`, so
+ *    `ratchetMessageLength > RatchetMessageCodec.MAX_MESSAGE_BYTES` can NEVER be true; that half of
+ *    the comparison is dead code, not a genuinely reachable rejection. The real, load-bearing reason
+ *    the `ByteArray(ratchetMessageLength)` allocation below can never run away is STRUCTURAL, not
+ *    this explicit check: a 2-byte length field can only ever encode a value up to 65,535 in the
+ *    first place, and 65,535 bytes is itself a small, unconditionally safe allocation size regardless
+ *    of whether anything explicitly gates it (this codec's actual defense against a genuinely
+ *    attacker-controlled oversized declared length lives one layer OUT, in
+ *    [net.lapisphilosophorum.lapisnet.dm.MAX_ENVELOPE_BYTES]'s own frame-level ceiling in `decode`'s
+ *    first line and, redundantly, in `DmProtocolHandler`'s Netty `LengthFieldBasedFrameDecoder` - see
+ *    that class's own doc comment). What this specific comparison DOES genuinely, reachably enforce
+ *    is the LOWER bound: `ratchetMessageLength >= 1`, rejecting a declared length of exactly `0` (an
+ *    empty, meaningless ratchet-message body) that `readUnsignedShort()` could otherwise legitimately
+ *    produce.
  * 9. Declared length must match actual remaining frame size exactly - no trailing bytes, no
  *    truncation.
  * 10. [RatchetMessageCodec.decode] - its OWN independent size/range/canonical-encoding checks run
@@ -263,8 +281,12 @@ object DmEnvelopeCodec {
                 x3dhInitialHeader = null
             }
 
-            // The load-bearing "length validated before allocation" gate: ratchetMessageLength is
-            // range-checked BEFORE the ByteArray(ratchetMessageLength) allocation below.
+            // ratchetMessageLength is range-checked BEFORE the ByteArray(ratchetMessageLength)
+            // allocation below - see this object's class doc comment step 8 (follow-up hardening item
+            // 4, 2026-08-11) for exactly what this check does and does not enforce: the reachable part
+            // is the >= 1 lower bound; the <= MAX_MESSAGE_BYTES upper bound can never actually fire,
+            // since readUnsignedShort()'s own 2-byte width already structurally caps this value at
+            // 65,535 (== MAX_MESSAGE_BYTES), which is itself a small, safe allocation size regardless.
             val ratchetMessageLength = input.readUnsignedShort()
             if (ratchetMessageLength !in 1..RatchetMessageCodec.MAX_MESSAGE_BYTES) {
                 throw MalformedDmEnvelopeException(

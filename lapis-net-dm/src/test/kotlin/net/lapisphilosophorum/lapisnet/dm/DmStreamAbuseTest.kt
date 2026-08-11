@@ -575,6 +575,103 @@ class DmStreamAbuseTest :
                 victim.stop()
             }
         }
+
+        test(
+            "(j) an attacker who harvests a legitimate correspondent's REAL, publicly-gossiped " +
+                "EncryptionKeyBinding (PrekeyBundle.encryptionBinding, broadcast by PrekeyBundleGossip - " +
+                "no secret material, anyone can read it) and replays it in a forged X3DH_INITIAL claiming " +
+                "to BE that correspondent is still rejected - the harvested binding alone lets the forged " +
+                "header pass EncryptionKeyBinding.verify (it really IS a valid signature by the " +
+                "correspondent's identity), but the attacker never held the correspondent's X25519 IDENTITY " +
+                "PRIVATE key (only its PUBLIC half is ever gossiped), so the resulting X3DH shared secret " +
+                "the victim derives can never match what any ratchet message the attacker can actually " +
+                "produce would decrypt under - follow-up hardening item 6 (2026-08-11), a permanent " +
+                "regression test for a security-audit ad-hoc probe that was never committed. The victim's " +
+                "REAL, already-established session with the genuine correspondent is unaffected: this " +
+                "forged attempt claims the SAME identity (same withPeerLock stripe, same liveSessionCache " +
+                "slot) but X3DH_INITIAL always bootstraps a BRAND-NEW session object first and only " +
+                "persists/caches it AFTER a successful decrypt (see handleInboundEnvelope's own doc " +
+                "comment) - since decrypt never succeeds here, the genuine cached session for the " +
+                "correspondent is never even touched, let alone overwritten.",
+        ) {
+            val victim = buildDmTestNode()
+            val correspondent = buildDmTestNode()
+            try {
+                connectAndConverge(correspondent, victim)
+
+                val identityCorrespondent = correspondent.identity.secp256k1KeyPair.publicKey
+                val identityVictim = victim.identity.secp256k1KeyPair.publicKey
+
+                val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                victim.dmSessionManager.addInboundListener { received.add(it) }
+
+                // A REAL, X3DH-bootstrapped session between the correspondent and the victim - the
+                // genuine session this forged attempt must not disturb.
+                sendAndAwait(correspondent, victim, identityVictim, received, "hello from the real correspondent")
+
+                // Harvest the correspondent's REAL, currently-published EncryptionKeyBinding exactly the
+                // way any peer on the network legitimately can - a plain PrekeyBundleGossip lookup, no
+                // secret material involved, mirroring PrekeyBundle.x25519IdentityKey's own "read-through
+                // alias" doc comment on what this field actually is: public.
+                val harvestedBinding =
+                    requireNotNull(victim.prekeyBundleGossip.lookup(identityCorrespondent)) {
+                        "connectAndConverge should have made the correspondent's bundle visible to the victim"
+                    }.encryptionBinding
+
+                // Forge an X3DH_INITIAL claiming senderIdentity = the CORRESPONDENT (impersonation, not
+                // just an unrelated throwaway identity like cases (h)/(h2)), reusing the harvested REAL
+                // binding - it verifies fine, since it really was signed by the correspondent's identity
+                // key. The ephemeral key is the attacker's own fresh one (X3DH ephemerals are per-message
+                // and never gossiped, so there is nothing of the correspondent's to harvest there) - the
+                // attacker has no way to supply the correspondent's real X25519 IDENTITY private key,
+                // only its binding's public half, so X3dh.initiate() itself cannot be used here at all
+                // (it hard-checks the supplied private key matches the binding's public key) - this
+                // forged header is hand-constructed directly, exactly like cases (h)/(h2).
+                val random = SecureRandom()
+                val targetOneTimePrekeyId = victim.prekeyStore.availableOneTimePrekeyIds().first()
+                val forgedHeader =
+                    X3dhPreKeyMessageHeader(
+                        initiatorIdentity = identityCorrespondent,
+                        initiatorEncryptionBinding = harvestedBinding,
+                        ephemeralPublicKey = X25519KeyPair.generate(random).publicKey,
+                        signedPrekeyId = victim.prekeyStore.signedPrekeyId,
+                        oneTimePrekeyId = targetOneTimePrekeyId,
+                    )
+                // The attacker cannot produce a ratchet message that actually decrypts under the real
+                // shared secret the victim will derive (that would require the correspondent's real
+                // X25519 identity private key) - any structurally-valid ratchet message stands in for
+                // "the best an attacker without that key can do", mirroring cases (h)/(h2)'s identical
+                // use of dmSampleRatchetMessage() for the same reason.
+                val forgedEnvelope =
+                    DmEnvelope(
+                        DmMessageType.X3DH_INITIAL,
+                        identityCorrespondent,
+                        forgedHeader,
+                        dmSampleRatchetMessage(),
+                    )
+                val forgedBytes = DmEnvelopeCodec.encode(forgedEnvelope)
+
+                val beforeCount = received.size
+                victim.dmSessionManager.handleInboundEnvelope(victim.node.peerId, forgedBytes)
+
+                // Never delivered - decrypt fails, the claimed identity is never trusted on its own.
+                received.size shouldBe beforeCount
+
+                // The victim's REAL session with the genuine correspondent is unaffected: a genuinely
+                // NEXT message from the correspondent still decrypts fine, proving the rejected forged
+                // attempt never touched (let alone overwrote) the real cached/persisted session state.
+                sendAndAwait(
+                    correspondent,
+                    victim,
+                    identityVictim,
+                    received,
+                    "genuinely the next message from the real correspondent",
+                )
+            } finally {
+                correspondent.stop()
+                victim.stop()
+            }
+        }
     })
 
 /** Sends [plaintext] from [from] to [recipientIdentity] (== [to]'s identity) and polls [received]
