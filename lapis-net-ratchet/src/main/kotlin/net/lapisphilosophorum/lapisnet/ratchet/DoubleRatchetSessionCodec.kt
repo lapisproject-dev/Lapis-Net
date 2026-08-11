@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.ratchet
 
+import net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException
 import net.lapisphilosophorum.lapisnet.identity.KeystoreEncryption
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.X25519PublicKey
@@ -8,7 +9,12 @@ import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.security.GeneralSecurityException
 import java.security.SecureRandom
+import javax.crypto.AEADBadTagException
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /** Thrown when a persisted [DoubleRatchetSession] file fails to load: wrong size, bad header, or a
  * structural inconsistency in the decrypted body (an out-of-range presence byte, a non-zero "absent"
@@ -171,6 +177,30 @@ internal class DoubleRatchetSessionState(
  *    v1 body genuinely IS a whole file. Here the body is never standalone, so a distinct magic makes
  *    "someone fed me a decrypted body as if it were a file" (or vice versa) a loud, immediate
  *    rejection.
+ *
+ * **V0.8.4 addition: [encodeWithKey]/[decodeWithKey], bypassing per-call Argon2id.** This class's
+ * own doc comment (rule 3 of the "persist and destroy ordering" section, above) already flagged
+ * that a live network message-send path calling [encode]/[decode] once per message - each re-running
+ * Argon2id at [KeystoreEncryption.DEFAULT_MEMORY_KIB]/[KeystoreEncryption.DEFAULT_ITERATIONS] (64
+ * MiB / 3 passes, order 10^2 ms-10^3 ms) - is "not viable as a live network message-send path's
+ * per-message cost." [encodeWithKey]/[decodeWithKey] take an ALREADY-DERIVED 32-byte AES key
+ * directly, skipping [KeystoreEncryption.deriveKey] entirely, so a caller (`lapis-net-dm`'s
+ * `DmSessionManager`) can derive the key ONCE per process lifetime and reuse it for every
+ * session-persist call thereafter. **The wire format is byte-IDENTICAL to [encode]/[decode]** - the
+ * header still carries the real [KeystoreEncryption.Params]/salt (so the file stays
+ * self-describing and portable, e.g. for a future recovery CLI using the slow [decode] path); only
+ * the AES-256-GCM key's ORIGIN differs (a raw `key` parameter instead of
+ * [KeystoreEncryption.deriveKey]`(passphrase, params)`). [encode] delegates into [encodeWithKey]
+ * once it has a key; [decode] and [decodeWithKey] both funnel into the shared private
+ * `decodeWithParsedHeader` once THEY have a key, so [parseAndValidateHeader] runs exactly once per
+ * call either way and there is exactly one AEAD-header-assembly/parsing implementation, not two.
+ * **A caller-supplied `key` that did not actually come from this file's own
+ * `params`/salt cannot be detected as wrong by [decodeWithKey] itself** - nothing here can verify
+ * `key`'s provenance - it simply fails the AEAD tag and throws [KeystoreDecryptionException], the
+ * same safe failure a wrong passphrase produces today. [decodeWithKey] still runs every existing
+ * structural/range/sanity-cap check [decode] runs (size cap, magic, version, kdfId, implausible-
+ * Argon2-cost-parameter caps) BEFORE attempting AES-GCM decryption - none of that discipline is
+ * weakened by skipping Argon2id.
  */
 object DoubleRatchetSessionCodec {
     private val FILE_MAGIC = "LNRS".toByteArray(Charsets.US_ASCII)
@@ -450,51 +480,103 @@ object DoubleRatchetSessionCodec {
         }
     }
 
-    /** Serialises [session]'s CURRENT state and encrypts it at rest under [passphrase], reusing
-     * [KeystoreEncryption] (Argon2id + AES-256-GCM) verbatim. The 43-byte header is assembled FIRST
-     * and used as the GCM AAD.
-     *
-     * **This function is a PURE READ of [session]: it mutates nothing and destroys nothing.** See
-     * [DoubleRatchetSession]'s persist/destroy-ordering doc-comment section for why that is the
-     * correct contract and where the ordering that actually matters lives instead (the caller's).
-     *
-     * **Zeroes its own plaintext body in a `finally`**, unlike `KeystoreFileFormat.encodeEncrypted`
-     * and `PrekeyStoreFileFormat.encodeEncrypted`, both of which leave theirs on the heap - a
-     * pre-existing gap in those two, deliberately not touched by this wave (different files,
-     * different waves); noted here so the divergence reads as intentional. */
-    fun encode(
+    /** Raw AES-256-GCM encrypt under an ALREADY-DERIVED [key] - the shared primitive [encode] (via
+     * [encodeWithKey]) uses once it has a key, whether that key was just derived from a passphrase
+     * or was handed in directly by [encodeWithKey]'s own caller. Mirrors
+     * `DoubleRatchetSession.kt`'s private `aesGcmEncrypt` top-level function exactly - duplicated
+     * rather than shared because that one is `private` to a different file and this class has no
+     * existing internal-visibility channel to it worth introducing for one function. */
+    private fun aesGcmEncryptWithKey(
+        key: ByteArray,
+        nonce: ByteArray,
+        aad: ByteArray,
+        plaintext: ByteArray,
+    ): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            GCMParameterSpec(KeystoreEncryption.GCM_TAG_BITS, nonce),
+        )
+        cipher.updateAAD(aad)
+        return cipher.doFinal(plaintext)
+    }
+
+    /** Raw AES-256-GCM decrypt under an ALREADY-DERIVED [key], funnelling every AEAD/JCE failure
+     * into [KeystoreDecryptionException] - mirrors [KeystoreEncryption.decrypt]'s own funnel
+     * exactly, so a caller cannot distinguish "wrong key" from "wrong passphrase" by exception
+     * shape, only by which entry point ([decode] vs. [decodeWithKey]) it called. */
+    private fun aesGcmDecryptWithKey(
+        key: ByteArray,
+        nonce: ByteArray,
+        aad: ByteArray,
+        ciphertext: ByteArray,
+    ): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        try {
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(KeystoreEncryption.GCM_TAG_BITS, nonce),
+            )
+            cipher.updateAAD(aad)
+            return cipher.doFinal(ciphertext)
+        } catch (e: AEADBadTagException) {
+            throw KeystoreDecryptionException(
+                "session decryption failed: wrong key or corrupted/tampered session file",
+                e,
+            )
+        } catch (e: GeneralSecurityException) {
+            throw KeystoreDecryptionException("session decryption failed: ${e.message}", e)
+        }
+    }
+
+    /** Assembles the 43-byte v1 header from already-decided [params]/[nonce] - the ONE header-
+     * assembly implementation [encode] and [encodeWithKey] both funnel through, so the two can never
+     * drift into assembling byte-different headers for the same logical inputs. */
+    private fun assembleHeader(
+        params: KeystoreEncryption.Params,
+        nonce: ByteArray,
+    ): ByteArray {
+        val header = ByteBuffer.allocate(V1_HEADER_SIZE)
+        header.put(FILE_MAGIC)
+        header.put(FILE_VERSION)
+        header.put(KeystoreEncryption.KDF_ID_ARGON2ID)
+        header.putInt(params.memoryKiB)
+        header.putInt(params.iterations)
+        header.put(params.parallelism.toByte())
+        header.put(params.salt)
+        header.put(nonce)
+        val headerBytes = header.array()
+        check(headerBytes.size == V1_HEADER_SIZE) { "v1 header assembly produced an unexpected size" }
+        return headerBytes
+    }
+
+    /**
+     * Serialises [session]'s CURRENT state and encrypts it at rest under an ALREADY-DERIVED 32-byte
+     * [key] and [params] (the params this [key] was actually derived from, or claims to have been -
+     * see this class's own doc comment section on [encodeWithKey]/[decodeWithKey] for why a
+     * mismatched `key`/`params` pairing is safe, not a security hole: it simply fails to decrypt
+     * later). Wire-format-identical to [encode]; see that function's doc comment for the shared
+     * "pure read of [session]" and "zeroes its own plaintext body" guarantees, both preserved here
+     * unchanged - [encode] now delegates into this function once it has derived a key.
+     */
+    fun encodeWithKey(
         session: DoubleRatchetSession,
-        passphrase: CharArray,
+        key: ByteArray,
+        params: KeystoreEncryption.Params,
         random: SecureRandom = SecureRandom(),
     ): ByteArray {
+        require(key.size == KeystoreEncryption.DERIVED_KEY_SIZE) {
+            "key must be ${KeystoreEncryption.DERIVED_KEY_SIZE} bytes, was ${key.size}"
+        }
         val state = session.stateForCodec()
         try {
             val plaintext = encodeBody(state)
             try {
-                val salt = ByteArray(KeystoreEncryption.SALT_SIZE).also(random::nextBytes)
                 val nonce = ByteArray(KeystoreEncryption.NONCE_SIZE).also(random::nextBytes)
-
-                val header = ByteBuffer.allocate(V1_HEADER_SIZE)
-                header.put(FILE_MAGIC)
-                header.put(FILE_VERSION)
-                header.put(KeystoreEncryption.KDF_ID_ARGON2ID)
-                header.putInt(KeystoreEncryption.DEFAULT_MEMORY_KIB)
-                header.putInt(KeystoreEncryption.DEFAULT_ITERATIONS)
-                header.put(KeystoreEncryption.DEFAULT_PARALLELISM.toByte())
-                header.put(salt)
-                header.put(nonce)
-                val headerBytes = header.array()
-                check(headerBytes.size == V1_HEADER_SIZE) { "v1 header assembly produced an unexpected size" }
-
-                val params =
-                    KeystoreEncryption.Params(
-                        memoryKiB = KeystoreEncryption.DEFAULT_MEMORY_KIB,
-                        iterations = KeystoreEncryption.DEFAULT_ITERATIONS,
-                        parallelism = KeystoreEncryption.DEFAULT_PARALLELISM,
-                        salt = salt,
-                    )
-                val ciphertext = KeystoreEncryption.encrypt(plaintext, passphrase, params, nonce, headerBytes)
-
+                val headerBytes = assembleHeader(params, nonce)
+                val ciphertext = aesGcmEncryptWithKey(key, nonce, headerBytes, plaintext)
                 val out = ByteArray(V1_HEADER_SIZE + ciphertext.size)
                 headerBytes.copyInto(out, 0)
                 ciphertext.copyInto(out, V1_HEADER_SIZE)
@@ -507,20 +589,60 @@ object DoubleRatchetSessionCodec {
         }
     }
 
-    /**
-     * @throws CorruptedRatchetSessionException on any structural problem, checked BEFORE decryption
-     *   is attempted (size cap, magic, version, kdfId, Argon2 cost-parameter sanity caps) and again
-     *   after (body magic/version/flags/ranges/presence bytes).
-     * @throws net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException for a wrong
-     *   passphrase or ANY tampered byte anywhere in the 43-byte header or the ciphertext - propagated
-     *   UNCHANGED from [KeystoreEncryption.decrypt], mirroring
-     *   [PrekeyStoreFileFormat.decodeEncrypted]'s identical split.
-     */
-    fun decode(
-        bytes: ByteArray,
+    /** Serialises [session]'s CURRENT state and encrypts it at rest under [passphrase], reusing
+     * [KeystoreEncryption] (Argon2id + AES-256-GCM) verbatim. The 43-byte header is assembled FIRST
+     * and used as the GCM AAD.
+     *
+     * **This function is a PURE READ of [session]: it mutates nothing and destroys nothing.** See
+     * [DoubleRatchetSession]'s persist/destroy-ordering doc-comment section for why that is the
+     * correct contract and where the ordering that actually matters lives instead (the caller's).
+     *
+     * **Zeroes its own plaintext body in a `finally`**, unlike `KeystoreFileFormat.encodeEncrypted`
+     * and `PrekeyStoreFileFormat.encodeEncrypted`, both of which leave theirs on the heap - a
+     * pre-existing gap in those two, deliberately not touched by this wave (different files,
+     * different waves); noted here so the divergence reads as intentional.
+     *
+     * [salt] defaults to a fresh random draw (100% preserving every existing caller's behaviour) -
+     * V0.8.4's [DmSessionManager][net.lapisphilosophorum.lapisnet.dm.DmSessionManager] passes a
+     * FIXED, persisted salt instead, the prerequisite for [encodeWithKey]'s key-reuse optimisation
+     * (same passphrase + same salt + same params ⇒ same Argon2id-derived key, safe to cache for a
+     * process's lifetime - see this class's own doc comment section on why). */
+    fun encode(
+        session: DoubleRatchetSession,
         passphrase: CharArray,
         random: SecureRandom = SecureRandom(),
-    ): DoubleRatchetSession {
+        salt: ByteArray = ByteArray(KeystoreEncryption.SALT_SIZE).also(random::nextBytes),
+    ): ByteArray {
+        require(salt.size == KeystoreEncryption.SALT_SIZE) {
+            "salt must be ${KeystoreEncryption.SALT_SIZE} bytes, was ${salt.size}"
+        }
+        val params =
+            KeystoreEncryption.Params(
+                memoryKiB = KeystoreEncryption.DEFAULT_MEMORY_KIB,
+                iterations = KeystoreEncryption.DEFAULT_ITERATIONS,
+                parallelism = KeystoreEncryption.DEFAULT_PARALLELISM,
+                salt = salt,
+            )
+        val key = KeystoreEncryption.deriveKey(passphrase, params)
+        try {
+            return encodeWithKey(session, key, params, random)
+        } finally {
+            key.fill(0)
+        }
+    }
+
+    /** Every structural, PRE-decryption check [decode]/[decodeWithKey] share: size cap, magic,
+     * version, kdfId, Argon2-cost-parameter sanity caps - extracted so the two entry points can
+     * never drift into checking a different set. Returns the parsed [KeystoreEncryption.Params]
+     * plus the exact `nonce`/`aadHeader`/`ciphertext` byte ranges [decodeWithKey] needs next. */
+    private class ParsedSessionHeader(
+        val params: KeystoreEncryption.Params,
+        val nonce: ByteArray,
+        val aadHeader: ByteArray,
+        val ciphertext: ByteArray,
+    )
+
+    private fun parseAndValidateHeader(bytes: ByteArray): ParsedSessionHeader {
         if (bytes.size > MAX_SESSION_FILE_BYTES) {
             throw CorruptedRatchetSessionException("session file exceeds $MAX_SESSION_FILE_BYTES bytes: ${bytes.size}")
         }
@@ -539,7 +661,8 @@ object DoubleRatchetSessionCodec {
         val memoryKiB = header.getInt(MEMORY_OFFSET)
         val iterations = header.getInt(ITERATIONS_OFFSET)
         val parallelism = bytes[PARALLELISM_OFFSET].toInt() and 0xFF
-        // Sanity-cap the KDF cost parameters read off disk BEFORE ever handing them to Argon2.
+        // Sanity-cap the KDF cost parameters read off disk BEFORE ever handing them to Argon2 (or,
+        // for decodeWithKey, before ever treating them as authoritative at all).
         if (memoryKiB <= 0 || memoryKiB > KeystoreEncryption.DEFAULT_MEMORY_KIB * 16) {
             throw CorruptedRatchetSessionException("implausible Argon2 memoryKiB $memoryKiB in session file header")
         }
@@ -560,7 +683,30 @@ object DoubleRatchetSessionCodec {
             } catch (e: IllegalArgumentException) {
                 throw CorruptedRatchetSessionException("malformed KDF params in session file header: ${e.message}")
             }
-        val plaintext = KeystoreEncryption.decrypt(ciphertext, passphrase, params, nonce, aadHeader)
+        return ParsedSessionHeader(params, nonce, aadHeader, ciphertext)
+    }
+
+    /** Shared decrypt-then-rebuild path once a [ParsedSessionHeader] already exists: [decode] and
+     * [decodeWithKey] both need "decrypt under this key, then build a session from the plaintext",
+     * but each starts from a DIFFERENT point (Decode still needs to derive the key from a passphrase;
+     * decodeWithKey already has one) - this is the common suffix, so [parseAndValidateHeader] runs
+     * exactly ONCE per call regardless of which entry point is used, never twice on the same bytes. */
+    private fun decodeWithParsedHeader(
+        parsed: ParsedSessionHeader,
+        key: ByteArray,
+        random: SecureRandom,
+    ): DoubleRatchetSession {
+        val plaintext = aesGcmDecryptWithKey(key, parsed.nonce, parsed.aadHeader, parsed.ciphertext)
+        return buildSessionFromPlaintext(plaintext, random)
+    }
+
+    /** Shared POST-decryption path: decode the plaintext body and rebuild a live session - the
+     * "given a plaintext body, build the session" half [decode] and [decodeWithKey] share, so the
+     * `finally { state.zeroAll() }`/`plaintext.fill(0)` discipline exists exactly once. */
+    private fun buildSessionFromPlaintext(
+        plaintext: ByteArray,
+        random: SecureRandom,
+    ): DoubleRatchetSession {
         try {
             val state = decodeBody(plaintext)
             try {
@@ -587,6 +733,54 @@ object DoubleRatchetSessionCodec {
             }
         } finally {
             plaintext.fill(0)
+        }
+    }
+
+    /**
+     * Decodes a session file encrypted (via [encodeWithKey]) under an ALREADY-DERIVED 32-byte [key]
+     * - see this class's own doc comment section on why this bypasses Argon2id entirely and why a
+     * wrong `key` is a safe, ordinary [KeystoreDecryptionException] failure, never a security hole.
+     * Runs every structural/range/sanity-cap check [decode] runs (size cap, magic, version, kdfId,
+     * implausible-Argon2-cost-parameter caps) BEFORE attempting AES-GCM decryption - identical
+     * discipline, just without ever calling [KeystoreEncryption.deriveKey].
+     *
+     * @throws CorruptedRatchetSessionException on any structural problem - identical conditions to
+     *   [decode].
+     * @throws KeystoreDecryptionException for a wrong `key` or any tampered byte anywhere in the
+     *   43-byte header or the ciphertext.
+     */
+    fun decodeWithKey(
+        bytes: ByteArray,
+        key: ByteArray,
+        random: SecureRandom = SecureRandom(),
+    ): DoubleRatchetSession {
+        require(key.size == KeystoreEncryption.DERIVED_KEY_SIZE) {
+            "key must be ${KeystoreEncryption.DERIVED_KEY_SIZE} bytes, was ${key.size}"
+        }
+        val parsed = parseAndValidateHeader(bytes)
+        return decodeWithParsedHeader(parsed, key, random)
+    }
+
+    /**
+     * @throws CorruptedRatchetSessionException on any structural problem, checked BEFORE decryption
+     *   is attempted (size cap, magic, version, kdfId, Argon2 cost-parameter sanity caps) and again
+     *   after (body magic/version/flags/ranges/presence bytes).
+     * @throws net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException for a wrong
+     *   passphrase or ANY tampered byte anywhere in the 43-byte header or the ciphertext - propagated
+     *   UNCHANGED from [KeystoreEncryption.decrypt], mirroring
+     *   [PrekeyStoreFileFormat.decodeEncrypted]'s identical split.
+     */
+    fun decode(
+        bytes: ByteArray,
+        passphrase: CharArray,
+        random: SecureRandom = SecureRandom(),
+    ): DoubleRatchetSession {
+        val parsed = parseAndValidateHeader(bytes)
+        val key = KeystoreEncryption.deriveKey(passphrase, parsed.params)
+        try {
+            return decodeWithParsedHeader(parsed, key, random)
+        } finally {
+            key.fill(0)
         }
     }
 }

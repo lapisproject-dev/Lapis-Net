@@ -2821,6 +2821,351 @@ snapshot never saw has been mixed into the root chain.
 * **No automatic signed-prekey-driven session re-establishment**, no session expiry, no periodic
   re-keying scheduler.
 
+== DM stream protocol (V0.8.4)
+
+New module `lapis-net-dm`. This wave wires V0.8.2's X3DH handshake and V0.8.3's Double Ratchet
+into a live network path — and in doing so becomes the FIRST place in this codebase that parses
+untrusted bytes arriving directly off a raw libp2p stream, with no GossipSub message-size ceiling
+backstopping the parser. Every other GossipSub-based validator in this codebase (`PeerDirectoryGossip`,
+`PrekeyBundleGossip`, `VeritasGossip`, `InboxGossip`, ...) inherits a hard upper bound on message
+size from `GossipPubSub`'s own `maxGossipMessageSize` (256 KiB) before its own validator ever runs.
+A raw libp2p stream protocol has no such backstop unless the protocol itself builds one — this
+section is that discipline, worked through end to end.
+
+=== The stream-protocol binding shape, verified against the resolved jar
+
+`DmProtocol`/`DmProtocolHandler` are built directly against jvm-libp2p 1.3.5-RELEASE's real
+`ProtocolHandler`/`ProtocolMessageHandler`/`StrictProtocolBinding` API — confirmed via `javap`
+against the resolved jar and cross-checked against the decompiled sources jar, not assumed. The
+shape mirrors the bundled reference implementation, `io.libp2p.protocol.Ping`/`PingProtocol`
+(`StrictProtocolBinding` wraps a `ProtocolHandler`, which pushes handlers in `initProtocolStream`
+— run for BOTH initiator and responder roles — then hands off to `onStartInitiator`/
+`onStartResponder`), with one deliberate divergence: `Ping` relies on the implicit assumption that
+"one `writeAndFlush` call produces one inbound `ByteBuf`," pushing no frame-decoding codec of its
+own. `DmProtocolHandler` instead explicitly pushes a Netty `LengthFieldBasedFrameDecoder`/
+`LengthFieldPrepender` pair — an explicit, verifiable frame boundary is what actually gives a
+length-validated-before-allocation guarantee, regardless of how the underlying mplex substream
+happens to chunk bytes on the wire; relying on an implicit one-write-one-read assumption would be
+the wrong default for a wave whose entire risk framing is "no upstream size ceiling."
+
+=== Four independent, layered defenses against the untrusted-raw-stream surface
+
+1. **`InboundTrafficLimitHandler`** — pushed AUTOMATICALLY by the `ProtocolHandler` base class,
+   BEFORE `initProtocolStream` even runs, from the `initiatorTrafficLimit`/`responderTrafficLimit`
+   constructor arguments. Caps TOTAL inbound bytes over the stream's lifetime, independent of and
+   prior to the frame decoder. Unlike `Ping` (which disables this with `Long.MAX_VALUE` for both),
+   `DmProtocolHandler` passes sane, non-`MAX_VALUE` limits — generous enough for one full
+   `DmEnvelope` plus its length prefix on the responder side, deliberately small on the initiator
+   side (this wave's design is fire-and-forget one-way, see below, so a well-behaved peer never
+   sends anything back on a stream WE dialled).
+2. **`LengthFieldBasedFrameDecoder`**, `maxFrameLength = DmEnvelopeCodec.MAX_ENVELOPE_BYTES +
+   LENGTH_FIELD_SIZE`, `failFast = true` — rejects a frame whose declared length exceeds the cap
+   BEFORE allocating any buffer proportional to that declared size. This is the load-bearing gate
+   `DmStreamAbuseTest` case (a) constructs the adversarial payload for: a 4-byte length prefix
+   declaring an ~1 GB frame, with only a handful of actual bytes following.
++
+**`+ LENGTH_FIELD_SIZE` fixes a security audit round 1 finding (2026-08-11): the bare
+`DmEnvelopeCodec.MAX_ENVELOPE_BYTES` value here was off by 4 bytes.** Netty's
+`LengthFieldBasedFrameDecoder` compares the FULL frame length — the declared body length PLUS
+`lengthFieldEndOffset` (`lengthFieldOffset + lengthFieldLength`, `4` here) — against
+`maxFrameLength`, not the declared body length alone. Passing the bare codec-level ceiling therefore
+rejected any envelope whose encoded size landed in the top 4 bytes of the otherwise-legitimate
+range: a maximum-size envelope (a 65,459-byte plaintext — exactly `RatchetMessageCodec.MAX_PLAINTEXT_BYTES`,
+which `DoubleRatchetSession.encrypt` explicitly permits — encoding to exactly `MAX_ENVELOPE_BYTES` =
+65,715 bytes) round-tripped cleanly through `DmEnvelopeCodec.decode` directly, but was silently
+discarded by this handler's own decoder with `TooLongFrameException` once framed onto the wire —
+silently, since this wave is fire-and-forget with no application-level ack. Root cause of it
+surviving three prior review rounds: no test anywhere sent a maximum-size LEGITIMATE envelope
+through the real prepender/decoder pair — `TwoNodeDmIntegrationTest`'s original case used 4,096
+bytes, and every `DmStreamAbuseTest` size case is adversarially OVERSIZED, not
+maximum-but-still-valid. `TwoNodeDmIntegrationTest` now has a dedicated maximum-size round-trip case
+closing this gap.
+3. **`ReadTimeoutHandler`** (10 seconds) — the classic slowloris defense: force-closes a stream that
+   goes idle (no read event at all) for this long.
+4. **An absolute per-stream wall-clock deadline** (20 seconds), scheduled independently of read
+   activity in `onStartResponder`/`onStartInitiator` and cancelled once the stream finishes
+   normally. This catches the slowloris variant #3 alone cannot: a peer that drips one byte just
+   before every idle window would expire, resetting `ReadTimeoutHandler`'s own clock forever without
+   ever completing a frame. `DmStreamAbuseTest` case (c2) is this exact scenario, verified against
+   the real timers, not a mock clock.
+
+Plus a **per-remote-`PeerId` concurrent-stream cap** (8, `MAX_CONCURRENT_STREAMS_PER_PEER`),
+enforced in `onStartResponder` — bounds how many not-yet-completed `/lapis/dm/1.0.0` streams a
+single peer may have open against this node at once, so one misbehaving or malicious peer cannot
+exhaust this node's stream-handling capacity (`DmStreamAbuseTest` case (d): dialling
+`MAX_CONCURRENT_STREAMS_PER_PEER + 1` streams from one peer gets exactly one rejected, and a
+DIFFERENT peer is unaffected — the cap is per-peer, not global).
+
+=== Design decision: one stream per message, fire-and-forget, no application-level ack
+
+Not mandated by the concept note, chosen deliberately during implementation. Each
+`DmSessionManager.send` call dials a FRESH stream (cheap if a `Connection` to the peer already
+exists — only a new mplex substream, not a new TCP/Noise handshake), writes EXACTLY ONE
+`DmEnvelope` frame, and closes. The responder decodes exactly one frame per stream and closes too,
+success or failure. This is what makes the four defenses above simple to reason about — one frame
+lifecycle per stream, no ongoing multi-frame backpressure bookkeeping to get wrong — and matches
+this wave's "no delivery receipts, no typing indicators, not even as stubs" scope cut: no
+application-level response frame is ever written back on a DM stream.
+
+=== `DmEnvelope`/`DmEnvelopeCodec`: the outer wire frame
+
+```
+off    len   field
+  0      4   magic "LNDM"
+  4      1   version = 1
+  5      1   flags - reserved, must be zero
+  6      1   messageType  (0=TEXT, 1=X3DH_INITIAL, 2=RECEIPT reserved, 3=CALL_SIGNAL reserved)
+  7     33   senderIdentity              (secp256k1 compressed public key)
+ 40      1   x3dhInitialHeaderPresent    (MUST equal 1 iff messageType == X3DH_INITIAL)
+ 41    137   X3DH section (initiator X25519 pubkey | binding signature | ephemeral pubkey |
+             signedPrekeyId | oneTimePrekeyIdPresent | oneTimePrekeyId) - all-zero when absent
+178      2   ratchetMessageLength   (1..RatchetMessageCodec.MAX_MESSAGE_BYTES)
+180      N   ratchetMessageBytes    (a RatchetMessageCodec.encode()'d blob)
+```
+
+Decode order is cheapest/most-selective first, mirroring `RatchetMessageCodec.decode`'s/
+`PeerRecordCodec.decode`'s established discipline: total size cap first (before any stream is even
+opened), then magic/version/flags, then `messageType` — REJECTED IMMEDIATELY for `RECEIPT`/
+`CALL_SIGNAL`/an unrecognized wire byte, BEFORE `senderIdentity` or anything downstream is even
+parsed (the cheapest possible rejection point, and what the CALL_SIGNAL adversarial test asserts
+the ordering of), then the X3DH presence-flag cross-check (with every sub-field of an absent
+section required to be exactly all-zero/0 — tamper evidence, mirroring `DoubleRatchetSessionCodec`'s
+identical "absent slot must be zero" discipline), then `ratchetMessageLength` — range-checked
+BEFORE the corresponding allocation — and finally `RatchetMessageCodec.decode` itself, whose own
+independent checks run again as defense in depth.
+
+No separate `x3dhInitiatorIdentity` wire field: the X3DH initiator IS the envelope's own
+`senderIdentity` by construction (`DmSessionManager` only ever emits `X3DH_INITIAL` for a message
+it originates as initiator), so encoding it twice would be a redundant field an attacker could make
+disagree with `senderIdentity` — the exact anti-pattern `PrekeyBundle.x25519IdentityKey`'s
+"read-through alias, never a second copy" discipline exists to prevent everywhere else in this
+codebase. `X3dhPreKeyMessageHeader.initiatorIdentity` is reconstructed on decode as
+`= envelope.senderIdentity`, never carried separately on the wire.
+
+The X3DH section is always present in the fixed layout, gated by a presence byte, not conditional
+placement — exactly `DoubleRatchetSessionCodec`'s own established idiom for "sometimes-present"
+fields. Costs 137 extra bytes on every `TEXT` envelope (negligible relative to a <=65 KB ratchet
+payload) in exchange for zero offset arithmetic to get wrong.
+
+=== The identity-authority rule
+
+The single most security-critical property of this wave, deserving its own subsection rather than
+a bullet point, matching this codebase's precedent of a dedicated write-up wherever a construction
+closes a specific attack (`X3dh`'s associated-data section, `PeerRecord`'s possession-proof
+section):
+
+**The libp2p `PeerId` a stream connection authenticates (via Noise, at the TRANSPORT layer) is NOT
+the same thing as the secp256k1 identity the Double Ratchet/X3DH layer authenticates.** The two are
+completely separate identity spaces, and this wave never lets them be confused. `PeerId` appears in
+exactly ONE place in `DmProtocolHandler` — `onStartResponder`, as a resource-management key
+bounding how many concurrent `/lapis/dm/1.0.0` streams one transport connection may open — and is
+NEVER used for message authorization or sender attribution anywhere in this module.
+
+`DmEnvelope.senderIdentity` is an UNTRUSTED CLAIM the moment an envelope arrives off the wire. In
+`DmSessionManager.handleInboundEnvelope`, this claim selects WHICH session to attempt — nothing
+more — and it is never cross-checked against the transport-authenticated `PeerId` either (a
+completely separate identity space). The claim only becomes trustworthy the instant
+`DoubleRatchetSession.decrypt` returns successfully: AEAD authentication under a session that was
+itself bootstrapped via a real X3DH exchange, bound (via `X3dh`'s own associated-data construction,
+folded into both the AEAD-style AD and the HKDF `info` string — see V0.8.2's section above) to this
+EXACT secp256k1 identity pair, is the ONLY thing ever treated as proof of "who actually sent this."
+A message truly encrypted under a DIFFERENT `(sender, us)` identity pair can never verify here, even
+if the wrapping envelope lies about who sent it.
+
+`DmStreamAbuseTest` case (e) is the executable proof: a genuine `RatchetMessage`, encrypted under a
+REAL session between the local identity and peer Y, is wrapped in a `DmEnvelope` whose
+`senderIdentity` field instead names an unrelated peer X (with its OWN real, independently
+established session). Fed into `handleInboundEnvelope`, this is rejected — the ratchet's own
+authentication under the CLAIMED (X) session fails, and the message is never accepted or attributed
+to X. Case (g) re-verifies the complementary property one layer up from `DoubleRatchetAdversarialTest`'s
+own cross-session-confusion case: a genuinely valid envelope, correctly decrypting under session A,
+is rejected outright if replayed verbatim against an unrelated session B belonging to a completely
+different peer pair.
+
+=== The Argon2id-per-message-persist problem, resolved
+
+`DoubleRatchetSession`'s own V0.8.3 doc comment (see above) flagged, and deliberately deferred, a
+concrete viability problem: persisting session state once per message in each direction means one
+full `DoubleRatchetSessionCodec.encode` call per message — a fresh Argon2id derivation at
+`KeystoreEncryption.DEFAULT_MEMORY_KIB`/`DEFAULT_ITERATIONS` (64 MiB / 3 passes, order
+10^2^–10^3^ ms) plus a full re-serialisation of the skipped-key store. Correct, but "not viable as a
+live network message-send path's per-message cost." This wave is where the fix — flagged then as
+"most likely: cache the Argon2id-derived key for the session's lifetime instead of re-deriving it
+per call" — actually lands.
+
+`DoubleRatchetSessionCodec.encode` gains an optional `salt` parameter (default: a fresh random
+draw, 100% preserving every existing caller's behaviour). Two new functions, `encodeWithKey`/
+`decodeWithKey`, take an ALREADY-DERIVED 32-byte AES-256 key directly, bypassing
+`KeystoreEncryption.deriveKey` (and therefore Argon2id) entirely. The wire format is byte-identical
+to `encode`/`decode` — the header still carries the real KDF params/salt, so the file stays
+self-describing and portable for a future slow-path recovery tool; only the AES-256-GCM key's
+ORIGIN differs. `encode`/`decode` are refactored to delegate into `encodeWithKey`/`decodeWithKey`
+once a key exists, so there remains exactly one AEAD-header-assembly/parsing implementation, not
+two — `decodeWithKey` runs every existing structural/range/sanity-cap check `decode` runs (size
+cap, magic, version, kdfId, implausible-Argon2-cost-parameter caps) BEFORE attempting AES-GCM
+decryption, unweakened.
+
+`DmSessionManager.attach` derives the key ONCE per process — from a passphrase plus a persisted
+`.salt` file (0600 where POSIX permissions are supported, generated on first use, reused
+thereafter: same passphrase + same salt + same params ⇒ same derived key) — and reuses it for every
+`persistSession` call for the process's lifetime. **A caller-supplied key that did not actually come
+from a given file's own salt is not, and cannot be, detected as wrong by `decodeWithKey` itself** —
+nothing in that function can verify a key's provenance; it simply fails the AEAD tag and throws
+`KeystoreDecryptionException`, the identical safe failure a wrong passphrase produces today. No new
+security hole is opened by skipping Argon2id here — only a legitimate holder of the correct
+passphrase/salt pair could ever have derived a key that verifies.
+
+=== Session persistence: what this wave deliberately does NOT match from `PrekeyStore`
+
+`DmSessionManager` persists sessions via atomic temp-file-then-`Files.move` writes (durable against
+a crash mid-write, mirroring `PrekeyStore.persistAtomically`'s core discipline), guarded by an
+IN-PROCESS per-peer monitor (`withPeerLock`) — but deliberately stops short of `PrekeyStore`'s full
+cross-process sidecar-`FileChannel`-lock discipline. A single `LapisNode` process is this
+codebase's only supported deployment shape per identity today; no two `DmSessionManager` instances
+ever legitimately point at the same session-store directory from different processes. Stated
+explicitly as a scope reduction from the wave's own planning notes, not a silent omission — should
+this codebase ever support multiple concurrent processes sharing one identity's DM session store,
+`PrekeyStore`'s sidecar-lock pattern is the reference implementation to copy.
+
+=== `DmDedupKey`: a forward-compatible hook for V0.8.5, unused by this wave
+
+`DmDedupKey.of(senderIdentity, ratchetMessage)` computes
+`domainSeparatedDigest(domainTag, senderIdentity.bytes(33), ratchetPublicKey.bytes(32),
+messageNumber(4, BE))` for every successfully-decrypted inbound message — a domain-separated SHA-256
+(1-byte tag-length-prefixed tag, then each part individually 2-byte-length-prefixed), NOT plain
+concatenation (doc correction, security audit round 1 finding, 2026-08-11: this section previously
+stated the formula as plain concatenation, which did not match the implementation; the
+implementation is strictly stronger — unambiguous parsing, no cross-field boundary ambiguity — so
+only this doc text changed, not the code; `DmDedupKeyTest` now pins the exact preimage as a
+known-answer-style test so the contract is enforced in code, not merely in prose). A message's
+`(ratchetPublicKey, messageNumber)` pair is unique per session position by the Double Ratchet's own
+construction (`Ns`/`Nr` never rewind for a correctly-persisted session), and `senderIdentity` scopes
+it across DIFFERENT sessions that identity may hold. Computed from fields already on the decoded
+`RatchetMessage` — the same fields V0.8.5's planned offline-mailbox redelivery path will see too, so
+a message delivered both online (this wave) and later redelivered via the mailbox produces the
+IDENTICAL dedup key without either path needing to know about the other. **Nothing in this wave
+deduplicates against anything with this key** — it is computed and exposed on `DmInboundMessage`
+purely so V0.8.5 does not have to retrofit the concept later.
+
+=== Explicit, deliberate scope cuts for this wave
+
+* **No delivery receipts, no typing indicators** — not even as stubs. `DmMessageType.RECEIPT`/
+  `CALL_SIGNAL` exist on the wire but are rejected outright at every layer that can reject them
+  (the envelope's own constructor, the codec, and `DmSessionManager`'s inbound handler) — mirrors
+  `EncryptionMode.MLS_ARCHIVE`'s precedent.
+* **No NAT traversal.** A documented gap since V0.1.3/networking, unchanged by this wave. Only
+  direct-dialable peers (same-LAN, or otherwise directly reachable) are supported.
+* **No offline/mailbox redelivery** — V0.8.5's job; see `DmDedupKey` above.
+* **`DmStore` (conversation history) is in-memory-only** — see below.
+* **Deliberate sidecar-lock simplification** for session persistence — see above.
+* **No multi-device / no session migration** (inherited from `DoubleRatchetSession`).
+* **No session registry beyond what V0.8.3 already documents as partial.**
+
+=== Bounded resources — every cap this wave enforces, and why
+
+Mirrors this codebase's established discipline of an explicit, justified numeric cap on every
+structure an unauthenticated or lightly-authenticated remote actor can grow — not silently omitted
+for the structures below, closed during this wave's own review round:
+
+* **`DmSessionManager.liveSessionCache`** (`MAX_LIVE_SESSIONS`, 4,096) — bounded, LRU-evicting cache
+  of decoded `DoubleRatchetSession`s. Persist-before-cache (see above), so evicting the in-memory
+  copy never loses durable state.
+* **`DmSessionManager.dialSemaphore`** (`MAX_CONCURRENT_OUTBOUND_DIALS`, 32) — bounds simultaneous
+  in-flight `send()` dials.
+* **`DmProtocolHandler.perPeerStreamCounts`** (`MAX_CONCURRENT_STREAMS_PER_PEER`, 8, per remote
+  `PeerId`) — bounds concurrent, not-yet-completed streams one connection may hold open. Backed by a
+  `ConcurrentHashMap<PeerId, Int>` mutated only via `compute`/`computeIfPresent`, self-cleaning: an
+  entry is removed outright the instant its count returns to zero, so this map is bounded by peers
+  CURRENTLY holding an open stream, never by the total distinct peers ever seen over the node's
+  lifetime — a `PeerId` here costs a real TCP+Noise-authenticated connection to mint, unlike the next
+  bullet.
+* **`DmSessionManager.peerLockStripes`** (`PEER_LOCK_STRIPE_COUNT`, 2,048, fixed-size lock striping,
+  not a per-identity map) — closes a gap found during this wave's own review: `withPeerLock` is
+  called for every distinct CLAIMED `senderIdentity` on every inbound envelope, in
+  `handleInboundEnvelope`, BEFORE any cryptographic authentication of that claim (see "The
+  identity-authority rule" above). A structurally-valid `Secp256k1PublicKey` costs an attacker
+  nothing to mint in bulk — no private key needed, only curve-point validity — so an unbounded
+  per-identity monitor map here would have let an unauthenticated remote peer grow this node's
+  memory without bound, exactly the class of risk `MAX_CONCURRENT_STREAMS_PER_PEER` and
+  `MAX_LIVE_SESSIONS` already close for their own structures. Fixed-size lock striping (indexed by a
+  stable, content-derived hash of the peer's public key bytes) bounds this at a small constant
+  regardless of identity count — the only cost is occasional false contention between two unrelated
+  peers sharing a stripe, never a correctness issue.
+* **`DmStore.historyByPeer`** (`MAX_TRACKED_PEERS`, 4,096, LRU-evicting, on top of the existing
+  per-peer `MAX_HISTORY_PER_PEER`, 500) — `DmStore` is opt-in and each entry requires a genuinely
+  completed, AEAD-authenticated session to populate (not free for an attacker), but is still bounded
+  on both axes for the same reasons as every sibling cache above.
+* **`DmSessionManager.prekeyConsumptionSemaphore`** (`MAX_CONCURRENT_PREKEY_CONSUMPTIONS`, 4) —
+  closes a MAJOR gap found during this wave's own review round 3: `handleInboundEnvelope`'s
+  `X3DH_INITIAL` branch calls `PrekeyStore.consumeOneTimePrekey` whenever `header.oneTimePrekeyId`
+  is non-null, gated only by `EncryptionKeyBinding.verify` — which proves a claimed identity's
+  binding is internally self-consistent, NOT that the identity is legitimate or known. Minting a
+  throwaway secp256k1 identity and self-signing a binding for it costs an attacker microseconds of
+  local CPU. `PrekeyStore.consumeOneTimePrekey` (unmodified by this wave, in `lapis-net-ratchet`)
+  unconditionally performs a full Argon2id derivation (64 MiB/3 passes) via
+  `PrekeyStore.withExclusiveFileAccess` BEFORE the id lookup that could reject the request even
+  runs, and that method is guarded by a single per-file JVM monitor shared by the whole store — so
+  every concurrent call serializes on ONE lock. Without a bound, a flood of such envelopes would
+  queue without limit, denying every legitimate incoming first-contact handshake for as long as the
+  flood continues — the same class of "Argon2id is not viable as an unbounded live-network-path
+  cost" problem `DoubleRatchetSessionCodec.encodeWithKey`/`decodeWithKey` (below) closes for session
+  persistence, left open here because `PrekeyStore` itself is out of this wave's scope. A small,
+  fixed concurrency bound converts the unbounded pileup into a bounded amount of concurrent CPU/
+  lock-contention work; permits are acquired with a ZERO-wait `tryAcquire` (never blocks) because
+  `handleInboundEnvelope` runs directly on a Netty I/O thread — blocking it while waiting for a
+  permit would itself compound the stall this guards against. This mitigation bounds resource
+  consumption; it does not and cannot distinguish a flooding attacker from a legitimate initiator
+  before the ratchet itself authenticates (see "The identity-authority rule" above) — a sustained
+  flood can still starve legitimate handshakes of their fair share of the four permits, just no
+  longer of unbounded queueing/memory.
++
+**Residual gap this left open, and its fix (security audit round 1, 2026-08-11, PROVEN with an
+executable probe): `prekeyConsumptionSemaphore` bounds CONCURRENCY, not RATE or TOTAL.** A purely
+SEQUENTIAL attacker — one self-signed, structurally-valid `X3DH_INITIAL` at a time, each one
+trivially passing `EncryptionKeyBinding.verify` for the same "costs microseconds, no shared key
+material" reason described above — never touches the concurrency bound at all, and durably drains
+this node's entire one-time-prekey pool one request at a time. Proven, not theoretical: five
+throwaway self-signed identities burned a five-entry test pool to zero in 2.9 seconds. Because this
+wave's own `X3dh` class doc comment states that a replay naming NO one-time prekey is not detected by
+anything in this wave, permanent pool exhaustion is not a mere inconvenience — it durably strips this
+node of the only replay protection X3DH initial messages have here. Two complementary additions close
+this:
+
+* **`DmSessionManager.prekeyConsumptionRateLimiter`** (`MAX_PREKEY_CONSUMPTIONS_PER_WINDOW`, 10, per
+  `PREKEY_CONSUMPTION_RATE_WINDOW`, 60 seconds) — a plain fixed-window counter, checked BEFORE
+  `prekeyConsumptionSemaphore` (cheaper, and rejects a sustained flood without even touching the
+  concurrency-bounded resource). Deliberately GLOBAL, not keyed per claimed `senderIdentity` — a
+  per-identity limiter is trivially bypassed by minting a fresh throwaway identity per attempt,
+  exactly the attack this closes.
+* **`DmSessionManager.replenishOneTimePrekeysIfLow`** — after every SUCCESSFUL
+  `consumeOneTimePrekey`, if `PrekeyStore.availableOneTimePrekeyCount` has dropped to or below
+  `PREKEY_REPLENISH_LOW_WATERMARK` (20), generates fresh one-time prekeys back up to
+  `PREKEY_REPLENISH_TARGET_COUNT` (100, matching `PrekeyStore.DEFAULT_ONE_TIME_PREKEY_COUNT`) and
+  republishes an updated `PrekeyBundle`, so a drained pool recovers on its own instead of requiring
+  manual operator intervention. Dispatched onto a dedicated single-thread executor, never inline on
+  the Netty thread that triggered it — `PrekeyStore.generateOneTimePrekeys`/`publishBundle` both take
+  the same Argon2id-guarded exclusive file lock `consumeOneTimePrekey` does, and a
+  `replenishmentInFlight` guard caps this at one outstanding replenishment pass at a time, so a flood
+  that keeps crossing the watermark cannot queue unboundedly many redundant top-ups either. Residual,
+  accepted, BOUNDED trade-off: because `PrekeyStore`'s per-file monitor is shared by every handle open
+  on the same file (by design, for correctness — see that class's own doc comment), a concurrent
+  `consumeOneTimePrekey` call can observe brief added latency while a replenishment pass holds that
+  monitor — the same class of bounded, serialized cost `prekeyConsumptionSemaphore` already accepts
+  for up to `MAX_CONCURRENT_PREKEY_CONSUMPTIONS` concurrent attempts today, not a new unbounded one.
+
+Together these turn "durable, permanent depletion after a cheap sequential flood" into "rate-limited,
+self-healing depletion" — the disclosure above (bounding resource consumption, not attacker
+distinguishability) still holds for the CONCURRENCY dimension; it is the RATE and TOTAL dimensions
+this addition closes. `DmStreamAbuseTest` case (h2) is the regression test: the SAME self-signed
+attack case (h)'s garbage-signature gate cannot catch (a genuinely valid binding legitimately passes
+that gate), now shown to be rate-limited and self-healing rather than able to achieve permanent
+depletion.
+
+`DoubleRatchetSessionCodec.encodeWithKey`/`decodeWithKey` (V0.8.4) — not a numeric cap, but the same
+"expensive-Argon2id-is-not-viable-on-a-live-network-path" concern: session persistence derives its
+AES key ONCE per process lifetime (`DmSessionManager.cachedKey`) rather than re-running Argon2id on
+every `send()`/inbound message, which is what makes per-message session persistence viable at all.
+
 == Diagrams
 
 Diagrams for this repository are authored in kUML and embedded via the

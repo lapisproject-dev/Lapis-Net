@@ -243,8 +243,8 @@ already covered by the incremental browser growth documented in V0.2–V0.5 abov
 Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec in the vault concept
 note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
 on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
-remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1, V0.8.2
-and V0.8.3 have landed.
+remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1, V0.8.2,
+V0.8.3, and V0.8.4 have landed.
 
 [cols="1,3"]
 |===
@@ -266,9 +266,15 @@ post-compromise-secure encrypted session an X3DH handshake's output bootstraps i
 independently testable state machine; still NOT yet wired into a live network message-send path
 (implemented — see below).
 
-| V0.8.4+
-| Online DM delivery and calling — not yet started, not sub-wave-planned in fine-grained detail
-here; see the vault's 2026-08-04 sub-wave plan for the intended breakdown.
+| V0.8.4
+| Online DM stream (new module `lapis-net-dm`) — the custom `/lapis/dm/1.0.0` libp2p stream
+protocol wiring V0.8.2's X3DH handshake and V0.8.3's Double Ratchet into a live send/receive path
+for directly-dialable peers. The first module in this codebase parsing untrusted bytes off a raw
+libp2p stream, with no GossipSub size ceiling backstopping the parser (implemented — see below).
+
+| V0.8.5+
+| Offline mailbox redelivery and calling — not yet started, not sub-wave-planned in fine-grained
+detail here; see the vault's 2026-08-04 sub-wave plan for the intended breakdown.
 |===
 
 **Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
@@ -592,6 +598,138 @@ Deliberate scope cuts, stated as such in the code's own doc comments rather than
 * **No multi-device / no session migration between devices.**
 * **No automatic signed-prekey-driven session re-establishment**, no session expiry, no periodic
   re-keying scheduler.
+
+=== V0.8.4 — Online DM stream
+
+Target: the online-delivery path for 1:1 direct messages, over a custom libp2p stream protocol. A
+different kind of risk than V0.8.2/V0.8.3: the cryptography is already built, reviewed, and
+independently verified in those two waves — this wave's job is to wire that already-correct crypto
+into a live network path, and that makes it the FIRST place in this codebase that parses untrusted
+bytes arriving directly off a raw libp2p stream, rather than off a size-bounded GossipSub message.
+Every prior wave's "zero clock/network in the validator" and "length-validated-before-allocation"
+rules were designed around GossipSub's own message-size ceiling as a backstop; a raw stream has no
+such backstop unless this wave builds one. New module `lapis-net-dm`.
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.8.4
+| `DmProtocol`/`DmProtocolHandler` — a custom `/lapis/dm/1.0.0` jvm-libp2p `StrictProtocolBinding`/
+`ProtocolHandler`, mirroring the bundled `io.libp2p.protocol.Ping` reference implementation's
+shape, verified against the resolved jar rather than assumed. Four independent, layered defenses
+against the untrusted-raw-stream surface: jvm-libp2p's own `InboundTrafficLimitHandler` (total
+inbound bytes over a stream's lifetime, pushed automatically before this wave's own
+`initProtocolStream` even runs), an explicit Netty `LengthFieldBasedFrameDecoder`
+(`maxFrameLength = DmEnvelopeCodec.MAX_ENVELOPE_BYTES`, `failFast = true` — rejects an oversized
+declared frame length BEFORE allocating a buffer proportional to it), a `ReadTimeoutHandler`
+(10s idle-read slowloris defense), and an absolute per-stream wall-clock deadline (20s, scheduled
+independently of read activity — catches the "drip one byte just before the idle timer fires"
+slowloris variant the idle timer alone cannot). Plus a per-remote-`PeerId` concurrent-stream cap
+(8), so one misbehaving peer cannot exhaust this node's stream-handling capacity. Design decision:
+one stream per message, fire-and-forget, no application-level ack — matches this wave's "no
+delivery receipts, not even as stubs" scope cut and keeps the defenses above simple to reason
+about (one frame lifecycle per stream).
+
+| V0.8.4
+| `DmEnvelope`/`DmEnvelopeCodec` — the outer wire frame: `messageType` discriminator (`TEXT`,
+`X3DH_INITIAL` for first-contact handshake headers, `RECEIPT`/`CALL_SIGNAL` reserved and rejected
+outright — mirrors `EncryptionMode.MLS_ARCHIVE`'s precedent exactly), the claimed `senderIdentity`,
+an optional embedded X3DH initial-message header (present iff `messageType == X3DH_INITIAL`, gated
+by a presence byte in the FIXED layout rather than conditional placement — mirrors
+`DoubleRatchetSessionCodec`'s own established idiom), and the embedded `RatchetMessageCodec`-encoded
+payload. `messageType` is checked — and `RECEIPT`/`CALL_SIGNAL`/unknown rejected — BEFORE
+`senderIdentity` or anything downstream is even parsed: the cheapest possible rejection point.
+`ratchetMessageLength` is range-checked (`1..RatchetMessageCodec.MAX_MESSAGE_BYTES`) BEFORE the
+corresponding allocation — the load-bearing "length validated before allocation" gate for the one
+genuinely variable-length field in this format. No separate `x3dhInitiatorIdentity` wire field —
+the X3DH initiator IS the envelope's own `senderIdentity` by construction, reconstructed on decode,
+never carried (and therefore never able to disagree) twice.
+
+| V0.8.4
+| `DmSessionManager` — resolves a recipient's current network address
+(`PeerDirectoryGossip.lookup`) and prekey bundle (`PrekeyBundleGossip.lookup`), dials them via
+`DmProtocol`, and on first contact with a given recipient runs `X3dh.initiate` to bootstrap a
+`DoubleRatchetSession`, thereafter driving that session's `encrypt`/`decrypt` for every further
+message to/from that recipient. Sessions are durably persisted (atomic temp-file + `Files.move`,
+`DoubleRatchetSessionCodec.encodeWithKey`/`decodeWithKey` — see below), so a process restart
+resumes a conversation rather than re-handshaking. Bounded live-session cache (4,096, LRU-evicting,
+destroys the evicted session's in-memory secrets) and bounded concurrent outbound dials (32), both
+explicit numeric caps with justification, mirroring this codebase's established convention.
+
+|===
+
+==== The identity-authority rule
+
+The load-bearing security property of this entire wave, and the reason it gets its own
+subsection rather than a bullet point: **the libp2p `PeerId` a stream connection authenticates
+(via Noise, at the TRANSPORT layer) is NOT the same thing as the secp256k1 identity the Double
+Ratchet/X3DH layer authenticates.** `PeerId` is used in exactly one place in this module —
+`DmProtocolHandler.onStartResponder`, as a resource-management key bounding how many concurrent
+`/lapis/dm/1.0.0` streams one transport connection may open — and NEVER for message authorization
+or sender attribution. A connection from a given `PeerId` claiming to relay messages "from" some
+`senderIdentity` in a `DmEnvelope` is not trusted on that claim alone: the message only counts as
+genuinely from that identity once `DoubleRatchetSession.decrypt` succeeds under a session that was
+itself bootstrapped, via a real X3DH exchange, with that identity's own prekey bundle. `X3dh`'s own
+associated-data construction (folded into both the AEAD-style AD and the HKDF `info` string, see
+V0.8.2's section above) is what makes this sound: a message genuinely encrypted under a DIFFERENT
+`(sender, us)` identity pair can never verify here, even if the wrapping envelope lies about who
+sent it. `DmSessionManager.handleInboundEnvelope`'s own doc comment states this rule at the exact
+point the untrusted claim is read, and `DmStreamAbuseTest` case (e) constructs the concrete
+confusion scenario (a genuine ciphertext from session Y, wrapped in an envelope claiming
+`senderIdentity = X`) and proves the ratchet's own authentication — never the claimed field alone —
+is what is trusted.
+
+==== The Argon2id-per-message-persist problem, resolved
+
+`DoubleRatchetSession`'s own V0.8.3 doc comment flagged that calling
+`DoubleRatchetSessionCodec.encode`/`decode` once per message — each re-running Argon2id at
+`KeystoreEncryption.DEFAULT_MEMORY_KIB`/`DEFAULT_ITERATIONS` (64 MiB / 3 passes, order
+10^2^–10^3^ ms) — is "not viable as a live network message-send path's per-message cost," and
+proposed the fix: "cache the Argon2id-derived key for the session's lifetime instead of re-deriving
+it per call." This wave is where that fix lands. `DoubleRatchetSessionCodec` gains
+`encode`'s optional `salt` parameter (defaults to a fresh random draw, preserving every existing
+caller's behaviour unchanged) plus two new functions, `encodeWithKey`/`decodeWithKey`, that take an
+ALREADY-DERIVED 32-byte AES key directly, bypassing `KeystoreEncryption.deriveKey` entirely. The
+wire format is byte-identical to `encode`/`decode` — only the AES-256-GCM key's origin differs.
+`DmSessionManager.attach` derives this key ONCE, from a passphrase plus a persisted `.salt` file
+(0600 where POSIX permissions are supported), and reuses it for every session-persist call for the
+lifetime of the process. A caller-supplied key that did not actually come from a given file's own
+salt cannot be detected as wrong by `decodeWithKey` itself — it simply fails the AEAD tag and
+throws `KeystoreDecryptionException`, the same safe failure a wrong passphrase produces today; no
+new security hole, and every existing structural/range/sanity-cap check `decode` runs, still runs
+here too, before AES-GCM decryption is ever attempted.
+
+==== Explicit, deliberate scope cuts for this wave
+
+* **No delivery receipts, no typing indicators** — not even as stubs. `DmMessageType.RECEIPT`
+  exists on the wire but is rejected outright at every layer that can reject it (the envelope's own
+  constructor, the codec, and `DmSessionManager`'s inbound handler) — mirrors
+  `EncryptionMode.MLS_ARCHIVE`'s precedent exactly.
+* **No NAT traversal.** This repo has no working NAT traversal — a documented gap since
+  V0.1.3/networking, unchanged by this wave. This wave supports only DIRECT-DIALABLE peers
+  (same-LAN, or otherwise directly reachable); a peer behind NAT without port forwarding simply
+  cannot be reached.
+* **No offline/mailbox redelivery.** V0.8.5's job. A forward-compatible dedup key (`DmDedupKey`,
+  `SHA-256(domainTag || senderIdentity || ratchetPublicKey || messageNumber)`) is computed now,
+  from fields already on the decoded `RatchetMessage` that V0.8.5's mailbox path will see too, so a
+  message delivered both online (this wave) and later redelivered via the mailbox produces the
+  IDENTICAL dedup key without either path needing to know about the other — but nothing in this
+  wave deduplicates against anything with it.
+* **`DmStore` (conversation history) is in-memory-only.** An explicit, documented scope cut — this
+  wave already carries the highest structural risk in the codebase to date (a new stream protocol,
+  a new wire format, a new session state machine, the mandatory adversarial suite), and inventing a
+  THIRD at-rest encryption scheme (after `KeystoreFileFormat`/`PrekeyStoreFileFormat` and
+  `DoubleRatchetSessionCodec`) has no spare review budget here. Durable `DoubleRatchetSession`
+  persistence — a DIFFERENT concern, what makes a restart resume rather than re-handshake — IS
+  implemented, in `DmSessionManager`.
+* **Deliberate simplification versus a full cross-process `PrekeyStore`-grade sidecar file lock**
+  for session persistence: atomic temp-file-then-`Files.move` writes, guarded by an in-process
+  per-peer monitor only, no OS-level `FileChannel` lock. A single `LapisNode` process is this
+  codebase's only supported deployment shape per identity today.
+* **No multi-device / no session migration** (inherited from `DoubleRatchetSession` itself).
+* **No session registry beyond what V0.8.3 already documents as partial** — a second, legitimate
+  `X3DH_INITIAL` from the same peer simply creates a new session, overwriting the persisted one.
 
 == V0.9 — Asynchronous messages (email replacement)
 
