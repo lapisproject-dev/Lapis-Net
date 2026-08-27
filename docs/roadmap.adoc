@@ -817,10 +817,12 @@ below for why this is load-bearing, not an optimization.
 | `DmSessionManager.sendOffline` — encrypts exactly as `send` does (same `X3dh.initiate`-on-first-
 contact / `DoubleRatchetSession.encrypt` reuse, via a shared `bootstrapSenderSession` helper so the
 two call sites are byte-identical for first contact by construction, not by convention), durably
-stores the resulting `DmEnvelope` bytes in Nabu, THEN persists a signed `MailboxPointer` referencing
-that blob's CID, THEN publishes the pointer — "persist then publish, publish strictly last" applied
-to a two-object case (blob, then the pointer that references it), so a fast-arriving pointer can
-never reference a not-yet-fetchable blob. Also a new cross-path dedup pre-check in
+stores the resulting `DmEnvelope` bytes in Nabu, THEN signs a `MailboxPointer` referencing that
+blob's CID and hands it to `MailboxRedeliveryScheduler` (bounded, in-memory), THEN publishes the
+pointer — "persist then publish, publish strictly last" so a fast-arriving pointer can never
+reference a not-yet-fetchable blob. The pointer itself is not separately Nabu-persisted (a V0.8.5
+hardening-pass finding, 2026-08-27, removed an earlier unread `nabuStorage.put` of the pointer bytes
+- see `DmSessionManager.sendOffline`'s own doc comment). Also a new cross-path dedup pre-check in
 `processInboundDmEnvelope` (a bounded, LRU-evicting, global `recentlyDeliveredDedupKeys` cache keyed
 by `DmDedupKey`) — see below for why this is belt-and-braces, not the load-bearing guarantee.
 

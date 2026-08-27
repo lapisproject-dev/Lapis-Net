@@ -32,9 +32,6 @@ class MailboxGossip private constructor(
     /** See [MailboxPointerIndex.markResolved]. */
     fun markResolved(pointer: MailboxPointer) = index.markResolved(pointer)
 
-    /** See [MailboxPointerIndex.pointersFrom]. */
-    fun pointersFrom(sender: Secp256k1PublicKey): List<MailboxPointer> = index.pointersFrom(sender)
-
     /** See [MailboxPointerIndex.evictExpired]. */
     fun evictExpired(nowEpochSecond: Long): Int = index.evictExpired(nowEpochSecond)
 

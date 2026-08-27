@@ -40,7 +40,7 @@ private val logger = KotlinLogging.logger {}
  * is independently try/caught so one bad pointer never blocks the rest of the pass (the adversarial
  * "unfetchable pointer must not wedge the poller" property).
  *
- * **Security audit round 1 findings (2026-08-2x) closed in this class, stated here because they
+ * **Security audit round 1 findings (2026-08-27) closed in this class, stated here because they
  * shape [pollOnce]/[attemptOne]'s structure below:**
  * - **Unbounded, attacker-controlled, serialized network work per pass.** Every pending pointer
  *   used to get up to [net.lapisphilosophorum.lapisnet.directory.PeerRecordCodec.MAX_ADDRESSES]
@@ -65,7 +65,7 @@ private val logger = KotlinLogging.logger {}
  *   project's own primary, expected peer address space, not an anomaly to block).
  *
  * **Security audit round 2 major finding closed in this class - head-of-line blocking across
- * multiple sender identities (2026-08-2x):** round 1's [MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS] caps
+ * multiple sender identities (2026-08-27):** round 1's [MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS] caps
  * attempts per SENDER, but [MailboxGossip.pending] returns a STABLY-ORDERED list with no rotation -
  * iterating it from index 0 on every pass meant that a small number of DISTINCT claimed sender
  * identities (no coordination between them required - a handful of legitimately-offline senders is
@@ -82,6 +82,38 @@ private val logger = KotlinLogging.logger {}
  * passes" fix the finding itself suggested; per-pointer exponential backoff was considered as a
  * complementary fix but judged unnecessary on top of rotation, which alone already guarantees no
  * pending pointer can occupy the head of the budget indefinitely.
+ *
+ * **`MailboxPointer.senderIdentity` is a routing hint, NEVER trusted for message attribution or
+ * authorization - V0.8.5 hardening pass finding, 2026-08-27, mirroring `DmSessionManager`'s own
+ * CRITICAL IDENTITY-AUTHORITY RULE for `envelope.senderIdentity`/`fromPeerId`.** Everywhere in this
+ * class that reads `pointer.senderIdentity` - [attemptOne]'s `peerDirectory.lookup` call and its
+ * fingerprint-only logging, and [pollOnce]'s [fetchAttemptsBySender] cap key below - it does so
+ * ONLY to pick which address to dial and which counter to charge, never to decide who actually sent
+ * the underlying message: [DmEnvelope.senderIdentity] inside the fetched blob is a SEPARATE,
+ * independently-signed-or-not claim, and only [DoubleRatchetSession]'s own AEAD-authenticated
+ * decrypt (run downstream, inside `DmSessionManager.processInboundDmEnvelope`) is ever trusted for
+ * "who actually sent this" - see that class's own doc comment. A pointer's `senderIdentity` and its
+ * referenced blob's `DmEnvelope.senderIdentity` can legitimately disagree (anyone can sign a pointer
+ * under a throwaway identity that references a blob whose decrypted envelope claims a wholly
+ * different sender) with no exploitable consequence THIS class needs to guard against, precisely
+ * because this class never treats either field as proof of authorship.
+ *
+ * **Does keying [MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS] on this same untrusted-for-attribution
+ * field open a fairness/DoS gap - e.g. a malicious pointer author claiming a VICTIM's
+ * `senderIdentity` to burn the victim's fetch-attempt budget instead of their own? No - determined
+ * and closed by construction, not merely accepted as residual risk.** `MailboxPointer.senderIdentity`
+ * is UNTRUSTED only with respect to who authored the DmEnvelope inside the referenced blob; it is
+ * NOT unauthenticated as a claim about who deposited THIS pointer. [MailboxPointer.verify] - called
+ * by both [MailboxGossip.onGossipMessage] before a pointer is ever indexed AND, defensively, again
+ * inside [MailboxPointerIndex.add] - checks the pointer's own signature against exactly this field,
+ * so a pointer can only carry a given `senderIdentity` if its author possesses that identity's
+ * secp256k1 private key. An attacker without a victim's private key cannot mint a pointer that
+ * `fetchAttemptsBySender` will ever attribute to the victim; the only party who CAN make
+ * `senderIdentity` say "the victim" is the victim's own key holder, which collapses this to the
+ * ALREADY-accepted "one flooding identity spends its own pass budget" shape [pollOnce]'s round 1
+ * finding above exists specifically to bound (see [MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS]'s own doc
+ * comment) - not a new gap. `MailboxPollerHardeningTest`'s round 1 regression case is exactly this
+ * scenario exercised end to end (one real identity, six of its own pointers, capped at 4/pass).
  */
 class MailboxPoller private constructor(
     private val mailboxGossip: MailboxGossip,

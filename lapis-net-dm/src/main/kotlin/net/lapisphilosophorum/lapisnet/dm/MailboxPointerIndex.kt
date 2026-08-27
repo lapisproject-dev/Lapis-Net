@@ -1,7 +1,5 @@
 package net.lapisphilosophorum.lapisnet.dm
 
-import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
-
 /** Wraps a [MailboxPointer.contentId] byte array with value equality, so it can be used as a
  * `HashMap`/`HashSet` key - mirrors `net.lapisphilosophorum.lapisnet.directory.PeerRecordContentId`/
  * `net.lapisphilosophorum.lapisnet.mail.MailContentId` exactly, duplicated locally rather than
@@ -28,6 +26,22 @@ internal data class MailboxPointerContentId(
  * [persistedContentIds]/[tryReservePersistence]) - see
  * `net.lapisphilosophorum.lapisnet.trust.VeritasGrantIndex`'s class doc comment for the full
  * reasoning this is copied from.
+ *
+ * **No per-sender lookup structure - V0.8.5 hardening pass finding, 2026-08-27.** An earlier
+ * revision of this class kept a SECOND, parallel `pointersBySender` map alongside
+ * [entriesByContentId] (a `Secp256k1PublicKey -> MutableList<MailboxPointer>` bucket, kept in sync
+ * at both [add] and [evictExpired]) purely to serve a `pointersFrom(sender)` query. Removed here: a
+ * repo-wide grep at the time of removal showed [MailboxGossip]'s own `pointersFrom` delegate had
+ * exactly one caller anywhere in this codebase - `MailboxPointerIndexTest` itself - never any
+ * production code path ([MailboxPoller] iterates [pending] only, never per-sender). Carrying a
+ * second synchronized bucket that exists solely to make a test pass is the wrong trade: real
+ * bookkeeping cost (a second map to keep consistent at every insertion AND eviction site) for a
+ * capability nothing production-side uses. If a genuine near-term need for a per-sender pointer
+ * query surfaces (e.g. a future "list pending mailbox deposits by sender" UI, or a per-sender
+ * pointer cap enforced independently of [MailboxPoller.MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS]), it
+ * should come back in whatever shape that consumer actually needs - not be spec-guessed back into
+ * existence now. No such consumer is planned as of this note (V0.8.6 is an explicitly unplanned
+ * reserved slot - see `docs/roadmap.adoc`'s own V0.8.6 entry).
  */
 class MailboxPointerIndex internal constructor(
     private val maxTracked: Int = MAX_TRACKED_POINTERS,
@@ -43,21 +57,13 @@ class MailboxPointerIndex internal constructor(
         var resolved: Boolean = false,
     )
 
-    private val pointersBySender = HashMap<Secp256k1PublicKey, MutableList<MailboxPointer>>()
-
     /** Backed by a [LinkedHashMap] with access-order tracking enabled, mirroring
      * `PeerRecordIndex.recordsByContentId`/`InboxIndex.messagesByContentId` exactly - see those
      * fields' doc comments for why this is FIFO-equivalent in practice, not true LRU. */
     private val entriesByContentId =
         object : LinkedHashMap<MailboxPointerContentId, Entry>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<MailboxPointerContentId, Entry>): Boolean {
-                if (size <= maxTracked) return false
-                val evicted = eldest.value.pointer
-                val bucket = pointersBySender[evicted.senderIdentity]
-                bucket?.remove(evicted)
-                if (bucket != null && bucket.isEmpty()) pointersBySender.remove(evicted.senderIdentity)
-                return true
-            }
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<MailboxPointerContentId, Entry>): Boolean =
+                size > maxTracked
         }
 
     /** Backing set for [tryReservePersistence] - a plain, never-evicting [HashSet], mirroring
@@ -76,7 +82,6 @@ class MailboxPointerIndex internal constructor(
             val id = MailboxPointerContentId(pointer.contentId())
             if (entriesByContentId.containsKey(id)) return@runCatching false
             entriesByContentId[id] = Entry(pointer)
-            pointersBySender.getOrPut(pointer.senderIdentity) { mutableListOf() }.add(pointer)
             true
         }.getOrDefault(false)
 
@@ -127,11 +132,6 @@ class MailboxPointerIndex internal constructor(
         entriesByContentId[MailboxPointerContentId(pointer.contentId())]?.resolved = true
     }
 
-    /** Every pointer currently tracked from [sender], regardless of resolved state. */
-    @Synchronized
-    fun pointersFrom(sender: Secp256k1PublicKey): List<MailboxPointer> =
-        pointersBySender[sender]?.toList() ?: emptyList()
-
     /** Number of currently content-id-tracked pointers (`<= maxTracked` always). */
     @Synchronized
     fun size(): Int = entriesByContentId.size
@@ -150,9 +150,6 @@ class MailboxPointerIndex internal constructor(
             val pointer = iterator.next().value.pointer
             if (pointer.notValidAfterEpochSecond < nowEpochSecond) {
                 iterator.remove()
-                val bucket = pointersBySender[pointer.senderIdentity]
-                bucket?.remove(pointer)
-                if (bucket != null && bucket.isEmpty()) pointersBySender.remove(pointer.senderIdentity)
                 evictedCount++
             }
         }

@@ -7,7 +7,7 @@ import java.net.UnknownHostException
 
 /**
  * SSRF-style hygiene guard for automatically-dialed, gossip-supplied [Multiaddr]s - security audit
- * round 1 finding (2026-08-2x): [MailboxPoller.attemptOne] resolves and dials a
+ * round 1 finding (2026-08-27): [MailboxPoller.attemptOne] resolves and dials a
  * [net.lapisphilosophorum.lapisnet.directory.PeerRecord]'s addresses for whatever sender identity a
  * signed [MailboxPointer] NAMES - an attacker-chosen value, since anyone can mint a throwaway
  * identity, publish a [net.lapisphilosophorum.lapisnet.directory.PeerRecord] for it naming ARBITRARY

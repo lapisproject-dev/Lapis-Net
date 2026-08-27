@@ -47,7 +47,7 @@ private const val SIGNATURE_SIZE = 64
  * open question, left open here, not resolved) - see `DmSessionManager.sendOffline`'s doc comment
  * for the full list of this wave's scope cuts.
  *
- * **Extended 2026-08-2x, security audit round 1 minor finding: this note stopped at identity
+ * **Extended 2026-08-27, security audit round 1 minor finding: this note stopped at identity
  * metadata, but the exposure does not.** This pointer also publishes [blobCid] in the clear, and
  * Bitswap serves blocks to any requesting peer with no read-access control (see `NabuStorage`'s own
  * doc comment, `allowAllReads`). Consequently, ANY mailbox-topic observer - not merely the intended
@@ -98,7 +98,33 @@ class MailboxPointer private constructor(
     companion object {
         /** Generous - an offline deposit should survive a realistic "recipient on vacation"
          * absence, unlike `PeerRecord`'s 24h heartbeat window. Provisional magnitude, not derived
-         * from pilot data, same framing as every sibling cap in this codebase. */
+         * from pilot data, same framing as every sibling cap in this codebase.
+         *
+         * **[create]'s cap on [notValidAfterEpochSecond] only binds the honest-signing path, not
+         * decode/gossip ingestion - V0.8.5 hardening pass finding, 2026-08-27, mirroring
+         * `PeerRecord.MAX_TTL_WINDOW_SECONDS`'s own identical, already-documented caveat.** A
+         * custom/modified attacker client can hand-craft wire bytes claiming an unbounded TTL (e.g.
+         * `notValidAfterEpochSecond = Long.MAX_VALUE`) and sign them directly, bypassing [create]
+         * entirely - [MailboxPointerCodec.decode] performs no range check on this field (deliberate,
+         * see that object's own doc comment step 7) and [MailboxGossip.onGossipMessage] never
+         * consults it for accept/reject (deliberate, zero-clock-calls invariant - see that method's
+         * own doc comment). Such a pointer is accepted into [MailboxPointerIndex], is NEVER reclaimed
+         * by [MailboxPointerIndex.evictExpired] (proven directly by
+         * `MailboxPointerIndexTest`'s "evictExpired never evicts a pointer with an extreme
+         * (Long.MAX_VALUE) claimed TTL" case), and is re-attempted by [MailboxPoller.pollOnce] on
+         * every pass for as long as it stays tracked. **This is bounded, not a real
+         * resource-exhaustion vector, entirely by mechanisms OUTSIDE this class**: the index's own
+         * size-based [MailboxPointerIndex.MAX_TRACKED_POINTERS]/LRU eviction cap (unaffected by TTL -
+         * the same eviction path any other pointer is subject to once the index fills), and
+         * [MailboxPoller]'s [MailboxPoller.POLL_PASS_WALL_CLOCK_BUDGET]/
+         * [MailboxPoller.MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS]/pass-rotation trio, which bound the
+         * PER-PASS cost of repeatedly retrying any perpetually-unfetchable pointer regardless of why
+         * it never resolves - `MailboxPollerHardeningTest`'s round 1/round 2 regression cases already
+         * exercise exactly this bounding for the general "keeps failing forever" shape; an extreme
+         * claimed TTL changes nothing about which code path handles it, only removes the one
+         * mechanism ([evictExpired]) that would otherwise have freed the index slot for free once a
+         * normal pointer's TTL passed. Same "accepted, explicitly disclosed limitation" framing as
+         * `PeerRecord.create`'s own doc comment for its identical gap. */
         const val MAX_TTL_WINDOW_SECONDS = 30 * 86_400L
 
         /** [DmSessionManager.sendOffline]'s default TTL when the caller does not specify one. */

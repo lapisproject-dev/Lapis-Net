@@ -226,4 +226,68 @@ class MailboxPollerHardeningTest :
                 nodeB.stop()
             }
         }
+
+        test(
+            "an extreme (Long.MAX_VALUE) claimed TTL does not defeat MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS " +
+                "or pass rotation - V0.8.5 hardening pass finding regression",
+        ) {
+            // MailboxPointer's own class doc comment (MAX_TTL_WINDOW_SECONDS) documents the concern
+            // this test closes with an executable proof: MailboxPointer.create's TTL cap only binds
+            // the honest-signing path, so a hand-crafted pointer claiming Long.MAX_VALUE never
+            // TTL-expires and is therefore NEVER auto-resolved for free by MailboxPointer.evictExpired
+            // (unlike this file's other test above, whose pointers use a normal, finite TTL). This
+            // test proves that fact changes NOTHING about how MailboxPoller bounds the cost of
+            // repeatedly retrying such pointers - the same MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS cap
+            // and cross-pass draining this file's "round 1 major finding" test already exercises for a
+            // normal-TTL flood applies identically here, because neither mechanism ever consults TTL.
+            val nodeA = buildDmTestNode()
+            val nodeB = buildDmTestNode()
+            var poller: MailboxPoller? = null
+            try {
+                connectAndConverge(nodeA, nodeB)
+
+                // Six pointers, all claiming nodeA as sender, each with an UNCAPPED
+                // (Long.MAX_VALUE) TTL and referencing a distinct GARBAGE blob nodeA genuinely has and
+                // serves fast - mirrors the "round 1 major finding" test's own fixture exactly, the
+                // only difference being the TTL, so this test isolates that one variable.
+                (0 until 6).forEach { i ->
+                    val cid = nodeA.storage.put(Random.nextBytes(32 + i))
+                    val pointer =
+                        mailboxPointerWithUncappedTtl(
+                            sender = nodeA.identity.secp256k1KeyPair,
+                            recipientIdentity = nodeB.identity.secp256k1KeyPair.publicKey,
+                            blobCid = cid,
+                            notValidAfterEpochSecond = Long.MAX_VALUE,
+                        )
+                    publishAndConvergeMailboxPointer(nodeA.pubsub, nodeB.mailboxGossip, pointer)
+                }
+                nodeB.mailboxGossip.pending().size shouldBe 6
+
+                // attach()'s synchronous initial pollOnce() is PASS 1.
+                poller =
+                    MailboxPoller.attach(
+                        nodeB.mailboxGossip,
+                        nodeB.storage,
+                        nodeB.peerDirectory,
+                        onDecodedEnvelope = { true },
+                        pollIntervalSeconds = 999_999_999L,
+                    )
+
+                // THE CENTRAL ASSERTION: exactly MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS (4) of the 6
+                // same-sender, uncapped-TTL pointers were dispatched (and resolved, since every one
+                // decodes to garbage) in pass 1 - identical bound to the finite-TTL case above,
+                // proving the cap is genuinely TTL-independent, not merely TTL-typically-bounded.
+                nodeB.mailboxGossip.pending().size shouldBe 2
+
+                // PASS 2: the 2 deferred, still-uncapped-TTL pointers are dispatched and resolved -
+                // not evicted by evictExpired (they never would be), but drained by the SAME
+                // per-pass cap resetting, exactly as the finite-TTL case.
+                poller.pollOnce()
+                nodeB.mailboxGossip.pending().size shouldBe 0
+            } finally {
+                poller?.stop()
+                nodeA.stop()
+                nodeB.stop()
+            }
+        }
     })

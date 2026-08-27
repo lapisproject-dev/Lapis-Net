@@ -153,7 +153,7 @@ data class DmInboundMessage(
  * - **Session registry: a second, DIFFERENT-ephemeral-key `X3DH_INITIAL` from the same peer (e.g.
  *   because they lost local state) still simply creates a new session, overwriting the persisted one
  *   - the same residual gap `X3dh`'s own doc comment already discloses, not something this wave
- *   closes.** What IS closed (security audit round 1 finding, 2026-08-2x, PROVEN with an executable
+ *   closes.** What IS closed (security audit round 1 finding, 2026-08-27, PROVEN with an executable
  *   probe: stop this manager, rebuild a second instance over the SAME identity/session directory,
  *   replay the identical `X3DH_INITIAL` bytes - delivered a SECOND time before this fix): a LITERAL
  *   replay of an ALREADY-ACCEPTED `X3DH_INITIAL` - same ephemeral key, same everything - surviving a
@@ -437,7 +437,7 @@ class DmSessionManager private constructor(
      * which path re-delivers it, since both paths share the SAME [liveSessionCache]/persisted-
      * session-file for a given peer - see [processInboundDmEnvelope]'s own doc comment.
      *
-     * **Corrected 2026-08-2x, security audit round 1 finding: this "regardless of which path"
+     * **Corrected 2026-08-27, security audit round 1 finding: this "regardless of which path"
      * framing does NOT extend to `X3DH_INITIAL`, and this class's own doc comment previously
      * overclaimed that it did.** `X3DH_INITIAL` resolves NO existing session at all - it always
      * builds a brand-new [DoubleRatchetSession] first, so [liveSessionCache]/the persisted session
@@ -607,9 +607,12 @@ class DmSessionManager private constructor(
      * via the SAME [bootstrapSenderSession] helper [send] uses - so first contact bootstraps a
      * byte-identical session either way), durably stores the resulting [DmEnvelope] bytes in Nabu
      * ([NabuStorage.put]) BEFORE announcing a [MailboxPointer] referencing that blob's CID -
-     * "persist then publish, publish strictly last" applied to a TWO-object case (blob persisted,
-     * THEN the pointer that references it persisted, THEN the pointer published): a fast-arriving
-     * pointer can never reference a not-yet-fetchable blob.
+     * "persist then publish, publish strictly last": a fast-arriving pointer can never reference a
+     * not-yet-fetchable blob. **The pointer itself is NOT ALSO put into Nabu** (a prior revision did;
+     * removed as a V0.8.5 hardening-pass finding - see the `nabuStorage.put`/`mailboxRedeliveryScheduler.track`
+     * call site below for the full reasoning): the pointer's own durability for redelivery comes
+     * entirely from [mailboxRedeliveryScheduler]'s bounded in-memory copy, and nothing ever reads a
+     * `MailboxPointer` back from Nabu by its own content id.
      *
      * Unlike [send], this method never dials [recipient] and therefore never needs
      * [PeerDirectoryGossip.lookup] for the RECIPIENT - it only needs [PrekeyBundleGossip.lookup] for
@@ -638,6 +641,31 @@ class DmSessionManager private constructor(
      * - **No re-delivery guarantee beyond the TTL window.** Once a pointer expires or is evicted
      *   from [MailboxPointerIndex], that message is genuinely gone if the recipient never came
      *   online in time - an accepted, bounded-storage tradeoff, not a bug.
+     * - **A smaller, un-closed sibling of the "phantom session" hazard [send] guards against - V0.8.5
+     *   hardening pass finding, 2026-08-27, acknowledged here rather than silently carried.** [send]'s
+     *   own doc comment explains WHY it resolves [peerDirectory] BEFORE touching any session state:
+     *   persisting a brand-new session and only THEN discovering the recipient is undialable would
+     *   leave a durable session this node thinks is live but the recipient never bootstrapped their
+     *   side of (no `X3DH_INITIAL` ever reached them), silently poisoning every later [send]/
+     *   [sendOffline] to that recipient. `sendOffline` has no directory lookup to sequence against (it
+     *   never dials [recipient] - see this doc comment's own paragraph above), so that SPECIFIC
+     *   ordering fix does not apply here. What DOES remain: `persistSession`/`putCached` still commit
+     *   BEFORE `nabuStorage.put(envelopeBytes)`/`mailboxRedeliveryScheduler.track`/`pubsub.publish`
+     *   below - a THIS-node-local, no-network-round-trip window (unlike [send]'s dial, which crosses
+     *   the network and can time out or fail for reasons entirely outside this node's control) between
+     *   "session persisted" and "blob durably stored". A crash or process kill in that narrow window
+     *   (a `nabuStorage.put` I/O failure propagating as an uncaught exception, or the process dying
+     *   between the two calls) leaves a session this node believes is live with no corresponding blob
+     *   ever deposited - the SAME class of inconsistency [send]'s fix targets, just with a
+     *   dramatically smaller and non-adversarial failure window (local disk I/O vs. a full network
+     *   round trip an unreachable/malicious-seeming peer can trivially trigger). Not fixed in this
+     *   pass - re-ordering `persistSession` after `nabuStorage.put` would itself violate
+     *   [DoubleRatchetSession]'s own "persist and destroy ordering" rule 3 (persist ratchet state
+     *   before any externally observable effect of having advanced it), the same rule [send] and this
+     *   method both already follow; closing this residual properly would need a different mechanism
+     *   (e.g. a session-state rollback on a failed deposit) judged out of scope for a hardening pass
+     *   over already-shipped, already-audited code. Stated here so the asymmetry with [send] is
+     *   documented, not silently inherited.
      *
      * @throws DmUnknownRecipientException (first contact only) if no [PrekeyBundleGossip] bundle
      *   exists for [recipient].
@@ -663,6 +691,18 @@ class DmSessionManager private constructor(
                     )
                 session = newSession
             } else {
+                // NOTE (V0.8.5 hardening pass finding, 2026-08-27, tracked not fixed here): this
+                // check(...) throws a bare IllegalStateException, outside this class's documented
+                // @throws taxonomy (DmUnknownRecipientException/DmHandshakeFailedException/
+                // DmSessionException) - copied verbatim from send()'s own identical check at
+                // send:572-574, pre-existing there, not introduced by this wave. Left as-is rather
+                // than fixed in either call site as part of this pass: fixing it here alone would
+                // make send()/sendOffline() diverge in exception shape for the IDENTICAL "receiver-
+                // only session" condition, which is worse than the current consistent-but-undocumented
+                // state; fixing both together is a real (if small) behavior change - a new
+                // DmSessionException subtype, or documenting IllegalStateException in @throws for
+                // both - better done as its own tiny, deliberately-scoped follow-up than folded
+                // silently into an unrelated hardening pass.
                 check(session.canSend) {
                     "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
                 }
@@ -672,7 +712,9 @@ class DmSessionManager private constructor(
             }
 
             // Persist session BEFORE any Nabu write - same "persist session before anything
-            // externally observable" rule send() follows.
+            // externally observable" rule send() follows. See this method's own doc comment
+            // ("smaller, un-closed sibling of the phantom session hazard") for the residual window
+            // this ordering does NOT close, unlike send()'s directory-lookup-first fix.
             persistSession(recipient, session)
             putCached(recipient, session)
 
@@ -686,9 +728,25 @@ class DmSessionManager private constructor(
                     notValidAfterEpochSecond = notValidAfterEpochSecond,
                 )
             val pointerBytes = MailboxPointerCodec.encode(pointer)
-            // Blob persisted (above), THEN pointer persisted, THEN pointer published - see this
-            // method's own doc comment.
-            nabuStorage.put(pointerBytes)
+            // Blob persisted (above) via nabuStorage.put - THIS pointer's own bytes are deliberately
+            // NOT ALSO put into Nabu here, unlike the recipient side's MailboxGossip.onGossipMessage
+            // (which does storage.put the pointer bytes it receives, under a capped
+            // tryReservePersistence reservation - see that method's own doc comment). V0.8.5 hardening
+            // pass finding, 2026-08-27: an earlier revision of sendOffline DID call
+            // `nabuStorage.put(pointerBytes)` here, discarding the returned Cid immediately - nothing
+            // in this codebase ever fetches a MailboxPointer by ITS OWN content id. The pointer's
+            // durability for redelivery comes entirely from `mailboxRedeliveryScheduler.track` below,
+            // which keeps `pointerBytes` in its own bounded, in-memory `pending` map
+            // (MailboxRedeliveryScheduler.MAX_PENDING_OUTBOUND_MAILBOX_SENDS-capped, LRU-evicting) and
+            // republishes from THAT copy - no restart-recovery path anywhere reloads a sent pointer
+            // from Nabu by CID either (MailboxRedeliveryScheduler's own class doc comment already
+            // documents "lost on restart" as an accepted limitation for the in-memory copy; Nabu
+            // durability would not have changed that, since nothing reads it back). The removed call
+            // was therefore pure write-only local disk growth: one never-evicted NabuStorage blob per
+            // sendOffline call, with no cap, unlike every other durable write in this class. Persist
+            // then publish, publish strictly last still holds for the TWO objects that ARE read back -
+            // the blob (via blobCid, by the recipient) and the session state (via persistSession,
+            // above) - it just no longer includes a third, unread copy of the pointer itself.
             // Security audit round 2 minor finding fixed here: `track` runs BEFORE `publish`, not
             // after. `GossipPubSub.publish` swallows `NoPeersForOutboundMessageException` but
             // rethrows every other `GossipPubSubException` (including its own `awaitOrWrap` publish
@@ -859,7 +917,7 @@ class DmSessionManager private constructor(
                                 }
                                 return@withPeerLock true // garbage/tamper - these exact bytes will never verify
                             }
-                            // **Security audit round 1 fix (2026-08-2x): DURABLE, per-peer replay guard
+                            // **Security audit round 1 fix (2026-08-27): DURABLE, per-peer replay guard
                             // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
                             // the full story of the gap this closes, PROVEN exploitable by a restart
                             // (which empties that in-memory-only cache) via an executable probe.**
@@ -1271,7 +1329,7 @@ class DmSessionManager private constructor(
 
     /** Durably records [ephemeralKeyBytes] - an accepted `X3DH_INITIAL` header's
      * [X3dhPreKeyMessageHeader.ephemeralPublicKey] bytes - into [peer]'s replay registry, closing
-     * the security-audit round 1 major finding (2026-08-2x): a replayed `X3DH_INITIAL` naming NO
+     * the security-audit round 1 major finding (2026-08-27): a replayed `X3DH_INITIAL` naming NO
      * one-time prekey (`header.oneTimePrekeyId == null`, see [processInboundDmEnvelope]'s own doc
      * comment on that branch for why [PrekeyStore]'s own durable consumption tracking never runs
      * for it) could otherwise resurrect an already-delivered message and rewind the persisted

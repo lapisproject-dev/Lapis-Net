@@ -96,7 +96,6 @@ class MailboxPointerIndexTest :
             val recipient = DualKeyIdentity.generate().secp256k1KeyPair
             repeat(5) { i -> index.add(pointerFor(sender, recipient, i.toByte())) }
             index.pending().size shouldBe 5
-            index.pointersFrom(sender.publicKey).size shouldBe 5
         }
 
         test("evictExpired removes only pointers whose TTL has passed, leaves the rest tracked") {
@@ -172,16 +171,49 @@ class MailboxPointerIndexTest :
             index.size() shouldBe 3
         }
 
-        test("eviction from the tracking cap also removes the entry from pointersFrom's per-sender bucket") {
+        test("eviction from the tracking cap removes exactly the eldest entry, leaves the rest pending") {
             val index = MailboxPointerIndex(maxTracked = 2, maxPersisted = 100)
             val sender = DualKeyIdentity.generate().secp256k1KeyPair
             val recipient = DualKeyIdentity.generate().secp256k1KeyPair
-            val first = pointerFor(sender, recipient, 1)
-            index.add(first)
+            index.add(pointerFor(sender, recipient, 1))
             index.add(pointerFor(sender, recipient, 2))
-            index.add(pointerFor(sender, recipient, 3)) // evicts `first`
+            index.add(pointerFor(sender, recipient, 3)) // evicts pointer 1 (the eldest)
 
-            index.pointersFrom(sender.publicKey).map { it.blobCid } shouldBe
+            index.pending().map { it.blobCid } shouldBe
                 listOf(pointerFor(sender, recipient, 2).blobCid, pointerFor(sender, recipient, 3).blobCid)
+        }
+
+        test("evictExpired never evicts a pointer with an extreme (Long.MAX_VALUE) claimed TTL") {
+            // V0.8.5 hardening pass finding: MailboxPointer.create's MAX_TTL_WINDOW_SECONDS cap only
+            // binds the honest-signing path (see MailboxPointer's own class doc comment, mirroring
+            // PeerRecord's identical caveat) - a hand-crafted client that signs the body directly
+            // (bypassing create()'s require() check, exactly as PeerRecord's own doc comment already
+            // discloses for its own MAX_TTL_WINDOW_SECONDS) can still produce a GENUINELY, validly
+            // signed pointer claiming an unbounded notValidAfterEpochSecond - decode()/verify() accept
+            // it structurally (no range check - see MailboxPointerCodec.decode's own doc comment).
+            // This test builds exactly that (signing over the real wire body with the real domain tag,
+            // the same construction MailboxPointer.create uses internally, just without its TTL
+            // guard) and proves evictExpired's OWN behavior for it directly: it never reclaims such a
+            // pointer no matter how far into the future `now` is pushed - the index-level bound this
+            // leaves on that pointer's lifetime is entirely the size-based
+            // MAX_TRACKED_POINTERS/LRU cap (see the "two-cap eviction" test above), never a TTL-based
+            // one. See MailboxPointer's and MailboxPoller's own class doc comments for why this
+            // residual is still bounded overall.
+            val index = MailboxPointerIndex()
+            val sender = DualKeyIdentity.generate().secp256k1KeyPair
+            val recipient = DualKeyIdentity.generate().secp256k1KeyPair
+            val extremeTtl =
+                mailboxPointerWithUncappedTtl(
+                    sender = sender,
+                    recipientIdentity = recipient.publicKey,
+                    blobCid = testCid(1),
+                    notValidAfterEpochSecond = Long.MAX_VALUE,
+                )
+            MailboxPointer.verify(extremeTtl) shouldBe true // a genuinely, validly signed pointer
+            index.add(extremeTtl) shouldBe true
+
+            index.evictExpired(nowEpochSecond = Long.MAX_VALUE - 1) shouldBe 0
+            index.size() shouldBe 1
+            index.pending().map { it.blobCid } shouldBe listOf(extremeTtl.blobCid)
         }
     })

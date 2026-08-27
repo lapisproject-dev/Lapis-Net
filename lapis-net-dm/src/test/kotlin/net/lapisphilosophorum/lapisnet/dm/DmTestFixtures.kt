@@ -1,7 +1,11 @@
 package net.lapisphilosophorum.lapisnet.dm
 
+import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.EncryptionKeyBinding
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSession
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
@@ -81,4 +85,42 @@ internal fun dmEstablishedPair(
 internal fun dmSampleRatchetMessage(plaintext: ByteArray = "hello".toByteArray()): RatchetMessage {
     val (alice, _) = dmEstablishedPair()
     return alice.encrypt(plaintext)
+}
+
+/** Same domain tag `MailboxPointer`'s own private `signingDigest()` uses - re-declared here rather
+ * than exposed from production code, purely as a test seam for hand-crafting a pointer that bypasses
+ * [MailboxPointer.create]'s own [MailboxPointer.MAX_TTL_WINDOW_SECONDS] guard. */
+private const val TEST_MAILBOX_POINTER_DOMAIN_TAG = "LapisNet:mailbox-pointer:v1"
+
+/**
+ * Builds a GENUINELY, validly signed [MailboxPointer] whose [MailboxPointer.notValidAfterEpochSecond]
+ * exceeds [MailboxPointer.MAX_TTL_WINDOW_SECONDS] - the shape [MailboxPointer.create] itself refuses
+ * to sign (see that companion's own doc comment), but which a hand-crafted/modified client could
+ * still produce and broadcast, since neither [MailboxPointerCodec.decode] nor
+ * [MailboxGossip.onGossipMessage] range-check this field. V0.8.5 hardening pass test seam - used by
+ * `MailboxPointerIndexTest`/`MailboxPollerHardeningTest` to prove the caps that DO bound such a
+ * pointer (index size/LRU, [MailboxPoller]'s per-pass wall-clock and per-sender budgets) still hold
+ * regardless of how extreme the claimed TTL is.
+ */
+internal fun mailboxPointerWithUncappedTtl(
+    sender: Secp256k1KeyPair,
+    recipientIdentity: Secp256k1PublicKey,
+    blobCid: Cid,
+    notValidAfterEpochSecond: Long,
+): MailboxPointer {
+    val body =
+        MailboxPointerCodec.encodeSignedBody(
+            recipientIdentity = recipientIdentity,
+            senderIdentity = sender.publicKey,
+            blobCid = blobCid,
+            notValidAfterEpochSecond = notValidAfterEpochSecond,
+        )
+    val digest = domainSeparatedDigest(TEST_MAILBOX_POINTER_DOMAIN_TAG, body)
+    return MailboxPointer.fromDecoded(
+        recipientIdentity = recipientIdentity,
+        senderIdentity = sender.publicKey,
+        blobCid = blobCid,
+        notValidAfterEpochSecond = notValidAfterEpochSecond,
+        signature = sender.sign(digest),
+    )
 }
