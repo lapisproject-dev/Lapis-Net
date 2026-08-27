@@ -62,10 +62,21 @@ must remain reachable, or at least come back online before the pointer's TTL
 expires, for offline delivery to complete. Recipients fetch the referenced
 blob via a direct Bitswap request to the sender's currently-gossiped address
 (`MailboxPoller`), never via `NabuStorage.findProviders`, which remains
-broken since V0.1.4.
-Also not yet implemented: mail encryption, threading, attachments, and spam
-protection (V0.9.2–V0.9.4 — the V0.9.1 envelope/body format and GossipSub
-inbox propagation are implemented, see `lapis-net-mail` below).
+broken since V0.1.4. A follow-up hardening pass closed a persistence-
+reservation resource leak found across four gossip-validated record types
+(`MailboxPointerIndex`, `PeerRecordIndex`, `InboxIndex`, `PrekeyBundleIndex` —
+a reservation slot burned permanently if the subsequent durable write
+failed), an unhandled-synchronous-exception gap in `NabuStorage` (the pinned
+Nabu jar throws directly rather than failing a `CompletableFuture` on one
+specific I/O path), and several smaller findings in the mailbox code (dead
+lookup structure removed, an unbounded local write removed, TTL-cap and
+sender-identity-trust documentation added, a missing topic-collision test
+added).
+Not yet implemented in this arc: attachments, policy/spam-filtering, a
+browser UI for direct messages (V0.8.6), and 1:1 voice/video calls (V0.8.7).
+Mail (V0.9) is a separate, already-completed arc — encryption, threading,
+attachments, and spam protection are all implemented, see `lapis-net-mail`
+below.
 
 == Modules
 
@@ -98,7 +109,7 @@ inbox propagation are implemented, see `lapis-net-mail` below).
 | Madli (machine-to-machine node reputation): five-metric observation vector with Veritas-weighted, manipulation-resistant weighted-median aggregation.
 
 | `lapis-net-mail`
-| Asynchronous messages (the e-mail replacement): signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1).
+| Asynchronous messages (the e-mail replacement), fully implemented (V0.9.1–V0.9.4): a signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1); hybrid-ecies encryption (HKDF + AES-256-GCM over a secp256k1 ECDH exchange, V0.9.2); cycle-safe, receive-order-independent threading, encrypted attachments, a local sent-folder view, and a browser inbox UI with verified XSS protection (V0.9.3); and a Veritas/Karma scoring filter plus a Lightning first-contact deposit for spam resistance (V0.9.4). A follow-up security-hardening pass closed a critical unauthenticated remote memory-exhaustion bug found in this module and, on audit, in three other already-shipped modules (`lapis-net-trust`, `lapis-net-virtus`, `lapis-net-karma`) plus a fourth instance in `lapis-net-browser`.
 
 | `lapis-net-directory`
 | Signed peer/presence directory records (`PeerRecord`): identity bound to its current network addresses and libp2p peer identity, with a monotonic sequence number and a heartbeat TTL, gossiped and Nabu-persisted — the foundational discovery layer V0.8's later sub-waves (online DM addressing) resolve recipients through (V0.8.1). Also carries `PrekeyBundle` gossip/indexing (`PrekeyBundleGossip`/`PrekeyBundleIndex`) for `lapis-net-ratchet`'s prekey bundles (V0.8.2).
