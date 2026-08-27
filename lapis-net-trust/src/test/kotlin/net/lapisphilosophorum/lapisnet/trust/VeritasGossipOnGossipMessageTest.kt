@@ -12,6 +12,7 @@ import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 
 /**
  * Unit-level tests of [VeritasGossip.onGossipMessage] itself - the actual GossipSub validator
@@ -169,6 +170,50 @@ class VeritasGossipOnGossipMessageTest :
                         mintingNode.stop()
                     }
                 persistedCount shouldBe persistCap
+            } finally {
+                node.stop()
+            }
+        }
+
+        // --- NabuStorage synchronous-exception-funnel regression (V0.8.5) ---
+
+        test(
+            "a genuine local I/O failure during storage.put (read-only blockstore directory) returns Invalid " +
+                "and never crashes with a raw RuntimeException - VeritasGossip is the class every other gossip " +
+                "validator's persist/catch(NabuStorageException)/reject shape was modeled after (see this file's " +
+                "own doc comment), so this proves the NabuStorage.awaitOrWrap synchronous-throw fix genuinely " +
+                "propagates up through a real call site, not just through NabuStorage's own unit tests. Without " +
+                "the fix, Nabu's FileBlockstore.put rethrows the local IOException as a bare RuntimeException " +
+                "synchronously - before NabuStorage.put's awaitOrWrap ever sees a failed CompletableFuture - and " +
+                "this test crashes instead of observing ValidationResult.Invalid",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val blockstoreDir = Files.createTempDirectory("veritas-ongossip-readonly")
+                val storage = NabuStorage.attach(node, blockstoreDir)
+                val blocksDir = blockstoreDir.resolve("blocks")
+                if ("posix" !in blocksDir.fileSystem.supportedFileAttributeViews()) return@test
+
+                Files.setPosixFilePermissions(blocksDir, PosixFilePermissions.fromString("r-xr-xr-x"))
+                try {
+                    val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                    val truster = identity.secp256k1KeyPair
+                    val target = Secp256k1KeyPair.generate().publicKey
+                    val grant = VeritasGrant.create(truster, target, trustMicros = 500_000)
+                    val bytes = VeritasGrantCodec.encode(grant)
+                    val index = VeritasGrantIndex()
+
+                    val result = VeritasGossip.onGossipMessage(bytes, from, storage, index)
+
+                    result shouldBe ValidationResult.Invalid
+                    // VeritasGossip deliberately never indexes a grant it failed to persist -
+                    // persist-before-index, per this function's own doc comment.
+                    index.grantsFor(truster.publicKey, target) shouldBe emptyList()
+                } finally {
+                    Files.setPosixFilePermissions(blocksDir, PosixFilePermissions.fromString("rwxr-xr-x"))
+                }
             } finally {
                 node.stop()
             }

@@ -10,6 +10,7 @@ import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 
 private fun testCid(seed: Byte): Cid = Cid.buildCidV1(Cid.Codec.Raw, Multihash.Type.sha2_256, ByteArray(32) { seed })
 
@@ -236,6 +237,64 @@ class MailboxGossipOnGossipMessageTest :
                     storage.get(mintingStorage.put(pointerBytes)) shouldBe null
                 } finally {
                     mintingNode.stop()
+                }
+            } finally {
+                node.stop()
+            }
+        }
+
+        test(
+            "a genuine local I/O failure during storage.put (read-only blockstore directory) returns Invalid, " +
+                "releases the persistence reservation, and never crashes with a raw RuntimeException - the " +
+                "exact scenario NabuStorage's synchronous-exception-funnel fix (see NabuStorage.awaitOrWrap) " +
+                "exists for: Nabu's FileBlockstore.put catches the local IOException itself and rethrows it as " +
+                "a bare RuntimeException synchronously, before NabuStorage.put's awaitOrWrap ever gets a failed " +
+                "CompletableFuture to react to. Without that fix, this test crashes the JVM thread with an " +
+                "uncaught RuntimeException instead of observing ValidationResult.Invalid",
+        ) {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val blockstoreDir = Files.createTempDirectory("mailbox-gossip-readonly")
+                val storage = NabuStorage.attach(node, blockstoreDir)
+                val blocksDir = blockstoreDir.resolve("blocks")
+                if ("posix" !in blocksDir.fileSystem.supportedFileAttributeViews()) return@test
+
+                Files.setPosixFilePermissions(blocksDir, PosixFilePermissions.fromString("r-xr-xr-x"))
+                try {
+                    val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                    val index = MailboxPointerIndex()
+                    val localIdentity = identity.secp256k1KeyPair.publicKey
+                    val sender = DualKeyIdentity.generate().secp256k1KeyPair
+                    val pointer =
+                        MailboxPointer.create(
+                            sender = sender,
+                            recipientIdentity = localIdentity,
+                            blobCid = testCid(1),
+                            notValidAfterEpochSecond = 1_000_000L,
+                            nowEpochSecond = 0,
+                        )
+                    val bytes = MailboxPointerCodec.encode(pointer)
+
+                    val result = MailboxGossip.onGossipMessage(bytes, from, storage, index, localIdentity)
+
+                    result shouldBe ValidationResult.Invalid
+                    index.pending().size shouldBe 0
+
+                    // The persistence reservation was released, not permanently burned - proven
+                    // behaviorally rather than by peeking at private state: restore write access and
+                    // re-deliver the SAME pointer. If the reservation had leaked, tryReservePersistence
+                    // would still report it as already-reserved (which is harmless on its own, since it
+                    // short-circuits to `true`) - the property this really guards is that the pointer
+                    // was never added to the index on the failed attempt, so it is free to be accepted
+                    // as if this were its first delivery.
+                    Files.setPosixFilePermissions(blocksDir, PosixFilePermissions.fromString("rwxr-xr-x"))
+                    val retryResult = MailboxGossip.onGossipMessage(bytes, from, storage, index, localIdentity)
+                    retryResult shouldBe ValidationResult.Valid
+                    index.pending().size shouldBe 1
+                } finally {
+                    Files.setPosixFilePermissions(blocksDir, PosixFilePermissions.fromString("rwxr-xr-x"))
                 }
             } finally {
                 node.stop()

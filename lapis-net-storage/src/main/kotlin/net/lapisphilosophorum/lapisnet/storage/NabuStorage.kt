@@ -216,6 +216,20 @@ class NabuStorage private constructor(
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             throw NabuStorageException("interrupted while waiting to $action", e)
+        } catch (e: NabuStorageException) {
+            // Already funneled (e.g. a future refactor of `block` that calls back into another
+            // NabuStorage method) - rethrow as-is instead of wrapping a NabuStorageException in
+            // another one below.
+            throw e
+        } catch (e: Exception) {
+            // `block()` itself can throw synchronously, before it ever produces a
+            // CompletableFuture for `.get()` above to wait on - e.g. Nabu's FileBlockstore.put/
+            // get catch a local IOException (disk full, permission denied, read-only filesystem)
+            // and rethrow it as a bare RuntimeException on the calling thread, never delivering
+            // it via a failed future. The catches above only see failures that *do* make it into
+            // a future (or its .get() call); this catches everything else so no exception from a
+            // storage/DHT call can escape this class unwrapped.
+            throw NabuStorageException("failed to $action", e)
         }
 
     companion object {
