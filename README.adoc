@@ -1,7 +1,9 @@
 = Lapis Net
 
-image:https://github.com/lapisproject-dev/Lapis-Net/actions/workflows/ci.yml/badge.svg?branch=master[CI,link=https://github.com/lapisproject-dev/Lapis-Net/actions/workflows/ci.yml]
-image:https://img.shields.io/github/license/lapisproject-dev/Lapis-Net[License,link=LICENSE]
+image:https://img.shields.io/github/actions/workflow/status/lapisproject-dev/Lapis-Net/ci.yml?branch=master&label=CI&logo=github[CI,link=https://github.com/lapisproject-dev/Lapis-Net/actions/workflows/ci.yml]
+image:https://img.shields.io/badge/Kotlin-2.4.10-7F52FF.svg?logo=kotlin&logoColor=white[Kotlin 2.4.10,link=https://kotlinlang.org]
+image:https://img.shields.io/badge/JDK-25-ED8B00.svg?logo=openjdk&logoColor=white[JDK 25,link=https://adoptium.net]
+image:https://img.shields.io/github/license/lapisproject-dev/Lapis-Net[Apache 2.0,link=https://github.com/lapisproject-dev/Lapis-Net/blob/master/LICENSE]
 
 image::docs/images/ln-banner.png[Lapis Net,link=https://github.com/lapisproject-dev/Lapis-Net]
 
