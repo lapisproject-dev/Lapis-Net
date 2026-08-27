@@ -244,7 +244,7 @@ Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec 
 note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
 on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
 remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1, V0.8.2,
-V0.8.3, and V0.8.4 have landed.
+V0.8.3, V0.8.4, and V0.8.5 have landed.
 
 [cols="1,3"]
 |===
@@ -272,9 +272,23 @@ protocol wiring V0.8.2's X3DH handshake and V0.8.3's Double Ratchet into a live 
 for directly-dialable peers. The first module in this codebase parsing untrusted bytes off a raw
 libp2p stream, with no GossipSub size ceiling backstopping the parser (implemented — see below).
 
-| V0.8.5+
-| Offline mailbox redelivery and calling — not yet started, not sub-wave-planned in fine-grained
-detail here; see the vault's 2026-08-04 sub-wave plan for the intended breakdown.
+| V0.8.5
+| Offline Nabu mailbox (`lapis-net-dm`) — the offline-delivery path completing V0.8.4's "recipient
+reachable now" story with "recipient offline, deposit for later": a signed `MailboxPointer`
+gossiped on the recipient's own topic, referencing an encrypted `DmEnvelope` blob deposited in
+Nabu, fetched via a direct Bitswap request to the sender's currently-gossiped address (never via
+the still-broken `NabuStorage.findProviders`) and periodically re-announced so a later-starting
+recipient can still discover it (implemented — see below).
+
+| V0.8.6
+| Not yet started, not sub-wave-planned in fine-grained detail here — a reserved slot between V0.8.5
+(offline mailbox) and V0.8.7+ (calling); see the vault's 2026-08-04 sub-wave plan for the intended
+breakdown.
+
+| V0.8.7+
+| Calling — reserved wire values already exist (`DmMessageType.CALL_SIGNAL`, rejected outright
+through V0.8.5), but not yet started and not sub-wave-planned in fine-grained detail here; see the
+vault's 2026-08-04 sub-wave plan for the intended breakdown.
 |===
 
 **Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
@@ -710,12 +724,14 @@ here too, before AES-GCM decryption is ever attempted.
   V0.1.3/networking, unchanged by this wave. This wave supports only DIRECT-DIALABLE peers
   (same-LAN, or otherwise directly reachable); a peer behind NAT without port forwarding simply
   cannot be reached.
-* **No offline/mailbox redelivery.** V0.8.5's job. A forward-compatible dedup key (`DmDedupKey`,
-  `SHA-256(domainTag || senderIdentity || ratchetPublicKey || messageNumber)`) is computed now,
-  from fields already on the decoded `RatchetMessage` that V0.8.5's mailbox path will see too, so a
-  message delivered both online (this wave) and later redelivered via the mailbox produces the
-  IDENTICAL dedup key without either path needing to know about the other — but nothing in this
-  wave deduplicates against anything with it.
+* **No offline/mailbox redelivery in THIS wave** — V0.8.5's job, since implemented (see that
+  section below). A forward-compatible dedup key (`DmDedupKey`,
+  `SHA-256(domainTag || senderIdentity || ratchetPublicKey || messageNumber)`) is computed here in
+  V0.8.4, from fields already on the decoded `RatchetMessage` that V0.8.5's mailbox path also sees,
+  so a message delivered both online (this wave) and later redelivered via the mailbox produces the
+  IDENTICAL dedup key without either path needing to know about the other — nothing in V0.8.4 itself
+  deduplicates against anything with it; V0.8.5's `processInboundDmEnvelope` cross-path pre-check is
+  what actually consumes it.
 * **`DmStore` (conversation history) is in-memory-only.** An explicit, documented scope cut — this
   wave already carries the highest structural risk in the codebase to date (a new stream protocol,
   a new wire format, a new session state machine, the mandatory adversarial suite), and inventing a
@@ -730,6 +746,146 @@ here too, before AES-GCM decryption is ever attempted.
 * **No multi-device / no session migration** (inherited from `DoubleRatchetSession` itself).
 * **No session registry beyond what V0.8.3 already documents as partial** — a second, legitimate
   `X3DH_INITIAL` from the same peer simply creates a new session, overwriting the persisted one.
+
+=== V0.8.5 — Offline Nabu mailbox
+
+Target: the offline-delivery path for 1:1 direct messages — completing the split V0.8.4 started:
+V0.8.4 covers "recipient reachable right now" (a live libp2p stream), this wave covers "recipient
+offline, deposit a message for later pickup." This wave's central mechanism is routing around the
+broken DHT (`NabuStorage.findProviders`, broken since V0.1.4 — see the Storage section below) via a
+peer-hint-based direct Bitswap fetch — AND, less obviously but just as load-bearing, that pointer
+*discoverability itself* required inventing a new periodic-re-announcement mechanism, because
+GossipSub has no message replay (`GossipPubSub.subscribe`'s own doc comment: a node that publishes
+while a peer isn't yet subscribed never redelivers that message to a later-joining subscriber).
+Both points are stated up front here, not buried, because together they are this wave's most
+important caveat — see "The sender-must-remain-reachable caveat" below.
+
+[cols="1,3"]
+|===
+| Wave | Content
+
+| V0.8.5
+| `MailboxPointer`/`MailboxPointerCodec` — a signed record: `recipientIdentity`, `senderIdentity`
+(the routing hint — NOT an address, which would go stale), the deposited blob's `io.ipfs.cid.Cid`,
+a TTL, and a 64-byte ECDSA signature by `senderIdentity`. Wire layout mirrors `PeerRecordCodec`'s
+discipline exactly — magic/version/reserved-flags-must-be-zero, every length validated BEFORE the
+corresponding allocation, `CidBytesValidation.isSafeToCast` checked before `Cid.cast` ever runs
+(the same OOM-DoS class `MessageEnvelopeCodec`'s CID fields already guard against). Located in
+`lapis-net-dm`, not a new module — tightly coupled to `DmSessionManager`/`DmDedupKey`/
+`DmEnvelopeCodec`, mirroring `lapis-net-directory` hosting both `PeerRecord` and the related-but-
+distinct `PrekeyBundle` gossip type in one module.
+
+| V0.8.5
+| `MailboxGossip`/`MailboxPointerIndex` — a dedicated GossipSub topic per RECIPIENT identity
+(`MailboxTopics.forRecipient`, mirroring `InboxTopics`'/`PeerDirectoryGossip`'s per-identity-topic
+pattern), subscribe-only (no `announce()` — publishing onto a DIFFERENT identity's topic is the
+SENDER's job, mirroring the `MailSender`/`InboxGossip` split). `MailboxPointerIndex` is content-id
+keyed with a resolved/pending flag — unlike `PeerRecordIndex`'s "latest wins per identity," a
+recipient can legitimately have many distinct pending offline messages at once, so it mirrors
+`InboxIndex`'s multiple-coexisting-entries shape instead, plus the established two-cap eviction/
+persistence structure. Zero clock/network calls inside the gossip validator, exactly like every
+prior wave's iron rule — TTL is checked only at read/poll time.
+
+| V0.8.5
+| `MailboxPoller` — the recipient-side driver: an initial synchronous pass over whatever
+`MailboxGossip`'s IN-MEMORY index already holds at `attach()` time (received via live gossip since
+this node's own process started — NOT a reload from durable storage; a pointer received-but-not-yet-
+processed before this node's OWN restart is lost from this node's own tracking, symmetric to
+`MailboxRedeliveryScheduler`'s documented sender-side "lost on restart" limitation below), then
+periodic (60s default) thereafter. For each pending pointer, resolves the sender's CURRENT
+address via `PeerDirectoryGossip.lookup` (V0.8.1), registers it, and attempts a direct Bitswap
+fetch by explicit peer — never via `NabuStorage.findProviders`. On a successful fetch, the blob is
+structurally decoded and routed through the EXACT SAME session-resolution/decrypt/persist/dedup/
+listener-notification core the online path uses (`DmSessionManager.processInboundDmEnvelope`) — one
+trust boundary for both transports. That core reports back whether its outcome was FINAL for the
+envelope's bytes or merely reflects this node's own current state (e.g. no session yet for the
+claimed sender, retryable once a session is bootstrapped from a different pointer) —
+`MailboxPoller` marks a pointer resolved only on a final outcome, so a `TEXT` pointer that outraces
+its own bootstrapping `X3DH_INITIAL` pointer is retried rather than permanently lost. Never throws;
+each pointer's attempt is independently try/caught so one bad pointer never blocks the rest of a
+pass.
+
+| V0.8.5
+| `MailboxRedeliveryScheduler` — the sender-side periodic re-announcer, and this wave's genuinely
+novel mechanism (no prior sub-wave has an equivalent). Re-publishes the SAME already-announced
+pointer bytes on a fixed interval (300s default) for as long as its TTL has not expired, so a
+recipient's node that starts up (or comes back online) LATER still receives the pointer on the next
+scheduled re-publish, through completely ordinary GossipSub delivery — see the caveat subsection
+below for why this is load-bearing, not an optimization.
+
+| V0.8.5
+| `DmSessionManager.sendOffline` — encrypts exactly as `send` does (same `X3dh.initiate`-on-first-
+contact / `DoubleRatchetSession.encrypt` reuse, via a shared `bootstrapSenderSession` helper so the
+two call sites are byte-identical for first contact by construction, not by convention), durably
+stores the resulting `DmEnvelope` bytes in Nabu, THEN persists a signed `MailboxPointer` referencing
+that blob's CID, THEN publishes the pointer — "persist then publish, publish strictly last" applied
+to a two-object case (blob, then the pointer that references it), so a fast-arriving pointer can
+never reference a not-yet-fetchable blob. Also a new cross-path dedup pre-check in
+`processInboundDmEnvelope` (a bounded, LRU-evicting, global `recentlyDeliveredDedupKeys` cache keyed
+by `DmDedupKey`) — see below for why this is belt-and-braces, not the load-bearing guarantee.
+
+|===
+
+==== The sender-must-remain-reachable caveat
+
+Stated plainly and prominently, per this wave's own most important limitation: **offline delivery
+genuinely fails to complete if the sender never comes back online before the pointer's TTL
+expires** — and this is a STRONGER requirement than "reachable enough to serve the eventual Bitswap
+fetch." GossipSub has zero message replay: a pointer published while the recipient's node was not
+yet running (the defining "genuinely offline" scenario `TwoNodeOfflineMailboxIntegrationTest`
+covers) is never delivered to that later-starting subscriber by the ORIGINAL publish, no matter how
+long the recipient stays subscribed afterward. The sender must be ALIVE FOR POINTER REDELIVERY
+(`MailboxRedeliveryScheduler`'s periodic re-publish) — that is the ONLY way the pointer's existence
+is ever discoverable by a recipient who missed the original publish, entirely separate from whether
+the underlying blob would still have been fetchable via Bitswap once the recipient learns about it.
+This is a real, inherent limitation of routing around the broken DHT with gossip alone — not a bug
+to silently paper over, and it is documented here exactly as bluntly as `MailboxRedeliveryScheduler`
+itself states it in code.
+
+==== A necessary deviation from the original DM concept note's metadata-minimization principle
+
+`MailboxPointer` carries `senderIdentity` and `recipientIdentity` in the clear, signed, and gossiped
+on a topic derived from `recipientIdentity` — a deliberate, necessary deviation from "Mailbox-
+Records enthalten keine Klartext-Absenderkennung" (mailbox records carry no plaintext sender
+identification). The recipient cannot resolve a routing hint to fetch the blob without knowing WHOSE
+current address to look up, and the gossip validator cannot cheaply reject a forged pointer without
+a signer identity to check it against — a fully metadata-blind mailbox record is not achievable
+under this wave's broken-DHT-workaround fetch mechanism. Anyone who can subscribe to a recipient's
+mailbox topic (i.e. anyone — GossipSub topics are not access-controlled) learns "someone claiming
+identity S deposited a message for X at time T," the same exposure `PeerRecord` already accepts for
+presence/address gossip. This is stated explicitly rather than silently claiming more privacy than
+the mechanism delivers.
+
+==== Explicit, deliberate scope cuts for this wave
+
+* **No onion routing for mailbox pointers.** The original DM concept note's own open question — left
+  open here, not resolved.
+* **No DHT mailbox record** — the same broken-Kademlia limitation as every other V0.8/V0.9 wave;
+  gossip plus explicit peer-hint-based Bitswap fetch instead.
+* **No pin-lifetime management.** Nabu has no pin/GC anywhere in this project (V0.1.4's own
+  documented state, see the Storage section below) — "pinning" a mailbox blob is currently a no-op;
+  this is stated plainly rather than implying a pinning economy exists.
+* **No re-delivery guarantee beyond the TTL window.** Once a pointer expires or is evicted from
+  `MailboxPointerIndex`, that message is genuinely gone if the recipient never came online in time —
+  an accepted, bounded-storage tradeoff, not a bug.
+* **The cross-path dedup registry (`recentlyDeliveredDedupKeys`) is belt-and-braces, not the load-
+  bearing guarantee against double delivery — for `TEXT`.** `DoubleRatchetSession.decrypt`'s own
+  commit-only-after-AEAD-verifies state machine already structurally rejects a literal replay of the
+  same `TEXT` ratchet message (`RatchetMessageRejectedException`), regardless of which path (online
+  or offline) re-delivers it, since both paths resolve the SAME session object for a given peer. The
+  registry exists so a KNOWN duplicate is skipped WITHOUT even attempting a wasted AEAD decrypt or
+  one-time-prekey-consumption attempt — an efficiency win, not the correctness property itself, for
+  `TEXT`.
+* **Correction (security audit round 1 major finding, PROVEN with an executable restart probe): the
+  bullet above did NOT extend to `X3DH_INITIAL`, and earlier revisions of this document overclaimed
+  that it did.** `X3DH_INITIAL` resolves no existing session at all, so the ratchet's own structural
+  guarantee cannot apply to it; when the header names no one-time prekey, `PrekeyStore`'s own durable
+  consumption tracking never runs either, leaving only the in-memory, restart-losable
+  `recentlyDeliveredDedupKeys` between a replayed `X3DH_INITIAL` and a resurrected message plus a
+  rewound persisted session. Closed by a DURABLE, per-peer registry of already-accepted
+  `X3DH_INITIAL` ephemeral public keys (`DmSessionManager.recordAcceptedX3dhInitialEphemeralKey`),
+  persisted alongside the session file and checked before ever bootstrapping a session — see
+  `docs/architecture.adoc`'s "Cross-path dedup" section for the full trace.
 
 == V0.9 — Asynchronous messages (email replacement)
 

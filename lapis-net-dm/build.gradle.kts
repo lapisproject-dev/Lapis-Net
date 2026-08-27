@@ -24,11 +24,23 @@
 // lapis-net-networking) appear directly in DmProtocol's/DmSessionManager's public signatures -
 // mirrors lapis-net-directory's own "explicit-not-transitive" house rule.
 //
-// Deliberately NO lapis-net-storage dependency: DM sessions persist via
-// DoubleRatchetSessionCodec's own file-based encrypted-at-rest format (mirroring PrekeyStore's
-// atomic-temp-file-then-move pattern), never via NabuStorage/CID - there is no content-addressed
-// blob here to store, and DmStore (conversation history) is explicitly in-memory-only this wave
-// (see that class's own doc comment for the documented scope cut).
+// V0.8.5 REVERSAL of an earlier statement in this comment (kept here, corrected, rather than
+// silently dropped - the original claimed the opposite of what is now true): this module used to
+// have NO lapis-net-storage dependency, because DM sessions persist via
+// DoubleRatchetSessionCodec's own file-based encrypted-at-rest format, and there was no content-
+// addressed blob to store. V0.8.5's offline Nabu mailbox makes that statement false: a
+// DmEnvelope deposited for offline pickup IS a content-addressed Nabu blob
+// (DmSessionManager.sendOffline calls NabuStorage.put/get), and MailboxPointer carries an
+// io.ipfs.cid.Cid field directly in its own public constructor/properties (see MailboxPointer.kt/
+// MailboxPointerCodec.kt). `api`, not `implementation`, because NabuStorage/Cid appear directly in
+// DmSessionManager.attach()'s and MailboxGossip.attach()'s public signatures and in MailboxPointer's
+// own public API - the same "explicit-not-transitive" house rule already governing every other
+// dependency edge in this module.
+//
+// V0.8.5 addition: GossipPubSub needs no NEW dependency edge (already reachable via
+// api(lapis-net-networking)), but is now used directly in this module's own implementation
+// (DmSessionManager.sendOffline, MailboxRedeliveryScheduler) and appears directly in
+// DmSessionManager.attach()'s new `pubsub` parameter - satisfying the same house rule.
 //
 // Netty codec classes (LengthFieldBasedFrameDecoder, LengthFieldPrepender, ReadTimeoutHandler) need
 // no separate dependency declaration - verified against the resolved classpath: as of jvm-libp2p
@@ -41,4 +53,5 @@ dependencies {
     api(project(":lapis-net-ratchet"))
     api(project(":lapis-net-directory"))
     api(project(":lapis-net-networking"))
+    api(project(":lapis-net-storage"))
 }

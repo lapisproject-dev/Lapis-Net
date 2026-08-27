@@ -16,7 +16,7 @@ import java.time.Duration
 import java.time.Instant
 
 /** A single, fully-wired node for DM integration/adversarial tests - real [LapisNode], real
- * GossipSub/directory/prekey-bundle machinery, and a real [DmSessionManager]. Mirrors
+ * GossipSub/directory/prekey-bundle/mailbox machinery, and a real [DmSessionManager]. Mirrors
  * `TwoNodePrekeyBundleGossipIntegrationTest`'s own real-two-node setup, extended one layer up. */
 internal class DmTestNode(
     val identity: DualKeyIdentity,
@@ -24,6 +24,9 @@ internal class DmTestNode(
     val prekeyStore: PrekeyStore,
     val peerDirectory: PeerDirectoryGossip,
     val prekeyBundleGossip: PrekeyBundleGossip,
+    val storage: NabuStorage,
+    val pubsub: GossipPubSub,
+    val mailboxGossip: MailboxGossip,
     val dmSessionManager: DmSessionManager,
 ) {
     fun publishSelf(notValidAfterEpochSecond: Long = Instant.now().epochSecond + 3600) {
@@ -42,6 +45,7 @@ internal class DmTestNode(
 
     fun stop() {
         runCatching { dmSessionManager.stop() }
+        runCatching { mailboxGossip.stop() }
         runCatching { peerDirectory.stop() }
         runCatching { prekeyBundleGossip.stop() }
         runCatching { node.stop() }
@@ -60,6 +64,10 @@ internal fun buildDmTestNode(
     // not asynchronously top the pool back up mid-test and invalidate their exact-count assertion -
     // see those tests' own call sites for why.
     oneTimePrekeyCount: Int = 5,
+    // V0.8.5 - test-overridable to a small value for tests that need a fast mailbox re-announce/
+    // poll cadence without waiting a full 5-minute/60-second default cycle.
+    mailboxRedeliverIntervalSeconds: Long = MailboxRedeliveryScheduler.DEFAULT_REDELIVER_INTERVAL_SECONDS,
+    mailboxPollIntervalSeconds: Long = MailboxPoller.DEFAULT_POLL_INTERVAL_SECONDS,
 ): DmTestNode {
     val node = LapisNode.create(identity)
     node.start(bootstrapPeers = emptyList())
@@ -68,6 +76,7 @@ internal fun buildDmTestNode(
     val pubsub = GossipPubSub.attach(node)
     val peerDirectory = PeerDirectoryGossip.attach(pubsub, storage)
     val prekeyBundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
+    val mailboxGossip = MailboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
     // Fresh PrekeyStore every call, even for a "restarted" identity - fine for this test harness
     // because the node using buildDmTestNode() a SECOND time with the same identity is always the
     // X3DH INITIATOR side in these tests, never the responder, so it never needs its own
@@ -85,10 +94,25 @@ internal fun buildDmTestNode(
             node,
             peerDirectory,
             prekeyBundleGossip,
+            mailboxGossip,
+            storage,
+            pubsub,
             sessionStoreDirectory,
             passphrase,
+            mailboxRedeliverIntervalSeconds = mailboxRedeliverIntervalSeconds,
+            mailboxPollIntervalSeconds = mailboxPollIntervalSeconds,
         )
-    return DmTestNode(identity, node, prekeyStore, peerDirectory, prekeyBundleGossip, dmSessionManager)
+    return DmTestNode(
+        identity,
+        node,
+        prekeyStore,
+        peerDirectory,
+        prekeyBundleGossip,
+        storage,
+        pubsub,
+        mailboxGossip,
+        dmSessionManager,
+    )
 }
 
 /** Connects [a] to [b] and republishes both nodes' directory records/prekey bundles until each side
@@ -117,4 +141,31 @@ internal fun connectAndConverge(
         "directory/prekey-bundle records for ${a.identity.secp256k1KeyPair.publicKey.fingerprint()} <-> " +
             "${b.identity.secp256k1KeyPair.publicKey.fingerprint()} did not converge within $timeout",
     )
+}
+
+/**
+ * V0.8.5: publishes [pointer] via [publisherPubsub] on its own recipient-scoped mailbox topic and
+ * retries (republishing the WHOLE call, mirroring [connectAndConverge]'s established
+ * bounded-polling-against-one-deadline discipline) until it appears in [recipientMailboxGossip]'s
+ * [MailboxGossip.pending] list - GossipSub mesh formation (GRAFT) is asynchronous, exactly like
+ * every sibling two-node test's directory/prekey-bundle convergence. [publisherPubsub] need not be
+ * subscribed to the topic itself - mirrors how [DmSessionManager.sendOffline]/
+ * [MailboxRedeliveryScheduler] publish on a RECIPIENT's topic without ever subscribing to it.
+ */
+internal fun publishAndConvergeMailboxPointer(
+    publisherPubsub: GossipPubSub,
+    recipientMailboxGossip: MailboxGossip,
+    pointer: MailboxPointer,
+    timeout: Duration = Duration.ofSeconds(30),
+) {
+    val bytes = MailboxPointerCodec.encode(pointer)
+    val topic = MailboxTopics.forRecipient(pointer.recipientIdentity)
+    val targetContentId = pointer.contentId()
+    val deadline = Instant.now().plus(timeout)
+    while (Instant.now().isBefore(deadline)) {
+        publisherPubsub.publish(topic, bytes)
+        if (recipientMailboxGossip.pending().any { it.contentId().contentEquals(targetContentId) }) return
+        Thread.sleep(500)
+    }
+    error("mailbox pointer for CID ${pointer.blobCid} did not converge on topic $topic within $timeout")
 }

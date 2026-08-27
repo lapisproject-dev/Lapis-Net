@@ -6,14 +6,18 @@ import net.lapisphilosophorum.lapisnet.ratchet.RatchetMessage
 
 private const val DOMAIN_TAG = "LapisNet:dm-dedup:v1"
 
-/** Forward-compatible, NOT-YET-USED dedup key for a delivered [net.lapisphilosophorum.lapisnet.dm.DmInboundMessage].
+/** Dedup key for a delivered [net.lapisphilosophorum.lapisnet.dm.DmInboundMessage], shared across
+ * both delivery paths.
  *
- * **This wave (V0.8.4) only computes and exposes this key - nothing in this wave deduplicates
- * against anything with it.** V0.8.5 (a later sub-wave) adds an offline mailbox path that can
- * redeliver a message also delivered online through this wave's [DmProtocol] stream; that wave
- * needs a dedup key derived from fields BOTH delivery paths can see, so it does not have to retrofit
- * one. Computing it now, even though nothing consumes it yet, means V0.8.5 does not have to change
- * this wave's wire format or [DmSessionManager]'s call sites to add it later.
+ * **Originated in V0.8.4, which only computed and exposed this key - nothing in that wave
+ * deduplicated against anything with it.** V0.8.5 (a later sub-wave, since landed in this branch)
+ * adds an offline mailbox path that can redeliver a message also delivered online through V0.8.4's
+ * [DmProtocol] stream; that path needs a dedup key derived from fields BOTH delivery paths can see,
+ * so it did not have to retrofit one. **V0.8.5, since landed, is exactly what consumes it** -
+ * [DmSessionManager.processInboundDmEnvelope] computes `DmDedupKey.of(...)` and checks it against
+ * `isRecentlyDelivered(dedupKey)` for every inbound envelope, online or offline, before it is ever
+ * handed to a session for decryption - see that method's own doc comment and `docs/architecture.adoc`
+ * for the cross-path `recentlyDeliveredDedupKeys`/durable-registry mechanics this key feeds.
  *
  * **The exact preimage is [net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest]'s
  * domain-separated construction, NOT plain concatenation** (doc correction, security audit round 1

@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.dm
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
@@ -10,6 +11,7 @@ import net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException
 import net.lapisphilosophorum.lapisnet.identity.KeystoreEncryption
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
+import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.ratchet.CorruptedRatchetSessionException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetException
@@ -20,6 +22,8 @@ import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import net.lapisphilosophorum.lapisnet.ratchet.RatchetMessageRejectedException
 import net.lapisphilosophorum.lapisnet.ratchet.X3dh
 import net.lapisphilosophorum.lapisnet.ratchet.X3dhException
+import net.lapisphilosophorum.lapisnet.ratchet.X3dhPreKeyMessageHeader
+import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -136,13 +140,32 @@ data class DmInboundMessage(
  *   [send] - [PeerDirectoryGossip.lookup]'s returned [net.lapisphilosophorum.lapisnet.directory.PeerRecord.addresses]
  *   will not be dialable, and [send] will surface a [DmSessionException] wrapping the underlying
  *   dial failure, not silently hang.
- * - **No offline/mailbox redelivery in this wave** - V0.8.5's job. [DmDedupKey] exists now
- *   specifically so that wave does not have to retrofit one.
+ * - **V0.8.5: offline/mailbox redelivery is implemented** - [sendOffline] deposits an encrypted
+ *   message as a Nabu blob plus a signed [MailboxPointer] gossiped on the recipient's own mailbox
+ *   topic ([MailboxGossip]), periodically re-announced ([MailboxRedeliveryScheduler]) so a
+ *   recipient who returns online later can still discover it; [MailboxPoller] fetches the
+ *   referenced blob via a direct Bitswap request to the sender's currently-gossiped address, never
+ *   via `NabuStorage.findProviders` (broken since V0.1.4), and routes a successful fetch through
+ *   the SAME [processInboundDmEnvelope] core the online path uses. [DmDedupKey] - computed by this
+ *   wave specifically so V0.8.5 would not have to retrofit one - is what [processInboundDmEnvelope]
+ *   uses for the cross-path dedup pre-check; see that function's own doc comment.
  * - **No multi-device/session migration** (inherited limitation from [DoubleRatchetSession] itself).
- * - **No session registry beyond what V0.8.3 already documents as partial** - a second, legitimate
- *   `X3DH_INITIAL` from the same peer (e.g. because they lost local state) simply creates a new
- *   session, overwriting the persisted one - the same residual gap `X3dh`'s own doc comment already
- *   discloses, not something this wave closes further.
+ * - **Session registry: a second, DIFFERENT-ephemeral-key `X3DH_INITIAL` from the same peer (e.g.
+ *   because they lost local state) still simply creates a new session, overwriting the persisted one
+ *   - the same residual gap `X3dh`'s own doc comment already discloses, not something this wave
+ *   closes.** What IS closed (security audit round 1 finding, 2026-08-2x, PROVEN with an executable
+ *   probe: stop this manager, rebuild a second instance over the SAME identity/session directory,
+ *   replay the identical `X3DH_INITIAL` bytes - delivered a SECOND time before this fix): a LITERAL
+ *   replay of an ALREADY-ACCEPTED `X3DH_INITIAL` - same ephemeral key, same everything - surviving a
+ *   process restart. [recentlyDeliveredDedupKeys] alone cannot catch this (in-memory-only, empty
+ *   after a restart), and when `header.oneTimePrekeyId == null` (a bundle-exhaustion degradation,
+ *   see [processInboundDmEnvelope]'s own doc comment on that branch) [PrekeyStore]'s durable
+ *   consumption tracking never even runs, so nothing else stood in the way either. Closed by a
+ *   DURABLE, per-peer registry of already-accepted `X3DH_INITIAL` ephemeral public keys, persisted
+ *   alongside the session file (see [recordAcceptedX3dhInitialEphemeralKey]'s own doc comment) and
+ *   checked BEFORE ever bootstrapping a session - [X3dh.initiate] mints a FRESH ephemeral key on
+ *   every call, so this closes only literal-byte replay, never a genuinely new (if still redundant)
+ *   second handshake attempt.
  * - **[prekeyConsumptionSemaphore]/[prekeyConsumptionRateLimiter] bound HOW MUCH and HOW FAST, they
  *   do not authenticate anyone** - see those fields' own doc comments. This wave does NOT attempt to
  *   distinguish a flooding attacker's self-signed throwaway identity from a legitimate first-contact
@@ -173,12 +196,21 @@ class DmSessionManager private constructor(
     private val node: LapisNode,
     private val peerDirectory: PeerDirectoryGossip,
     private val prekeyBundleGossip: PrekeyBundleGossip,
+    private val nabuStorage: NabuStorage,
+    private val pubsub: GossipPubSub,
     private val sessionStoreDirectory: Path,
     private val cachedKey: ByteArray,
     private val kdfParams: KeystoreEncryption.Params,
     private val random: SecureRandom,
+    private val mailboxRedeliveryScheduler: MailboxRedeliveryScheduler,
 ) {
     private lateinit var dmProtocol: DmProtocol
+
+    /** V0.8.5 - lateinit for the exact same reason as [dmProtocol]: [MailboxPoller.attach] needs a
+     * bound method reference to this manager (`this::handleOfflineEnvelope`) that does not fully
+     * exist until after this primary constructor has already run. Assigned once, immediately after
+     * construction, in [attach]. */
+    private lateinit var mailboxPoller: MailboxPoller
 
     /** Guards [cachedKey] against the race between [stop]'s `cachedKey.fill(0)` and an IN-FLIGHT
      * [persistSession]/[loadPersisted] call reading it - follow-up hardening item 2 (2026-08-11).
@@ -385,12 +417,109 @@ class DmSessionManager private constructor(
 
     private val inboundListeners = CopyOnWriteArrayList<(DmInboundMessage) -> Unit>()
 
+    /** V0.8.5 cross-path dedup key wrapper - mirrors `PeerRecordContentId`/`MailContentId`/
+     * `MailboxPointerContentId` exactly (value equality over the key bytes). */
+    private data class DedupKeyId(
+        private val bytes: ByteArray,
+    ) {
+        override fun equals(other: Any?): Boolean = other is DedupKeyId && bytes.contentEquals(other.bytes)
+
+        override fun hashCode(): Int = bytes.contentHashCode()
+    }
+
+    /** Bounded, LRU-evicting, GLOBAL (not per-peer) cross-path dedup cache - an efficiency/
+     * belt-and-braces pre-check, NOT the load-bearing correctness guarantee for "no double
+     * delivery" between the online ([handleInboundEnvelope]) and offline ([handleOfflineEnvelope])
+     * paths, for the `TEXT` case. That guarantee is structural for `TEXT`:
+     * [DoubleRatchetSession.decrypt]'s own commit-only-after-AEAD-verifies state machine already
+     * rejects a literal replay of the same ratchet message
+     * (`RatchetMessageRejectedException("message number ... already been consumed")`) regardless of
+     * which path re-delivers it, since both paths share the SAME [liveSessionCache]/persisted-
+     * session-file for a given peer - see [processInboundDmEnvelope]'s own doc comment.
+     *
+     * **Corrected 2026-08-2x, security audit round 1 finding: this "regardless of which path"
+     * framing does NOT extend to `X3DH_INITIAL`, and this class's own doc comment previously
+     * overclaimed that it did.** `X3DH_INITIAL` resolves NO existing session at all - it always
+     * builds a brand-new [DoubleRatchetSession] first, so [liveSessionCache]/the persisted session
+     * file cannot reject a replay of it the way they reject a `TEXT` replay; this in-memory,
+     * restart-losable cache was, until this fix, the ONLY thing standing between a replayed
+     * `X3DH_INITIAL` (when `header.oneTimePrekeyId == null`, so [PrekeyStore]'s own durable
+     * consumption tracking never runs either) and a resurrected message plus a rewound persisted
+     * session, PROVEN exploitable by a restart (which empties this cache) - see
+     * [recordAcceptedX3dhInitialEphemeralKey]'s own doc comment for the DURABLE fix that now closes
+     * that specific gap independently of this cache's own (still in-memory-only) state.
+     *
+     * This registry exists so a KNOWN-duplicate delivery (e.g. a re-gossiped/replayed mailbox
+     * pointer already fetched-and-acked once, within the SAME process lifetime) is skipped WITHOUT
+     * even attempting a wasted AEAD decrypt or, for a replayed `X3DH_INITIAL`, a wasted
+     * one-time-prekey-consumption attempt. Lost on restart - an accepted, documented limitation for
+     * the `TEXT` case (an optimization layer over a guarantee that holds regardless of its own
+     * state), but NOT accepted for `X3DH_INITIAL`, which is why that case now has its own,
+     * independent, durable registry rather than relying on this one. */
+    private val recentlyDeliveredDedupKeys =
+        object : LinkedHashMap<DedupKeyId, Boolean>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<DedupKeyId, Boolean>): Boolean =
+                size > MAX_RECENT_DEDUP_KEYS
+        }
+
+    private fun isRecentlyDelivered(key: ByteArray): Boolean =
+        synchronized(recentlyDeliveredDedupKeys) { recentlyDeliveredDedupKeys.containsKey(DedupKeyId(key)) }
+
+    private fun markRecentlyDelivered(key: ByteArray) {
+        synchronized(recentlyDeliveredDedupKeys) { recentlyDeliveredDedupKeys[DedupKeyId(key)] = true }
+    }
+
     /** Registers a listener invoked for every successfully decrypted inbound message, from within
      * the same [withPeerLock] critical section that persisted it - see
      * [handleInboundEnvelope]'s doc comment. A listener that throws is caught and logged; it never
      * prevents delivery to other listeners or corrupts this manager's own state. */
     fun addInboundListener(listener: (DmInboundMessage) -> Unit) {
         inboundListeners.add(listener)
+    }
+
+    /**
+     * V0.8.5 extraction: the first-contact X3DH bootstrap block [send] and [sendOffline] both need,
+     * factored out so the two call sites produce byte-identical crypto behavior for "first contact"
+     * mechanically (via one shared implementation), not merely by convention. Resolves
+     * [recipient]'s [PrekeyBundleGossip] bundle, runs [X3dh.initiate] against it, and initializes a
+     * fresh sender-side [DoubleRatchetSession] - exactly [send]'s own former inline first-contact
+     * block, unchanged in substance.
+     *
+     * @throws DmUnknownRecipientException if [prekeyBundleGossip] has no bundle for [recipient].
+     * @throws DmHandshakeFailedException if X3DH initiation against that bundle fails.
+     */
+    private fun bootstrapSenderSession(
+        recipient: Secp256k1PublicKey,
+    ): Pair<DoubleRatchetSession, X3dhPreKeyMessageHeader> {
+        val bundle =
+            prekeyBundleGossip.lookup(recipient)
+                ?: throw DmUnknownRecipientException("no prekey bundle for recipient ${recipient.fingerprint()}")
+        val ownBinding =
+            EncryptionKeyBinding.create(
+                localIdentity.secp256k1KeyPair,
+                localPrekeyStore.x25519IdentityPublicKey,
+            )
+        val ownX25519Private = localPrekeyStore.x25519IdentityPrivateKey()
+        val initiation =
+            try {
+                X3dh.initiate(
+                    initiatorIdentity = localIdentity.secp256k1KeyPair.publicKey,
+                    initiatorEncryptionBinding = ownBinding,
+                    initiatorX25519IdentityPrivateKey = ownX25519Private,
+                    bundle = bundle,
+                    random = random,
+                )
+            } catch (e: X3dhException) {
+                throw DmHandshakeFailedException(
+                    "X3DH initiation failed against ${recipient.fingerprint()}'s bundle",
+                    e,
+                )
+            } finally {
+                ownX25519Private.destroy()
+            }
+        val newSession = DoubleRatchetSession.initializeSender(initiation.session, bundle.signedPrekey, random)
+        initiation.session.destroy()
+        return newSession to initiation.header
     }
 
     /**
@@ -429,42 +558,13 @@ class DmSessionManager private constructor(
             var session = getCachedOrLoad(recipient)
             val envelope: DmEnvelope
             if (session == null) {
-                val bundle =
-                    prekeyBundleGossip.lookup(recipient)
-                        ?: throw DmUnknownRecipientException(
-                            "no prekey bundle for recipient ${recipient.fingerprint()}",
-                        )
-                val ownBinding =
-                    EncryptionKeyBinding.create(
-                        localIdentity.secp256k1KeyPair,
-                        localPrekeyStore.x25519IdentityPublicKey,
-                    )
-                val ownX25519Private = localPrekeyStore.x25519IdentityPrivateKey()
-                val initiation =
-                    try {
-                        X3dh.initiate(
-                            initiatorIdentity = localIdentity.secp256k1KeyPair.publicKey,
-                            initiatorEncryptionBinding = ownBinding,
-                            initiatorX25519IdentityPrivateKey = ownX25519Private,
-                            bundle = bundle,
-                            random = random,
-                        )
-                    } catch (e: X3dhException) {
-                        throw DmHandshakeFailedException(
-                            "X3DH initiation failed against ${recipient.fingerprint()}'s bundle",
-                            e,
-                        )
-                    } finally {
-                        ownX25519Private.destroy()
-                    }
-                val newSession = DoubleRatchetSession.initializeSender(initiation.session, bundle.signedPrekey, random)
-                initiation.session.destroy()
+                val (newSession, header) = bootstrapSenderSession(recipient)
                 val ratchetMessage = newSession.encrypt(plaintext)
                 envelope =
                     DmEnvelope(
                         DmMessageType.X3DH_INITIAL,
                         localIdentity.secp256k1KeyPair.publicKey,
-                        initiation.header,
+                        header,
                         ratchetMessage,
                     )
                 session = newSession
@@ -502,6 +602,115 @@ class DmSessionManager private constructor(
     }
 
     /**
+     * V0.8.5: deposits [plaintext] for [recipient] via the offline Nabu mailbox: encrypts exactly
+     * as [send] does (same [X3dh.initiate]-on-first-contact / [DoubleRatchetSession.encrypt] reuse,
+     * via the SAME [bootstrapSenderSession] helper [send] uses - so first contact bootstraps a
+     * byte-identical session either way), durably stores the resulting [DmEnvelope] bytes in Nabu
+     * ([NabuStorage.put]) BEFORE announcing a [MailboxPointer] referencing that blob's CID -
+     * "persist then publish, publish strictly last" applied to a TWO-object case (blob persisted,
+     * THEN the pointer that references it persisted, THEN the pointer published): a fast-arriving
+     * pointer can never reference a not-yet-fetchable blob.
+     *
+     * Unlike [send], this method never dials [recipient] and therefore never needs
+     * [PeerDirectoryGossip.lookup] for the RECIPIENT - it only needs [PrekeyBundleGossip.lookup] for
+     * first contact, exactly mirroring [send]'s own inner X3DH branch (via [bootstrapSenderSession]).
+     *
+     * The announced pointer is re-published periodically (via [mailboxRedeliveryScheduler]) until
+     * [notValidAfterEpochSecond] passes - see [MailboxRedeliveryScheduler]'s own class doc comment
+     * for why this is load-bearing, not an optimization: GossipSub never replays a message to a
+     * subscriber that joins after the original publish, so a recipient offline during THIS call can
+     * only ever learn the pointer exists via a LATER live re-publish. **This means the sender must
+     * remain reachable, or at least come back online periodically, for offline delivery to complete
+     * at all** - not only to serve the eventual Bitswap fetch, but, more fundamentally, for the
+     * recipient to ever discover the pointer in the first place. A real, inherent limitation of
+     * routing around the broken DHT (`NabuStorage.findProviders`, broken since V0.1.4) with gossip
+     * alone - not a bug.
+     *
+     * **Explicit, deliberate scope cuts for V0.8.5 (stated here rather than silently omitted,
+     * mirroring this class's own established practice above):**
+     * - **No onion routing for mailbox pointers.** The original DM concept note's own open question
+     *   - left open here, not attempted.
+     * - **No DHT mailbox record** - same broken-Kademlia limitation as everything else in this
+     *   class; gossip + explicit peer-hint-based Bitswap fetch instead.
+     * - **No pin-lifetime management.** Nabu has no pin/GC anywhere in this project (V0.1.4's own
+     *   documented state) - "pinning" a mailbox blob is currently a no-op, stated plainly rather than
+     *   implying a pinning economy exists.
+     * - **No re-delivery guarantee beyond the TTL window.** Once a pointer expires or is evicted
+     *   from [MailboxPointerIndex], that message is genuinely gone if the recipient never came
+     *   online in time - an accepted, bounded-storage tradeoff, not a bug.
+     *
+     * @throws DmUnknownRecipientException (first contact only) if no [PrekeyBundleGossip] bundle
+     *   exists for [recipient].
+     * @throws DmHandshakeFailedException as [send].
+     */
+    fun sendOffline(
+        recipient: Secp256k1PublicKey,
+        plaintext: ByteArray,
+        notValidAfterEpochSecond: Long = Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
+    ) {
+        withPeerLock(recipient) {
+            var session = getCachedOrLoad(recipient)
+            val envelope: DmEnvelope
+            if (session == null) {
+                val (newSession, header) = bootstrapSenderSession(recipient)
+                val ratchetMessage = newSession.encrypt(plaintext)
+                envelope =
+                    DmEnvelope(
+                        DmMessageType.X3DH_INITIAL,
+                        localIdentity.secp256k1KeyPair.publicKey,
+                        header,
+                        ratchetMessage,
+                    )
+                session = newSession
+            } else {
+                check(session.canSend) {
+                    "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
+                }
+                val ratchetMessage = session.encrypt(plaintext)
+                envelope =
+                    DmEnvelope(DmMessageType.TEXT, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
+            }
+
+            // Persist session BEFORE any Nabu write - same "persist session before anything
+            // externally observable" rule send() follows.
+            persistSession(recipient, session)
+            putCached(recipient, session)
+
+            val envelopeBytes = DmEnvelopeCodec.encode(envelope)
+            val blobCid: Cid = nabuStorage.put(envelopeBytes)
+            val pointer =
+                MailboxPointer.create(
+                    sender = localIdentity.secp256k1KeyPair,
+                    recipientIdentity = recipient,
+                    blobCid = blobCid,
+                    notValidAfterEpochSecond = notValidAfterEpochSecond,
+                )
+            val pointerBytes = MailboxPointerCodec.encode(pointer)
+            // Blob persisted (above), THEN pointer persisted, THEN pointer published - see this
+            // method's own doc comment.
+            nabuStorage.put(pointerBytes)
+            // Security audit round 2 minor finding fixed here: `track` runs BEFORE `publish`, not
+            // after. `GossipPubSub.publish` swallows `NoPeersForOutboundMessageException` but
+            // rethrows every other `GossipPubSubException` (including its own `awaitOrWrap` publish
+            // timeout) - by the time this line used to run, `persistSession`/`putCached` had already
+            // committed above, so a propagating publish failure would leave a perfectly valid,
+            // durably-stored pointer with NO re-announcement registered at all:
+            // `MailboxRedeliveryScheduler`'s own class doc establishes periodic re-announcement as
+            // the ONLY way an offline recipient ever learns a pointer exists, so skipping `track`
+            // turned a transient publish timeout into permanent non-delivery - worse still for a
+            // FIRST-CONTACT `sendOffline`, since a caller retry would find `session != null` above
+            // and emit `TEXT` instead of `X3DH_INITIAL`, which the recipient can never bootstrap.
+            // `track` is a cheap, no-I/O map write (see its own doc comment) - calling it first
+            // means a subsequent `publish` failure here just means this call's own immediate publish
+            // didn't land, but `mailboxRedeliveryScheduler`'s next periodic tick will still announce
+            // the pointer and self-heal, exactly as it does for every OTHER transient publish
+            // failure it independently guards against.
+            mailboxRedeliveryScheduler.track(recipient, pointer, pointerBytes)
+            pubsub.publish(MailboxTopics.forRecipient(recipient), pointerBytes)
+        }
+    }
+
+    /**
      * Called from [DmProtocolHandler]'s inbound-envelope callback. `fromPeerId` is the TRANSPORT-
      * authenticated [PeerId] - used here ONLY for logging/diagnostics, NEVER for authorization (see
      * this class's own CRITICAL IDENTITY-AUTHORITY RULE doc-comment section).
@@ -534,10 +743,87 @@ class DmSessionManager private constructor(
                 logger.warn(e) { "unexpected exception decoding DM envelope from $fromPeerId - rejecting" }
                 return
             }
+        processInboundDmEnvelope(envelope, "peer $fromPeerId")
+    }
 
+    /**
+     * V0.8.5 reuse point. [MailboxPoller] calls this after a successful Bitswap fetch + structural
+     * decode of an offline-mailbox blob ([DmEnvelopeCodec.decode] already ran in
+     * [MailboxPoller.attemptOne] to distinguish "garbage frame, mark resolved" from "worth
+     * attempting"). Routes through the IDENTICAL session-resolution/decrypt/persist/dedup/listener-
+     * notification logic [processInboundDmEnvelope] already provides for the online path - one
+     * trust boundary for both transports, not two independently-reasoned-about ones. Never throws.
+     *
+     * Returns whether [MailboxPoller] should call `MailboxGossip.markResolved` for the pointer this
+     * envelope was fetched from - see [processInboundDmEnvelope]'s own doc comment on the return
+     * value for exactly which outcomes are final (`true`) vs. retryable (`false`). The online path
+     * ([handleInboundEnvelope]) has no equivalent "try again later" concept - a dropped live message
+     * is simply gone - so it discards this same return value.
+     */
+    internal fun handleOfflineEnvelope(envelope: DmEnvelope): Boolean =
+        processInboundDmEnvelope(envelope, "offline mailbox")
+
+    /**
+     * The shared core [handleInboundEnvelope] and [handleOfflineEnvelope] both funnel through -
+     * everything below was [handleInboundEnvelope]'s own inline body before V0.8.5 extracted this
+     * function to give the offline-mailbox path a second, structurally identical entry point.
+     * [sourceDescription] is used ONLY for logging (`"peer $fromPeerId"` for the online path,
+     * `"offline mailbox"` for V0.8.5's) - never for any accept/reject decision, mirroring this
+     * class's own CRITICAL IDENTITY-AUTHORITY RULE for `fromPeerId` itself.
+     *
+     * **V0.8.5 cross-path dedup check, inserted at the very top, before session resolution even
+     * begins.** [DmDedupKey.of] is safe to compute pre-decrypt: the ratchet message header's
+     * `ratchetPublicKey`/`messageNumber` fields are unencrypted this wave (see
+     * [DoubleRatchetSession]'s own doc comment). Checking [isRecentlyDelivered] here - before the
+     * `X3DH_INITIAL` branch's one-time-prekey consumption, and before any AEAD attempt - means a
+     * KNOWN-duplicate delivery (case (c) in `MailboxAbuseTest`: an already-fetched-and-acked pointer
+     * re-gossiped/replayed) costs this node neither. See [recentlyDeliveredDedupKeys]'s own doc
+     * comment for why this is a belt-and-braces optimization layer, not the load-bearing guarantee
+     * against double delivery - that guarantee is [DoubleRatchetSession.decrypt]'s own commit-only-
+     * after-AEAD-verifies state machine, which structurally rejects a literal replay of the same
+     * ratchet message regardless of this cache's own state, since both [handleInboundEnvelope] and
+     * [handleOfflineEnvelope] resolve the SAME session (via [getCachedOrLoad]/[liveSessionCache])
+     * for a given claimed sender.
+     *
+     * **Return value (V0.8.5, consumed by [handleOfflineEnvelope]/[MailboxPoller] only - the online
+     * path via [handleInboundEnvelope] ignores it, there being no "retry later" concept for a live
+     * transport delivery): `true` means this outcome is FINAL for this exact envelope's bytes - the
+     * message was delivered, cleanly rejected as tamper/garbage/replay, or rejected on grounds that
+     * will never change no matter how many times the SAME bytes are re-attempted, so the caller
+     * should stop retrying (mark the mailbox pointer resolved). `false` means the rejection reason is
+     * about THIS node's own current, mutable state rather than about the envelope's bytes - today,
+     * exactly one case: the `TEXT` branch's "no session yet for claimed sender," which becomes
+     * processable once a session is bootstrapped from a DIFFERENT pointer (typically an
+     * `X3DH_INITIAL` from the same sender). [MailboxPoller.pending]'s iteration order tracks gossip
+     * arrival order, not send order, so a `TEXT` pointer sent second can easily be fetched+attempted
+     * BEFORE the `X3DH_INITIAL` pointer that would establish the session it needs - marking it
+     * resolved on that specific rejection would silently and permanently lose a message that is
+     * genuinely fetchable and cryptographically valid, once the session exists. The unexpected-
+     * exception catch at the bottom of this function also returns `false`, for the same "unknown, so
+     * don't foreclose a retry" reasoning [pollOnce]'s own top-level `catch (e: RuntimeException)`
+     * already applies to a pointer attempt that throws.
+     */
+    private fun processInboundDmEnvelope(
+        envelope: DmEnvelope,
+        sourceDescription: String,
+    ): Boolean {
         val claimedSender = envelope.senderIdentity
-        try {
+        return try {
             withPeerLock(claimedSender) {
+                val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
+                if (isRecentlyDelivered(dedupKey)) {
+                    logger.debug {
+                        "skipping envelope from $sourceDescription claimed sender ${claimedSender.fingerprint()} " +
+                            "- already delivered (dedup key match)"
+                    }
+                    return@withPeerLock true
+                }
+
+                // Set ONLY inside the X3DH_INITIAL branch below, to the accepted header's ephemeral
+                // key - recorded into the durable per-peer registry AFTER decrypt succeeds (commit-
+                // only-after-AEAD-verifies, same discipline as persistSession's own call sites below).
+                // See recordAcceptedX3dhInitialEphemeralKey's own doc comment.
+                var freshX3dhInitialEphemeralKeyToRecord: ByteArray? = null
                 val (session, isFreshHandshake) =
                     when (envelope.messageType) {
                         DmMessageType.X3DH_INITIAL -> {
@@ -571,7 +857,32 @@ class DmSessionManager private constructor(
                                         "encryption key binding that does not verify against the claimed identity " +
                                         "- rejecting BEFORE any one-time prekey consumption"
                                 }
-                                return@withPeerLock
+                                return@withPeerLock true // garbage/tamper - these exact bytes will never verify
+                            }
+                            // **Security audit round 1 fix (2026-08-2x): DURABLE, per-peer replay guard
+                            // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
+                            // the full story of the gap this closes, PROVEN exploitable by a restart
+                            // (which empties that in-memory-only cache) via an executable probe.**
+                            // Checked here - BEFORE any one-time-prekey consumption, BEFORE X3dh.respond,
+                            // BEFORE a new session is ever built - because [X3dh.initiate] mints a FRESH
+                            // ephemeral X25519 keypair on EVERY call (see that function's own body), so a
+                            // genuinely repeated, legitimate handshake from the same peer (the accepted
+                            // residual "no session registry" gap this class's own doc comment discloses)
+                            // always carries a DIFFERENT [X3dhPreKeyMessageHeader.ephemeralPublicKey] -
+                            // only a literal byte-for-byte replay of an ALREADY-ACCEPTED handshake ever
+                            // collides here. Loaded fresh from disk on every attempt (not cached in
+                            // memory) specifically so this survives this manager's own restart -
+                            // [loadAcceptedX3dhInitialEphemeralKeys]'s own doc comment.
+                            if (loadAcceptedX3dhInitialEphemeralKeys(claimedSender).any {
+                                    it.contentEquals(header.ephemeralPublicKey.bytes)
+                                }
+                            ) {
+                                logger.debug {
+                                    "rejecting X3DH_INITIAL from claimed sender ${claimedSender.fingerprint()} - " +
+                                        "this exact ephemeral key was already accepted for a prior handshake " +
+                                        "(durable, survives a restart) - replay, not a legitimate re-handshake"
+                                }
+                                return@withPeerLock true // this exact handshake will never become acceptable again
                             }
                             // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
                             // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
@@ -641,7 +952,7 @@ class DmSessionManager private constructor(
                                                 "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
                                                 "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
                                         }
-                                        return@withPeerLock
+                                        return@withPeerLock true
                                     }
                                     // See prekeyConsumptionSemaphore's own doc comment for why this
                                     // gate exists and why it never blocks.
@@ -652,7 +963,7 @@ class DmSessionManager private constructor(
                                                 "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
                                                 "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
                                         }
-                                        return@withPeerLock
+                                        return@withPeerLock true
                                     }
                                     try {
                                         val result = localPrekeyStore.consumeOneTimePrekey(id)
@@ -665,7 +976,8 @@ class DmSessionManager private constructor(
                                             "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
                                                 "${claimedSender.fingerprint()} - rejecting"
                                         }
-                                        return@withPeerLock
+                                        // this specific one-time-prekey id will never become valid again
+                                        return@withPeerLock true
                                     } finally {
                                         prekeyConsumptionSemaphore.release()
                                     }
@@ -706,7 +1018,8 @@ class DmSessionManager private constructor(
                                                 "X3DH respond failed for claimed sender " +
                                                     "${claimedSender.fingerprint()} - rejecting, never falls back to trusting the claim"
                                             }
-                                            return@withPeerLock
+                                            // crypto verification failure - these exact bytes will never verify
+                                            return@withPeerLock true
                                         } finally {
                                             ownX25519Private.destroy()
                                         }
@@ -722,21 +1035,33 @@ class DmSessionManager private constructor(
                                 } finally {
                                     signedPrekeyPrivate.destroy()
                                 }
+                            freshX3dhInitialEphemeralKeyToRecord = header.ephemeralPublicKey.bytes
                             newSession to true
                         }
                         DmMessageType.TEXT -> {
                             val existing = getCachedOrLoad(claimedSender)
                             if (existing == null) {
+                                // NOT foreclosed with `true` (see this function's own doc comment on the
+                                // return value) - a session for claimed_sender may simply not exist YET on
+                                // THIS node. Concretely, via MailboxPoller: a sender who calls sendOffline()
+                                // twice to the same still-offline recipient produces one X3DH_INITIAL pointer
+                                // (bootstraps the session) and one TEXT pointer (reuses it) - MailboxPoller's
+                                // pending() iteration order tracks gossip arrival order, not send order, so
+                                // the TEXT pointer can easily be fetched+attempted first. Returning `false`
+                                // leaves its mailbox pointer pending so a later poll pass - after the
+                                // X3DH_INITIAL pointer has been processed and installed a session - can
+                                // deliver it, instead of permanently losing a genuinely valid message.
                                 logger.debug {
-                                    "no session for claimed sender ${claimedSender.fingerprint()} - rejecting TEXT envelope"
+                                    "no session for claimed sender ${claimedSender.fingerprint()} - rejecting TEXT " +
+                                        "envelope for now, not marking permanently resolved"
                                 }
-                                return@withPeerLock
+                                return@withPeerLock false
                             }
                             existing to false
                         }
                         DmMessageType.RECEIPT, DmMessageType.CALL_SIGNAL -> {
                             logger.debug { "reserved messageType ${envelope.messageType} rejected outright" }
-                            return@withPeerLock
+                            return@withPeerLock true // these types are never accepted, regardless of node state
                         }
                     }
 
@@ -751,16 +1076,21 @@ class DmSessionManager private constructor(
                                 "rejecting; the claimed field alone is never trusted"
                         }
                         if (isFreshHandshake) session.destroy()
-                        return@withPeerLock
+                        return@withPeerLock true // tamper/garbage against this exact session state - not retryable
                     } catch (e: RatchetMessageRejectedException) {
                         logger.debug(e) { "message rejected on public-data grounds: ${e.message}" }
                         if (isFreshHandshake) session.destroy()
-                        return@withPeerLock
+                        return@withPeerLock true // public-data rejection (e.g. replay) - not retryable
                     }
 
                 persistSession(claimedSender, session)
                 putCached(claimedSender, session)
-                val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
+                // Durable X3DH_INITIAL replay guard commit - see recordAcceptedX3dhInitialEphemeralKey's
+                // own doc comment. Only set (non-null) on the X3DH_INITIAL branch above, and only
+                // reached here after session.decrypt already succeeded - never burns the durable
+                // registry on a tampered/garbage attempt.
+                freshX3dhInitialEphemeralKeyToRecord?.let { recordAcceptedX3dhInitialEphemeralKey(claimedSender, it) }
+                markRecentlyDelivered(dedupKey)
                 val message = DmInboundMessage(claimedSender, plaintext, dedupKey, Instant.now().epochSecond)
                 inboundListeners.forEach { listener ->
                     try {
@@ -769,16 +1099,24 @@ class DmSessionManager private constructor(
                         logger.warn(e) { "inbound DM listener threw - other listeners still notified" }
                     }
                 }
+                true // delivered - final
             }
         } catch (e: RuntimeException) {
             // Final defense-in-depth catch: every known failure mode above already funnels itself
-            // into a logged `return@withPeerLock`, so nothing should reach here today - but this
-            // function is called directly from a Netty callback and must NEVER let an exception
-            // escape (adversarial test case (f)).
+            // into a logged `return@withPeerLock`, so nothing should reach here today - but
+            // handleInboundEnvelope is called directly from a Netty callback and handleOfflineEnvelope
+            // directly from MailboxPoller, and neither may ever let an exception escape (adversarial
+            // test case (f), and its offline-path mirror in MailboxAbuseTest). Returns `false`
+            // (retryable) rather than `true`: an UNEXPECTED exception gives no evidence one way or the
+            // other about whether the envelope's bytes are actually the problem, and the offline path
+            // ([handleOfflineEnvelope]/[MailboxPoller]) leaving the pointer pending mirrors exactly
+            // what [MailboxPoller.pollOnce]'s own top-level `catch (e: RuntimeException)` already does
+            // for a pointer attempt that throws ("leaving pending, will retry next poll").
             logger.warn(e) {
-                "unexpected exception handling inbound DM envelope from $fromPeerId " +
+                "unexpected exception handling inbound DM envelope from $sourceDescription " +
                     "(claimed sender ${claimedSender.fingerprint()})"
             }
+            false
         }
     }
 
@@ -875,6 +1213,118 @@ class DmSessionManager private constructor(
     private fun sessionFilePath(peer: Secp256k1PublicKey): Path {
         val hex = peer.bytes.joinToString("") { "%02x".format(it) }
         return sessionStoreDirectory.resolve("$hex.lndm")
+    }
+
+    /** Sidecar path for [peer]'s durable X3DH_INITIAL ephemeral-key replay registry - see
+     * [loadAcceptedX3dhInitialEphemeralKeys]/[recordAcceptedX3dhInitialEphemeralKey]'s own doc
+     * comments. Deliberately a DIFFERENT file from [sessionFilePath] (`.x3dhinit` suffix, not
+     * `.lndm`) rather than folded into the session file itself: this registry must keep working -
+     * and keep rejecting an already-accepted ephemeral key - even across the "corrupt/undecryptable
+     * session file, treat as absent, re-handshake" recovery path [loadPersisted] already documents,
+     * which would otherwise silently reset it if the two were the same file. */
+    private fun x3dhInitialEphemeralKeyRegistryPath(peer: Secp256k1PublicKey): Path {
+        val hex = peer.bytes.joinToString("") { "%02x".format(it) }
+        return sessionStoreDirectory.resolve("$hex.lndm.x3dhinit")
+    }
+
+    /** Loads the durable set of `X3DH_INITIAL` ephemeral public keys ALREADY ACCEPTED for [peer] -
+     * see [recordAcceptedX3dhInitialEphemeralKey]'s own doc comment for why this exists and why it
+     * must be durable (survive THIS manager's own restart), unlike [recentlyDeliveredDedupKeys].
+     * Read fresh from disk on every call, deliberately NOT cached in memory - an in-memory cache is
+     * exactly the property that made the original gap this closes possible in the first place (see
+     * [recentlyDeliveredDedupKeys]'s own doc comment). No file - "never accepted anything from this
+     * peer yet" - returns an empty list, mirroring [loadPersisted]'s own "no file, no prior state"
+     * convention. A structurally corrupt file (size not a whole multiple of
+     * [X3DH_INITIAL_EPHEMERAL_KEY_SIZE], or unreadable) is treated the SAME way as "no prior
+     * state", never thrown - this is a replay GUARD, not a source of truth a caller must be able to
+     * trust unconditionally; failing open here at worst re-admits one already-processed handshake
+     * for re-attempt (no worse than this fix not existing at all), while failing closed (throwing)
+     * would let a corrupted bookkeeping file permanently block a peer's legitimate future
+     * `X3DH_INITIAL` entirely - a strictly worse outcome for a file that holds no secret material. */
+    private fun loadAcceptedX3dhInitialEphemeralKeys(peer: Secp256k1PublicKey): List<ByteArray> {
+        val target = x3dhInitialEphemeralKeyRegistryPath(peer)
+        if (!Files.exists(target)) return emptyList()
+        val bytes =
+            try {
+                Files.readAllBytes(target)
+            } catch (e: java.io.IOException) {
+                logger.warn(e) {
+                    "failed to read X3DH_INITIAL ephemeral-key replay registry for " +
+                        "${peer.fingerprint()} at $target - treating as empty (fails open, not closed - " +
+                        "see this function's own doc comment)"
+                }
+                return emptyList()
+            }
+        if (bytes.size % X3DH_INITIAL_EPHEMERAL_KEY_SIZE != 0) {
+            logger.warn {
+                "X3DH_INITIAL ephemeral-key replay registry for ${peer.fingerprint()} at $target has an " +
+                    "unexpected size (${bytes.size}, not a multiple of $X3DH_INITIAL_EPHEMERAL_KEY_SIZE) - " +
+                    "treating as empty"
+            }
+            return emptyList()
+        }
+        val count = bytes.size / X3DH_INITIAL_EPHEMERAL_KEY_SIZE
+        return (0 until count).map { i ->
+            bytes.copyOfRange(i * X3DH_INITIAL_EPHEMERAL_KEY_SIZE, (i + 1) * X3DH_INITIAL_EPHEMERAL_KEY_SIZE)
+        }
+    }
+
+    /** Durably records [ephemeralKeyBytes] - an accepted `X3DH_INITIAL` header's
+     * [X3dhPreKeyMessageHeader.ephemeralPublicKey] bytes - into [peer]'s replay registry, closing
+     * the security-audit round 1 major finding (2026-08-2x): a replayed `X3DH_INITIAL` naming NO
+     * one-time prekey (`header.oneTimePrekeyId == null`, see [processInboundDmEnvelope]'s own doc
+     * comment on that branch for why [PrekeyStore]'s own durable consumption tracking never runs
+     * for it) could otherwise resurrect an already-delivered message and rewind the persisted
+     * ratchet session AFTER a restart of this manager - PROVEN with an executable probe: stop this
+     * manager, rebuild a second instance over the SAME identity/session directory/prekey store,
+     * replay the identical `X3DH_INITIAL` bytes, observe a second delivery. [recentlyDeliveredDedupKeys]
+     * is in-memory-only and empty after exactly the restart that makes this exploitable, so it
+     * cannot close this gap by itself.
+     *
+     * **Called ONLY after [processInboundDmEnvelope]'s `X3DH_INITIAL` branch has ALREADY
+     * committed** - i.e. `session.decrypt` already returned successfully and the resulting session
+     * was already persisted via [persistSession] - the same "commit only after AEAD verifies"
+     * discipline every other durable write in this class follows. A tampered/garbage `X3DH_INITIAL`
+     * therefore never burns a slot in this registry.
+     *
+     * FIFO-capped at [MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER] - generous headroom for the
+     * legitimate "peer lost local state and re-handshakes" case (each such re-handshake uses a
+     * genuinely DIFFERENT ephemeral key, since [X3dh.initiate] mints a fresh one every call, so it
+     * is never blocked by this registry - only a LITERAL replay of an already-accepted key is),
+     * same "provisional magnitude, not derived from pilot data" framing as every sibling cap in
+     * this class. A no-op if [ephemeralKeyBytes] is already present (avoids a pointless duplicate
+     * disk write on, e.g., a redundant call - not expected in practice given the call site, but
+     * cheap to guard against). Atomic temp-file-then-[Files.move] write, same durability discipline
+     * as [persistSession] - this is what makes the check in [processInboundDmEnvelope] survive a
+     * process restart. Never encrypted under [cachedKey] - unlike a session file, this registry
+     * holds only PUBLIC key material (an X25519 public key is not secret), so it carries none of
+     * [persistSession]'s [cachedKeyLock] key-hygiene concerns. */
+    private fun recordAcceptedX3dhInitialEphemeralKey(
+        peer: Secp256k1PublicKey,
+        ephemeralKeyBytes: ByteArray,
+    ) {
+        require(ephemeralKeyBytes.size == X3DH_INITIAL_EPHEMERAL_KEY_SIZE) {
+            "ephemeralKeyBytes must be $X3DH_INITIAL_EPHEMERAL_KEY_SIZE bytes, was ${ephemeralKeyBytes.size}"
+        }
+        val existing = loadAcceptedX3dhInitialEphemeralKeys(peer)
+        if (existing.any { it.contentEquals(ephemeralKeyBytes) }) return
+        val updated = (existing + listOf(ephemeralKeyBytes)).takeLast(MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER)
+        val bytes = ByteArray(updated.size * X3DH_INITIAL_EPHEMERAL_KEY_SIZE)
+        updated.forEachIndexed { index, key -> key.copyInto(bytes, index * X3DH_INITIAL_EPHEMERAL_KEY_SIZE) }
+        val target = x3dhInitialEphemeralKeyRegistryPath(peer)
+        val tempFile =
+            if (supportsPosixPermissions(sessionStoreDirectory)) {
+                Files.createTempFile(
+                    sessionStoreDirectory,
+                    "${target.fileName}.",
+                    ".tmp",
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")),
+                )
+            } else {
+                Files.createTempFile(sessionStoreDirectory, "${target.fileName}.", ".tmp")
+            }
+        Files.write(tempFile, bytes)
+        Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
 
     /** Atomic temp-file-then-[Files.move] write - durable against a crash mid-write. See this
@@ -987,13 +1437,27 @@ class DmSessionManager private constructor(
      *
      * **[cachedKey.fill(0)][cachedKey] runs under [cachedKeyLock]'s WRITE lock** - see that field's
      * own doc comment for the exact race this closes against a concurrent, in-flight
-     * [persistSession]/[loadPersisted] call on another thread. */
+     * [persistSession]/[loadPersisted] call on another thread.
+     *
+     * **V0.8.5 addition: also stops [mailboxPoller] and [mailboxRedeliveryScheduler].** Ownership
+     * mirrors [dmProtocol]'s own convention exactly: both are constructed BY [attach] (mailboxPoller
+     * lazily, right after this manager's primary constructor runs; mailboxRedeliveryScheduler
+     * eagerly, passed into the primary constructor), so both are stopped BY this method. By
+     * contrast, `mailboxGossip`/[peerDirectory]/[prekeyBundleGossip]/[nabuStorage] are constructed
+     * by the CALLER and stopped by the caller, mirroring the existing convention exactly - see
+     * `DmTestNode.stop()` for the concrete pattern this follows (it calls `peerDirectory.stop()`/
+     * `prekeyBundleGossip.stop()` independently of `dmSessionManager.stop()`). `mailboxGossip` itself
+     * is not a stored field here (see [attach]'s own doc comment) - only [mailboxPoller] is, which is
+     * why this class's own `stop()` does not (and structurally cannot) call `mailboxGossip.stop()`
+     * directly; the caller who constructed it remains responsible for stopping it. */
     fun stop() {
         synchronized(liveSessionCache) {
             liveSessionCache.values.forEach { it.destroy() }
             liveSessionCache.clear()
         }
         if (::dmProtocol.isInitialized) dmProtocol.stop()
+        if (::mailboxPoller.isInitialized) mailboxPoller.stop()
+        mailboxRedeliveryScheduler.stop()
         replenishmentExecutor.shutdownNow()
         cachedKeyLock.write { cachedKey.fill(0) }
     }
@@ -1054,11 +1518,40 @@ class DmSessionManager private constructor(
          * on top of the dial itself. */
         val DIAL_TIMEOUT: Duration = Duration.ofSeconds(15)
 
+        /** Bounds [recentlyDeliveredDedupKeys] - generous headroom, same "provisional magnitude"
+         * framing as [MAX_LIVE_SESSIONS]. */
+        const val MAX_RECENT_DEDUP_KEYS = 8_192
+
+        /** The fixed byte size of an X25519 ephemeral public key - see
+         * [recordAcceptedX3dhInitialEphemeralKey]/[loadAcceptedX3dhInitialEphemeralKeys]. Matches
+         * `X25519PublicKey`'s own internal size constant (not itself exposed as a public constant
+         * on that class, hence duplicated here rather than referenced). */
+        const val X3DH_INITIAL_EPHEMERAL_KEY_SIZE = 32
+
+        /** Bounds [recordAcceptedX3dhInitialEphemeralKey]'s per-peer durable replay registry -
+         * generous headroom for the legitimate "lost local state, re-handshake" case (see that
+         * function's own doc comment for why a legitimate re-handshake is never blocked by this
+         * cap), same "provisional magnitude, not derived from pilot data" framing as every sibling
+         * cap in this class. */
+        const val MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER = 8
+
         /**
          * Bootstraps a [DmSessionManager]: loads or generates a persisted `.salt` file (0600 where
          * POSIX permissions are supported), derives [cachedKey] ONCE via
          * [KeystoreEncryption.deriveKey]`(passphrase, params)`, attaches [DmProtocol] to [node]'s
-         * host wired to the new manager's [handleInboundEnvelope], and returns the manager.
+         * host wired to the new manager's [handleInboundEnvelope], attaches [MailboxPoller] wired to
+         * [handleOfflineEnvelope] (V0.8.5), and returns the manager.
+         *
+         * [mailboxGossip] is caller-constructed (typically via
+         * `MailboxGossip.attach(pubsub, nabuStorage, localIdentity.secp256k1KeyPair.publicKey)`) and
+         * passed in already-attached - mirrors [peerDirectory]/[prekeyBundleGossip]'s own
+         * "already-attached collaborator passed in" convention. **Unlike those two, [mailboxGossip]
+         * is NOT retained as a field on the constructed manager** - it is used exactly once, to wire
+         * [MailboxPoller.attach] below, and nothing on this class ever calls a `mailboxGossip` method
+         * afterward, so keeping a copy would be dead state (confirmed 2026-08-27: a private field of
+         * the same name existed until then with zero reads anywhere in this class - removed).
+         * [mailboxRedeliverIntervalSeconds]/[mailboxPollIntervalSeconds] are test-overridable to small
+         * values - see [MailboxRedeliveryScheduler]/[MailboxPoller]'s own defaults.
          */
         fun attach(
             localIdentity: DualKeyIdentity,
@@ -1066,9 +1559,14 @@ class DmSessionManager private constructor(
             node: LapisNode,
             peerDirectory: PeerDirectoryGossip,
             prekeyBundleGossip: PrekeyBundleGossip,
+            mailboxGossip: MailboxGossip,
+            nabuStorage: NabuStorage,
+            pubsub: GossipPubSub,
             sessionStoreDirectory: Path,
             passphrase: CharArray,
             random: SecureRandom = SecureRandom(),
+            mailboxRedeliverIntervalSeconds: Long = MailboxRedeliveryScheduler.DEFAULT_REDELIVER_INTERVAL_SECONDS,
+            mailboxPollIntervalSeconds: Long = MailboxPoller.DEFAULT_POLL_INTERVAL_SECONDS,
         ): DmSessionManager {
             Files.createDirectories(sessionStoreDirectory)
             if ("posix" in sessionStoreDirectory.fileSystem.supportedFileAttributeViews()) {
@@ -1119,12 +1617,23 @@ class DmSessionManager private constructor(
                     node,
                     peerDirectory,
                     prekeyBundleGossip,
+                    nabuStorage,
+                    pubsub,
                     sessionStoreDirectory,
                     cachedKey,
                     params,
                     random,
+                    MailboxRedeliveryScheduler.attach(pubsub, mailboxRedeliverIntervalSeconds),
                 )
             manager.dmProtocol = DmProtocol.attach(node, manager::handleInboundEnvelope)
+            manager.mailboxPoller =
+                MailboxPoller.attach(
+                    mailboxGossip,
+                    nabuStorage,
+                    peerDirectory,
+                    manager::handleOfflineEnvelope,
+                    mailboxPollIntervalSeconds,
+                )
             return manager
         }
     }
