@@ -162,6 +162,13 @@ class PrekeyBundleGossip private constructor(
                 try {
                     storage.put(bytes)
                 } catch (e: NabuStorageException) {
+                    // Backported from PeerDirectoryGossip/InboxGossip/MailboxGossip's identical fix
+                    // (V0.8.5 security audit finding): release the reservation on failure -
+                    // tryReservePersistence already inserted the content id into the never-evicting
+                    // persistedContentIds set, so leaving it in place here would permanently burn a
+                    // slot for a bundle that ends up neither persisted nor tracked. See
+                    // PrekeyBundleIndex.releaseReservedPersistence's own doc comment.
+                    index.releaseReservedPersistence(bundle)
                     logger.warn(e) {
                         "failed to persist gossip-received prekey bundle from $from - declining to accept it"
                     }

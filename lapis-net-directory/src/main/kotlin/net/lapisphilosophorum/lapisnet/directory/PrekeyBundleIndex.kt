@@ -168,6 +168,21 @@ class PrekeyBundleIndex internal constructor(
         return true
     }
 
+    /** Releases a reservation [tryReservePersistence] granted, WITHOUT the corresponding
+     * `storage.put` ever actually succeeding - mirrors [PeerRecordIndex.releaseReservedPersistence]
+     * exactly (itself backported from
+     * `net.lapisphilosophorum.lapisnet.dm.MailboxPointerIndex.releaseReservedPersistence`, V0.8.5
+     * security audit finding): [tryReservePersistence] permanently inserts into the never-evicting
+     * [persistedContentIds] the moment it is called, so a caller that reserves and then has the
+     * actual durable write fail (e.g. `NabuStorageException`) previously burned one of
+     * [maxPersisted] slots forever, for a bundle that ended up neither persisted NOR tracked -
+     * [PrekeyBundleGossip.onGossipMessage] is the only caller. No-op if [bundle]'s content id was
+     * never reserved (or was already released) - safe to call defensively. */
+    @Synchronized
+    fun releaseReservedPersistence(bundle: PrekeyBundle) {
+        persistedContentIds.remove(PrekeyBundleContentId(bundle.contentId()))
+    }
+
     /** The current (latest-by-sequence-number) bundle for [identity], regardless of expiry - TTL
      * filtering happens ONLY in [PrekeyBundleGossip.lookup]. `internal`: only [PrekeyBundleGossip]
      * (same module) and this module's own tests need read access. */

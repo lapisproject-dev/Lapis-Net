@@ -160,6 +160,39 @@ class PrekeyBundleIndexTest :
             index.size() shouldBe 2
         }
 
+        // Security regression backport (V0.8.5 finding, originally fixed in
+        // MailboxPointerIndex.releaseReservedPersistence, mirrored from PeerRecordIndex's identical
+        // backport): releaseReservedPersistence must free a reservation for reuse rather than
+        // burning it permanently. maxPersisted = 1 is the tightest possible window to prove RELEASE,
+        // not merely non-exhaustion - a single successful reservation would otherwise permanently
+        // exhaust a cap of 1 forever if release() were a no-op.
+        test(
+            "releaseReservedPersistence frees a reservation for reuse rather than burning it " +
+                "permanently - V0.8.5 security fix backport regression",
+        ) {
+            val index = PrekeyBundleIndex(maxTracked = 100, maxPersisted = 1, maxHighWaterMarks = 100)
+            val a = bundle(DualKeyIdentity.generate(), 0)
+            val b = bundle(DualKeyIdentity.generate(), 0)
+
+            // Mirrors what PrekeyBundleGossip.onGossipMessage does on a storage.put() failure: call
+            // tryReservePersistence (which unconditionally inserts into the never-evicting
+            // persistedContentIds the moment it is called), THEN releaseReservedPersistence when the
+            // actual durable write never went through.
+            index.tryReservePersistence(a) shouldBe true
+            index.releaseReservedPersistence(a)
+
+            // THE CENTRAL ASSERTION: a wholly different, later bundle can still claim the cap's ONE
+            // slot - proving `a`'s failed/released reservation did not permanently burn it. Without
+            // releaseReservedPersistence (or if it were a no-op), this would fail: the cap would
+            // already be exhausted by `a` alone.
+            index.tryReservePersistence(b) shouldBe true
+
+            // releaseReservedPersistence is a no-op for a content id that was never reserved (or was
+            // already released) - safe to call defensively.
+            index.releaseReservedPersistence(a) // already released above - must not throw or corrupt state
+            index.tryReservePersistence(bundle(DualKeyIdentity.generate(), 0)) shouldBe false // cap still enforced
+        }
+
         test("evictExpired removes bundles whose TTL has passed, without touching the high-water mark") {
             val index = PrekeyBundleIndex()
             val identity = DualKeyIdentity.generate()
