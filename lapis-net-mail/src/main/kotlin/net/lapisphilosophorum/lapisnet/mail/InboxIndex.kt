@@ -165,6 +165,20 @@ class InboxIndex internal constructor(
         return true
     }
 
+    /** Releases a reservation [tryReservePersistence] granted, WITHOUT the corresponding
+     * `storage.put` ever actually succeeding - backported from
+     * `net.lapisphilosophorum.lapisnet.dm.MailboxPointerIndex.releaseReservedPersistence`
+     * (V0.8.5 security audit finding): [tryReservePersistence] permanently inserts into the
+     * never-evicting [persistedContentIds] the moment it is called, so a caller that reserves and
+     * then has the actual durable write fail (e.g. `NabuStorageException`) previously burned one
+     * of [maxPersisted] slots forever, for an envelope that ended up neither persisted NOR
+     * tracked - [InboxGossip.onGossipMessage] is the only caller. No-op if [envelope]'s content id
+     * was never reserved (or was already released) - safe to call defensively. */
+    @Synchronized
+    fun releaseReservedPersistence(envelope: MessageEnvelope) {
+        persistedContentIds.remove(MailContentId(envelope.contentId()))
+    }
+
     /** All tracked messages, oldest first (insertion order) - a defensive copy. */
     @Synchronized
     fun latest(): List<InboxMessage> = messagesByContentId.values.toList()

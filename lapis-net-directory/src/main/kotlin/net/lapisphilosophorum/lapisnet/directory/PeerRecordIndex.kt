@@ -399,6 +399,20 @@ class PeerRecordIndex internal constructor(
         return true
     }
 
+    /** Releases a reservation [tryReservePersistence] granted, WITHOUT the corresponding
+     * `storage.put` ever actually succeeding - backported from
+     * `net.lapisphilosophorum.lapisnet.dm.MailboxPointerIndex.releaseReservedPersistence`
+     * (V0.8.5 security audit finding): [tryReservePersistence] permanently inserts into the
+     * never-evicting [persistedContentIds] the moment it is called, so a caller that reserves and
+     * then has the actual durable write fail (e.g. `NabuStorageException`) previously burned one
+     * of [maxPersisted] slots forever, for a record that ended up neither persisted NOR tracked -
+     * [PeerDirectoryGossip.onGossipMessage] is the only caller. No-op if [record]'s content id was
+     * never reserved (or was already released) - safe to call defensively. */
+    @Synchronized
+    fun releaseReservedPersistence(record: PeerRecord) {
+        persistedContentIds.remove(PeerRecordContentId(record.contentId()))
+    }
+
     /** The current (latest-by-sequence-number) record for [identity], regardless of whether it has
      * expired - TTL filtering happens ONLY in [PeerDirectoryGossip.lookup], never here. `internal`:
      * only [PeerDirectoryGossip] (same module) and this module's own tests need read access. */

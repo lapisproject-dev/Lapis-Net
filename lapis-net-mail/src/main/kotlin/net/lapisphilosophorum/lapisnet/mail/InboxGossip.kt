@@ -273,6 +273,25 @@ class InboxGossip private constructor(
                     storage.put(frame.bodyBytes)
                     storage.put(frame.envelopeBytes)
                 } catch (e: NabuStorageException) {
+                    // Backported from MailboxGossip's identical fix (V0.8.5 security audit
+                    // finding): release the reservation on failure - tryReservePersistence already
+                    // inserted the content id into the never-evicting persistedContentIds set, so
+                    // leaving it in place here would permanently burn a slot for an envelope that
+                    // ends up neither persisted nor tracked. See
+                    // InboxIndex.releaseReservedPersistence's own doc comment.
+                    //
+                    // Partial-failure case, thought through explicitly: if storage.put(bodyBytes)
+                    // above already succeeded and ONLY storage.put(envelopeBytes) throws, the body
+                    // blob is now durably stored even though this envelope is being rejected here -
+                    // an orphaned blob with no envelope ever pointing at it. This is accepted,
+                    // deliberately not fixed by this backport: Nabu has no pin/GC in this project
+                    // (see NabuStorage's own scope), so an orphaned blob is not a NEW class of
+                    // problem this change introduces - it is exactly as inert as any other
+                    // unreferenced blob this node may already hold. The bug this backport actually
+                    // fixes - the never-evicting persistence-reservation slot leak - is fully closed
+                    // by releasing the reservation below regardless of which of the two put() calls
+                    // failed.
+                    index.releaseReservedPersistence(envelope)
                     logger.warn(e) { "failed to persist gossip-received mail from $from - declining to accept it" }
                     return ValidationResult.Invalid
                 }

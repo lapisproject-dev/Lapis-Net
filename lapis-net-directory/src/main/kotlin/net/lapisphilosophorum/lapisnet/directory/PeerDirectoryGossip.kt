@@ -216,6 +216,13 @@ class PeerDirectoryGossip private constructor(
                 try {
                     storage.put(bytes)
                 } catch (e: NabuStorageException) {
+                    // Backported from InboxGossip/MailboxGossip's identical fix (V0.8.5 security
+                    // audit finding): release the reservation on failure - tryReservePersistence
+                    // already inserted the content id into the never-evicting persistedContentIds
+                    // set, so leaving it in place here would permanently burn a slot for a record
+                    // that ends up neither persisted nor tracked. See
+                    // PeerRecordIndex.releaseReservedPersistence's own doc comment.
+                    index.releaseReservedPersistence(record)
                     logger.warn(e) {
                         "failed to persist gossip-received peer record from $from - declining to accept it"
                     }

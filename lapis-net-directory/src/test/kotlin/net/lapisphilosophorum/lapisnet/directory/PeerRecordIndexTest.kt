@@ -404,6 +404,41 @@ class PeerRecordIndexTest :
             index.add(rollback) shouldBe false
         }
 
+        // Security regression backport (V0.8.5 finding, originally fixed in
+        // MailboxPointerIndex.releaseReservedPersistence, backported here): releaseReservedPersistence
+        // must free a reservation for reuse rather than burning it permanently. maxPersisted = 1 is
+        // the tightest possible window to prove RELEASE, not merely non-exhaustion - a single
+        // successful reservation would otherwise permanently exhaust a cap of 1 forever if release()
+        // were a no-op.
+        test(
+            "releaseReservedPersistence frees a reservation for reuse rather than burning it " +
+                "permanently - V0.8.5 security fix backport regression",
+        ) {
+            val index = PeerRecordIndex(maxTracked = 100, maxPersisted = 1)
+            val identityA = DualKeyIdentity.generate()
+            val identityB = DualKeyIdentity.generate()
+            val a = record(identityA, 0)
+            val b = record(identityB, 0)
+
+            // Mirrors what PeerDirectoryGossip.onGossipMessage does on a storage.put() failure: call
+            // tryReservePersistence (which unconditionally inserts into the never-evicting
+            // persistedContentIds the moment it is called), THEN releaseReservedPersistence when the
+            // actual durable write never went through.
+            index.tryReservePersistence(a) shouldBe true
+            index.releaseReservedPersistence(a)
+
+            // THE CENTRAL ASSERTION: a wholly different, later record can still claim the cap's ONE
+            // slot - proving `a`'s failed/released reservation did not permanently burn it. Without
+            // releaseReservedPersistence (or if it were a no-op), this would fail: the cap would
+            // already be exhausted by `a` alone.
+            index.tryReservePersistence(b) shouldBe true
+
+            // releaseReservedPersistence is a no-op for a content id that was never reserved (or was
+            // already released) - safe to call defensively.
+            index.releaseReservedPersistence(a) // already released above - must not throw or corrupt state
+            index.tryReservePersistence(record(DualKeyIdentity.generate(), 0)) shouldBe false // cap still enforced
+        }
+
         test("evictExpired evicts nothing when every tracked record is still valid") {
             val index = PeerRecordIndex()
             val identities = (1..3).map { DualKeyIdentity.generate() }
