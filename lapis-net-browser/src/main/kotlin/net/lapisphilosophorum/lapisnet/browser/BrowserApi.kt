@@ -205,6 +205,12 @@ class BrowserApiDependencies(
     val mailInbox: InboxGossip,
     val mailSender: MailSender,
     val sentFolder: SentFolder,
+    /** V0.8.6b - see `DmApi.kt`'s `installDmRoutes` for the routes wired against this. `null`
+     * (the default) preserves every prior wave's behavior exactly - none of the `/api/dm` routes
+     * are installed at all (see [installBrowserApi]'s own null-check) - so every test fixture built
+     * before this wave keeps compiling and behaving unchanged without ever constructing the real
+     * libp2p/gossip/session-store machinery [DmApiDependencies] needs. */
+    val dm: DmApiDependencies? = null,
 )
 
 /**
@@ -637,6 +643,12 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         // `routing { }` block so it shares the exact route tree the routes above are installed
         // into.
         installMailRoutes(deps)
+
+        // V0.8.6b DM routes - kept in their own file (DmApi.kt) for the same readability reason
+        // as installMailRoutes above. Only installed when deps.dm is non-null - see
+        // BrowserApiDependencies.dm's own doc comment for why a caller that never wires DM (every
+        // test fixture built before this wave) is unaffected.
+        deps.dm?.let { dm -> installDmRoutes(dm, deps.storage, deps.identity.secp256k1KeyPair.publicKey) }
 
         // Serves src/main/resources/static/ (index.html, style.css, app.js) at the site root -
         // e.g. /index.html, /style.css, /app.js. Mapped LAST relative to the /api/* routes above

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lapis Net - DM</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  #dm-nav a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  #dm-nav a:hover { text-decoration: underline; }
+  main#dm-main { max-width: 900px; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.5rem; }
+  section.dm-panel { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  section.dm-panel h2 { margin-top: 0; }
+  #dm-open-form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  #dm-open-form input[type="text"] {
+    flex: 1; min-width: 16rem; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0.5rem; font-family: inherit;
+  }
+  ul#dm-conversation-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .dm-conversation-item {
+    border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; background: var(--bg);
+    cursor: pointer; display: flex; flex-direction: column; gap: 0.2rem;
+  }
+  .dm-conversation-item.active { outline: 2px solid var(--accent); }
+  .dm-conversation-header { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.85rem; color: var(--muted); }
+  .dm-conversation-preview { white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .dm-quarantine-badge { color: var(--badge-low-text); font-style: italic; font-size: 0.8rem; }
+  #dm-thread-peer { font-weight: 600; }
+  #dm-accept-banner { display: none; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+  #dm-accept-banner.visible { display: flex; }
+  ul#dm-message-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; max-height: 24rem; overflow-y: auto; }
+  .dm-message-item { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem; }
+  .dm-message-item.outbound { background: var(--bg); align-self: flex-end; }
+  .dm-message-item.inbound { background: var(--panel-bg); }
+  .dm-message-header { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; color: var(--muted); }
+  .dm-message-body { white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0; font-family: inherit; }
+  .dm-message-attachments { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.3rem; }
+  .dm-message-attachment-item { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; }
+  #dm-compose-form { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+  #dm-compose-body { width: 100%; min-height: 5rem; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; font-family: inherit; }
+  #dm-compose-attachments { display: flex; flex-direction: column; gap: 0.4rem; }
+  .dm-attachment-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  #dm-compose-status { font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<header id="identity-header">
+  <div class="brand">
+    <h1>Lapis Net DM</h1>
+    <p id="tagline">Ratcheted, always end-to-end-encrypted direct messages.</p>
+  </div>
+  <div id="identity-info">
+    <span id="identity-label">You:</span>
+    <span id="identity-fingerprint">loading identity&hellip;</span>
+  </div>
+  <nav id="dm-nav">
+    <a href="/index.html">&larr; Timeline</a>
+    <a href="/mail.html">Mail</a>
+  </nav>
+</header>
+
+<main id="dm-main">
+  <section class="dm-panel" id="dm-open-panel">
+    <h2>Start / open a conversation</h2>
+    <form id="dm-open-form">
+      <input type="text" id="dm-open-peer" placeholder="recipient hex public key (03ab...ef)" />
+      <button type="submit" id="dm-open-submit">Open</button>
+    </form>
+  </section>
+
+  <section class="dm-panel" id="dm-conversation-panel">
+    <h2>Conversations</h2>
+    <button type="button" id="dm-refresh-button" class="btn-secondary">Refresh</button>
+    <ul id="dm-conversation-list"></ul>
+  </section>
+
+  <section class="dm-panel" id="dm-thread-panel" hidden>
+    <h2>Conversation with <span id="dm-thread-peer"></span></h2>
+    <div id="dm-accept-banner">
+      <span>This contact is not yet accepted - inbound messages are quarantined.</span>
+      <button type="button" id="dm-accept-button" class="btn-secondary">Accept</button>
+    </div>
+    <ul id="dm-message-list"></ul>
+    <form id="dm-compose-form">
+      <textarea id="dm-compose-body" placeholder="Message"></textarea>
+      <div id="dm-compose-attachments">
+        <div id="dm-compose-attachment-rows"></div>
+        <button type="button" id="dm-add-attachment" class="btn-secondary">Add attachment</button>
+      </div>
+      <button type="submit" id="dm-compose-submit">Send</button>
+      <span id="dm-compose-status"></span>
+    </form>
+  </section>
+</main>
+
+<template id="dm-conversation-item-template">
+  <li class="dm-conversation-item">
+    <div class="dm-conversation-header">
+      <span class="dm-conversation-peer"></span>
+      <span class="dm-conversation-time"></span>
+    </div>
+    <p class="dm-conversation-preview"></p>
+    <span class="dm-quarantine-badge" hidden>quarantined</span>
+  </li>
+</template>
+
+<template id="dm-message-item-template">
+  <li class="dm-message-item">
+    <div class="dm-message-header">
+      <span class="dm-message-direction"></span>
+      <span class="dm-message-time"></span>
+      <span class="dm-message-status"></span>
+    </div>
+    <pre class="dm-message-body"></pre>
+    <div class="dm-message-attachments"></div>
+  </li>
+</template>
+
+<template id="dm-message-attachment-item-template">
+  <div class="dm-message-attachment-item">
+    <a class="dm-message-attachment-link" href="#" target="_blank" rel="noopener"></a>
+    <span class="dm-message-attachment-meta"></span>
+  </div>
+</template>
+
+<template id="dm-attachment-row-template">
+  <div class="dm-attachment-row">
+    <input type="file" class="dm-attachment-file" />
+    <input type="text" class="dm-attachment-mime" placeholder="mime type (optional)" />
+    <button type="button" class="btn-secondary dm-attachment-remove">Remove</button>
+  </div>
+</template>
+
+<script src="/dm.js"></script>
+</body>
+</html>

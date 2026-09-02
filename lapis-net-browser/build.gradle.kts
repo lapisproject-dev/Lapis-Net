@@ -22,6 +22,11 @@ dependencies {
     implementation(project(":lapis-net-karma"))
     // V0.9.3 - new edge: mail was explicitly untouched by browser through V0.9.2.
     implementation(project(":lapis-net-mail"))
+    // V0.8.6b - new edges: DM browser wiring needs the directory (PeerRecord/PrekeyBundle) and
+    // ratchet (PrekeyStore) layers DmSessionManager.attach itself depends on, plus lapis-net-dm.
+    implementation(project(":lapis-net-directory"))
+    implementation(project(":lapis-net-ratchet"))
+    implementation(project(":lapis-net-dm"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)

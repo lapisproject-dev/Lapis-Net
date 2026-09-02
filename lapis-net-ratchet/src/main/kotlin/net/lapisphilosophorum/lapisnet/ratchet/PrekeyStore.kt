@@ -517,6 +517,28 @@ class PrekeyStore private constructor(
         val baseDirectory = file.parent
         val passphrase = passphraseProvider.get()
         try {
+            // Defense in depth against a passphraseProvider that is NOT stable across calls (the
+            // real production provider is stable for a given BrowserServer.start() lifetime - see
+            // BrowserServer's own dmPrekeyMasterPassphrase doc comment - but this class has no way
+            // to enforce that on an arbitrary caller-supplied PassphraseProvider). Refuses to write
+            // an unencrypted (v1) file over an already-encrypted (v2) one just because THIS
+            // particular get() call came back null - that would silently strip encryption from
+            // X3DH private key material that a previous call correctly wrote as v2, with no
+            // exception and no on-disk trace of what happened. A genuinely intentional "stop
+            // encrypting this store" is not a supported operation; an operator who wants that must
+            // delete and recreate the store.
+            if (passphrase == null && file.exists()) {
+                val onDiskVersion = PrekeyStoreFileFormat.formatVersionOf(Files.readAllBytes(file))
+                check(onDiskVersion != PrekeyStoreFileFormat.FORMAT_VERSION_2) {
+                    "refusing to persist an unencrypted (v1) prekey store over an existing " +
+                        "encrypted (v2) one at $file - passphraseProvider.get() returned null this " +
+                        "time even though the store on disk is currently encrypted, which would " +
+                        "silently downgrade X3DH private key material to plaintext. The " +
+                        "passphraseProvider must resolve the SAME passphrase (or consistently " +
+                        "null) for this store's entire lifetime, never a real passphrase on some " +
+                        "calls and null on others."
+                }
+            }
             val bytes =
                 if (passphrase != null) {
                     PrekeyStoreFileFormat.encodeEncrypted(newState, passphrase)
