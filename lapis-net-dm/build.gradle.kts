@@ -47,6 +47,16 @@
 // 1.3.5-RELEASE's transitive Netty 4.2.10.Final, both moved into netty-codec-base/netty-handler
 // (already pulled in transitively via api(lapis-net-networking) -> api(jvm-libp2p) -> Netty), the
 // same way GossipPubSub.kt's own Unpooled/ByteBufUtil usage arrives.
+//
+// V0.8.6 additions:
+// api(lapis-net-policy): AcceptanceGate/KarmaScoreLookup appear directly in DmAcceptancePolicy's/
+// DmAcceptanceCheck's public signatures.
+// implementation(lightning-kmp)/implementation(bitcoin-kmp): identical reasoning and identical
+// bitcoin-kmp version-pinning note to lapis-net-mail/build.gradle.kts's own comment (lightning-kmp's
+// published POM pins an older bitcoin-kmp-jvm than this project resolves elsewhere; the explicit
+// bitcoin-kmp dependency here forces the same resolved version everywhere). Every fr.acinq.* type
+// stays confined to DmFirstContactDepositVerifier.kt, mirroring FirstContactDepositVerifier's "sole
+// consumer" discipline.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
@@ -54,4 +64,7 @@ dependencies {
     api(project(":lapis-net-directory"))
     api(project(":lapis-net-networking"))
     api(project(":lapis-net-storage"))
+    api(project(":lapis-net-policy"))
+    implementation(rootProject.libs.lightning.kmp)
+    implementation(rootProject.libs.bitcoin.kmp)
 }

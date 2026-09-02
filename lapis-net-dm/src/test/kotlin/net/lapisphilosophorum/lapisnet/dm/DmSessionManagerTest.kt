@@ -24,7 +24,14 @@ import java.util.Collections
 private fun awaitAtLeast(
     received: MutableList<DmInboundMessage>,
     count: Int,
-    timeout: Duration = Duration.ofSeconds(20),
+    // 60s rather than the tighter 20s used elsewhere: this specific test's second wait
+    // (waiting on a SECOND inbound message on a directly-invoked handleInboundEnvelope
+    // path, not a network round-trip) was observed to miss a 20s deadline only under a
+    // full, parallel `./gradlew check` run - never in isolation or a single-module run -
+    // i.e. it is a machine-load flake, not a correctness signal. See review finding
+    // (2026-09) in the V0.8.6 wave notes for the reproduction (isolated class/module
+    // green, full parallel `check` red).
+    timeout: Duration = Duration.ofSeconds(60),
 ): List<DmInboundMessage> {
     val deadline = Instant.now().plus(timeout)
     while (received.size < count && Instant.now().isBefore(deadline)) {
@@ -62,7 +69,7 @@ class DmSessionManagerTest :
             try {
                 val unknown = DualKeyIdentity.generate().secp256k1KeyPair.publicKey
                 shouldThrow<DmUnknownRecipientException> {
-                    node.dmSessionManager.send(unknown, "hello nobody".toByteArray())
+                    node.dmSessionManager.send(unknown, DmContent(body = "hello nobody"))
                 }
             } finally {
                 node.stop()
@@ -96,18 +103,18 @@ class DmSessionManagerTest :
                 // --- FIRST CONTACT: a real X3dh.initiate is triggered, proven indirectly by a
                 // one-time prekey actually being consumed on B's side (the responder). ---
                 val beforeFirstContact = nodeB.prekeyStore.availableOneTimePrekeyCount()
-                nodeA.dmSessionManager.send(identityBPub, "first message".toByteArray())
+                nodeA.dmSessionManager.send(identityBPub, DmContent(body = "first message"))
                 var messages = awaitAtLeast(received, 1)
                 messages[0].sender shouldBe identityAPub
-                messages[0].plaintext.decodeToString() shouldBe "first message"
+                messages[0].content.body shouldBe "first message"
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforeFirstContact - 1)
 
                 // --- SESSION RESUMPTION: a second send to the SAME recipient must NOT consume
                 // another one-time prekey - proof it reused the existing ratchet session rather
                 // than re-handshaking. ---
-                nodeA.dmSessionManager.send(identityBPub, "second message".toByteArray())
+                nodeA.dmSessionManager.send(identityBPub, DmContent(body = "second message"))
                 messages = awaitAtLeast(received, 2)
-                messages[1].plaintext.decodeToString() shouldBe "second message"
+                messages[1].content.body shouldBe "second message"
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforeFirstContact - 1)
 
                 // --- RESTART RESUMPTION: stop A's node entirely, rebuild a FRESH LapisNode/
@@ -118,10 +125,10 @@ class DmSessionManagerTest :
                 nodeA = buildDmTestNode(identity = identityA, sessionStoreDirectory = sessionDirA)
                 connectAndConverge(nodeA, nodeB)
 
-                nodeA.dmSessionManager.send(identityBPub, "third message after restart".toByteArray())
+                nodeA.dmSessionManager.send(identityBPub, DmContent(body = "third message after restart"))
                 messages = awaitAtLeast(received, 3)
                 messages[2].sender shouldBe identityAPub
-                messages[2].plaintext.decodeToString() shouldBe "third message after restart"
+                messages[2].content.body shouldBe "third message after restart"
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforeFirstContact - 1)
             } finally {
                 nodeA.stop()
@@ -158,7 +165,10 @@ class DmSessionManagerTest :
                 nodeA.peerDirectory.lookup(identityBPub) shouldBe null
 
                 shouldThrow<DmUnknownRecipientException> {
-                    nodeA.dmSessionManager.send(identityBPub, "must never bootstrap a phantom session".toByteArray())
+                    nodeA.dmSessionManager.send(
+                        identityBPub,
+                        DmContent(body = "must never bootstrap a phantom session"),
+                    )
                 }
 
                 // No phantom session left behind - not cached, not persisted (liveSessionForTest
@@ -172,9 +182,9 @@ class DmSessionManagerTest :
                 nodeB.dmSessionManager.addInboundListener { received.add(it) }
                 val beforeFirstContact = nodeB.prekeyStore.availableOneTimePrekeyCount()
                 connectAndConverge(nodeA, nodeB)
-                nodeA.dmSessionManager.send(identityBPub, "genuine first message".toByteArray())
+                nodeA.dmSessionManager.send(identityBPub, DmContent(body = "genuine first message"))
                 val messages = awaitAtLeast(received, 1)
-                messages[0].plaintext.decodeToString() shouldBe "genuine first message"
+                messages[0].content.body shouldBe "genuine first message"
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforeFirstContact - 1)
             } finally {
                 nodeA.stop()
@@ -208,9 +218,9 @@ class DmSessionManagerTest :
                 victim.dmSessionManager.addInboundListener { received.add(it) }
 
                 // A REAL first session, bootstrapped the normal way via send()'s own X3DH_INITIAL path.
-                correspondent.dmSessionManager.send(identityVictim, "first contact".toByteArray())
+                correspondent.dmSessionManager.send(identityVictim, DmContent(body = "first contact"))
                 val firstMessages = awaitAtLeast(received, 1)
-                firstMessages[0].plaintext.decodeToString() shouldBe "first contact"
+                firstMessages[0].content.body shouldBe "first contact"
 
                 val oldSession = requireNotNull(victim.dmSessionManager.liveSessionForTest(identityCorrespondent))
                 oldSession.canSend shouldBe true
@@ -244,14 +254,15 @@ class DmSessionManagerTest :
                 val newSendingSession =
                     DoubleRatchetSession.initializeSender(initiation.session, victimBundle.signedPrekey, SecureRandom())
                 initiation.session.destroy()
-                val ratchetMessage = newSendingSession.encrypt("second, fresh handshake".toByteArray())
+                val secondContentBytes = DmContentCodec.encode(DmContent(body = "second, fresh handshake"))
+                val ratchetMessage = newSendingSession.encrypt(secondContentBytes)
                 val secondEnvelope =
                     DmEnvelope(DmMessageType.X3DH_INITIAL, identityCorrespondent, initiation.header, ratchetMessage)
                 val secondBytes = DmEnvelopeCodec.encode(secondEnvelope)
 
                 victim.dmSessionManager.handleInboundEnvelope(victim.node.peerId, secondBytes)
                 val secondMessages = awaitAtLeast(received, 2)
-                secondMessages[1].plaintext.decodeToString() shouldBe "second, fresh handshake"
+                secondMessages[1].content.body shouldBe "second, fresh handshake"
 
                 // The OLD session object is destroyed, not merely dropped from the cache - proven
                 // behaviourally (this module's test sources cannot reach DoubleRatchetSession's
@@ -299,10 +310,10 @@ class DmSessionManagerTest :
                 val beforePrekeys = nodeB.prekeyStore.availableOneTimePrekeyCount()
 
                 shouldNotThrowAny {
-                    nodeA.dmSessionManager.send(identityBPub, "survives a corrupt session file".toByteArray())
+                    nodeA.dmSessionManager.send(identityBPub, DmContent(body = "survives a corrupt session file"))
                 }
                 val messages = awaitAtLeast(received, 1)
-                messages[0].plaintext.decodeToString() shouldBe "survives a corrupt session file"
+                messages[0].content.body shouldBe "survives a corrupt session file"
                 // A REAL, fresh X3DH handshake ran instead of the corrupt file wedging this peer
                 // forever - proven via one-time-prekey consumption, the same proof this file's other
                 // first-contact assertions already use.
@@ -335,7 +346,7 @@ class DmSessionManagerTest :
                 // first-contact send() - unlike the structurally-corrupt case above, this file is a
                 // perfectly well-formed v1 session until it gets tampered with below.
                 val beforePrekeys = nodeB.prekeyStore.availableOneTimePrekeyCount()
-                nodeA.dmSessionManager.send(identityBPub, "first message".toByteArray())
+                nodeA.dmSessionManager.send(identityBPub, DmContent(body = "first message"))
                 var messages = awaitAtLeast(received, 1)
                 messages[0].sender shouldBe identityAPub
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforePrekeys - 1)
@@ -358,10 +369,10 @@ class DmSessionManagerTest :
                 connectAndConverge(nodeA, nodeB)
 
                 shouldNotThrowAny {
-                    nodeA.dmSessionManager.send(identityBPub, "survives a tampered session file".toByteArray())
+                    nodeA.dmSessionManager.send(identityBPub, DmContent(body = "survives a tampered session file"))
                 }
                 messages = awaitAtLeast(received, 2)
-                messages[1].plaintext.decodeToString() shouldBe "survives a tampered session file"
+                messages[1].content.body shouldBe "survives a tampered session file"
                 // A REAL, fresh X3DH handshake ran again - proven via a SECOND one-time-prekey
                 // consumption, not merely "did not throw".
                 nodeB.prekeyStore.availableOneTimePrekeyCount() shouldBe (beforePrekeys - 2)

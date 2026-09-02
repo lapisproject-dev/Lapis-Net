@@ -47,7 +47,7 @@ Ratchet itself (`DoubleRatchetSession`, its message codec, its bounded
 skipped-key store, and encrypted-at-rest session persistence) — is also
 implemented in that module.
 V0.8.4 — the online DM stream itself — is also implemented, in the new
-`lapis-net-dm` module: 1:1 direct messages over a custom `/lapis/dm/1.0.0`
+`lapis-net-dm` module: 1:1 direct messages over a custom `/lapis/dm/1.1.0`
 libp2p stream protocol, driving V0.8.2's X3DH handshake and V0.8.3's Double
 Ratchet into a live send/receive path. This wave supports only
 directly-dialable peers (same-LAN or otherwise directly reachable) — this
@@ -74,8 +74,22 @@ specific I/O path), and several smaller findings in the mailbox code (dead
 lookup structure removed, an unbounded local write removed, TTL-cap and
 sender-identity-trust documentation added, a missing topic-collision test
 added).
-Not yet implemented in this arc: attachments, policy/spam-filtering, a
-browser UI for direct messages (V0.8.6), and 1:1 voice/video calls (V0.8.7).
+V0.8.6 — attachments and an opt-in DM acceptance/quarantine policy — is also
+implemented: a structured `DmContent` payload (body + up to 4 encrypted
+attachments, `DmAttachmentCipher`/`EncryptedDmAttachmentBlobCodec`, mirroring
+`lapis-net-mail`'s attachment encryption) replaces the raw ratchet plaintext,
+carried over the outer `/lapis/dm/1.1.0` stream protocol (a deliberate,
+breaking bump from `1.0.0`). `DmAcceptancePolicy` (new module
+`lapis-net-policy`, gates shared with `lapis-net-mail`) gives a node an
+opt-in Veritas/Karma/Lightning-deposit filter for unsolicited DMs, as a
+deliberately separate decision function from mail's — see
+link:docs/architecture.adoc[docs/architecture.adoc]'s "two acceptance
+gates" section. **A browser UI for direct messages is explicitly NOT built
+this wave**: `DmAcceptanceCheck`, `DmAcceptedContacts`, and
+`DmAttachmentFetcher` are complete, independently tested building blocks
+with no production caller in this repo yet.
+Not yet implemented in this arc: a browser UI for direct messages, and
+1:1 voice/video calls (V0.8.7).
 Mail (V0.9) is a separate, already-completed arc — encryption, threading,
 attachments, and spam protection are all implemented, see `lapis-net-mail`
 below.
@@ -120,7 +134,7 @@ below.
 | X25519 encryption sub-key and the X3DH handshake (Signal's Extended Triple Diffie-Hellman, reimplemented from the public specification): `PrekeyBundle`/`PrekeyBundleCodec`, `PrekeyStore` (durable one-time-prekey consumption), and the `X3dh` handshake itself. Deliberately network-free (V0.8.2). Plus the Double Ratchet itself: `DoubleRatchetSession` (forward-secret, post-compromise-secure 1:1 sessions over an HKDF root chain and HMAC symmetric chains), `RatchetMessage`/`RatchetMessageCodec`, a bounded evicting `SkippedMessageKeyStore`, and `DoubleRatchetSessionCodec` for encrypted-at-rest session persistence, including the `encodeWithKey`/`decodeWithKey` Argon2id-bypass pair `lapis-net-dm` uses for per-message persistence (V0.8.3).
 
 | `lapis-net-dm`
-| The custom `/lapis/dm/1.0.0` libp2p stream protocol wiring `lapis-net-ratchet`'s X3DH/Double-Ratchet primitives into a live network path: `DmProtocol`/`DmProtocolHandler` (stream-protocol binding, the first raw-libp2p-stream parser in this codebase — length-validated-before-allocation frame decoding, slowloris/absolute-lifetime timeouts, per-peer stream cap), `DmEnvelope`/`DmEnvelopeCodec` (the outer wire frame), `DmSessionManager` (first-contact/resumed session state machine, durable session persistence, the identity-authority-safe inbound handler), and `DmStore` (in-memory-only conversation history) — online 1:1 direct messages between directly-dialable peers (V0.8.4), plus V0.8.5's offline Nabu mailbox (`MailboxPointer`/`MailboxGossip`/`MailboxPoller`/`MailboxRedeliveryScheduler`, `DmSessionManager.sendOffline`) for offline delivery via a Bitswap-fetched, periodically re-announced signed pointer.
+| The custom `/lapis/dm/1.1.0` libp2p stream protocol wiring `lapis-net-ratchet`'s X3DH/Double-Ratchet primitives into a live network path: `DmProtocol`/`DmProtocolHandler` (stream-protocol binding, the first raw-libp2p-stream parser in this codebase — length-validated-before-allocation frame decoding, slowloris/absolute-lifetime timeouts, per-peer stream cap), `DmEnvelope`/`DmEnvelopeCodec` (the outer wire frame), `DmSessionManager` (first-contact/resumed session state machine, durable session persistence, the identity-authority-safe inbound handler), and `DmStore` (in-memory-only conversation history) — online 1:1 direct messages between directly-dialable peers (V0.8.4), plus V0.8.5's offline Nabu mailbox (`MailboxPointer`/`MailboxGossip`/`MailboxPoller`/`MailboxRedeliveryScheduler`, `DmSessionManager.sendOffline`) for offline delivery via a Bitswap-fetched, periodically re-announced signed pointer.
 
 | `lapis-net-browser`
 | Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data and the LTR record-authoring endpoints.

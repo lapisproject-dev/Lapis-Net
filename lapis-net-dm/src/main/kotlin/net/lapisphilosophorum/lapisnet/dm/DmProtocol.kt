@@ -25,10 +25,20 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
 
-/** This wave's custom libp2p stream protocol id - the FIRST protocol binding in this codebase that
- * is not GossipSub. Versioned (`1.0.0`), mirroring `io.libp2p.protocol.Ping`'s own
- * `"/ipfs/ping/1.0.0"` convention. */
-const val DM_PROTOCOL_ID = "/lapis/dm/1.0.0"
+/** This module's custom libp2p stream protocol id - the FIRST protocol binding in this codebase
+ * that is not GossipSub. Versioned, mirroring `io.libp2p.protocol.Ping`'s own
+ * `"/ipfs/ping/1.0.0"` convention.
+ *
+ * **Bumped `1.0.0` -> `1.1.0` in V0.8.6 - a deliberate, BREAKING change, no dual-listen, no
+ * heuristic byte-sniffing fallback.** V0.8.6 changes the RATCHET PLAINTEXT's own contract: what a
+ * `TEXT`/`X3DH_INITIAL` [DmEnvelope] carries as its decrypted payload switches from an opaque raw
+ * `ByteArray` to a framed [DmContent] (see [DmContentCodec]). The two are not reliably
+ * distinguishable by sniffing decrypted bytes - and this codebase's stated policy at every other
+ * such crossroads (`/lapis/dm/1.0.0` itself, `EncryptionMode.MLS_ARCHIVE`) is a clean version bump
+ * over a heuristic. Consequence-free in practice: `lapis-net-dm` has never shipped outside this
+ * repo, so there is no external `/lapis/dm/1.0.0` deployment to remain compatible with - see
+ * `docs/roadmap.adoc`'s V0.8.6 section for the explicit breaking-change note. */
+const val DM_PROTOCOL_ID = "/lapis/dm/1.1.0"
 
 private const val LENGTH_FIELD_SIZE = 4
 
@@ -47,7 +57,7 @@ private const val READ_IDLE_TIMEOUT_SECONDS = 10L
 private const val MAX_STREAM_LIFETIME_SECONDS = 20L
 
 /** Per remote [PeerId], enforced in [DmProtocolHandler.onStartResponder] - bounds how many
- * concurrent, not-yet-completed `/lapis/dm/1.0.0` streams a single misbehaving or malicious peer may
+ * concurrent, not-yet-completed `/lapis/dm/1.1.0` streams a single misbehaving or malicious peer may
  * have open against this node at once, so one peer cannot exhaust this node's stream-handling
  * capacity (adversarial test case (d)). 8 is generous headroom above any legitimate 1:1-DM traffic
  * pattern (this wave's design is one stream per message, fire-and-forget - see
@@ -76,7 +86,7 @@ interface DmSendHandle : DmStreamRole {
 }
 
 /**
- * This module's custom `/lapis/dm/1.0.0` stream-protocol handler - the FIRST place in this codebase
+ * This module's custom `/lapis/dm/1.1.0` stream-protocol handler - the FIRST place in this codebase
  * that parses untrusted bytes arriving directly off a raw libp2p stream, with NO GossipSub
  * message-size ceiling backstopping the parser. Built directly against jvm-libp2p's real
  * `ProtocolHandler`/`ProtocolMessageHandler` API (verified against the resolved
@@ -126,7 +136,7 @@ interface DmSendHandle : DmStreamRole {
  *
  * **CRITICAL IDENTITY-AUTHORITY NOTE.** The libp2p [PeerId] a stream connection authenticates (via
  * Noise, at the TRANSPORT layer - [Stream.remotePeerId]) is used in [onStartResponder] ONLY as a
- * resource-management key: rate-limiting how many concurrent `/lapis/dm/1.0.0` streams one
+ * resource-management key: rate-limiting how many concurrent `/lapis/dm/1.1.0` streams one
  * transport connection may open. It is NEVER treated as a claim about who the [DmEnvelope]'s own
  * `senderIdentity` field is - that claim is authorized ONLY once [DmSessionManager]'s ratchet
  * decrypt succeeds. See [DmSessionManager.handleInboundEnvelope]'s own doc comment for the complete
@@ -146,7 +156,7 @@ class DmProtocolHandler(
         256L,
     ) {
     /** Self-cleaning: an entry exists ONLY while [PeerId] currently has at least one open
-     * `/lapis/dm/1.0.0` stream against this node - [onStartResponder]/its `onFinished` callback both
+     * `/lapis/dm/1.1.0` stream against this node - [onStartResponder]/its `onFinished` callback both
      * mutate this atomically via [ConcurrentHashMap.compute]/[ConcurrentHashMap.computeIfPresent], and
      * the latter removes the entry outright once its count reaches zero (see both call sites below).
      * Deliberately NOT an `AtomicInteger`-per-key map that lingers forever once created - unlike

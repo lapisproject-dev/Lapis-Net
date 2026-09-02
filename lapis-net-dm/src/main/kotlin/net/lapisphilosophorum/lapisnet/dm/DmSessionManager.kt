@@ -4,6 +4,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
+import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.EncryptionKeyBinding
@@ -102,13 +103,28 @@ private class FixedWindowRateLimiter(
  * here, after [DmSessionManager.handleInboundEnvelope]'s ratchet decryption already succeeded under
  * a session bootstrapped with this exact identity - see that function's own doc comment. [dedupKey]
  * is V0.8.5's forward-compatible hook (see [DmDedupKey]'s own doc comment) - NOT deduplicated
- * against anything in this wave. */
+ * against anything in this wave.
+ *
+ * **V0.8.6**: [plaintext] is the raw ratchet plaintext (== [DmContentCodec.encode]`(content)`,
+ * unchanged, kept for callers that still want the raw bytes); [content] is that same plaintext,
+ * already decoded - see [DmContentCodec]. [quarantined] is `true` iff [DmAcceptancePolicy
+ * .classifyDelivered] rejected this sender against every configured gate AFTER decryption already
+ * succeeded (see that object's class doc comment for why this is `Quarantine`, never `Reject`, at
+ * this point in the pipeline) - always `false` when no [DmAcceptanceCheck] is configured. */
 data class DmInboundMessage(
     val sender: Secp256k1PublicKey,
     val plaintext: ByteArray,
+    val content: DmContent,
+    val quarantined: Boolean,
     val dedupKey: ByteArray,
     val receivedAtEpochSecond: Long,
 )
+
+/** [DmSessionManager.sendAuto]'s result - which transport actually carried the message. */
+enum class DmSendOutcome {
+    SENT_ONLINE,
+    QUEUED_FOR_PICKUP,
+}
 
 /**
  * Drives the full handshake-then-ratchet lifecycle: resolves a recipient's current network address
@@ -203,6 +219,17 @@ class DmSessionManager private constructor(
     private val kdfParams: KeystoreEncryption.Params,
     private val random: SecureRandom,
     private val mailboxRedeliveryScheduler: MailboxRedeliveryScheduler,
+    initialAcceptance: DmAcceptanceCheck?,
+    /** V0.8.6 - see [DmAcceptedContacts]'s own doc comment. `null` (the default everywhere no
+     * caller opts in) means outbound sends never mark a recipient accepted - identical to every
+     * prior wave's behavior. When non-null, [prepareEnvelopeLocked] calls [DmAcceptedContacts.accept]
+     * on every outbound send (online, offline, or via [sendAuto]) - this is the "OR because this
+     * node itself sent that peer a message" half of [DmAcceptedContacts]'s own class doc comment,
+     * made reachable. A caller that wants BOTH halves (the send-side auto-accept AND an explicit
+     * future UI accept button) passes the SAME [DmAcceptedContacts] instance here and into the
+     * [DmAcceptanceCheck.isAcceptedContact] lambda of whatever [DmAcceptanceCheck] it configures via
+     * [initialAcceptance]/[updateAcceptanceCheck]. */
+    private val acceptedContacts: DmAcceptedContacts?,
 ) {
     private lateinit var dmProtocol: DmProtocol
 
@@ -211,6 +238,26 @@ class DmSessionManager private constructor(
      * exist until after this primary constructor has already run. Assigned once, immediately after
      * construction, in [attach]. */
     private lateinit var mailboxPoller: MailboxPoller
+
+    /** V0.8.6 - the post-AEAD acceptance policy [classifyQuarantined] consults, `null` meaning "no
+     * check configured, deliver everything unquarantined" (V0.8.5's behavior, unchanged). `@Volatile`,
+     * not guarded by any [withPeerLock] stripe: [updateAcceptanceCheck] is the sole writer, called
+     * from a caller's own thread (e.g. a future UI handler reacting to newly-learned trust, not yet
+     * built this wave) entirely outside any per-peer critical section, and [classifyQuarantined]
+     * only ever needs a single consistent read of the CURRENT reference, never a multi-field
+     * snapshot. */
+    @Volatile
+    private var acceptance: DmAcceptanceCheck? = initialAcceptance
+
+    /** Replaces the acceptance-policy check this manager consults post-AEAD - a fresh [TrustGraph]
+     * means a fresh, empty [net.lapisphilosophorum.lapisnet.policy.VeritasPathCache], since a
+     * [TrustGraph] is an immutable snapshot that is never mutated in place (see that class's own doc
+     * comment): reflecting newly-learned trust means constructing a brand NEW [DmAcceptanceCheck],
+     * never mutating an existing one's graph. Pass `null` to disable acceptance checking entirely
+     * (every message delivered unquarantined). */
+    fun updateAcceptanceCheck(check: DmAcceptanceCheck?) {
+        acceptance = check
+    }
 
     /** Guards [cachedKey] against the race between [stop]'s `cachedKey.fill(0)` and an IN-FLIGHT
      * [persistSession]/[loadPersisted] call reading it - follow-up hardening item 2 (2026-08-11).
@@ -523,12 +570,19 @@ class DmSessionManager private constructor(
     }
 
     /**
-     * Sends [plaintext] to [recipient]: resolves [recipient]'s [PeerDirectoryGossip] record FIRST
+     * Sends [content] to [recipient]: resolves [recipient]'s [PeerDirectoryGossip] record FIRST
      * (before any session state is touched - see this function's body for why), then resolves or
      * bootstraps a session (X3DH first contact, or reuse of an existing/persisted session), persists
      * the post-encrypt session state BEFORE putting the ciphertext on the wire (mirroring
      * [DoubleRatchetSession]'s own "persist and destroy ordering" rule 3), then dials [recipient]'s
      * current address via [DmProtocol] and writes exactly one [DmEnvelope] frame.
+     *
+     * **V0.8.6: takes a [DmContent], not a raw [ByteArray]** - the former `plaintext: ByteArray`
+     * overload has been REMOVED, not kept as a convenience wrapper (a `ByteArray` -> `DmContent`
+     * bridge would need to invent a body/attachment split on the caller's behalf, silently
+     * misinterpreting arbitrary binary as UTF-8 text). [DmContentCodec.encode] is called ONCE,
+     * outside [withPeerLock], before any session work - a pure, side-effect-free encode never needs
+     * the per-peer lock.
      *
      * @throws DmUnknownRecipientException if [recipient] has no [PeerDirectoryGossip] record (checked
      *   first, before any session work) or no [PrekeyBundleGossip] bundle (first-contact only).
@@ -539,15 +593,16 @@ class DmSessionManager private constructor(
      */
     fun send(
         recipient: Secp256k1PublicKey,
-        plaintext: ByteArray,
+        content: DmContent,
     ) {
+        val plaintext = DmContentCodec.encode(content)
         withPeerLock(recipient) {
             // Directory lookup happens FIRST, before any X3DH/encrypt/persist work below - see this
             // function's own doc comment and the CRITICAL review finding it fixes. PeerRecord and
             // PrekeyBundle have independent TTL/propagation lifecycles, so it is realistic for the
-            // bundle lookup (further down) to succeed while this lookup fails; if that check ran
-            // AFTER a brand-new session was already persisted+cached, this recipient would end up
-            // with a durable phantom session here that the recipient never received the
+            // bundle lookup (inside prepareEnvelopeLocked) to succeed while this lookup fails; if
+            // that check ran AFTER a brand-new session was already persisted+cached, this recipient
+            // would end up with a durable phantom session here that the recipient never received the
             // X3DH_INITIAL envelope to bootstrap their own side of - every subsequent send() would
             // then silently reuse that phantom session forever. Failing here, before any session
             // state exists yet, makes the whole first-contact attempt a no-op on failure.
@@ -555,55 +610,15 @@ class DmSessionManager private constructor(
                 peerDirectory.lookup(recipient)
                     ?: throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
 
-            var session = getCachedOrLoad(recipient)
-            val envelope: DmEnvelope
-            if (session == null) {
-                val (newSession, header) = bootstrapSenderSession(recipient)
-                val ratchetMessage = newSession.encrypt(plaintext)
-                envelope =
-                    DmEnvelope(
-                        DmMessageType.X3DH_INITIAL,
-                        localIdentity.secp256k1KeyPair.publicKey,
-                        header,
-                        ratchetMessage,
-                    )
-                session = newSession
-            } else {
-                check(session.canSend) {
-                    "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
-                }
-                val ratchetMessage = session.encrypt(plaintext)
-                envelope =
-                    DmEnvelope(DmMessageType.TEXT, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
-            }
-
-            // Persist BEFORE network write - see DoubleRatchetSession's own persist/destroy-ordering
-            // rule 3, and this class's own doc comment. `record` was already resolved above, before
-            // any of this session state was created.
-            persistSession(recipient, session)
-            putCached(recipient, session)
-
-            val bytes = DmEnvelopeCodec.encode(envelope)
-
-            if (!dialSemaphore.tryAcquire(DIAL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
-                throw DmSessionException(
-                    "timed out waiting for an available outbound dial slot " +
-                        "(MAX_CONCURRENT_OUTBOUND_DIALS=$MAX_CONCURRENT_OUTBOUND_DIALS)",
-                )
-            }
-            try {
-                val promise = dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
-                val controller = await(promise.controller, "dial ${recipient.fingerprint()} for DM send")
-                (controller as DmSendHandle).sendEnvelope(bytes)
-            } finally {
-                dialSemaphore.release()
-            }
+            val envelope = prepareEnvelopeLocked(recipient, plaintext)
+            dispatchOnlineLocked(recipient, record, DmEnvelopeCodec.encode(envelope))
         }
     }
 
     /**
-     * V0.8.5: deposits [plaintext] for [recipient] via the offline Nabu mailbox: encrypts exactly
-     * as [send] does (same [X3dh.initiate]-on-first-contact / [DoubleRatchetSession.encrypt] reuse,
+     * V0.8.5: deposits [content] for [recipient] via the offline Nabu mailbox (V0.8.6: takes a
+     * [DmContent], same removed-`ByteArray`-overload reasoning as [send]'s own doc comment):
+     * encrypts exactly as [send] does (same [X3dh.initiate]-on-first-contact / [DoubleRatchetSession.encrypt] reuse,
      * via the SAME [bootstrapSenderSession] helper [send] uses - so first contact bootstraps a
      * byte-identical session either way), durably stores the resulting [DmEnvelope] bytes in Nabu
      * ([NabuStorage.put]) BEFORE announcing a [MailboxPointer] referencing that blob's CID -
@@ -673,99 +688,187 @@ class DmSessionManager private constructor(
      */
     fun sendOffline(
         recipient: Secp256k1PublicKey,
-        plaintext: ByteArray,
+        content: DmContent,
         notValidAfterEpochSecond: Long = Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
     ) {
+        val plaintext = DmContentCodec.encode(content)
         withPeerLock(recipient) {
-            var session = getCachedOrLoad(recipient)
-            val envelope: DmEnvelope
-            if (session == null) {
-                val (newSession, header) = bootstrapSenderSession(recipient)
-                val ratchetMessage = newSession.encrypt(plaintext)
-                envelope =
-                    DmEnvelope(
-                        DmMessageType.X3DH_INITIAL,
-                        localIdentity.secp256k1KeyPair.publicKey,
-                        header,
-                        ratchetMessage,
-                    )
-                session = newSession
-            } else {
-                // NOTE (V0.8.5 hardening pass finding, 2026-08-27, tracked not fixed here): this
-                // check(...) throws a bare IllegalStateException, outside this class's documented
-                // @throws taxonomy (DmUnknownRecipientException/DmHandshakeFailedException/
-                // DmSessionException) - copied verbatim from send()'s own identical check at
-                // send:572-574, pre-existing there, not introduced by this wave. Left as-is rather
-                // than fixed in either call site as part of this pass: fixing it here alone would
-                // make send()/sendOffline() diverge in exception shape for the IDENTICAL "receiver-
-                // only session" condition, which is worse than the current consistent-but-undocumented
-                // state; fixing both together is a real (if small) behavior change - a new
-                // DmSessionException subtype, or documenting IllegalStateException in @throws for
-                // both - better done as its own tiny, deliberately-scoped follow-up than folded
-                // silently into an unrelated hardening pass.
-                check(session.canSend) {
-                    "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
-                }
-                val ratchetMessage = session.encrypt(plaintext)
-                envelope =
-                    DmEnvelope(DmMessageType.TEXT, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
-            }
-
-            // Persist session BEFORE any Nabu write - same "persist session before anything
-            // externally observable" rule send() follows. See this method's own doc comment
-            // ("smaller, un-closed sibling of the phantom session hazard") for the residual window
-            // this ordering does NOT close, unlike send()'s directory-lookup-first fix.
-            persistSession(recipient, session)
-            putCached(recipient, session)
-
-            val envelopeBytes = DmEnvelopeCodec.encode(envelope)
-            val blobCid: Cid = nabuStorage.put(envelopeBytes)
-            val pointer =
-                MailboxPointer.create(
-                    sender = localIdentity.secp256k1KeyPair,
-                    recipientIdentity = recipient,
-                    blobCid = blobCid,
-                    notValidAfterEpochSecond = notValidAfterEpochSecond,
-                )
-            val pointerBytes = MailboxPointerCodec.encode(pointer)
-            // Blob persisted (above) via nabuStorage.put - THIS pointer's own bytes are deliberately
-            // NOT ALSO put into Nabu here, unlike the recipient side's MailboxGossip.onGossipMessage
-            // (which does storage.put the pointer bytes it receives, under a capped
-            // tryReservePersistence reservation - see that method's own doc comment). V0.8.5 hardening
-            // pass finding, 2026-08-27: an earlier revision of sendOffline DID call
-            // `nabuStorage.put(pointerBytes)` here, discarding the returned Cid immediately - nothing
-            // in this codebase ever fetches a MailboxPointer by ITS OWN content id. The pointer's
-            // durability for redelivery comes entirely from `mailboxRedeliveryScheduler.track` below,
-            // which keeps `pointerBytes` in its own bounded, in-memory `pending` map
-            // (MailboxRedeliveryScheduler.MAX_PENDING_OUTBOUND_MAILBOX_SENDS-capped, LRU-evicting) and
-            // republishes from THAT copy - no restart-recovery path anywhere reloads a sent pointer
-            // from Nabu by CID either (MailboxRedeliveryScheduler's own class doc comment already
-            // documents "lost on restart" as an accepted limitation for the in-memory copy; Nabu
-            // durability would not have changed that, since nothing reads it back). The removed call
-            // was therefore pure write-only local disk growth: one never-evicted NabuStorage blob per
-            // sendOffline call, with no cap, unlike every other durable write in this class. Persist
-            // then publish, publish strictly last still holds for the TWO objects that ARE read back -
-            // the blob (via blobCid, by the recipient) and the session state (via persistSession,
-            // above) - it just no longer includes a third, unread copy of the pointer itself.
-            // Security audit round 2 minor finding fixed here: `track` runs BEFORE `publish`, not
-            // after. `GossipPubSub.publish` swallows `NoPeersForOutboundMessageException` but
-            // rethrows every other `GossipPubSubException` (including its own `awaitOrWrap` publish
-            // timeout) - by the time this line used to run, `persistSession`/`putCached` had already
-            // committed above, so a propagating publish failure would leave a perfectly valid,
-            // durably-stored pointer with NO re-announcement registered at all:
-            // `MailboxRedeliveryScheduler`'s own class doc establishes periodic re-announcement as
-            // the ONLY way an offline recipient ever learns a pointer exists, so skipping `track`
-            // turned a transient publish timeout into permanent non-delivery - worse still for a
-            // FIRST-CONTACT `sendOffline`, since a caller retry would find `session != null` above
-            // and emit `TEXT` instead of `X3DH_INITIAL`, which the recipient can never bootstrap.
-            // `track` is a cheap, no-I/O map write (see its own doc comment) - calling it first
-            // means a subsequent `publish` failure here just means this call's own immediate publish
-            // didn't land, but `mailboxRedeliveryScheduler`'s next periodic tick will still announce
-            // the pointer and self-heal, exactly as it does for every OTHER transient publish
-            // failure it independently guards against.
-            mailboxRedeliveryScheduler.track(recipient, pointer, pointerBytes)
-            pubsub.publish(MailboxTopics.forRecipient(recipient), pointerBytes)
+            val envelope = prepareEnvelopeLocked(recipient, plaintext)
+            depositOfflineLocked(recipient, DmEnvelopeCodec.encode(envelope), notValidAfterEpochSecond)
         }
+    }
+
+    /**
+     * V0.8.6: builds and sends [content] to [recipient], choosing online delivery when a
+     * [PeerDirectoryGossip] record exists and the dial succeeds, falling back to the offline Nabu
+     * mailbox ([sendOffline]'s own mechanism) otherwise - the "one send button" a future UI's send
+     * action is intended to call (not yet built this wave), so a caller never has to choose a
+     * transport itself.
+     *
+     * **This is the security-critical reason [sendAuto] cannot be `try { send(...) } catch (...)
+     * { sendOffline(...) }` composed from the OUTSIDE.** [send] persists the session BEFORE it ever
+     * touches the network ([prepareEnvelopeLocked]'s ordering) - so a caller-level retry after a
+     * failed [send] would find `getCachedOrLoad(recipient) != null` and emit `TEXT`, not
+     * `X3DH_INITIAL`, for what the recipient's mailbox would receive as their FIRST message from
+     * this sender - a `TEXT` envelope the recipient can never bootstrap a session to decrypt (see
+     * [sendOffline]'s own doc comment, which already documents this exact trap for a caller retry).
+     * [sendAuto] avoids it entirely by building the envelope via [prepareEnvelopeLocked] EXACTLY
+     * ONCE per call, then reusing those SAME encoded bytes for whichever delivery path is actually
+     * taken - there is no second encrypt, so there is no second, wrong-typed envelope to leak.
+     */
+    fun sendAuto(
+        recipient: Secp256k1PublicKey,
+        content: DmContent,
+    ): DmSendOutcome {
+        val plaintext = DmContentCodec.encode(content)
+        return withPeerLock(recipient) {
+            val envelope = prepareEnvelopeLocked(recipient, plaintext)
+            val envelopeBytes = DmEnvelopeCodec.encode(envelope)
+
+            val record = peerDirectory.lookup(recipient)
+            if (record != null) {
+                try {
+                    dispatchOnlineLocked(recipient, record, envelopeBytes)
+                    return@withPeerLock DmSendOutcome.SENT_ONLINE
+                } catch (e: DmSessionException) {
+                    logger.debug(e) {
+                        "sendAuto: online dial/send to ${recipient.fingerprint()} failed - falling back to an " +
+                            "offline mailbox deposit of the SAME already-built envelope (no re-encrypt)"
+                    }
+                }
+            }
+            depositOfflineLocked(
+                recipient,
+                envelopeBytes,
+                Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
+            )
+            DmSendOutcome.QUEUED_FOR_PICKUP
+        }
+    }
+
+    /**
+     * MUST be called from within a [withPeerLock] critical section for [recipient] - the shared
+     * "build the envelope, persist, cache" core [send], [sendOffline], and [sendAuto] all funnel
+     * through (V0.8.6 extraction of what used to be each function's own duplicated inline body).
+     * Resolves or bootstraps a session (X3DH first contact via [bootstrapSenderSession], or reuse of
+     * an existing/persisted session), encrypts [plaintext] under it, persists the resulting session
+     * state, and caches it - identical substance to [send]'s/[sendOffline]'s former bodies.
+     */
+    private fun prepareEnvelopeLocked(
+        recipient: Secp256k1PublicKey,
+        plaintext: ByteArray,
+    ): DmEnvelope {
+        var session = getCachedOrLoad(recipient)
+        val envelope: DmEnvelope
+        if (session == null) {
+            val (newSession, header) = bootstrapSenderSession(recipient)
+            val ratchetMessage = newSession.encrypt(plaintext)
+            envelope =
+                DmEnvelope(DmMessageType.X3DH_INITIAL, localIdentity.secp256k1KeyPair.publicKey, header, ratchetMessage)
+            session = newSession
+        } else {
+            // NOTE (V0.8.5 hardening pass finding, 2026-08-27, tracked not fixed here): this
+            // check(...) throws a bare IllegalStateException, outside this class's documented
+            // @throws taxonomy - pre-existing, not introduced by this wave. See the historical note
+            // this comment used to carry in send()'s/sendOffline()'s own former inline bodies.
+            check(session.canSend) {
+                "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
+            }
+            val ratchetMessage = session.encrypt(plaintext)
+            envelope = DmEnvelope(DmMessageType.TEXT, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
+        }
+
+        // Persist BEFORE any externally-observable effect (network write or Nabu deposit) - see
+        // DoubleRatchetSession's own persist/destroy-ordering rule 3.
+        persistSession(recipient, session)
+        putCached(recipient, session)
+        // V0.8.6 - "this node itself sent that peer a message" half of DmAcceptedContacts' own
+        // class doc comment, made reachable. A no-op when this manager was attach()ed without an
+        // acceptedContacts instance (every prior wave's behavior, unchanged).
+        acceptedContacts?.accept(recipient)
+        return envelope
+    }
+
+    /** MUST be called from within a [withPeerLock] critical section for [recipient] - the online
+     * dial-and-write tail [send] and [sendAuto] share. */
+    private fun dispatchOnlineLocked(
+        recipient: Secp256k1PublicKey,
+        record: PeerRecord,
+        envelopeBytes: ByteArray,
+    ) {
+        if (!dialSemaphore.tryAcquire(DIAL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+            throw DmSessionException(
+                "timed out waiting for an available outbound dial slot " +
+                    "(MAX_CONCURRENT_OUTBOUND_DIALS=$MAX_CONCURRENT_OUTBOUND_DIALS)",
+            )
+        }
+        try {
+            val promise =
+                try {
+                    dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
+                } catch (e: DmSessionException) {
+                    throw e
+                } catch (e: RuntimeException) {
+                    // V0.8.6 hardening-pass finding: dmProtocol.dial(...) can throw SYNCHRONOUSLY
+                    // (e.g. jvm-libp2p's TransportNotSupportedException when a peer gossips a
+                    // PeerRecord whose addresses use a transport this node never bound) rather than
+                    // failing the returned future - unlike await(...) below, which only translates
+                    // ExecutionException/TimeoutException from an already-obtained future. Without
+                    // this translation, such a synchronous throw would propagate straight out of
+                    // sendAuto's `catch (e: DmSessionException)`, past the offline-deposit fallback,
+                    // even though prepareEnvelopeLocked has already persisted/cached the session -
+                    // a caller-level retry would then see getCachedOrLoad(recipient) != null and
+                    // deposit a TEXT (not X3DH_INITIAL) envelope offline: the exact wrong-typed
+                    // first-message trap sendAuto's own doc comment says it eliminates.
+                    throw DmSessionException("failed to dial ${recipient.fingerprint()} for DM send", e)
+                }
+            val controller = await(promise.controller, "dial ${recipient.fingerprint()} for DM send")
+            val sendHandle =
+                controller as? DmSendHandle
+                    ?: throw DmSessionException(
+                        "dial controller for ${recipient.fingerprint()} was a " +
+                            "${controller::class.qualifiedName}, not a DmSendHandle",
+                    )
+            sendHandle.sendEnvelope(envelopeBytes)
+        } finally {
+            dialSemaphore.release()
+        }
+    }
+
+    /**
+     * MUST be called from within a [withPeerLock] critical section for [recipient] - the offline
+     * Nabu-mailbox deposit tail [sendOffline] and [sendAuto] share: durably stores [envelopeBytes]
+     * in Nabu ([NabuStorage.put]) BEFORE announcing a [MailboxPointer] referencing that blob's CID -
+     * "persist then publish, publish strictly last": a fast-arriving pointer can never reference a
+     * not-yet-fetchable blob.
+     *
+     * **The pointer itself is NOT ALSO put into Nabu** (V0.8.5 hardening-pass finding) - the
+     * pointer's own durability for redelivery comes entirely from [mailboxRedeliveryScheduler]'s
+     * bounded in-memory copy; nothing ever reads a [MailboxPointer] back from Nabu by its own
+     * content id.
+     *
+     * `track` runs BEFORE `publish` (V0.8.5 security-audit-round-2 finding): [GossipPubSub.publish]
+     * can throw, and by the time that call runs, [prepareEnvelopeLocked] has already persisted the
+     * session above - a propagating publish failure must not also skip registering the periodic
+     * re-announcement [MailboxRedeliveryScheduler]'s own class doc establishes as the ONLY way an
+     * offline recipient ever learns a pointer exists.
+     */
+    private fun depositOfflineLocked(
+        recipient: Secp256k1PublicKey,
+        envelopeBytes: ByteArray,
+        notValidAfterEpochSecond: Long,
+    ) {
+        val blobCid: Cid = nabuStorage.put(envelopeBytes)
+        val pointer =
+            MailboxPointer.create(
+                sender = localIdentity.secp256k1KeyPair,
+                recipientIdentity = recipient,
+                blobCid = blobCid,
+                notValidAfterEpochSecond = notValidAfterEpochSecond,
+            )
+        val pointerBytes = MailboxPointerCodec.encode(pointer)
+        mailboxRedeliveryScheduler.track(recipient, pointer, pointerBytes)
+        pubsub.publish(MailboxTopics.forRecipient(recipient), pointerBytes)
     }
 
     /**
@@ -1148,8 +1251,50 @@ class DmSessionManager private constructor(
                 // reached here after session.decrypt already succeeded - never burns the durable
                 // registry on a tampered/garbage attempt.
                 freshX3dhInitialEphemeralKeyToRecord?.let { recordAcceptedX3dhInitialEphemeralKey(claimedSender, it) }
+
+                // V0.8.6: decode the DmContent framing the ratchet plaintext now carries - AFTER the
+                // ratchet state has already been committed above (persistSession/putCached), since
+                // that commit must never depend on this decode's outcome (a malformed DmContent is a
+                // property of THIS message, not of the session). The Ratchet's own bytes never
+                // change, so a decode failure here is permanent for these exact envelope bytes.
+                val content =
+                    try {
+                        DmContentCodec.decode(plaintext)
+                    } catch (e: MalformedDmContentException) {
+                        logger.debug(e) {
+                            "authenticated peer ${claimedSender.fingerprint()} sent an unparseable DmContent - dropping"
+                        }
+                        return@withPeerLock true // final - the bytes never change
+                    }
+
+                // V0.8.6: acceptance-policy classification wires in DmAcceptanceCheck (see
+                // updateAcceptanceCheck) - `quarantined` becomes non-false once that is attached.
+                // depositBinding is only constructible for a FIRST-CONTACT (X3DH_INITIAL) message -
+                // see DmFirstContactDepositVerifier's own class doc comment for why the binding is
+                // keyed to the session's X3DH ephemeral key, not to a per-message value: a TEXT
+                // message reusing an already-established session has no fresh ephemeral key to bind
+                // to, so a deposit riding on it (an odd, off-label shape DmContent's own field never
+                // rules out structurally) simply cannot verify - `null` here, not a special case.
+                val depositBinding =
+                    envelope.x3dhInitialHeader?.let { header ->
+                        DmDepositBinding(
+                            x3dhEphemeralPublicKey = header.ephemeralPublicKey,
+                            initiatorIdentity = claimedSender,
+                            recipientIdentity = localIdentity.secp256k1KeyPair.publicKey,
+                        )
+                    }
+                val quarantined = classifyQuarantined(claimedSender, content, depositBinding)
+
                 markRecentlyDelivered(dedupKey)
-                val message = DmInboundMessage(claimedSender, plaintext, dedupKey, Instant.now().epochSecond)
+                val message =
+                    DmInboundMessage(
+                        claimedSender,
+                        plaintext,
+                        content,
+                        quarantined,
+                        dedupKey,
+                        Instant.now().epochSecond,
+                    )
                 inboundListeners.forEach { listener ->
                     try {
                         listener(message)
@@ -1266,6 +1411,32 @@ class DmSessionManager private constructor(
                 "failed to submit one-time prekey pool replenishment task - will retry on the next low-watermark trigger"
             }
         }
+    }
+
+    /** The post-AEAD classification [processInboundDmEnvelope] runs for every successfully
+     * decrypted, successfully DmContent-decoded message - see [DmAcceptancePolicy.classifyDelivered]'s
+     * own class doc comment for why this can only ever quarantine, never reject, at this point in
+     * the pipeline (the prekey is already spent, the plaintext already decrypted). `false` when no
+     * [acceptance] check is configured - V0.8.5's unchanged behavior. */
+    private fun classifyQuarantined(
+        sender: Secp256k1PublicKey,
+        content: DmContent,
+        depositBinding: DmDepositBinding?,
+    ): Boolean {
+        val check = acceptance ?: return false
+        val decision =
+            DmAcceptancePolicy.classifyDelivered(
+                sender = sender,
+                localRecipient = localIdentity.secp256k1KeyPair.publicKey,
+                gates = check.gates,
+                hasVeritasPath = check.cachedVeritasPathCheck(localIdentity.secp256k1KeyPair.publicKey),
+                karmaScoreOf = check.karmaScoreOf,
+                isAcceptedContact = check.isAcceptedContact,
+                minDepositMsat = check.minDepositMsat,
+                deposit = content.firstContactDeposit,
+                depositBinding = depositBinding,
+            )
+        return decision is DmAcceptanceDecision.Quarantine
     }
 
     private fun sessionFilePath(peer: Secp256k1PublicKey): Path {
@@ -1625,6 +1796,30 @@ class DmSessionManager private constructor(
             random: SecureRandom = SecureRandom(),
             mailboxRedeliverIntervalSeconds: Long = MailboxRedeliveryScheduler.DEFAULT_REDELIVER_INTERVAL_SECONDS,
             mailboxPollIntervalSeconds: Long = MailboxPoller.DEFAULT_POLL_INTERVAL_SECONDS,
+            /** V0.8.6 - see [DmAcceptanceCheck]/[updateAcceptanceCheck]'s own doc comments. `null`
+             * (the default) preserves V0.8.5's behavior exactly: every message delivered
+             * unquarantined.
+             *
+             * **This wires ONLY the post-AEAD gate ([classifyQuarantined]) - it does NOT also wire
+             * [mailboxGossip]'s offline pre-check.** [mailboxGossip] is passed in already-attached
+             * (see this function's own class doc comment), constructed by the CALLER via a separate
+             * `MailboxGossip.attach(pubsub, nabuStorage, localIdentity, acceptance = ...)` call that
+             * this function never makes or influences. Passing the SAME [DmAcceptanceCheck] instance
+             * to BOTH this parameter AND that separate `MailboxGossip.attach` call is the caller's
+             * own responsibility - nothing here enforces it, and nothing logs or fails if it is
+             * skipped. Skipping it does not break anything observably: messages are still correctly
+             * quarantined by this post-AEAD gate alone. It only silently forfeits the one real saving
+             * [DmAcceptancePolicy]'s own class doc comment attributes to the pre-check (skipping the
+             * Bitswap fetch and persistence-index reservation for a pointer this gate would have
+             * rejected anyway) - so a node whose pointer-fetch cost seems higher than its configured
+             * gates would predict should check for exactly this double-wiring gap first. */
+            acceptance: DmAcceptanceCheck? = null,
+            /** V0.8.6 - see [DmAcceptedContacts]/this class's own `acceptedContacts` field doc
+             * comment. `null` (the default) preserves every prior wave's behavior exactly: outbound
+             * sends never mark a recipient accepted. A caller that wants sends to auto-accept AND a
+             * future UI's explicit accept button to agree passes the SAME instance here and into
+             * [acceptance]'s own `isAcceptedContact` lambda. */
+            acceptedContacts: DmAcceptedContacts? = null,
         ): DmSessionManager {
             Files.createDirectories(sessionStoreDirectory)
             if ("posix" in sessionStoreDirectory.fileSystem.supportedFileAttributeViews()) {
@@ -1682,6 +1877,8 @@ class DmSessionManager private constructor(
                     params,
                     random,
                     MailboxRedeliveryScheduler.attach(pubsub, mailboxRedeliverIntervalSeconds),
+                    acceptance,
+                    acceptedContacts,
                 )
             manager.dmProtocol = DmProtocol.attach(node, manager::handleInboundEnvelope)
             manager.mailboxPoller =

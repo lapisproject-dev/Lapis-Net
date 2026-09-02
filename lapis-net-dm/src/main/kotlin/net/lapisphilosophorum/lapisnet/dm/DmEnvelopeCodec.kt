@@ -14,7 +14,7 @@ import java.nio.ByteBuffer
 
 /**
  * Canonical, deterministic byte encoding for [DmEnvelope] - the outer frame carried on a
- * [DmProtocol] `/lapis/dm/1.0.0` stream. **This is the FIRST codec in this codebase parsing bytes
+ * [DmProtocol] `/lapis/dm/1.1.0` stream. **This is the FIRST codec in this codebase parsing bytes
  * arriving directly off a raw libp2p stream, with no GossipSub message-size ceiling backstopping
  * it** - every check below is ordered cheapest/most-selective first and, above all, EVERY variable-
  * length field's declared size is validated BEFORE the corresponding allocation, mirroring

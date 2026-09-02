@@ -3,24 +3,42 @@ package net.lapisphilosophorum.lapisnet.dm
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.time.Instant
 
+/** How an outbound [DmHistoryEntry.Outbound] entry was actually delivered - mirrors
+ * [DmSendOutcome], plus `UNDELIVERED` for the case neither transport worked - intended for a caller
+ * that wants to still record the attempt rather than silently dropping it from history (e.g. a
+ * future `lapis-net-browser` send route, not yet built this wave). Nothing in `lapis-net-dm` itself
+ * produces this state today: [DmSessionManager.send]/`sendAuto` currently either succeed with
+ * [SENT]/[QUEUED_FOR_PICKUP] or throw. */
+enum class DmDeliveryState {
+    SENT,
+    QUEUED_FOR_PICKUP,
+    UNDELIVERED,
+}
+
 /** One entry in a [DmStore] conversation - either an inbound [DmInboundMessage] or an outbound
- * message this node itself sent, recorded by the caller from [DmSessionManager.send]'s own
- * plaintext argument (this class has no visibility into `send()`'s internals). */
+ * message this node itself sent. **V0.8.6: carries [content] (a decoded [DmContent]), not a raw
+ * [plaintext][DmContent] - unlike the V0.8.4 shape, which stored the raw [ByteArray] plaintext**,
+ * so a future caller (e.g. a browser UI, not yet built this wave) can render body text and
+ * attachment metadata without re-decoding. */
 sealed class DmHistoryEntry {
     abstract val peer: Secp256k1PublicKey
-    abstract val plaintext: ByteArray
+    abstract val content: DmContent
     abstract val epochSecond: Long
 
     data class Inbound(
         override val peer: Secp256k1PublicKey,
-        override val plaintext: ByteArray,
+        override val content: DmContent,
         override val epochSecond: Long,
+        /** `true` iff [DmAcceptancePolicy.classifyDelivered] quarantined this message - see
+         * [DmInboundMessage.quarantined]'s own doc comment. */
+        val quarantined: Boolean = false,
     ) : DmHistoryEntry()
 
     data class Outbound(
         override val peer: Secp256k1PublicKey,
-        override val plaintext: ByteArray,
+        override val content: DmContent,
         override val epochSecond: Long,
+        val deliveryState: DmDeliveryState,
     ) : DmHistoryEntry()
 }
 
@@ -29,26 +47,16 @@ sealed class DmHistoryEntry {
  * peer ([DmStore.MAX_HISTORY_PER_PEER]) and the number of distinct peers tracked at all
  * ([DmStore.MAX_TRACKED_PEERS], LRU-evicted) - see [historyByPeer]'s own doc comment for the latter.
  *
- * **Explicit, deliberate V0.8.4 scope cut, not an oversight: this class persists nothing to disk.**
- * The plan for this wave asked to "decide and document the at-rest encryption approach for stored
- * plaintext history (recommend: reuse `KeystoreEncryption`) - or, if scope permits, defer
- * conversation-history persistence entirely to a later wave and keep [DmStore] in-memory-only for
- * V0.8.4, as long as that scope cut is explicit and documented, not silent." This wave already
- * carries the highest structural risk in the codebase to date (a new stream protocol, a new wire
- * format, a new session state machine, and the mandatory adversarial suite this all demands) -
- * inventing a THIRD at-rest encryption scheme (after `KeystoreFileFormat`/`PrekeyStoreFileFormat`
- * and `DoubleRatchetSessionCodec`) has no spare review budget in this wave. Durable [DoubleRatchetSession]
- * persistence (a DIFFERENT concern - it is what makes a process restart resume rather than
- * re-handshake) **is** required and implemented, in [DmSessionManager] - this class is purely a
- * caller-convenience conversation-history cache, never consulted by [DmSessionManager] itself.
- *
- * A later wave (plausibly bundled with V0.8.5's offline-mailbox work, since both need durable
- * storage) should revisit whether [DmStore] should persist via [net.lapisphilosophorum.lapisnet.identity.KeystoreEncryption]
- * at that point.
+ * **Explicit, deliberate scope cut, not an oversight, carried forward unchanged into V0.8.6: this
+ * class persists nothing to disk.** See the V0.8.4 history for the original reasoning (this wave's
+ * highest-structural-risk-to-date carried no spare review budget for a third at-rest encryption
+ * scheme). `docs/roadmap.adoc`'s V0.8.6 section restates this as an explicit scope cut once more,
+ * rather than letting it quietly age into an assumption: conversation history and
+ * [DmAcceptedContacts]' accept-decisions still do not survive a process restart.
  *
  * Not wired to [DmSessionManager] automatically - a caller populates it explicitly, e.g.
  * `dmSessionManager.addInboundListener { message -> dmStore.recordInbound(message) }` and its own
- * call to `dmStore.recordOutbound(...)` alongside every [DmSessionManager.send] call.
+ * call to `dmStore.recordOutbound(...)` alongside every send.
  */
 class DmStore(
     private val maxHistoryPerPeer: Int = MAX_HISTORY_PER_PEER,
@@ -56,9 +64,13 @@ class DmStore(
 ) {
     /** Bounds history LENGTH per peer via [maxHistoryPerPeer] (below) - this bounds the NUMBER of
      * distinct peers tracked, via LRU eviction once [maxTrackedPeers] is exceeded, mirroring
-     * [DmSessionManager.liveSessionCache]'s identical access-ordered `removeEldestEntry` pattern
-     * (the same bounded-structure discipline this codebase applies everywhere else, e.g.
-     * `PeerRecordIndex.MAX_TRACKED_RECORDS`). */
+     * [DmSessionManager.liveSessionCache]'s identical access-ordered `removeEldestEntry` pattern.
+     *
+     * **Access-ordered - [peers] must NOT return this map's own iteration order.** A plain
+     * `LinkedHashMap(accessOrder = true)`'s iteration order tracks the most-recently-ACCESSED key,
+     * not the most-recently-ACTIVE conversation, and [historyFor] itself is a read that reorders
+     * this map - so [peers] sorts explicitly by each peer's [lastEntryFor] epoch instead of trusting
+     * map order (see [peers]' own doc comment). */
     private val historyByPeer =
         object : LinkedHashMap<Secp256k1PublicKey, ArrayDeque<DmHistoryEntry>>(16, 0.75f, true) {
             override fun removeEldestEntry(
@@ -68,16 +80,19 @@ class DmStore(
 
     @Synchronized
     fun recordInbound(message: DmInboundMessage) {
-        record(DmHistoryEntry.Inbound(message.sender, message.plaintext, message.receivedAtEpochSecond))
+        record(
+            DmHistoryEntry.Inbound(message.sender, message.content, message.receivedAtEpochSecond, message.quarantined),
+        )
     }
 
     @Synchronized
     fun recordOutbound(
         peer: Secp256k1PublicKey,
-        plaintext: ByteArray,
+        content: DmContent,
+        deliveryState: DmDeliveryState,
         epochSecond: Long = Instant.now().epochSecond,
     ) {
-        record(DmHistoryEntry.Outbound(peer, plaintext, epochSecond))
+        record(DmHistoryEntry.Outbound(peer, content, epochSecond, deliveryState))
     }
 
     private fun record(entry: DmHistoryEntry) {
@@ -89,6 +104,19 @@ class DmStore(
     /** Oldest-first snapshot of the history recorded for [peer] so far. */
     @Synchronized
     fun historyFor(peer: Secp256k1PublicKey): List<DmHistoryEntry> = historyByPeer[peer]?.toList() ?: emptyList()
+
+    /** Every peer with at least one history entry, sorted by [lastEntryFor]'s own
+     * [DmHistoryEntry.epochSecond] DESCENDING (most recently active conversation first) -
+     * **deliberately NOT [historyByPeer]'s own map-iteration order**, which tracks access recency,
+     * not conversation activity, and would otherwise reshuffle on every [historyFor] read. */
+    @Synchronized
+    fun peers(): List<Secp256k1PublicKey> =
+        historyByPeer.keys
+            .sortedByDescending { peer -> historyByPeer[peer]?.lastOrNull()?.epochSecond ?: Long.MIN_VALUE }
+
+    /** The most recent entry recorded for [peer], or `null` if none exists. */
+    @Synchronized
+    fun lastEntryFor(peer: Secp256k1PublicKey): DmHistoryEntry? = historyByPeer[peer]?.lastOrNull()
 
     companion object {
         /** Generous, provisional magnitude - not derived from pilot data, same framing as this

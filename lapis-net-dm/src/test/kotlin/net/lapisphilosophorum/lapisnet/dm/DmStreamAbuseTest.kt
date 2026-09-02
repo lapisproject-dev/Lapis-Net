@@ -382,7 +382,8 @@ class DmStreamAbuseTest :
 
                 // X's own live session-to-victim1 encrypts one more, genuine message.
                 val sessionXtoVictim1 = requireNotNull(nodeX.dmSessionManager.liveSessionForTest(identityVictim1))
-                val genuineMessage = sessionXtoVictim1.encrypt("only for victim1".toByteArray())
+                val genuineMessage =
+                    sessionXtoVictim1.encrypt(DmContentCodec.encode(DmContent(body = "only for victim1")))
                 val genuineEnvelope = DmEnvelope(DmMessageType.TEXT, identityX, null, genuineMessage)
                 val genuineBytes = DmEnvelopeCodec.encode(genuineEnvelope)
 
@@ -390,7 +391,7 @@ class DmStreamAbuseTest :
                 val before1 = received1.size
                 victim1.dmSessionManager.handleInboundEnvelope(nodeX.node.peerId, genuineBytes)
                 awaitAtLeastCount(received1, before1 + 1)
-                received1.last().plaintext.decodeToString() shouldBe "only for victim1"
+                received1.last().content.body shouldBe "only for victim1"
 
                 // Replaying the EXACT SAME bytes against victim2's UNRELATED session (session B) is
                 // rejected - it is never accepted, and never misattributed as a message from X to
@@ -696,7 +697,7 @@ private fun sendAndAwait(
     val before = received.size
     val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
     while (received.size <= before && System.currentTimeMillis() < deadline) {
-        runCatching { from.dmSessionManager.send(recipientIdentity, plaintext.toByteArray()) }
+        runCatching { from.dmSessionManager.send(recipientIdentity, DmContent(body = plaintext)) }
         Thread.sleep(1000)
     }
     if (received.size <= before) error("expected at least ${before + 1} inbound message(s), got ${received.size}")

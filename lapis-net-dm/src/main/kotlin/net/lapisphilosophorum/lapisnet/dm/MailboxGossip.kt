@@ -52,11 +52,16 @@ class MailboxGossip private constructor(
             pubsub: GossipPubSub,
             storage: NabuStorage,
             localIdentity: Secp256k1PublicKey,
+            /** V0.8.6 - see [DmAcceptanceCheck]'s own doc comment. `null` (the default) preserves
+             * V0.8.5's behavior exactly: every pointer addressed to this identity is accepted. */
+            acceptance: DmAcceptanceCheck? = null,
         ): MailboxGossip {
             val index = MailboxPointerIndex()
             val topic = MailboxTopics.forRecipient(localIdentity)
             val subscription =
-                pubsub.subscribe(topic) { bytes, from -> onGossipMessage(bytes, from, storage, index, localIdentity) }
+                pubsub.subscribe(topic) { bytes, from ->
+                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
+                }
             return MailboxGossip(index, subscription)
         }
 
@@ -87,6 +92,7 @@ class MailboxGossip private constructor(
             storage: NabuStorage,
             index: MailboxPointerIndex,
             localIdentity: Secp256k1PublicKey,
+            acceptance: DmAcceptanceCheck? = null,
         ): ValidationResult {
             val pointer =
                 try {
@@ -107,6 +113,35 @@ class MailboxGossip private constructor(
             if (!MailboxPointer.verify(pointer)) {
                 logger.debug { "rejected signature-invalid mailbox pointer from $from" }
                 return ValidationResult.Invalid
+            }
+
+            // V0.8.6 offline pre-check - see DmAcceptancePolicy's own class doc comment for why this
+            // sits HERE (after signature verification, before canAccept/tryReservePersistence: no
+            // slot, no persistence cost for a pointer this check would reject). The `gates.isEmpty()`
+            // short-circuit is load-bearing, not an optimization: without it, a node running NO
+            // filters would still pay pointerDepositLookup's cost on every single pointer - the exact
+            // V0.9.4 security-audit-round-2 finding MailAcceptanceCheck's own doc comment documents,
+            // reproduced here deliberately rather than re-discovered.
+            if (acceptance != null && acceptance.gates.isNotEmpty()) {
+                val decision =
+                    DmAcceptancePolicy.shouldFetch(
+                        sender = pointer.senderIdentity,
+                        localRecipient = localIdentity,
+                        gates = acceptance.gates,
+                        hasVeritasPath = acceptance.cachedVeritasPathCheck(localIdentity),
+                        karmaScoreOf = acceptance.karmaScoreOf,
+                        isAcceptedContact = acceptance.isAcceptedContact,
+                        minDepositMsat = acceptance.minDepositMsat,
+                        deposit = acceptance.pointerDepositLookup(pointer),
+                        depositBinding = null,
+                    )
+                if (decision is DmAcceptanceDecision.Reject) {
+                    logger.debug {
+                        "declining to fetch mailbox pointer from $from claiming sender " +
+                            "${pointer.senderIdentity.fingerprint()} - acceptance policy rejected: ${decision.reason}"
+                    }
+                    return ValidationResult.Invalid
+                }
             }
 
             if (!index.canAccept(pointer)) {

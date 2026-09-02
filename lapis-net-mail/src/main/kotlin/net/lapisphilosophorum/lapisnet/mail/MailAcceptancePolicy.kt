@@ -1,9 +1,9 @@
 package net.lapisphilosophorum.lapisnet.mail
 
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
-import net.lapisphilosophorum.lapisnet.trust.MIN_TRUST_MICROS
+import net.lapisphilosophorum.lapisnet.policy.AcceptanceGate
+import net.lapisphilosophorum.lapisnet.policy.AcceptanceGateEvaluator
 import net.lapisphilosophorum.lapisnet.trust.TrustGraph
-import net.lapisphilosophorum.lapisnet.trust.TrustPathFinder
 
 /**
  * Pull-based Karma-score lookup for a candidate sender, mirroring
@@ -123,8 +123,7 @@ object MailAcceptancePolicy {
     fun veritasPathCheck(
         graph: TrustGraph,
         localIdentity: Secp256k1PublicKey,
-    ): (Secp256k1PublicKey) -> Boolean =
-        { candidate -> TrustPathFinder.trustMicros(graph, localIdentity, candidate) > MIN_TRUST_MICROS }
+    ): (Secp256k1PublicKey) -> Boolean = AcceptanceGateEvaluator.veritasPathCheck(graph, localIdentity)
 
     /**
      * The accept/reject decision for [envelope], addressed to [recipient] (the local identity
@@ -179,20 +178,29 @@ object MailAcceptancePolicy {
             return MailAcceptanceDecision.Accept
         }
 
-        val failedGates = mutableListOf<String>()
-        for (gate in gates) {
-            val passed =
-                when (gate) {
-                    is MailAcceptanceGate.VeritasPath -> hasVeritasPath(sender)
-                    is MailAcceptanceGate.KarmaThreshold -> karmaScoreOf.karmaScoreOf(sender) >= gate.minScore
-                }
-            if (passed) return MailAcceptanceDecision.Accept
-            failedGates +=
-                when (gate) {
-                    is MailAcceptanceGate.VeritasPath -> "no Veritas path from local identity to sender"
-                    is MailAcceptanceGate.KarmaThreshold -> "karma below threshold ${gate.minScore}"
-                }
-        }
-        return MailAcceptanceDecision.Reject(failedGates.joinToString("; "))
+        // V0.8.6: delegates to lapis-net-policy's shared evaluator - see this module's
+        // build.gradle.kts header comment for why the gate TYPES stay declared here
+        // (MailAcceptanceGate, unchanged public signature) while the evaluation LOGIC now lives in
+        // one place shared with lapis-net-dm's DmAcceptancePolicy.
+        val reason =
+            AcceptanceGateEvaluator.firstPassOrFailureReason(
+                sender = sender,
+                gates = gates.map { it.toPolicyGate() },
+                hasVeritasPath = hasVeritasPath,
+                karmaScoreOf =
+                    net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup { candidate ->
+                        karmaScoreOf.karmaScoreOf(candidate)
+                    },
+            )
+        return if (reason == null) MailAcceptanceDecision.Accept else MailAcceptanceDecision.Reject(reason)
     }
 }
+
+/** Maps this module's own [MailAcceptanceGate] onto lapis-net-policy's shared [AcceptanceGate] -
+ * see [MailAcceptancePolicy.shouldAccept]'s own doc comment for why a `typealias` cannot be used
+ * here instead (Kotlin does not allow a type alias to qualify a nested classifier - KT-11968). */
+private fun MailAcceptanceGate.toPolicyGate(): AcceptanceGate =
+    when (this) {
+        is MailAcceptanceGate.VeritasPath -> AcceptanceGate.VeritasPath
+        is MailAcceptanceGate.KarmaThreshold -> AcceptanceGate.KarmaThreshold(minScore)
+    }

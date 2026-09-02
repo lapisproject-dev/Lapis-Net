@@ -67,6 +67,26 @@ class NabuStorage private constructor(
     }
 
     /**
+     * Returns the bytes for [cid] from the LOCAL blockstore only - guaranteed no network I/O and
+     * no [findProviders] call, unlike [get]. `null` if [cid] is not held locally.
+     *
+     * **V0.8.6 addition, for exactly one shape of caller: "is this blob already on my own disk?"**
+     * (`lapis-net-dm`'s `DmAttachmentFetcher`). Neither of [get]'s own two forms answers that
+     * question correctly: `get(cid, peers = emptySet())` falls through to [findProviders] on a
+     * local miss - broken since V0.1.4 (see [provide]'s doc comment) - and `get(cid, peers =
+     * setOf(somePeer))` forces a real Bitswap dial-and-timeout against a peer that may not even be
+     * reachable, just to answer a question [get]'s own first line (`blockstore.get(cid)`) already
+     * answers for free. This method is exactly that first line, exposed directly.
+     */
+    fun getLocal(
+        cid: Cid,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): ByteArray? {
+        val local = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
+        return if (local.isPresent) local.get() else null
+    }
+
+    /**
      * Returns the bytes for [cid], or `null` if it can't be found anywhere reachable. Checks
      * the local blockstore first (no network involved). If absent: fetches from [peers] via
      * Bitswap if given, otherwise looks up providers via the DHT ([findProviders]) first and

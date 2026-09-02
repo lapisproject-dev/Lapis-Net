@@ -244,7 +244,7 @@ Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec 
 note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
 on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
 remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1, V0.8.2,
-V0.8.3, V0.8.4, and V0.8.5 have landed.
+V0.8.3, V0.8.4, V0.8.5, and V0.8.6 have landed.
 
 [cols="1,3"]
 |===
@@ -267,7 +267,7 @@ independently testable state machine; still NOT yet wired into a live network me
 (implemented — see below).
 
 | V0.8.4
-| Online DM stream (new module `lapis-net-dm`) — the custom `/lapis/dm/1.0.0` libp2p stream
+| Online DM stream (new module `lapis-net-dm`) — the custom `/lapis/dm/1.1.0` libp2p stream
 protocol wiring V0.8.2's X3DH handshake and V0.8.3's Double Ratchet into a live send/receive path
 for directly-dialable peers. The first module in this codebase parsing untrusted bytes off a raw
 libp2p stream, with no GossipSub size ceiling backstopping the parser (implemented — see below).
@@ -281,9 +281,25 @@ the still-broken `NabuStorage.findProviders`) and periodically re-announced so a
 recipient can still discover it (implemented — see below).
 
 | V0.8.6
-| Not yet started, not sub-wave-planned in fine-grained detail here — a reserved slot between V0.8.5
-(offline mailbox) and V0.8.7+ (calling); see the vault's 2026-08-04 sub-wave plan for the intended
-breakdown.
+| Attachments (`lapis-net-dm`) and an opt-in DM acceptance/quarantine policy (new module
+`lapis-net-policy`, gates extracted from `lapis-net-mail`) — a structured `DmContent` payload
+(body + up to 4 encrypted attachments + an in-band first-contact deposit section) replaces the
+raw ratchet plaintext, and `DmAcceptancePolicy` gives a node an opt-in Veritas/Karma/deposit
+filter for unsolicited DMs, mirroring `lapis-net-mail`'s equivalent but as a deliberately separate
+decision function (see the "two acceptance gates" section of docs/architecture.adoc). Implemented —
+see the dedicated V0.8.6 section below. **A browser UI for direct messages remains NOT built this
+wave** — see that section's "Deliberate scope cuts" for the reasoning.
+
+| V0.8.6 — deliberate scope cuts (see docs/architecture.adoc's V0.8.6 section for the full detail)
+| No `lapis-net-browser` wiring at all this wave — `DmAcceptanceCheck`, `DmAcceptedContacts`,
+`DmAttachmentFetcher.fetchAndDecrypt`, and `DmStore.peers()`/`lastEntryFor()` are complete,
+independently tested building blocks with no production caller yet; a future browser UI is their
+intended eventual caller. `DmStore`/`DmAcceptedContacts` persist nothing to disk (unchanged
+scope cut, same reasoning as V0.8.4's `DmStore` history). The outer stream-protocol id bumps
+`/lapis/dm/1.0.0` -> `/lapis/dm/1.1.0` — a deliberate, BREAKING change (the ratchet plaintext's own
+contract changes from a raw `ByteArray` to a framed `DmContent`), with no dual-listen and no
+heuristic byte-sniffing fallback. Consequence-free in practice: `lapis-net-dm` has never shipped
+outside this repo, so there is no external `/lapis/dm/1.0.0` deployment to remain compatible with.
 
 | V0.8.7+
 | Calling — reserved wire values already exist (`DmMessageType.CALL_SIGNAL`, rejected outright
@@ -629,7 +645,7 @@ such backstop unless this wave builds one. New module `lapis-net-dm`.
 | Wave | Content
 
 | V0.8.4
-| `DmProtocol`/`DmProtocolHandler` — a custom `/lapis/dm/1.0.0` jvm-libp2p `StrictProtocolBinding`/
+| `DmProtocol`/`DmProtocolHandler` — a custom `/lapis/dm/1.1.0` jvm-libp2p `StrictProtocolBinding`/
 `ProtocolHandler`, mirroring the bundled `io.libp2p.protocol.Ping` reference implementation's
 shape, verified against the resolved jar rather than assumed. Four independent, layered defenses
 against the untrusted-raw-stream surface: jvm-libp2p's own `InboundTrafficLimitHandler` (total
@@ -680,7 +696,7 @@ subsection rather than a bullet point: **the libp2p `PeerId` a stream connection
 (via Noise, at the TRANSPORT layer) is NOT the same thing as the secp256k1 identity the Double
 Ratchet/X3DH layer authenticates.** `PeerId` is used in exactly one place in this module —
 `DmProtocolHandler.onStartResponder`, as a resource-management key bounding how many concurrent
-`/lapis/dm/1.0.0` streams one transport connection may open — and NEVER for message authorization
+`/lapis/dm/1.1.0` streams one transport connection may open — and NEVER for message authorization
 or sender attribution. A connection from a given `PeerId` claiming to relay messages "from" some
 `senderIdentity` in a `DmEnvelope` is not trusted on that claim alone: the message only counts as
 genuinely from that identity once `DoubleRatchetSession.decrypt` succeeds under a session that was
@@ -888,6 +904,89 @@ the mechanism delivers.
   `X3DH_INITIAL` ephemeral public keys (`DmSessionManager.recordAcceptedX3dhInitialEphemeralKey`),
   persisted alongside the session file and checked before ever bootstrapping a session — see
   `docs/architecture.adoc`'s "Cross-path dedup" section for the full trace.
+
+=== V0.8.6 — Attachments and a DM acceptance/quarantine policy
+
+Target: attachments for direct messages, and an opt-in acceptance policy so a node can gate
+unsolicited DMs the same way V0.9.4 gates unsolicited mail — completing the "DM parity with mail"
+story `lapis-net-mail` already established. **A browser UI for direct messages is explicitly OUT of
+scope this wave**, despite being named in this sub-wave's original working title — see "Deliberate
+scope cuts" below.
+
+[cols="1,3"]
+|===
+| Content | Detail
+
+| `DmContent`/`DmContentCodec`
+| The structured payload `DmSessionManager.send`/`sendOffline`/`sendAuto` now build and hand in,
+replacing the raw `ByteArray` plaintext V0.8.4/V0.8.5 used: `body` (text, capped at
+`MAX_DM_BODY_BYTES` = 32,768 bytes), up to `MAX_DM_ATTACHMENTS` (4) `DmAttachmentRef`s (capped at
+`MAX_DM_ATTACHMENT_TOTAL_BYTES` = 32 MiB combined), and an optional in-band `firstContactDeposit`
+(see the policy row below). Same check-before-allocate discipline as every other codec in this
+codebase; worst case ≈36.4 KB, comfortably under `RatchetMessageCodec.MAX_PLAINTEXT_BYTES`
+(65,459 B) — see `DmContentCodec.MAX_CONTENT_BYTES`'s own doc comment for the exact arithmetic.
+
+| `DmAttachmentCipher`/`EncryptedDmAttachmentBlob`/`EncryptedDmAttachmentBlobCodec`
+| Per-attachment AES-256-GCM encryption, structurally mirroring `lapis-net-mail`'s
+`MailAttachmentCipher` (own domain-separating AAD tag, own magic `"LNDA"`). The blob lives
+content-addressed in Nabu; only a `DmAttachmentRef` (CID + a fresh, per-attachment AES-256 key)
+travels inside the ratchet-encrypted `DmContent`. Unlike mail, `DmAttachmentRef.encryptionKey` is
+non-nullable — every DM attachment is always encrypted, no unencrypted-attachment escape hatch this
+wave (a genuinely empty, 0-byte attachment is consequently not representable).
+
+| `DmAttachmentFetcher`
+| Resolves an attachment blob referenced by a `DmAttachmentRef`: local blockstore first, then a
+DIRECT Bitswap fetch against the sender's currently-gossiped address — never `NabuStorage.findProviders`,
+mirroring `MailboxPoller`'s established reasoning. `fetchAndDecrypt` is the full reachable pipeline:
+fetch, decode, decrypt, and verify the decrypted plaintext's length against the ref's declared
+`size` (a lying/corrupted ref is rejected, never silently trusted). No production caller wires this
+class yet this wave — see "Deliberate scope cuts" below.
+
+| `lapis-net-policy` (new module) / `DmAcceptancePolicy` / `DmAcceptanceCheck` / `DmAcceptedContacts`
+| An opt-in filter for unsolicited DMs, sharing `lapis-net-policy`'s gate vocabulary
+(`AcceptanceGate`/`KarmaScoreLookup`) with `lapis-net-mail`'s `MailAcceptancePolicy` but as a
+DELIBERATELY SEPARATE decision function — see docs/architecture.adoc's "two acceptance gates"
+section for why DM's untrusted-until-AEAD-succeeds sender claim forces two structurally different
+checkpoints (`shouldFetch`, an offline pre-check that can only Accept/Reject, and
+`classifyDelivered`, a post-AEAD check that can only Accept/Quarantine). `DmAcceptedContacts` is the
+one non-gate escape from quarantine: a peer becomes "accepted" either via an explicit future UI
+accept action, or because THIS node itself sent them a message — `DmSessionManager.attach`'s
+`acceptedContacts` parameter wires the latter automatically (see `DmSessionManagerTest`/
+`DmPolicyAuthorityTest` for the reachable end-to-end proof). In-memory only, same scope cut as
+`DmStore` below.
+
+| `/lapis/dm/1.1.0` (BREAKING protocol bump)
+| The outer libp2p stream protocol id bumps from `/lapis/dm/1.0.0` — a deliberate, breaking change:
+the ratchet plaintext's own contract switches from an opaque raw `ByteArray` to a framed
+`DmContent`, and the two are not reliably distinguishable by sniffing decrypted bytes. No
+dual-listen, no heuristic byte-sniffing fallback — this codebase's stated policy at every prior such
+crossroads. Consequence-free in practice: `lapis-net-dm` has never shipped outside this repo.
+|===
+
+==== Deliberate scope cuts
+
+* **No `lapis-net-browser` wiring at all.** `DmAcceptanceCheck`, `DmAcceptedContacts`,
+  `DmAttachmentFetcher.fetchAndDecrypt`, and `DmStore.peers()`/`lastEntryFor()` are complete,
+  independently unit-tested building blocks with no production caller yet in this repo — a future
+  browser UI (send button, attachment download route, an "Accept" action on a quarantined
+  conversation) is their intended eventual caller. Every doc comment in `lapis-net-dm` that
+  describes such a route describes an INTENDED future integration point, not an existing one — an
+  earlier revision of several of these doc comments incorrectly cited a nonexistent `DmApi.kt` and
+  specific nonexistent routes; corrected in this revision.
+* **`DmStore`/`DmAcceptedContacts` persist nothing to disk** — the same explicit, deliberate scope
+  cut V0.8.4's `DmStore` history already established, carried forward unchanged: a process restart
+  forgets conversation history and every accept decision.
+* **The offline pre-check (`shouldFetch`) can never see the in-band first-contact deposit.**
+  `DmFirstContactDeposit`/`DmDepositBinding`'s binding needs the X3DH ephemeral public key, which
+  only exists inside the `X3DH_INITIAL` header — unreadable until AFTER the very AEAD decrypt
+  `shouldFetch` runs before. A stranger behind a gated node's offline mailbox can therefore only earn
+  pre-check delivery by clearing a configured `AcceptanceGate`; the deposit only ever unlocks the
+  post-AEAD `classifyDelivered` check. See docs/architecture.adoc's "two acceptance gates" section.
+* **Unbounded attachment fetch, inherited from `NabuStorage`, not a new gap this wave introduces.**
+  `NabuStorage.get`/Bitswap has no max-block-size parameter to bound the wire transfer by a
+  declared size ahead of time — identical shape/limitation to `lapis-net-mail`'s existing attachment
+  route. `DmAttachmentFetcher.fetchAndDecrypt` rejects an oversized blob before ever handing it to
+  the codec, but cannot undo the memory already spent receiving it.
 
 == V0.9 — Asynchronous messages (email replacement)
 

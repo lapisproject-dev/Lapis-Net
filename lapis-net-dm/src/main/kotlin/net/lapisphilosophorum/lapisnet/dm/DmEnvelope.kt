@@ -18,7 +18,7 @@ class MalformedDmEnvelopeException(
 
 /**
  * The outer wire frame for one 1:1 direct message sent over [DmProtocol]'s
- * `/lapis/dm/1.0.0` stream: a [messageType] discriminator, the claimed [senderIdentity], an
+ * `/lapis/dm/1.1.0` stream: a [messageType] discriminator, the claimed [senderIdentity], an
  * optional [x3dhInitialHeader] (present iff this is a first-contact handshake message), and the
  * [RatchetMessage] that actually carries the encrypted application payload.
  *

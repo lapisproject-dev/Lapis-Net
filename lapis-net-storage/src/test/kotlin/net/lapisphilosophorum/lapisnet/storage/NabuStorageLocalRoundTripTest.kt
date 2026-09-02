@@ -45,6 +45,44 @@ class NabuStorageLocalRoundTripTest :
             }
         }
 
+        test("getLocal returns a locally-put blob without any network/DHT activity") {
+            val node = LapisNode.create(DualKeyIdentity.generate())
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("nabu-storage-test"))
+                val payload = "getLocal round trip".toByteArray()
+
+                val cid = storage.put(payload)
+                val fetched = storage.getLocal(cid)
+
+                fetched shouldBe payload
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("getLocal on a CID never stored on this node returns null") {
+            val otherNode = LapisNode.create(DualKeyIdentity.generate())
+            otherNode.start(bootstrapPeers = emptyList())
+            val neverStoredCid =
+                try {
+                    NabuStorage
+                        .attach(otherNode, Files.createTempDirectory("nabu-storage-test-other"))
+                        .put("never stored on the node under test".toByteArray())
+                } finally {
+                    otherNode.stop()
+                }
+
+            val node = LapisNode.create(DualKeyIdentity.generate())
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("nabu-storage-test"))
+                storage.getLocal(neverStoredCid).shouldBeNull()
+            } finally {
+                node.stop()
+            }
+        }
+
         test("get on a CID that was never stored, with no peers, returns null") {
             // Mint a CID that genuinely was never put on the node under test, by putting it on
             // a separate, never-connected node's own blockstore instead.

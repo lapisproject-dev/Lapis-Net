@@ -12,6 +12,7 @@ include(
     "lapis-net-directory",
     "lapis-net-ratchet",
     "lapis-net-networking",
+    "lapis-net-policy",
     "lapis-net-dm",
     "lapis-net-test",
     "lapis-net-cli",

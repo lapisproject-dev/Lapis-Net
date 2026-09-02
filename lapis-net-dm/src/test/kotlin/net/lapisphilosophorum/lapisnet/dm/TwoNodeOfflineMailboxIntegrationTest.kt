@@ -16,7 +16,6 @@ import java.nio.file.Files
 import java.time.Duration
 import java.time.Instant
 import java.util.Collections
-import kotlin.random.Random
 
 /**
  * The mandatory, defining V0.8.5 integration test: the RECIPIENT node starts AFTER the sender has
@@ -96,12 +95,14 @@ class TwoNodeOfflineMailboxIntegrationTest :
 
                 // THE DEFINING MOMENT: the sender deposits while the recipient's MailboxGossip/
                 // DmSessionManager do not exist yet - genuinely offline, not merely "not subscribed".
-                val plaintext = Random.nextBytes(2048)
+                val bodyText = "a".repeat(2048)
                 var deposited = false
                 val depositDeadline = Instant.now().plus(Duration.ofSeconds(30))
                 while (!deposited && Instant.now().isBefore(depositDeadline)) {
                     deposited =
-                        runCatching { sender.dmSessionManager.sendOffline(recipientPublicKey, plaintext) }.isSuccess
+                        runCatching {
+                            sender.dmSessionManager.sendOffline(recipientPublicKey, DmContent(body = bodyText))
+                        }.isSuccess
                     if (!deposited) Thread.sleep(1000)
                 }
                 deposited shouldBe true
@@ -139,7 +140,7 @@ class TwoNodeOfflineMailboxIntegrationTest :
                 // delivery (if this ever regresses) has time to show up before asserting the count.
                 Thread.sleep(4000)
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext
+                received[0].content.body shouldBe bodyText
                 received[0].sender shouldBe senderPublicKey
             } finally {
                 recipientDmSessionManager?.stop()

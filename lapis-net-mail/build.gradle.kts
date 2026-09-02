@@ -57,6 +57,16 @@
 // explicit bitcoin-kmp dependency here forces the same 0.31.0 resolved everywhere else). Every
 // fr.acinq.* type stays confined to FirstContactDepositVerifier.kt, mirroring LightningProofVerifier's
 // "sole consumer" discipline.
+//
+// V0.8.6 addition: this module now depends on lapis-net-policy. MailAcceptanceGate/
+// MailAcceptanceDecision/KarmaScoreLookup stay declared HERE (public API unchanged - see
+// MailAcceptancePolicy.kt's own class doc comment for why), but MailAcceptancePolicy.shouldAccept
+// and MailAcceptanceCheck.cachedVeritasPathCheck now delegate internally to
+// lapis-net-policy's AcceptanceGateEvaluator/VeritasPathCache, extracted so lapis-net-dm's
+// DmAcceptancePolicy (V0.8.6) can reuse the identical gate semantics without a lapis-net-dm ->
+// lapis-net-mail dependency (siblings, not an ancestor relationship). `implementation`, not `api`:
+// AcceptanceGate/VeritasPathCache never appear in this module's own public signatures, only inside
+// MailAcceptancePolicy's/MailAcceptanceCheck's private mapping/delegation code.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
@@ -64,6 +74,7 @@ dependencies {
     api(project(":lapis-net-networking"))
     api(project(":lapis-net-trust"))
     api(rootProject.libs.java.cid)
+    implementation(project(":lapis-net-policy"))
     implementation(rootProject.libs.bouncycastle.provider)
     implementation(rootProject.libs.lightning.kmp)
     implementation(rootProject.libs.bitcoin.kmp)

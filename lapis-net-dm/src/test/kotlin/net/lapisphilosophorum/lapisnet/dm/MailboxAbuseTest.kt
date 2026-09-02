@@ -116,7 +116,7 @@ private fun buildX3dhInitialEnvelope(
     senderIdentity: DualKeyIdentity,
     senderStore: PrekeyStore,
     recipientBundle: PrekeyBundle,
-    plaintext: ByteArray,
+    bodyText: String,
     preferredOneTimePrekeyId: Int?,
 ): DmEnvelope {
     val ownBinding = EncryptionKeyBinding.create(senderIdentity.secp256k1KeyPair, senderStore.x25519IdentityPublicKey)
@@ -135,7 +135,10 @@ private fun buildX3dhInitialEnvelope(
         }
     val session = DoubleRatchetSession.initializeSender(initiation.session, recipientBundle.signedPrekey)
     initiation.session.destroy()
-    val ratchetMessage = session.encrypt(plaintext)
+    // V0.8.6: the ratchet plaintext must itself be a valid DmContentCodec encoding - a raw,
+    // unframed body would be rejected by DmSessionManager.processInboundDmEnvelope's own decode
+    // step even after a correct AEAD decrypt.
+    val ratchetMessage = session.encrypt(DmContentCodec.encode(DmContent(body = bodyText)))
     return DmEnvelope(
         DmMessageType.X3DH_INITIAL,
         senderIdentity.secp256k1KeyPair.publicKey,
@@ -292,12 +295,15 @@ class MailboxAbuseTest :
             try {
                 connectAndConverge(sender, recipient)
                 val recipientPub = recipient.identity.secp256k1KeyPair.publicKey
-                val plaintext = Random.nextBytes(256)
+                val bodyText = "c-payload-${Random.nextInt()}"
 
                 var deposited = false
                 val depositDeadline = Instant.now().plus(Duration.ofSeconds(30))
                 while (!deposited && Instant.now().isBefore(depositDeadline)) {
-                    deposited = runCatching { sender.dmSessionManager.sendOffline(recipientPub, plaintext) }.isSuccess
+                    deposited =
+                        runCatching {
+                            sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText))
+                        }.isSuccess
                     if (!deposited) Thread.sleep(1000)
                 }
                 deposited shouldBe true
@@ -327,7 +333,7 @@ class MailboxAbuseTest :
                 recipient.dmSessionManager.handleOfflineEnvelope(envelope) // replay - must not double-deliver
 
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext
+                received[0].content.body shouldBe bodyText
             } finally {
                 sender.stop()
                 recipient.stop()
@@ -348,11 +354,14 @@ class MailboxAbuseTest :
 
                 // Establish the session: one successful sendOffline() (X3DH_INITIAL), fetched and
                 // delivered manually.
-                val plaintext1 = Random.nextBytes(64)
+                val bodyText1 = "d1-payload-1-${Random.nextInt()}"
                 var deposited = false
                 val depositDeadline1 = Instant.now().plus(Duration.ofSeconds(30))
                 while (!deposited && Instant.now().isBefore(depositDeadline1)) {
-                    deposited = runCatching { sender.dmSessionManager.sendOffline(recipientPub, plaintext1) }.isSuccess
+                    deposited =
+                        runCatching {
+                            sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText1))
+                        }.isSuccess
                     if (!deposited) Thread.sleep(1000)
                 }
                 deposited shouldBe true
@@ -366,12 +375,12 @@ class MailboxAbuseTest :
                 val bytes1 = recipient.storage.get(pointer1.blobCid, peers = setOf(sender.node.peerId))!!
                 recipient.dmSessionManager.handleOfflineEnvelope(DmEnvelopeCodec.decode(bytes1))
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext1
+                received[0].content.body shouldBe bodyText1
 
                 // Second message: TEXT on the now-established session. Deposit it, fetch the RAW
                 // bytes, TAMPER a ciphertext byte, and feed the tampered bytes.
-                val plaintext2 = Random.nextBytes(64)
-                sender.dmSessionManager.sendOffline(recipientPub, plaintext2)
+                val bodyText2 = "d1-payload-2-${Random.nextInt()}"
+                sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText2))
                 val pointer2 = awaitPendingPointer(recipient, excluding = setOf(pointer1))
                 val bytes2 = recipient.storage.get(pointer2.blobCid, peers = setOf(sender.node.peerId))!!
                 val tampered2 = bytes2.copyOf()
@@ -384,14 +393,14 @@ class MailboxAbuseTest :
                 // Third message: a genuinely valid TEXT message on the SAME (untouched) session -
                 // proves the tampered attempt above left the ratchet exactly where a successful
                 // decrypt would have left it.
-                val plaintext3 = Random.nextBytes(64)
-                sender.dmSessionManager.sendOffline(recipientPub, plaintext3)
+                val bodyText3 = "d1-payload-3-${Random.nextInt()}"
+                sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText3))
                 val pointer3 = awaitPendingPointer(recipient, excluding = setOf(pointer1, pointer2))
                 val bytes3 = recipient.storage.get(pointer3.blobCid, peers = setOf(sender.node.peerId))!!
                 recipient.dmSessionManager.handleOfflineEnvelope(DmEnvelopeCodec.decode(bytes3))
 
                 received.size shouldBe 2
-                received[1].plaintext shouldBe plaintext3
+                received[1].content.body shouldBe bodyText3
             } finally {
                 sender.stop()
                 recipient.stop()
@@ -421,13 +430,13 @@ class MailboxAbuseTest :
                 val oneTimePrekeyIds = recipientBundle.oneTimePrekeys.map { it.id }
                 (oneTimePrekeyIds.size >= 2) shouldBe true
 
-                val plaintext1 = Random.nextBytes(48)
+                val bodyText1 = "d2-payload-1-${Random.nextInt()}"
                 val envelope1 =
                     buildX3dhInitialEnvelope(
                         senderIdentity,
                         senderStore,
                         recipientBundle,
-                        plaintext1,
+                        bodyText1,
                         oneTimePrekeyIds[0],
                     )
                 val bytes1 = DmEnvelopeCodec.encode(envelope1).copyOf()
@@ -437,19 +446,19 @@ class MailboxAbuseTest :
                 recipient.dmSessionManager.handleOfflineEnvelope(tamperedEnvelope1)
                 received.size shouldBe 0
 
-                val plaintext2 = Random.nextBytes(48)
+                val bodyText2 = "d2-payload-2-${Random.nextInt()}"
                 val envelope2 =
                     buildX3dhInitialEnvelope(
                         senderIdentity,
                         senderStore,
                         recipientBundle,
-                        plaintext2,
+                        bodyText2,
                         oneTimePrekeyIds[1],
                     )
                 recipient.dmSessionManager.handleOfflineEnvelope(envelope2)
 
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext2
+                received[0].content.body shouldBe bodyText2
                 received[0].sender shouldBe senderIdentity.secp256k1KeyPair.publicKey
             } finally {
                 recipient.stop()
@@ -473,11 +482,14 @@ class MailboxAbuseTest :
 
                 // Establish the session: one successful sendOffline() (X3DH_INITIAL), fetched and
                 // delivered manually - identical setup to (d1).
-                val plaintext1 = Random.nextBytes(64)
+                val bodyText1 = "d3-payload-1-${Random.nextInt()}"
                 var deposited = false
                 val depositDeadline1 = Instant.now().plus(Duration.ofSeconds(30))
                 while (!deposited && Instant.now().isBefore(depositDeadline1)) {
-                    deposited = runCatching { sender.dmSessionManager.sendOffline(recipientPub, plaintext1) }.isSuccess
+                    deposited =
+                        runCatching {
+                            sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText1))
+                        }.isSuccess
                     if (!deposited) Thread.sleep(1000)
                 }
                 deposited shouldBe true
@@ -491,7 +503,7 @@ class MailboxAbuseTest :
                 val bytes1 = recipient.storage.get(pointer1.blobCid, peers = setOf(sender.node.peerId))!!
                 recipient.dmSessionManager.handleOfflineEnvelope(DmEnvelopeCodec.decode(bytes1))
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext1
+                received[0].content.body shouldBe bodyText1
 
                 // Second message: TEXT on the now-established session. Deposit it, fetch the RAW
                 // bytes, then substitute a FRESH, genuinely-valid X25519 public key into the embedded
@@ -503,8 +515,8 @@ class MailboxAbuseTest :
                 // - a different, unrecognized public key forces the DH-ratchet-step branch, exactly
                 // the shape a forged pointer against a LIVE cached session exercises, all the way into
                 // scratch derivation and a real AEAD attempt (which then fails, as it must).
-                val plaintext2 = Random.nextBytes(64)
-                sender.dmSessionManager.sendOffline(recipientPub, plaintext2)
+                val bodyText2 = "d3-payload-2-${Random.nextInt()}"
+                sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText2))
                 val pointer2 = awaitPendingPointer(recipient, excluding = setOf(pointer1))
                 val bytes2 = recipient.storage.get(pointer2.blobCid, peers = setOf(sender.node.peerId))!!
                 val forgedBytes2 = withForgedRatchetPublicKey(bytes2)
@@ -517,14 +529,14 @@ class MailboxAbuseTest :
                 // proves the forged DH-ratchet-step attempt above left the session exactly where a
                 // successful decrypt would have left it, on the live cached session the offline path
                 // shares with the online path.
-                val plaintext3 = Random.nextBytes(64)
-                sender.dmSessionManager.sendOffline(recipientPub, plaintext3)
+                val bodyText3 = "d3-payload-3-${Random.nextInt()}"
+                sender.dmSessionManager.sendOffline(recipientPub, DmContent(body = bodyText3))
                 val pointer3 = awaitPendingPointer(recipient, excluding = setOf(pointer1, pointer2))
                 val bytes3 = recipient.storage.get(pointer3.blobCid, peers = setOf(sender.node.peerId))!!
                 recipient.dmSessionManager.handleOfflineEnvelope(DmEnvelopeCodec.decode(bytes3))
 
                 received.size shouldBe 2
-                received[1].plaintext shouldBe plaintext3
+                received[1].content.body shouldBe bodyText3
             } finally {
                 sender.stop()
                 recipient.stop()
@@ -543,10 +555,10 @@ class MailboxAbuseTest :
                 recipient.dmSessionManager.addInboundListener { received.add(it) }
 
                 // Establish a real session via a real online send() first.
-                val bootstrapPlaintext = Random.nextBytes(32)
+                val bootstrapBodyText = "e-bootstrap-${Random.nextInt()}"
                 val bootstrapDeadline = Instant.now().plus(Duration.ofSeconds(30))
                 while (received.isEmpty() && Instant.now().isBefore(bootstrapDeadline)) {
-                    runCatching { sender.dmSessionManager.send(recipientPub, bootstrapPlaintext) }
+                    runCatching { sender.dmSessionManager.send(recipientPub, DmContent(body = bootstrapBodyText)) }
                     Thread.sleep(1000)
                 }
                 received.size shouldBe 1
@@ -555,8 +567,10 @@ class MailboxAbuseTest :
                 // hook, mirrors DmStreamAbuseTest's own established pattern), so the SAME encoded
                 // bytes can be delivered through BOTH the online and offline paths.
                 val session = sender.dmSessionManager.liveSessionForTest(recipientPub)!!
-                val plaintext = Random.nextBytes(64)
-                val ratchetMessage = session.encrypt(plaintext)
+                val ratchetMessage =
+                    session.encrypt(
+                        DmContentCodec.encode(DmContent(body = "e-payload-${Random.nextInt()}")),
+                    )
                 val envelope =
                     DmEnvelope(DmMessageType.TEXT, sender.identity.secp256k1KeyPair.publicKey, null, ratchetMessage)
                 val bytes = DmEnvelopeCodec.encode(envelope)
@@ -618,15 +632,15 @@ class MailboxAbuseTest :
                 val session = DoubleRatchetSession.initializeSender(initiation.session, recipientBundle.signedPrekey)
                 initiation.session.destroy()
 
-                val plaintext1 = Random.nextBytes(48)
+                val bodyText1 = "f-payload-1-${Random.nextInt()}"
                 val x3dhInitialEnvelope =
                     DmEnvelope(
                         DmMessageType.X3DH_INITIAL,
                         senderIdentity.secp256k1KeyPair.publicKey,
                         initiation.header,
-                        session.encrypt(plaintext1),
+                        session.encrypt(DmContentCodec.encode(DmContent(body = bodyText1))),
                     )
-                val plaintext2 = Random.nextBytes(48)
+                val bodyText2 = "f-payload-2-${Random.nextInt()}"
                 // Message #2 on the SAME sender-side ratchet chain - exactly what a second, real
                 // sendOffline() call to the same still-offline recipient would produce as a TEXT
                 // envelope once the first call had already bootstrapped this session.
@@ -635,7 +649,7 @@ class MailboxAbuseTest :
                         DmMessageType.TEXT,
                         senderIdentity.secp256k1KeyPair.publicKey,
                         null,
-                        session.encrypt(plaintext2),
+                        session.encrypt(DmContentCodec.encode(DmContent(body = bodyText2))),
                     )
 
                 val x3dhInitialCid = senderNode.storage.put(DmEnvelopeCodec.encode(x3dhInitialEnvelope))
@@ -684,7 +698,7 @@ class MailboxAbuseTest :
                     )
 
                 received.size shouldBe 1
-                received[0].plaintext shouldBe plaintext1
+                received[0].content.body shouldBe bodyText1
                 // THE CENTRAL ASSERTION: the TEXT pointer must still be pending here. Before this
                 // fix, MailboxPoller.attemptOne unconditionally called markResolved after ANY
                 // non-throwing dispatch through handleOfflineEnvelope - including this exact
@@ -698,7 +712,7 @@ class MailboxAbuseTest :
                 standalonePoller.pollOnce()
 
                 received.size shouldBe 2
-                received[1].plaintext shouldBe plaintext2
+                received[1].content.body shouldBe bodyText2
                 recipient.mailboxGossip.pending().size shouldBe 0
             } finally {
                 standalonePoller?.stop()
@@ -734,8 +748,8 @@ class MailboxAbuseTest :
                 recipientPrekeyStore.publishBundle(recipientIdentity, Instant.now().epochSecond + 3600)
             recipientBundle.oneTimePrekeys.isEmpty() shouldBe true
 
-            val plaintext = Random.nextBytes(48)
-            val envelope = buildX3dhInitialEnvelope(senderIdentity, senderStore, recipientBundle, plaintext, null)
+            val bodyText = "g-payload-${Random.nextInt()}"
+            val envelope = buildX3dhInitialEnvelope(senderIdentity, senderStore, recipientBundle, bodyText, null)
             envelope.x3dhInitialHeader?.oneTimePrekeyId shouldBe null
 
             // sessionStoreDirectory and recipientPrekeyStore are the two pieces of durable state a
@@ -787,7 +801,7 @@ class MailboxAbuseTest :
 
                 boot1.first.handleOfflineEnvelope(envelope)
                 received1.size shouldBe 1
-                received1[0].plaintext shouldBe plaintext
+                received1[0].content.body shouldBe bodyText
 
                 // "Restart": stop boot 1 entirely (which empties recentlyDeliveredDedupKeys, the
                 // in-memory-only cross-path dedup cache), then boot a wholly fresh recipient

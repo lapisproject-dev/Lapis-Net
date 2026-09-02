@@ -68,6 +68,15 @@ internal fun buildDmTestNode(
     // poll cadence without waiting a full 5-minute/60-second default cycle.
     mailboxRedeliverIntervalSeconds: Long = MailboxRedeliveryScheduler.DEFAULT_REDELIVER_INTERVAL_SECONDS,
     mailboxPollIntervalSeconds: Long = MailboxPoller.DEFAULT_POLL_INTERVAL_SECONDS,
+    // V0.8.6 - null (the default) preserves every prior test's "no filters configured" behavior
+    // exactly. Wired into BOTH MailboxGossip's offline pre-check AND DmSessionManager's post-AEAD
+    // classification - a real caller is intended to wire the SAME DmAcceptanceCheck into both.
+    acceptance: DmAcceptanceCheck? = null,
+    // V0.8.6 - null (the default) preserves every prior test's "sends never auto-accept" behavior
+    // exactly. A test that wants to exercise the send-marks-accepted escape path passes the SAME
+    // instance here and into `acceptance`'s own `isAcceptedContact` lambda - see
+    // DmSessionManager.attach's own `acceptedContacts` parameter doc comment.
+    acceptedContacts: DmAcceptedContacts? = null,
 ): DmTestNode {
     val node = LapisNode.create(identity)
     node.start(bootstrapPeers = emptyList())
@@ -76,7 +85,7 @@ internal fun buildDmTestNode(
     val pubsub = GossipPubSub.attach(node)
     val peerDirectory = PeerDirectoryGossip.attach(pubsub, storage)
     val prekeyBundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
-    val mailboxGossip = MailboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+    val mailboxGossip = MailboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey, acceptance)
     // Fresh PrekeyStore every call, even for a "restarted" identity - fine for this test harness
     // because the node using buildDmTestNode() a SECOND time with the same identity is always the
     // X3DH INITIATOR side in these tests, never the responder, so it never needs its own
@@ -101,6 +110,8 @@ internal fun buildDmTestNode(
             passphrase,
             mailboxRedeliverIntervalSeconds = mailboxRedeliverIntervalSeconds,
             mailboxPollIntervalSeconds = mailboxPollIntervalSeconds,
+            acceptance = acceptance,
+            acceptedContacts = acceptedContacts,
         )
     return DmTestNode(
         identity,
