@@ -87,10 +87,13 @@ breaking bump from `1.0.0`). `DmAcceptancePolicy` (new module
 opt-in Veritas/Karma/Lightning-deposit filter for unsolicited DMs, as a
 deliberately separate decision function from mail's — see
 link:docs/architecture.adoc[docs/architecture.adoc]'s "two acceptance
-gates" section. **A browser UI for direct messages is explicitly NOT built
-this wave**: `DmAcceptanceCheck`, `DmAcceptedContacts`, and
-`DmAttachmentFetcher` are complete, independently tested building blocks
-with no production caller in this repo yet.
+gates" section. A browser UI for direct messages was explicitly not built
+in this sub-wave itself — `DmAcceptanceCheck`, `DmAcceptedContacts`, and
+`DmAttachmentFetcher` shipped as complete, independently tested building
+blocks with no production caller yet — but the very next commit, V0.8.6b,
+closed that gap: a browser HTTP API and hand-written UI over `lapis-net-dm`
+(conversation list, history/send with encrypted attachments, contact
+acceptance), wired into `lapis-net-browser`'s `BrowserServer`.
 V0.8.7 — 1:1 audio calls over WebRTC — is also implemented, in the new
 `lapis-net-call` module: activates the `DmMessageType.CALL_SIGNAL` wire value
 reserved since V0.8.4, layering `webrtc-java` (libwebrtc JNI bindings,
@@ -145,6 +148,9 @@ below.
 | `lapis-net-mail`
 | Asynchronous messages (the e-mail replacement), fully implemented (V0.9.1–V0.9.4): a signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1); hybrid-ecies encryption (HKDF + AES-256-GCM over a secp256k1 ECDH exchange, V0.9.2); cycle-safe, receive-order-independent threading, encrypted attachments, a local sent-folder view, and a browser inbox UI with verified XSS protection (V0.9.3); and a Veritas/Karma scoring filter plus a Lightning first-contact deposit for spam resistance (V0.9.4). A follow-up security-hardening pass closed a critical unauthenticated remote memory-exhaustion bug found in this module and, on audit, in three other already-shipped modules (`lapis-net-trust`, `lapis-net-virtus`, `lapis-net-karma`) plus a fourth instance in `lapis-net-browser`.
 
+| `lapis-net-policy`
+| Acceptance-gate machinery extracted from `lapis-net-mail` in V0.8.6 so `lapis-net-dm` (direct messages) could share it rather than reimplement it: `AcceptanceGate`/`AcceptanceGateEvaluator` (the gate vocabulary and evaluation logic — Veritas distance, Karma threshold, Lightning first-contact deposit, explicit accept/deny lists) and `VeritasPathCache` (a bounded, LRU-evicting cache so a flood of never-repeating throwaway identities can't force an unbounded-heap shortest-path search on the GossipSub validator hot path).
+
 | `lapis-net-directory`
 | Signed peer/presence directory records (`PeerRecord`): identity bound to its current network addresses and libp2p peer identity, with a monotonic sequence number and a heartbeat TTL, gossiped and Nabu-persisted — the foundational discovery layer V0.8's later sub-waves (online DM addressing) resolve recipients through (V0.8.1). Also carries `PrekeyBundle` gossip/indexing (`PrekeyBundleGossip`/`PrekeyBundleIndex`) for `lapis-net-ratchet`'s prekey bundles (V0.8.2).
 
@@ -158,10 +164,10 @@ below.
 | 1:1 audio calls over WebRTC (V0.8.7): `CallManager` (the call-control state machine — INVITE/ACCEPT/REJECT/HANGUP, a three-executor concurrency model, invite-flood rate limiting), `CallSignal`/`CallSignalCodec` (the wire frame carried as a `DmMessageType.CALL_SIGNAL` envelope's ratchet plaintext), `CallSdpPolicy` (SSRF-class defenses against a peer-supplied SDP), and `WebRtcCallMediaEngine` (the sole `dev.onvoid.webrtc:webrtc-java` consumer — host-ICE-candidates only, no STUN/TURN). Depends on `lapis-net-dm` for signaling transport and DTLS-fingerprint identity binding; `lapis-net-dm` itself stays entirely WebRTC-free.
 
 | `lapis-net-browser`
-| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data and the LTR record-authoring endpoints.
+| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b).
 
 | `lapis-net-test`
-| Shared test fixtures and helpers used across module test sources, including the multi-node test harness.
+| An unused placeholder stub from V0.1.8 (`TestFixtures.describe()`, a single logging call) — no other module depends on it. Each module's own multi-node test harness lives in that module's `src/test`/`src/testFixtures` instead (e.g. `lapis-net-dm`'s `DmTwoNodeTestHarness`, consumed cross-module via `testFixtures(project(":lapis-net-dm"))`). Kept here rather than silently removed since a doc audit found the discrepancy rather than a decision to retire the module.
 
 | `lapis-net-cli`
 | Entry point / multi-node demo harness proving trust propagation end to end.
