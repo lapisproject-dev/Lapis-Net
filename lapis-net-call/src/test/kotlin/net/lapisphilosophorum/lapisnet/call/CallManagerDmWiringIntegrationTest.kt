@@ -41,13 +41,13 @@ import java.util.concurrent.CopyOnWriteArrayList
  * own doc comment). If [DmCallSignalTransport.send] ever hardcodes `marksAcceptance`, exactly one of
  * these two tests fails no matter which constant was hardcoded.
  *
- * Deliberately NOT reusing `lapis-net-dm`'s own `DmTwoNodeTestHarness.kt` - its `buildDmTestNode`/
- * `connectAndConverge`/`DmTestNode` are `internal` to that module's own test source set and
- * invisible here (same "not reusable across modules" situation `lapis-net-dm`'s own
- * `DmTestFixtures.kt` documents for `lapis-net-ratchet`'s equivalent helpers). This is therefore a
- * deliberately minimal, single-purpose re-implementation - just enough real `LapisNode`/GossipSub/
- * directory/prekey-bundle machinery for two [DmSessionManager]s to establish a session and exchange a
- * `CALL_SIGNAL`, not a general-purpose harness.
+ * Predates `lapis-net-dm`'s `DmTwoNodeTestHarness.kt` becoming reusable: `buildDmTestNode`/
+ * `connectAndConverge`/`DmTestNode` have since moved to that module's `testFixtures` source set and
+ * are public, consumable here via `testFixtures(project(":lapis-net-dm"))` - see
+ * [TwoNodeCallIntegrationTest] for a test built on that shared harness instead of hand-rolling this
+ * module's own two-node/GossipSub/directory/prekey-bundle setup below. This class was not migrated
+ * onto it (not a correctness issue, just an unclaimed cleanup opportunity - the two
+ * implementations stay in sync only by manual review, not by construction).
  */
 class CallManagerDmWiringIntegrationTest :
     FunSpec({
