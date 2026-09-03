@@ -111,7 +111,6 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   above)
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
-* `lapis-net-test` — shared test fixtures and helpers (not yet consumed by other modules' tests)
 * `lapis-net-cli` — entry point / demo harness, including the multi-node trust-propagation demo
   (V0.1.8, see below)
 

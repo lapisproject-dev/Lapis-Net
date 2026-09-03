@@ -166,9 +166,6 @@ below.
 | `lapis-net-browser`
 | Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b).
 
-| `lapis-net-test`
-| An unused placeholder stub from V0.1.8 (`TestFixtures.describe()`, a single logging call) — no other module depends on it. Each module's own multi-node test harness lives in that module's `src/test`/`src/testFixtures` instead (e.g. `lapis-net-dm`'s `DmTwoNodeTestHarness`, consumed cross-module via `testFixtures(project(":lapis-net-dm"))`). Kept here rather than silently removed since a doc audit found the discrepancy rather than a decision to retire the module.
-
 | `lapis-net-cli`
 | Entry point / multi-node demo harness proving trust propagation end to end.
 |===

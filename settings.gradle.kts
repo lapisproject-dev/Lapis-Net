@@ -15,7 +15,6 @@ include(
     "lapis-net-policy",
     "lapis-net-dm",
     "lapis-net-call",
-    "lapis-net-test",
     "lapis-net-cli",
     "lapis-net-browser",
 )
