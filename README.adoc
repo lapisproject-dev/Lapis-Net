@@ -26,94 +26,65 @@ reputation models. Veritas, Karma, Virtus, and Madli (the scoring dimensions)
 are optional tools for browser/view implementations, not protocol
 requirements.
 
-As of *V0.6*, all four scoring dimensions (Veritas, Virtus, Karma, Madli) are
-implemented end to end — data models, GossipSub propagation, Nabu persistence,
-and (for Virtus) real Bitcoin on-chain and Lightning payment-proof
-verification — alongside identity/keystore hardening (Argon2id + AES-256-GCM),
-a genuine multi-user Genesis-bootstrap/QR-code connection flow, and a first
-real client, the Minimal-Browser (`lapis-net-browser`). See
-link:docs/architecture.adoc[docs/architecture.adoc] for full technical detail
-and link:docs/roadmap.adoc[docs/roadmap.adoc] for the wave-by-wave history.
-Not yet implemented: an embedded Lightning node (proof verification only, no
-payment sending), BOLT-12 offer publication, and NAT traversal beyond
-directly-dialable peers (Circuit-Relay v2/AutoNAT exist in `jvm-libp2p` but
-are unwired; `dcutr` hole punching is absent from the library entirely).
-1:1 audio calling (V0.8.7) is now implemented — see below; V0.8's original
-group-calling/MLS/video target was cut from the arc entirely on 2026-08-04.
-V0.8.1, the signed peer/presence directory records
-later sub-waves resolve recipients' addresses through, is implemented — see
-`lapis-net-directory` below. V0.8.2 — the X25519 encryption sub-key, the X3DH
-handshake (Signal's Extended Triple Diffie-Hellman, reimplemented from the
-public specification), and prekey bundle publication/consumption — is also
-implemented, in the new `lapis-net-ratchet` module. V0.8.3 — the Double
-Ratchet itself (`DoubleRatchetSession`, its message codec, its bounded
-skipped-key store, and encrypted-at-rest session persistence) — is also
-implemented in that module.
-V0.8.4 — the online DM stream itself — is also implemented, in the new
-`lapis-net-dm` module: 1:1 direct messages over a custom `/lapis/dm/1.1.0`
-libp2p stream protocol, driving V0.8.2's X3DH handshake and V0.8.3's Double
-Ratchet into a live send/receive path. This wave supports only
-directly-dialable peers (same-LAN or otherwise directly reachable) — this
-repo has no working NAT traversal (a documented gap since V0.1.3/networking,
-unchanged by this wave), so a peer behind NAT without port forwarding cannot
-be reached. No delivery receipts, no typing indicators (both explicitly
-deferred, not built even as stubs).
-V0.8.5 — the offline Nabu mailbox — is also implemented: `DmSessionManager.sendOffline`
-deposits an encrypted message as a Nabu blob and a signed `MailboxPointer`
-gossiped on the recipient's own mailbox topic, periodically re-announced
-(`MailboxRedeliveryScheduler`) so a recipient who returns online later can
-still discover it — GossipSub itself has no message replay, so the sender
-must remain reachable, or at least come back online before the pointer's TTL
-expires, for offline delivery to complete. Recipients fetch the referenced
-blob via a direct Bitswap request to the sender's currently-gossiped address
-(`MailboxPoller`), never via `NabuStorage.findProviders`, which remains
-broken since V0.1.4. A follow-up hardening pass closed a persistence-
-reservation resource leak found across four gossip-validated record types
-(`MailboxPointerIndex`, `PeerRecordIndex`, `InboxIndex`, `PrekeyBundleIndex` —
-a reservation slot burned permanently if the subsequent durable write
-failed), an unhandled-synchronous-exception gap in `NabuStorage` (the pinned
-Nabu jar throws directly rather than failing a `CompletableFuture` on one
-specific I/O path), and several smaller findings in the mailbox code (dead
-lookup structure removed, an unbounded local write removed, TTL-cap and
-sender-identity-trust documentation added, a missing topic-collision test
-added).
-V0.8.6 — attachments and an opt-in DM acceptance/quarantine policy — is also
-implemented: a structured `DmContent` payload (body + up to 4 encrypted
-attachments, `DmAttachmentCipher`/`EncryptedDmAttachmentBlobCodec`, mirroring
-`lapis-net-mail`'s attachment encryption) replaces the raw ratchet plaintext,
-carried over the outer `/lapis/dm/1.1.0` stream protocol (a deliberate,
-breaking bump from `1.0.0`). `DmAcceptancePolicy` (new module
-`lapis-net-policy`, gates shared with `lapis-net-mail`) gives a node an
-opt-in Veritas/Karma/Lightning-deposit filter for unsolicited DMs, as a
-deliberately separate decision function from mail's — see
-link:docs/architecture.adoc[docs/architecture.adoc]'s "two acceptance
-gates" section. A browser UI for direct messages was explicitly not built
-in this sub-wave itself — `DmAcceptanceCheck`, `DmAcceptedContacts`, and
-`DmAttachmentFetcher` shipped as complete, independently tested building
-blocks with no production caller yet — but the very next commit, V0.8.6b,
-closed that gap: a browser HTTP API and hand-written UI over `lapis-net-dm`
-(conversation list, history/send with encrypted attachments, contact
-acceptance), wired into `lapis-net-browser`'s `BrowserServer`.
-V0.8.7 — 1:1 audio calls over WebRTC — is also implemented, in the new
-`lapis-net-call` module: activates the `DmMessageType.CALL_SIGNAL` wire value
-reserved since V0.8.4, layering `webrtc-java` (libwebrtc JNI bindings,
-Apache-2.0) on top of `DmSessionManager.sendCallSignal`/
-`addCallSignalListener` for signaling. A call's SDP travels inside the same
-Double Ratchet AEAD ciphertext as a text DM, binding its DTLS fingerprint to
-the same identity a text conversation already trusts — no signaling server,
-STUN/TURN server, or separate certificate authority needed, and empirically
-verified (not just argued): a tampered DTLS fingerprint provably prevents the
-call from ever connecting. Audio only, Non-Trickle ICE, host-ICE-candidates
-only (no STUN/TURN ever contacted — this node's own media path uses no third
-party either), direct-dialable peers only for the same NAT-traversal reasons
-noted above. See link:docs/architecture.adoc[docs/architecture.adoc]'s "1:1
-calls over WebRTC (V0.8.7)" section for the full design.
-Not yet implemented in this arc: a browser control surface for calls
-(V0.8.7b — the call's audio still runs in the JVM process; a browser page
-would only remote-control it, not carry browser-native WebRTC).
-Mail (V0.9) is a separate, already-completed arc — encryption, threading,
-attachments, and spam protection are all implemented, see `lapis-net-mail`
-below.
+== Status
+
+Every wave through *V0.9* is implemented and merged to `master` (V0.7 was never
+a standalone wave — its scope was folded into the incremental browser growth
+of V0.2–V0.5, see link:docs/roadmap.adoc[docs/roadmap.adoc]). Full technical
+detail for each module is in the Modules table below; the full wave-by-wave
+history — including scope cuts and hardening follow-ups — is in
+link:docs/roadmap.adoc[docs/roadmap.adoc] and
+link:docs/architecture.adoc[docs/architecture.adoc].
+
+[cols="1,4,1"]
+|===
+| Wave | What it added | Status
+
+| V0.1
+| Protocol core: secp256k1/Ed25519 identity, libp2p bootstrap, Nabu (DHT + Bitswap) storage, Veritas (web-of-trust)
+| ✅
+
+| V0.2
+| Virtus (LTR micropayment economy, on-chain `OP_RETURN`) + the first real client, the Minimal-Browser
+| ✅
+
+| V0.3
+| Karma (Sybil-resistant free "likes", Bitcoin time-anchored)
+| ✅
+
+| V0.4
+| Genesis-bootstrap, QR-code/deep-link identity linking, keystore encryption at rest (Argon2id + AES-256-GCM)
+| ✅
+
+| V0.5
+| Madli (machine-to-machine node reputation, weighted-median aggregation)
+| ✅
+
+| V0.6
+| Lightning payment-proof verification (`LightningProof`, a second `LtrProof` type alongside on-chain)
+| ✅
+
+| V0.7
+| _(no standalone wave — folded into V0.2–V0.5's incremental browser growth)_
+| —
+
+| V0.8
+| Direct messages (X3DH/Double Ratchet, online + offline delivery, encrypted attachments, acceptance policy, browser UI) and 1:1 voice calls over WebRTC
+| ✅
+
+| V0.9
+| Asynchronous messages / mail replacement: encryption, threading, attachments, spam protection
+| ✅
+|===
+
+Known, deliberate gaps — not oversights, each documented at the point it was cut:
+
+* *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
+* *No NAT traversal beyond directly-dialable peers* — Circuit-Relay v2/AutoNAT exist in `jvm-libp2p` but are unwired; `dcutr` hole punching is absent from the library entirely.
+* *No browser control surface for calls (V0.8.7b)* — a 1:1 call's audio runs in the JVM node process; a browser page would only remote-control it, not carry browser-native WebRTC.
+* *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
+* *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
+* *No DHT-based peer/mailbox discovery* — `Kademlia.dialPeer` has been broken since V0.1.4; every subsequent wave routes discovery over GossipSub instead.
 
 == Modules
 
