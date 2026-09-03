@@ -137,12 +137,17 @@ class WebRtcCallMediaEngine private constructor(
         }
 
         /** `true` iff `webrtc-java`'s native library is loadable on this platform - gates every test
-         * that needs a REAL engine (currently `WebRtcCallMediaEngineTest`; there is no
-         * `CallManager`+`DmSessionManager`+real-engine end-to-end test yet - see this module's
+         * that needs a REAL engine: `WebRtcCallMediaEngineTest` (the engine alone, two sessions in
+         * one JVM, no `CallManager`/`DmSessionManager` in the loop) and `TwoNodeCallIntegrationTest`
+         * (the full production stack - `CallManager.attach` over a real `DmSessionManager`/two real
+         * `LapisNode`s, both sides reaching `CallEvent.Active` against this real engine, closing the
+         * gap this comment used to flag as untested). See this module's
          * `CallManagerStateMachineTest`/`CallManagerAbuseTest` for the state-machine coverage against
          * a `FakeCallMediaEngine` instead, `DmSessionManagerCallSignalTest` in `lapis-net-dm` for the
          * opaque-bytes DM-transport coverage, and `CallManagerDmWiringIntegrationTest` for the
-         * `CallManager.attach` DM-listener wiring between the two.
+         * `CallManager.attach` DM-listener wiring against that same `FakeCallMediaEngine` -
+         * `TwoNodeCallIntegrationTest` is the one test in this constellation that replaces the fake
+         * with this real engine end to end.
          * Constructs and immediately disposes a throwaway [HeadlessAudioDeviceModule] - the cheapest
          * operation that forces the native library to load, without needing an actual audio device or
          * network interface. Never throws - catches [LinkageError] (the superclass of both

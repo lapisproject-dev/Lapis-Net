@@ -15,10 +15,24 @@ import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 
+/** `correct horse battery staple`, as a fresh [CharArray] every call - mirrors
+ * `lapis-net-ratchet`'s own `testPassphrase()` (not reusable across modules, `internal`). Moved
+ * here from `DmTestFixtures.kt` (V0.8.7 two-node-call-integration-test wave): `DmTestFixtures.kt`
+ * stays in `src/test`, which this `testFixtures` file cannot see (only the reverse - `src/test` can
+ * see `testFixtures`), so [buildDmTestNode]'s own default parameter needs this function local to
+ * this file now. */
+internal fun dmTestPassphrase(): CharArray = "correct horse battery staple".toCharArray()
+
 /** A single, fully-wired node for DM integration/adversarial tests - real [LapisNode], real
  * GossipSub/directory/prekey-bundle/mailbox machinery, and a real [DmSessionManager]. Mirrors
- * `TwoNodePrekeyBundleGossipIntegrationTest`'s own real-two-node setup, extended one layer up. */
-internal class DmTestNode(
+ * `TwoNodePrekeyBundleGossipIntegrationTest`'s own real-two-node setup, extended one layer up.
+ *
+ * V0.8.7 (two-node-call-integration-test wave): moved from `src/test` to this module's `testFixtures`
+ * source set and made public (was `internal`) - now also consumed cross-module by
+ * `lapis-net-call`'s `TwoNodeCallIntegrationTest` via `testFixtures(project(":lapis-net-dm"))`, not
+ * only by this module's own `src/test`. A future editor changing this class's shape should check
+ * that consumer too, not just this module's own tests. */
+class DmTestNode(
     val identity: DualKeyIdentity,
     val node: LapisNode,
     val prekeyStore: PrekeyStore,
@@ -52,7 +66,7 @@ internal class DmTestNode(
     }
 }
 
-internal fun buildDmTestNode(
+fun buildDmTestNode(
     identity: DualKeyIdentity = DualKeyIdentity.generate(),
     sessionStoreDirectory: Path = Files.createTempDirectory("dm-test-sessions"),
     passphrase: CharArray = dmTestPassphrase(),
@@ -131,7 +145,7 @@ internal fun buildDmTestNode(
  * publish, not just the assertion, mirrors `TwoNodePrekeyBundleGossipIntegrationTest`'s established
  * retry-the-whole-announce-call pattern. Bounded-polling-against-one-deadline, no fixed
  * `Thread.sleep` wait for the OUTCOME (only a short sleep between retries). */
-internal fun connectAndConverge(
+fun connectAndConverge(
     a: DmTestNode,
     b: DmTestNode,
     timeout: Duration = Duration.ofSeconds(30),

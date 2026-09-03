@@ -57,6 +57,18 @@
 // bitcoin-kmp dependency here forces the same resolved version everywhere). Every fr.acinq.* type
 // stays confined to DmFirstContactDepositVerifier.kt, mirroring FirstContactDepositVerifier's "sole
 // consumer" discipline.
+// V0.8.7 addition (two-node real-WebRTC-call integration test wave): java-test-fixtures is NEW to
+// this repo as of this wave (grep confirms no other module used it before) - it exposes
+// DmTwoNodeTestHarness.kt's buildDmTestNode/connectAndConverge/DmTestNode to lapis-net-call's own
+// test source set (TwoNodeCallIntegrationTest.kt needs a real two-node DM setup to drive
+// CallManager.attach with a real WebRtcCallMediaEngine - duplicating this module's own two-node/
+// GossipSub/directory/prekey-bundle convergence machinery a second time in lapis-net-call was
+// rejected as exactly the kind of copy this repo's own CallManagerDmWiringIntegrationTest.kt already
+// had to hand-roll before this harness existed).
+plugins {
+    id("java-test-fixtures")
+}
+
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
@@ -67,4 +79,21 @@ dependencies {
     api(project(":lapis-net-policy"))
     implementation(rootProject.libs.lightning.kmp)
     implementation(rootProject.libs.bitcoin.kmp)
+    // testFixturesApi, not testFixturesImplementation: DmTestNode's own public constructor
+    // properties (node/peerDirectory/prekeyStore/storage/pubsub/identity) put these five modules'
+    // types directly in DmTestNode's own public API surface - the same "api, not implementation"
+    // house rule this file's own api() edges above already document. Redeclared explicitly rather
+    // than relying on any implicit propagation from this module's OWN api() edges above - the
+    // java-test-fixtures plugin does NOT automatically extend testFixturesApi/testFixturesImplementation
+    // from a project's own main api()/implementation() edges (only main's compiled OUTPUT is added
+    // to testFixtures' classpath automatically, not main's own dependencies) - DmTwoNodeTestHarness.kt
+    // imports io.libp2p.core.PeerInfo (via lapis-net-networking) and directory/identity/ratchet/
+    // storage types directly, so its own testFixtures compile classpath needs these edges explicitly.
+    // lapis-net-policy deliberately NOT included here - DmAcceptanceCheck/DmAcceptedContacts are
+    // defined locally in this module's own main sources, no extra edge needed for them.
+    testFixturesApi(project(":lapis-net-identity"))
+    testFixturesApi(project(":lapis-net-directory"))
+    testFixturesApi(project(":lapis-net-networking"))
+    testFixturesApi(project(":lapis-net-ratchet"))
+    testFixturesApi(project(":lapis-net-storage"))
 }

@@ -14,10 +14,6 @@ import net.lapisphilosophorum.lapisnet.ratchet.X3dh
 import java.nio.file.Files
 import java.security.SecureRandom
 
-/** `correct horse battery staple`, as a fresh [CharArray] every call - mirrors
- * `lapis-net-ratchet`'s own `testPassphrase()` (not reusable across modules, `internal`). */
-internal fun dmTestPassphrase(): CharArray = "correct horse battery staple".toCharArray()
-
 /** One party's full material for a real, end-to-end X3DH+ratchet handshake, built entirely through
  * this codebase's PUBLIC API (no test-only seams) - mirrors `lapis-net-ratchet`'s own
  * `RatchetTestParty`/`handshake`/`establishedPair` helpers, which this module's test sources cannot
