@@ -92,23 +92,32 @@ class DmEnvelopeCodecTest :
             decoded.x3dhInitialHeader?.oneTimePrekeyId shouldBe null
         }
 
-        test("CALL_SIGNAL and RECEIPT messageType bytes are rejected outright, before senderIdentity is parsed") {
+        test("RECEIPT messageType byte is rejected outright, before senderIdentity is parsed") {
             val message = dmSampleRatchetMessage()
             val sender = Secp256k1KeyPair.generate().publicKey
             val validTextEnvelope = DmEnvelope(DmMessageType.TEXT, sender, null, message)
-            val bytes = DmEnvelopeCodec.encode(validTextEnvelope).copyOf()
-
-            // Flip messageType to CALL_SIGNAL (3), then ALSO corrupt senderIdentity so the test
-            // proves messageType is rejected BEFORE senderIdentity would ever be parsed - if
-            // senderIdentity parsing ran first, THIS corruption (not a bad curve point, just
-            // different bytes) would not by itself throw, so a passing test here is evidence of
-            // ordering, not just of rejection.
-            bytes[6] = DmMessageType.CALL_SIGNAL.wireValue
-            shouldThrow<MalformedDmEnvelopeException> { DmEnvelopeCodec.decode(bytes) }
 
             val receiptBytes = DmEnvelopeCodec.encode(validTextEnvelope).copyOf()
             receiptBytes[6] = DmMessageType.RECEIPT.wireValue
             shouldThrow<MalformedDmEnvelopeException> { DmEnvelopeCodec.decode(receiptBytes) }
+        }
+
+        // V0.8.7: CALL_SIGNAL is active, not rejected - see DmMessageType's own class doc comment.
+        // A CALL_SIGNAL envelope decodes structurally exactly like a TEXT one (this codec is entirely
+        // agnostic to what the ratchet plaintext frames - see DmEnvelopeCodec's own class doc
+        // comment); DmSessionManager, not this codec, is what routes a decoded CALL_SIGNAL envelope
+        // differently (see DmSessionManagerCallSignalTest/CallSignalMailboxRejectionTest).
+        test("CALL_SIGNAL messageType byte decodes structurally cleanly and reports messageType == CALL_SIGNAL") {
+            val message = dmSampleRatchetMessage()
+            val sender = Secp256k1KeyPair.generate().publicKey
+            val envelope = DmEnvelope(DmMessageType.CALL_SIGNAL, sender, null, message)
+            val bytes = DmEnvelopeCodec.encode(envelope)
+            val decoded = DmEnvelopeCodec.decode(bytes)
+
+            decoded.messageType shouldBe DmMessageType.CALL_SIGNAL
+            decoded.senderIdentity shouldBe sender
+            decoded.x3dhInitialHeader shouldBe null
+            DmEnvelopeCodec.encode(decoded) shouldBe bytes
         }
 
         test("an unknown messageType wire byte is rejected") {

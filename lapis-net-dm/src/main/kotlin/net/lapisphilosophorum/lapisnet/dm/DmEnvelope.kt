@@ -44,8 +44,8 @@ class DmEnvelope internal constructor(
     val ratchetMessage: RatchetMessage,
 ) {
     init {
-        require(messageType != DmMessageType.RECEIPT && messageType != DmMessageType.CALL_SIGNAL) {
-            "messageType $messageType is reserved and rejected outright in V0.8.4"
+        require(messageType != DmMessageType.RECEIPT) {
+            "messageType RECEIPT is reserved and rejected outright"
         }
         require((messageType == DmMessageType.X3DH_INITIAL) == (x3dhInitialHeader != null)) {
             "x3dhInitialHeader must be present iff messageType is X3DH_INITIAL"
@@ -57,6 +57,11 @@ class DmEnvelope internal constructor(
         require(x3dhInitialHeader == null || x3dhInitialHeader.initiatorIdentity == senderIdentity) {
             "x3dhInitialHeader.initiatorIdentity must equal senderIdentity"
         }
+        // V0.8.7: a CALL_SIGNAL envelope never carries an X3DH header - a call signal is only ever
+        // sent over an ALREADY-established session (see DmSessionManager.sendCallSignal, which never
+        // bootstraps one). This is already implied by the x3dhInitialHeader-iff-X3DH_INITIAL check
+        // above (CALL_SIGNAL != X3DH_INITIAL, so x3dhInitialHeader must be null), stated here
+        // explicitly rather than left as an inference: a call never begins a first contact.
     }
 
     override fun toString(): String =

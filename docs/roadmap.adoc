@@ -244,7 +244,9 @@ Target: X3DH/Double Ratchet for 1:1 chats, WebRTC for voice/video — full spec 
 note "Direktnachrichten und Anrufe" (not yet mirrored into this repo's `docs/`). **Reduced in scope
 on 2026-08-04**: MLS/conferencing/SFU were cut from this arc entirely — no group-calling target
 remains, see V0.8.1's own scope-cut notes below. Split into sub-waves the same day; V0.8.1, V0.8.2,
-V0.8.3, V0.8.4, V0.8.5, and V0.8.6 have landed.
+V0.8.3, V0.8.4, V0.8.5, V0.8.6, and V0.8.7 have landed — the full arc's original target is now
+implemented, modulo the explicit, deliberate scope cuts stated throughout this section and in
+docs/architecture.adoc's own "1:1 calls over WebRTC (V0.8.7)" section.
 
 [cols="1,3"]
 |===
@@ -301,10 +303,18 @@ contract changes from a raw `ByteArray` to a framed `DmContent`), with no dual-l
 heuristic byte-sniffing fallback. Consequence-free in practice: `lapis-net-dm` has never shipped
 outside this repo, so there is no external `/lapis/dm/1.0.0` deployment to remain compatible with.
 
-| V0.8.7+
-| Calling — reserved wire values already exist (`DmMessageType.CALL_SIGNAL`, rejected outright
-through V0.8.5), but not yet started and not sub-wave-planned in fine-grained detail here; see the
-vault's 2026-08-04 sub-wave plan for the intended breakdown.
+| V0.8.7
+| 1:1 audio calls over WebRTC (new module `lapis-net-call`) — activates the `DmMessageType
+.CALL_SIGNAL` wire value reserved since V0.8.4, layering `webrtc-java`'s libwebrtc bindings on top of
+`DmSessionManager.sendCallSignal`/`addCallSignalListener` for signaling. The SDP travels inside the
+same Double Ratchet AEAD as a text DM, binding its DTLS fingerprint to the same identity a text
+conversation already trusts — empirically verified (not just argued) with a real tampered-fingerprint
+test. Audio only, Non-Trickle ICE, host-candidates-only (no STUN/TURN, no third party in the media
+path), direct-dialable peers only (no `dcutr` — absent from `jvm-libp2p:1.3.5-RELEASE` entirely;
+Circuit-Relay v2/AutoNAT present but unwired, a realistic follow-up). Implemented — see the dedicated
+V0.8.7 section below and docs/architecture.adoc's "1:1 calls over WebRTC (V0.8.7)" section for the
+full design. **A browser control surface (V0.8.7b) is NOT built this wave** — see that section's own
+"Deliberate scope cuts" for the reasoning, following the V0.8.6/V0.8.6b precedent.
 |===
 
 **Forward reference (2026-08-04):** `lapis-net-mail`'s V0.9.2 sub-wave (`EncryptionMode.HYBRID_ECIES`,
@@ -987,6 +997,78 @@ crossroads. Consequence-free in practice: `lapis-net-dm` has never shipped outsi
   declared size ahead of time — identical shape/limitation to `lapis-net-mail`'s existing attachment
   route. `DmAttachmentFetcher.fetchAndDecrypt` rejects an oversized blob before ever handing it to
   the codec, but cannot undo the memory already spent receiving it.
+
+=== V0.8.7 — 1:1 calls over WebRTC
+
+New module `lapis-net-call`, depending on `lapis-net-dm` (`api`, for `DmSessionManager`/
+`Secp256k1PublicKey` in `DmCallSignalTransport`'s/`CallManager.attach`'s public signatures) and
+`lapis-net-core` (`implementation`, for the newly-extracted `FixedWindowRateLimiter` — see below).
+Full design: docs/architecture.adoc's "1:1 calls over WebRTC (V0.8.7)" section.
+
+**Wire/protocol**: `DmMessageType.CALL_SIGNAL` (reserved since V0.8.4) activated — no
+`DmEnvelopeCodec` format bump, no `/lapis/dm/1.1.0` -> `1.2.0` protocol-id bump. New
+`CallSignalCodec` frame (magic `"LNCS"`) carries `CallSignal`s (`INVITE`/`ACCEPT`/`REJECT`/`HANGUP`
+active; `ICE_CANDIDATE`/`RINGING`/`RENEGOTIATE` reserved+rejected, `AUDIO_VIDEO` reserved+rejected)
+as the `CALL_SIGNAL` envelope's ratchet plaintext.
+
+**`DmSessionManager` changes**: `sendCallSignal`/`addCallSignalListener`/`DmInboundCallSignal`/
+`DmNoSessionException` — a call signal is sent ONLY over an already-established session (never
+bootstraps X3DH — "a call never begins a first contact"), delivered ONLY online (never via the
+offline mailbox — `handleOfflineEnvelope` rejects a `CALL_SIGNAL` outright, before any decrypt
+attempt), and routed to its own listener list, NEVER to `addInboundListener`/`DmContentCodec`/
+`DmStore` — `lapis-net-dm` never learns `CallSignalCodec`'s shape (`DmInboundCallSignal.payload` stays
+opaque `ByteArray`). `sendCallSignal` also takes a `marksAcceptance` flag — SECURITY (round-11
+review finding, 2026-09-03; tightened round-12, 2026-09-03): only a genuinely user-decided signal
+that this node wants to *communicate* with the peer may promote its recipient to
+`DmAcceptedContacts` — `placeCall`'s INVITE, `acceptCall`'s ACCEPT, and a user-initiated `hangUp` of
+a call this node placed (OUTGOING) or already answered (CONNECTING/ACTIVE). Everything else is
+`false`: an automatically emitted signal (a BUSY/SDP-policy auto-reject, a ring/connect-timeout
+HANGUP/REJECT, a media-failure HANGUP), every `rejectCall` (a REJECT only ever applies to a
+still-ringing, never-answered INCOMING call), and a `hangUp` of a still-ringing, never-answered
+INCOMING call — dismissing a call the user never answered is a decision NOT to communicate with that
+peer, same as REJECT — see docs/architecture.adoc's "`sendCallSignal`'s `marksAcceptance` parameter"
+section for the full rationale.
+
+**`lapis-net-core` extraction**: `FixedWindowRateLimiter`, previously a `private class` inline in
+`DmSessionManager.kt` (its own `prekeyConsumptionRateLimiter` field), promoted to a shared, public
+`net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter` so `CallManager`'s own
+invite-flood rate limiter reuses the identical, already-reviewed implementation instead of a second
+copy.
+
+**Media engine**: `WebRtcCallMediaEngine` — the sole `dev.onvoid.webrtc.*` consumer in this module,
+mirroring `lapis-net-dm`'s own `fr.acinq.*`-confined-to-`DmFirstContactDepositVerifier.kt`
+discipline. Host-candidates-only (no STUN/TURN ever contacted, structurally via
+`PortAllocatorConfig`'s disable flags, not merely an empty `iceServers` list). Verified against the
+real native library on this wave's development machine (Linux x86_64, JDK 25 Temurin 25.0.4,
+`--enable-native-access=ALL-UNNAMED`): two `RTCPeerConnection`s in one JVM process connect end to end,
+and a tampered DTLS fingerprint in the answer SDP provably prevents the connection from ever
+completing (`WebRtcCallMediaEngineTest`) — the identity-binding argument holds in the running code,
+not only in prose.
+
+**A real, empirically-found bug fixed during this wave, worth recording**: an early version of
+`WebRtcCallMediaSession.close()` called `audioTrack.dispose()` after `peerConnection.close()` for a
+track that had been `addTrack`'d to that connection — `RTCPeerConnection.close()` already releases
+every track it holds a sender reference to, and the subsequent explicit dispose crashed the JVM with
+a native-level `Error: Native object was not deleted` (SIGSEGV, not a catchable exception) — observed
+taking down the entire test JVM process, not just the one test. Fixed by removing the explicit
+`audioTrack.dispose()` call entirely; `peerConnection.close()` is the complete, correct teardown for
+any track ever added to it.
+
+**`CallManager`**: the state machine — `placeCall`/`acceptCall`/`rejectCall`/`hangUp`/
+`activeCalls`/`addCallListener`, a three-executor concurrency model (state thread, media thread,
+timeout scheduler — see docs/architecture.adoc's own section for why this division is load-bearing,
+not stylistic), an invite-flood `FixedWindowRateLimiter`, a hard `MAX_TRACKED_CALLS` ceiling
+independent of `maxConcurrentCalls`, and `CallSdpPolicy` validation on every inbound INVITE/ACCEPT.
+
+**Explicit, deliberate scope cuts** (full reasoning in docs/architecture.adoc): no `dcutr` hole
+punching (absent from `jvm-libp2p:1.3.5-RELEASE` entirely) and no Circuit-Relay v2 fallback (present
+in the library, unwired in `LapisNode`, a realistically scoped follow-up) — direct-dialable peers
+only, same reach as V0.8.4/V0.8.5's own text-DM limitation; audio only, no video; Non-Trickle ICE;
+`maxConcurrentCalls = 1` by default (no call waiting/hold); a quarantined caller is silently dropped,
+never sent a `REJECT` (metadata minimization, at the cost of a confusing `RING_TIMEOUT` for a
+legitimate stranger); `CallLog` is in-memory-only, mirroring `DmStore`'s own discipline; **no
+`lapis-net-browser` wiring this wave** (V0.8.7b, a named follow-up, not an open question — following
+the V0.8.6/V0.8.6b precedent of shipping the engine before its browser UI).
 
 == V0.9 — Asynchronous messages (email replacement)
 

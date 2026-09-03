@@ -3,6 +3,7 @@ package net.lapisphilosophorum.lapisnet.dm
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
+import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
@@ -68,36 +69,16 @@ class DmHandshakeFailedException(
     cause: Throwable? = null,
 ) : DmSessionException(message, cause)
 
-/** Simple fixed-window rate limiter bounding [DmSessionManager]'s one-time-prekey consumption RATE,
- * not merely its concurrency - see [DmSessionManager.prekeyConsumptionRateLimiter]'s own doc comment
- * for exactly why a concurrency bound alone (what [DmSessionManager.prekeyConsumptionSemaphore]
- * provides) is insufficient. Deliberately a plain fixed-window counter, not a smoother token bucket
- * or sliding log - this codebase's usual "generous headroom, provisional magnitude, not derived from
- * pilot data" numeric-cap convention (see [DmSessionManager.MAX_LIVE_SESSIONS]) applies here too: the
- * goal is to turn an unbounded drain into a bounded one, not to perfectly smooth request admission.
- * Thread-safe via a single `synchronized` block per [tryAcquire] call - this sits behind
- * [DmSessionManager.prekeyConsumptionSemaphore]'s own small concurrency bound, so contention here is
- * never a hot path. */
-private class FixedWindowRateLimiter(
-    private val maxPerWindow: Int,
-    private val window: Duration,
-    private val clockMillis: () -> Long = System::currentTimeMillis,
-) {
-    private var windowStartMillis = clockMillis()
-    private var countInWindow = 0
-
-    @Synchronized
-    fun tryAcquire(): Boolean {
-        val now = clockMillis()
-        if (now - windowStartMillis >= window.toMillis()) {
-            windowStartMillis = now
-            countInWindow = 0
-        }
-        if (countInWindow >= maxPerWindow) return false
-        countInWindow++
-        return true
-    }
-}
+/** V0.8.7 - thrown by [DmSessionManager.sendCallSignal] when no session with the recipient exists
+ * yet. Deliberately a DIFFERENT, more specific exception than [DmUnknownRecipientException] (which
+ * means "no directory/prekey-bundle record at all") - this one means "a record may well exist, but
+ * there is no ratchet session to carry a call signal over, and [sendCallSignal] will never bootstrap
+ * one." A call never begins a first contact: [DmSessionManager]'s own class doc comment states this
+ * as a deliberate design choice, not an oversight - calling a stranger you have never exchanged a
+ * text message (or at least an X3DH handshake) with is not a supported flow in this wave. */
+class DmNoSessionException(
+    message: String,
+) : DmSessionException(message)
 
 /** One decrypted, delivered direct message - [sender] is trustworthy ONLY because it is handed out
  * here, after [DmSessionManager.handleInboundEnvelope]'s ratchet decryption already succeeded under
@@ -117,6 +98,32 @@ data class DmInboundMessage(
     val content: DmContent,
     val quarantined: Boolean,
     val dedupKey: ByteArray,
+    val receivedAtEpochSecond: Long,
+)
+
+/** V0.8.7 - one decrypted, delivered call signal. [sender] carries the SAME identity-authority
+ * guarantee [DmInboundMessage.sender] documents: trustworthy only because it is handed out here,
+ * after the ratchet decryption in [DmSessionManager.processInboundDmEnvelope] already succeeded
+ * under a session bootstrapped with this exact identity.
+ *
+ * **[payload] is OPAQUE to this module - deliberately.** It is the raw ratchet plaintext, which for a
+ * `CALL_SIGNAL` envelope is a `net.lapisphilosophorum.lapisnet.call.CallSignalCodec`-encoded frame -
+ * but `lapis-net-dm` never imports `lapis-net-call` (the dependency edge runs the other way: see
+ * `lapis-net-call/build.gradle.kts`'s own header comment) and must never learn that codec's shape.
+ * Decoding [payload] is entirely `lapis-net-call`'s `CallManager`'s job.
+ *
+ * [quarantined] mirrors [DmInboundMessage.quarantined]'s exact semantics - `true` iff
+ * [DmAcceptancePolicy.classifyDelivered] rejected this sender against every configured gate AFTER
+ * decryption already succeeded, always `false` when no [DmAcceptanceCheck] is configured. Unlike
+ * [DmInboundMessage], there is no `dedupKey` field here - a call signal is never redelivered via the
+ * offline mailbox (see [DmSessionManager.handleOfflineEnvelope]'s own doc comment), so the cross-path
+ * dedup key this module computes for every inbound envelope is consumed internally
+ * ([DmSessionManager] still calls [markRecentlyDelivered] on it) but never needs to be handed to a
+ * caller who has no second delivery path to reconcile it against. */
+data class DmInboundCallSignal(
+    val sender: Secp256k1PublicKey,
+    val payload: ByteArray,
+    val quarantined: Boolean,
     val receivedAtEpochSecond: Long,
 )
 
@@ -464,6 +471,12 @@ class DmSessionManager private constructor(
 
     private val inboundListeners = CopyOnWriteArrayList<(DmInboundMessage) -> Unit>()
 
+    /** V0.8.7 - see [addCallSignalListener]/[DmInboundCallSignal]'s own doc comments. A completely
+     * separate list from [inboundListeners]: a `CALL_SIGNAL` envelope is NEVER also handed to
+     * [inboundListeners] - see [processInboundDmEnvelope]'s own doc comment on why calling never
+     * touches [DmContentCodec]/`DmStore`/the browser DM history. */
+    private val callSignalListeners = CopyOnWriteArrayList<(DmInboundCallSignal) -> Unit>()
+
     /** V0.8.5 cross-path dedup key wrapper - mirrors `PeerRecordContentId`/`MailContentId`/
      * `MailboxPointerContentId` exactly (value equality over the key bytes). */
     private data class DedupKeyId(
@@ -522,6 +535,16 @@ class DmSessionManager private constructor(
      * prevents delivery to other listeners or corrupts this manager's own state. */
     fun addInboundListener(listener: (DmInboundMessage) -> Unit) {
         inboundListeners.add(listener)
+    }
+
+    /** V0.8.7 - registers a listener invoked for every successfully decrypted inbound
+     * [DmInboundCallSignal], from within the same [withPeerLock] critical section that persisted the
+     * underlying session - mirrors [addInboundListener]'s exact contract. A listener that throws is
+     * caught and logged; it never prevents delivery to other listeners or corrupts this manager's
+     * own state. The intended (today, sole expected) caller is
+     * `net.lapisphilosophorum.lapisnet.call.DmCallSignalTransport`. */
+    fun addCallSignalListener(listener: (DmInboundCallSignal) -> Unit) {
+        callSignalListeners.add(listener)
     }
 
     /**
@@ -747,6 +770,65 @@ class DmSessionManager private constructor(
     }
 
     /**
+     * V0.8.7 - sends a raw [payload] (opaque to this module - see [DmInboundCallSignal]'s own doc
+     * comment) to [recipient] as a `CALL_SIGNAL` envelope, over an EXISTING session only - unlike
+     * [send]/[sendOffline]/[sendAuto], this method NEVER bootstraps a fresh session via
+     * [bootstrapSenderSession]/X3DH: a call never begins a first contact (see [DmSessionManager]'s
+     * own class doc comment). Always delivered ONLINE - there is no offline/mailbox variant, and
+     * never will be (see [handleOfflineEnvelope]'s own doc comment for the metadata-minimization and
+     * "a call ringing hours late is a bug, not a feature" reasoning).
+     *
+     * The intended (today, sole expected) caller is
+     * `net.lapisphilosophorum.lapisnet.call.DmCallSignalTransport`, itself called only from
+     * `CallManager`'s own dedicated media thread - NEVER synchronously from a
+     * [addCallSignalListener] callback, which runs inside [withPeerLock] for the SAME peer and would
+     * otherwise deadlock-adjacently block that peer's entire DM traffic for the duration of this
+     * call's dial (see `CallManager`'s own class doc comment on its three-executor concurrency model
+     * for why this is load-bearing, not merely a style preference).
+     *
+     * [marksAcceptance] MUST be `true` only for a signal [CallManager] sends in direct response to a
+     * LOCAL user decision to COMMUNICATE with [recipient] - an outgoing INVITE from `placeCall`, an
+     * outgoing ACCEPT from `acceptCall`, or a HANGUP for a call this node already placed (OUTGOING)
+     * or already accepted (INCOMING past ringing) - and `false` for every signal `CallManager` emits
+     * on its own, driven by protocol state rather than a user's choice (a BUSY/malformed-SDP
+     * auto-reject, a ring/connect timeout, or a media-failure hangup), AND for a REJECT or an
+     * unanswered HANGUP: declining or dismissing a call the user never accepted is a decision NOT to
+     * communicate with [recipient], not a decision to. SECURITY (round-11/round-12 review findings,
+     * 2026-09-03): only the `true` case may call [DmAcceptedContacts.accept] below - promoting
+     * [recipient] to an accepted contact is, by [DmAcceptedContacts]'s own class doc comment, "a
+     * deliberate local decision, never inferred from protocol state alone", and neither an
+     * automatically emitted call signal NOR the user's own REJECT/unanswered-HANGUP is such a
+     * decision. Getting this wrong (as the round-11 fix still did for REJECT, fixed in round-12) lets
+     * a remote peer with an existing session force its own promotion to accepted contact merely by
+     * inviting this node and having the user press "reject" or dismiss the still-ringing call,
+     * permanently bypassing every configured [DmAcceptancePolicy] gate for that peer's later DMs and
+     * mailbox pickups.
+     *
+     * @throws DmUnknownRecipientException if [recipient] has no [PeerDirectoryGossip] record.
+     * @throws DmNoSessionException if no session with [recipient] exists yet.
+     * @throws DmSessionException if [payload] exceeds [MAX_CALL_SIGNAL_PAYLOAD_BYTES], or for a
+     *   dial/send timeout or failure.
+     */
+    fun sendCallSignal(
+        recipient: Secp256k1PublicKey,
+        payload: ByteArray,
+        marksAcceptance: Boolean,
+    ) {
+        if (payload.size > MAX_CALL_SIGNAL_PAYLOAD_BYTES) {
+            throw DmSessionException(
+                "call signal payload (${payload.size} bytes) exceeds $MAX_CALL_SIGNAL_PAYLOAD_BYTES bytes",
+            )
+        }
+        withPeerLock(recipient) {
+            val record =
+                peerDirectory.lookup(recipient)
+                    ?: throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
+            val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
+            dispatchOnlineLocked(recipient, record, DmEnvelopeCodec.encode(envelope))
+        }
+    }
+
+    /**
      * MUST be called from within a [withPeerLock] critical section for [recipient] - the shared
      * "build the envelope, persist, cache" core [send], [sendOffline], and [sendAuto] all funnel
      * through (V0.8.6 extraction of what used to be each function's own duplicated inline body).
@@ -786,6 +868,53 @@ class DmSessionManager private constructor(
         // class doc comment, made reachable. A no-op when this manager was attach()ed without an
         // acceptedContacts instance (every prior wave's behavior, unchanged).
         acceptedContacts?.accept(recipient)
+        return envelope
+    }
+
+    /**
+     * MUST be called from within a [withPeerLock] critical section for [recipient] - [sendCallSignal]'s
+     * own "build the envelope, persist, cache" core, structurally similar to [prepareEnvelopeLocked]
+     * but deliberately NOT sharing its implementation: unlike that function, this one (a) NEVER
+     * bootstraps a fresh session via [bootstrapSenderSession] - a missing session is
+     * [DmNoSessionException], not a first-contact opportunity, (b) always emits
+     * [DmMessageType.CALL_SIGNAL], never `TEXT`/`X3DH_INITIAL`, and (c) encrypts [payload] directly -
+     * no [DmContentCodec] framing (see [DmInboundCallSignal]'s own doc comment on why the payload
+     * stays opaque to this module).
+     *
+     * @param marksAcceptance see [sendCallSignal]'s own doc comment - the SECURITY-load-bearing
+     *   distinction between a user-decided signal and an automatic, protocol-driven one.
+     * @throws DmNoSessionException if no session with [recipient] exists yet.
+     */
+    private fun prepareCallEnvelopeLocked(
+        recipient: Secp256k1PublicKey,
+        payload: ByteArray,
+        marksAcceptance: Boolean,
+    ): DmEnvelope {
+        val session =
+            getCachedOrLoad(recipient)
+                ?: throw DmNoSessionException(
+                    "no established session with ${recipient.fingerprint()} - a call never begins a first contact",
+                )
+        check(session.canSend) {
+            "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
+        }
+        val ratchetMessage = session.encrypt(payload)
+        val envelope =
+            DmEnvelope(DmMessageType.CALL_SIGNAL, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
+
+        // Persist BEFORE any externally-observable effect - see prepareEnvelopeLocked's own
+        // identical comment and DoubleRatchetSession's persist/destroy-ordering rule 3.
+        persistSession(recipient, session)
+        putCached(recipient, session)
+        // SECURITY (round-11 review finding, 2026-09-03): unlike prepareEnvelopeLocked's identical
+        // call, this one is CONDITIONAL - an automatically emitted call signal (BUSY/SDP-policy
+        // auto-reject, ring/connect timeout, media-failure hangup) is protocol state, not a local
+        // decision, and must NEVER promote its remote peer to accepted contact. See
+        // [sendCallSignal]'s own doc comment on [marksAcceptance] for the full reasoning and the
+        // concrete escape-path attack this guards against.
+        if (marksAcceptance) {
+            acceptedContacts?.accept(recipient)
+        }
         return envelope
     }
 
@@ -920,9 +1049,37 @@ class DmSessionManager private constructor(
      * value for exactly which outcomes are final (`true`) vs. retryable (`false`). The online path
      * ([handleInboundEnvelope]) has no equivalent "try again later" concept - a dropped live message
      * is simply gone - so it discards this same return value.
-     */
-    internal fun handleOfflineEnvelope(envelope: DmEnvelope): Boolean =
-        processInboundDmEnvelope(envelope, "offline mailbox")
+     *
+     * **V0.8.7: a `CALL_SIGNAL` envelope is rejected here OUTRIGHT, before
+     * [processInboundDmEnvelope] - and therefore any decryption attempt - ever runs.** Two
+     * independent reasons, either alone sufficient:
+     * 1. A call ringing hours after it was placed, once the recipient happens to poll their mailbox,
+     *    is a malfunction, not a feature - [sendCallSignal] never deposits one for exactly this
+     *    reason (it has no offline path at all), so this rejection is defense in depth against a
+     *    HAND-CRAFTED `CALL_SIGNAL` blob an attacker deposits directly, not something the normal
+     *    send path could ever produce.
+     * 2. A mailbox blob is a Nabu blob referenced by a PUBLICLY gossiped [MailboxPointer] - anyone
+     *    watching [MailboxTopics.forRecipient] learns a pointer exists (though not its contents).
+     *    The plaintext `messageType` byte inside the fetched, still-undecrypted [DmEnvelope] would
+     *    tell an observer who fetches the SAME blob "a call was signaled here", a metadata leak this
+     *    node's DM traffic otherwise never produces. Rejecting before decryption avoids touching any
+     *    ratchet state - a tampered/forged `CALL_SIGNAL` mailbox blob never burns a message-number
+     *    slot in a real session.
+     *
+     * Returns `true` (final, mirroring [DmMessageType.RECEIPT]'s own "never accepted regardless of
+     * node state" rejection immediately below in [processInboundDmEnvelope]) - there is no
+     * retryable state that would ever make a `CALL_SIGNAL` acceptable via this path; [MailboxPoller]
+     * marks the pointer resolved and moves on. */
+    internal fun handleOfflineEnvelope(envelope: DmEnvelope): Boolean {
+        if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
+            logger.debug {
+                "call signal arrived via the offline mailbox - rejected outright (calls are online-only, " +
+                    "see this function's own doc comment)"
+            }
+            return true
+        }
+        return processInboundDmEnvelope(envelope, "offline mailbox")
+    }
 
     /**
      * The shared core [handleInboundEnvelope] and [handleOfflineEnvelope] both funnel through -
@@ -1220,9 +1377,32 @@ class DmSessionManager private constructor(
                             }
                             existing to false
                         }
-                        DmMessageType.RECEIPT, DmMessageType.CALL_SIGNAL -> {
+                        // V0.8.7: a CALL_SIGNAL resolves an EXISTING session only - just like TEXT
+                        // above - but, unlike TEXT, a missing session is FORECLOSED with `true`, not
+                        // retried with `false`. There is no X3DH_INITIAL-carrying "other pointer" that
+                        // could ever arrive later to establish one for this exact path: sendCallSignal
+                        // never deposits offline (handleOfflineEnvelope already rejects CALL_SIGNAL
+                        // before this function is ever reached for that transport - see that
+                        // function's own doc comment), so the only way this branch is ever reached at
+                        // all is via the ONLINE path, where "no session yet" can never self-resolve by
+                        // waiting for a second delivery attempt the way an out-of-order mailbox pointer
+                        // pair can for TEXT.
+                        DmMessageType.CALL_SIGNAL -> {
+                            val existing =
+                                getCachedOrLoad(claimedSender)
+                                    ?: run {
+                                        logger.debug {
+                                            "call signal from ${claimedSender.fingerprint()} without an " +
+                                                "established session - rejected (a call never begins a " +
+                                                "first contact)"
+                                        }
+                                        return@withPeerLock true
+                                    }
+                            existing to false
+                        }
+                        DmMessageType.RECEIPT -> {
                             logger.debug { "reserved messageType ${envelope.messageType} rejected outright" }
-                            return@withPeerLock true // these types are never accepted, regardless of node state
+                            return@withPeerLock true // never accepted, regardless of node state
                         }
                     }
 
@@ -1251,6 +1431,36 @@ class DmSessionManager private constructor(
                 // reached here after session.decrypt already succeeded - never burns the durable
                 // registry on a tampered/garbage attempt.
                 freshX3dhInitialEphemeralKeyToRecord?.let { recordAcceptedX3dhInitialEphemeralKey(claimedSender, it) }
+
+                // V0.8.7: a CALL_SIGNAL's ratchet plaintext is NOT a DmContentCodec frame - see
+                // DmInboundCallSignal's own doc comment for why this module never even imports the
+                // codec that DOES decode it (net.lapisphilosophorum.lapisnet.call.CallSignalCodec,
+                // lives in a downstream module). Branches off here, AFTER the ratchet state is
+                // already committed above (same "commit never depends on this branch's outcome"
+                // ordering DmContentCodec.decode's own placement below follows), and BEFORE ever
+                // reaching DmContentCodec.decode - a CALL_SIGNAL payload is never handed to that
+                // codec, which has no idea what shape it is. Routed to callSignalListeners ONLY -
+                // NEVER to inboundListeners, NEVER through DmContentCodec, so a call signal can never
+                // reach DmStore or a browser's DM history (see this class's own doc comment on
+                // lapis-net-dm staying WebRTC-free). Always `true` (final) - processInboundDmEnvelope's
+                // own doc comment on the return value's "false means later retryable" case does not
+                // apply here: this branch is reached only via the online path (handleOfflineEnvelope
+                // already rejects CALL_SIGNAL before this function ever runs for that transport), and
+                // a live delivery that already decrypted successfully has nothing left to retry.
+                if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
+                    val quarantined = classifyQuarantinedSender(claimedSender)
+                    markRecentlyDelivered(dedupKey)
+                    val signal =
+                        DmInboundCallSignal(claimedSender, plaintext, quarantined, Instant.now().epochSecond)
+                    callSignalListeners.forEach { listener ->
+                        try {
+                            listener(signal)
+                        } catch (e: RuntimeException) {
+                            logger.warn(e) { "inbound call signal listener threw - other listeners still notified" }
+                        }
+                    }
+                    return@withPeerLock true
+                }
 
                 // V0.8.6: decode the DmContent framing the ratchet plaintext now carries - AFTER the
                 // ratchet state has already been committed above (persistSession/putCached), since
@@ -1422,6 +1632,23 @@ class DmSessionManager private constructor(
         sender: Secp256k1PublicKey,
         content: DmContent,
         depositBinding: DmDepositBinding?,
+    ): Boolean = classifyQuarantinedCore(sender, content.firstContactDeposit, depositBinding)
+
+    /** V0.8.7 - [classifyQuarantined]'s CALL_SIGNAL-shaped sibling: an inbound call signal carries no
+     * [DmContent]/[DmFirstContactDeposit] at all (a call is never a first-contact deposit carrier -
+     * see [DmDepositBinding]'s and [DmFirstContactDepositVerifier]'s own class doc comments), so
+     * there is nothing to pass for those two parameters other than the same "absent" values
+     * [classifyQuarantinedCore] already treats as ordinary inputs. Reuses the EXACT same
+     * [DmAcceptancePolicy.classifyDelivered] evaluation [classifyQuarantined] does - refactored out
+     * as [classifyQuarantinedCore] specifically so these two callers cannot drift into two
+     * independently-reasoned-about acceptance checks. */
+    private fun classifyQuarantinedSender(sender: Secp256k1PublicKey): Boolean =
+        classifyQuarantinedCore(sender, deposit = null, depositBinding = null)
+
+    private fun classifyQuarantinedCore(
+        sender: Secp256k1PublicKey,
+        deposit: DmFirstContactDeposit?,
+        depositBinding: DmDepositBinding?,
     ): Boolean {
         val check = acceptance ?: return false
         val decision =
@@ -1433,7 +1660,7 @@ class DmSessionManager private constructor(
                 karmaScoreOf = check.karmaScoreOf,
                 isAcceptedContact = check.isAcceptedContact,
                 minDepositMsat = check.minDepositMsat,
-                deposit = content.firstContactDeposit,
+                deposit = deposit,
                 depositBinding = depositBinding,
             )
         return decision is DmAcceptanceDecision.Quarantine
@@ -1763,6 +1990,15 @@ class DmSessionManager private constructor(
          * cap), same "provisional magnitude, not derived from pilot data" framing as every sibling
          * cap in this class. */
         const val MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER = 8
+
+        /** V0.8.7 - the ceiling [sendCallSignal] enforces on its `payload` parameter, well under
+         * [net.lapisphilosophorum.lapisnet.ratchet.RatchetMessageCodec.MAX_PLAINTEXT_BYTES] (65,459) -
+         * a `CallSignalCodec`-encoded frame's own `MAX_CALL_SIGNAL_BYTES` ceiling
+         * (`net.lapisphilosophorum.lapisnet.call`) is smaller still (43 + 16,384 = 16,427 bytes), so
+         * this generous headroom never actually constrains a legitimate call signal - it exists as
+         * this module's OWN independent ceiling, not a duplicate of `lapis-net-call`'s, so
+         * `lapis-net-dm` never needs to know that module's exact constant to stay safe. */
+        const val MAX_CALL_SIGNAL_PAYLOAD_BYTES = 32_768
 
         /**
          * Bootstraps a [DmSessionManager]: loads or generates a persisted `.salt` file (0600 where

@@ -26,6 +26,14 @@ lightning-kmp = "1.8.4"
 # current on Maven Central as of this wave (2026-08-04) via maven-metadata.xml - re-verify at a
 # later implementation time, versions drift.
 htmlunit = "5.3.0"
+# V0.8.7 - libwebrtc JNI bindings (Apache-2.0; gebundeltes libwebrtc BSD-3), used exclusively by
+# lapis-net-call/WebRtcCallMediaEngine.kt. Bytecode target Java 8, verified runnable on JDK 25
+# (Temurin 25.0.4) via an executable probe on 2026-09-02 - two RTCPeerConnections in one JVM process,
+# HeadlessAudioDeviceModule, zero ICE servers, RESULT connected=true. Native classifier jars are
+# ~25 MB each - only the host platform's classifier is resolved, see
+# lapis-net-call/build.gradle.kts's own webrtcNativeClassifier() function. Verified current on Maven
+# Central as of this wave (2026-09-02) via maven-metadata.xml - versions drift, re-verify later.
+webrtc-java = "0.16.0"
 
 [libraries]
 jvm-libp2p = { group = "io.libp2p", name = "jvm-libp2p", version.ref = "jvm-libp2p" }
@@ -51,6 +59,7 @@ bitcoin-kmp = { group = "fr.acinq.bitcoin", name = "bitcoin-kmp-jvm", version.re
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
 lightning-kmp = { group = "fr.acinq.lightning", name = "lightning-kmp-jvm", version.ref = "lightning-kmp" }
 htmlunit = { group = "org.htmlunit", name = "htmlunit", version.ref = "htmlunit" }
+webrtc-java = { group = "dev.onvoid.webrtc", name = "webrtc-java", version.ref = "webrtc-java" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

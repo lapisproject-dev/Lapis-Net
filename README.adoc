@@ -35,9 +35,12 @@ real client, the Minimal-Browser (`lapis-net-browser`). See
 link:docs/architecture.adoc[docs/architecture.adoc] for full technical detail
 and link:docs/roadmap.adoc[docs/roadmap.adoc] for the wave-by-wave history.
 Not yet implemented: an embedded Lightning node (proof verification only, no
-payment sending), BOLT-12 offer publication, NAT traversal hardening, and
-calling (V0.8.7+; V0.8's group-calling/MLS target was cut from the arc
-entirely on 2026-08-04). V0.8.1, the signed peer/presence directory records
+payment sending), BOLT-12 offer publication, and NAT traversal beyond
+directly-dialable peers (Circuit-Relay v2/AutoNAT exist in `jvm-libp2p` but
+are unwired; `dcutr` hole punching is absent from the library entirely).
+1:1 audio calling (V0.8.7) is now implemented — see below; V0.8's original
+group-calling/MLS/video target was cut from the arc entirely on 2026-08-04.
+V0.8.1, the signed peer/presence directory records
 later sub-waves resolve recipients' addresses through, is implemented — see
 `lapis-net-directory` below. V0.8.2 — the X25519 encryption sub-key, the X3DH
 handshake (Signal's Extended Triple Diffie-Hellman, reimplemented from the
@@ -88,8 +91,23 @@ gates" section. **A browser UI for direct messages is explicitly NOT built
 this wave**: `DmAcceptanceCheck`, `DmAcceptedContacts`, and
 `DmAttachmentFetcher` are complete, independently tested building blocks
 with no production caller in this repo yet.
-Not yet implemented in this arc: a browser UI for direct messages, and
-1:1 voice/video calls (V0.8.7).
+V0.8.7 — 1:1 audio calls over WebRTC — is also implemented, in the new
+`lapis-net-call` module: activates the `DmMessageType.CALL_SIGNAL` wire value
+reserved since V0.8.4, layering `webrtc-java` (libwebrtc JNI bindings,
+Apache-2.0) on top of `DmSessionManager.sendCallSignal`/
+`addCallSignalListener` for signaling. A call's SDP travels inside the same
+Double Ratchet AEAD ciphertext as a text DM, binding its DTLS fingerprint to
+the same identity a text conversation already trusts — no signaling server,
+STUN/TURN server, or separate certificate authority needed, and empirically
+verified (not just argued): a tampered DTLS fingerprint provably prevents the
+call from ever connecting. Audio only, Non-Trickle ICE, host-ICE-candidates
+only (no STUN/TURN ever contacted — this node's own media path uses no third
+party either), direct-dialable peers only for the same NAT-traversal reasons
+noted above. See link:docs/architecture.adoc[docs/architecture.adoc]'s "1:1
+calls over WebRTC (V0.8.7)" section for the full design.
+Not yet implemented in this arc: a browser control surface for calls
+(V0.8.7b — the call's audio still runs in the JVM process; a browser page
+would only remote-control it, not carry browser-native WebRTC).
 Mail (V0.9) is a separate, already-completed arc — encryption, threading,
 attachments, and spam protection are all implemented, see `lapis-net-mail`
 below.
@@ -135,6 +153,9 @@ below.
 
 | `lapis-net-dm`
 | The custom `/lapis/dm/1.1.0` libp2p stream protocol wiring `lapis-net-ratchet`'s X3DH/Double-Ratchet primitives into a live network path: `DmProtocol`/`DmProtocolHandler` (stream-protocol binding, the first raw-libp2p-stream parser in this codebase — length-validated-before-allocation frame decoding, slowloris/absolute-lifetime timeouts, per-peer stream cap), `DmEnvelope`/`DmEnvelopeCodec` (the outer wire frame), `DmSessionManager` (first-contact/resumed session state machine, durable session persistence, the identity-authority-safe inbound handler), and `DmStore` (in-memory-only conversation history) — online 1:1 direct messages between directly-dialable peers (V0.8.4), plus V0.8.5's offline Nabu mailbox (`MailboxPointer`/`MailboxGossip`/`MailboxPoller`/`MailboxRedeliveryScheduler`, `DmSessionManager.sendOffline`) for offline delivery via a Bitswap-fetched, periodically re-announced signed pointer.
+
+| `lapis-net-call`
+| 1:1 audio calls over WebRTC (V0.8.7): `CallManager` (the call-control state machine — INVITE/ACCEPT/REJECT/HANGUP, a three-executor concurrency model, invite-flood rate limiting), `CallSignal`/`CallSignalCodec` (the wire frame carried as a `DmMessageType.CALL_SIGNAL` envelope's ratchet plaintext), `CallSdpPolicy` (SSRF-class defenses against a peer-supplied SDP), and `WebRtcCallMediaEngine` (the sole `dev.onvoid.webrtc:webrtc-java` consumer — host-ICE-candidates only, no STUN/TURN). Depends on `lapis-net-dm` for signaling transport and DTLS-fingerprint identity binding; `lapis-net-dm` itself stays entirely WebRTC-free.
 
 | `lapis-net-browser`
 | Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data and the LTR record-authoring endpoints.

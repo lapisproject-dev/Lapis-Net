@@ -27,10 +27,17 @@ private fun awaitAtLeast(
     // 60s rather than the tighter 20s used elsewhere: this specific test's second wait
     // (waiting on a SECOND inbound message on a directly-invoked handleInboundEnvelope
     // path, not a network round-trip) was observed to miss a 20s deadline only under a
-    // full, parallel `./gradlew check` run - never in isolation or a single-module run -
-    // i.e. it is a machine-load flake, not a correctness signal. See review finding
-    // (2026-09) in the V0.8.6 wave notes for the reproduction (isolated class/module
-    // green, full parallel `check` red).
+    // full, parallel `./gradlew check` run - never in isolation or a single-module run.
+    // See review finding (2026-09) in the V0.8.6 wave notes for that reproduction.
+    //
+    // **Correction (2026-09-02, BLOCKER review finding on the "a second, genuine
+    // X3DH_INITIAL..." test below).** That earlier reproduction was misdiagnosed as pure
+    // machine-load flakiness. The actual root cause was a genuine, if low-probability
+    // (~1-in-29 per run), one-time-prekey-id collision in that one test's hand-built
+    // second handshake - fixed at that test's own call site (see the doc comment there),
+    // not by anything timeout-related. This 60s bound is kept anyway as reasonable
+    // headroom for a real full-`check`-run slowdown on the genuine network-round-trip
+    // waits elsewhere in this file, but it was never what was failing.
     timeout: Duration = Duration.ofSeconds(60),
 ): List<DmInboundMessage> {
     val deadline = Instant.now().plus(timeout)
@@ -232,7 +239,28 @@ class DmSessionManagerTest :
                 // against the victim's real, currently-published PrekeyBundle) - calling
                 // correspondent.dmSessionManager.send() again would just reuse ITS OWN already
                 // cached/persisted session rather than re-handshaking.
-                val victimBundle = requireNotNull(correspondent.prekeyBundleGossip.lookup(identityVictim))
+                //
+                // **Root cause of a since-fixed flake (2026-09-02 BLOCKER review finding), and why
+                // this deliberately does NOT use correspondent.prekeyBundleGossip.lookup(identityVictim)
+                // here.** That gossiped bundle is a SNAPSHOT from BEFORE the first handshake above ran
+                // (victim's oneTimePrekeyCount=30 stays well above PREKEY_REPLENISH_LOW_WATERMARK after
+                // consuming one, so victim never republishes) - it still lists the exact one-time
+                // prekey the FIRST handshake already consumed, alongside every other still-available
+                // one. X3dh.initiate's own uniformly-random selection (see that function's own doc
+                // comment) then had a real, non-zero chance - 1 in the pool size - of picking that
+                // SAME already-consumed id, which fails processInboundDmEnvelope's
+                // localPrekeyStore.consumeOneTimePrekey with a PrekeyConsumptionException, silently and
+                // permanently rejecting this envelope (return@withPeerLock true, no session installed,
+                // no listener ever notified) - precisely the "one-time prekey collisions are inherent
+                // to gossip publication" degradation X3dh.initiate's own class doc comment already
+                // documents as expected behavior, just not what THIS test means to exercise. Publishing
+                // a FRESH bundle straight from victim's own live PrekeyStore instead reflects its
+                // CURRENT available set (the already-consumed id excluded) deterministically, with no
+                // dependency on gossip propagation timing or RNG luck - the collision this used to hit
+                // roughly 1-in-29 of the time, misdiagnosed by the review that found it as a
+                // resource-contention flake because it only ever surfaced during a full, all-tests
+                // `./gradlew check` run.
+                val victimBundle = victim.prekeyStore.publishBundle(victim.identity, Instant.now().epochSecond + 3600)
                 val ownBinding =
                     EncryptionKeyBinding.create(
                         correspondent.identity.secp256k1KeyPair,

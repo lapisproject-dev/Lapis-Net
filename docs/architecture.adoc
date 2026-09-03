@@ -167,7 +167,19 @@ Consensys artifacts) that must all be declared as repositories, since its own tr
 dependencies (`java-multibase`, `noise-java`) are split across them.
 
 GossipSub pub/sub and NAT traversal are explicitly out of scope for this wave; GossipSub lands in
-V0.1.7 (see below), NAT traversal remains an open research item.
+V0.1.7 (see below). **NAT traversal update (V0.8.7, 2026-09-02): no longer an open research
+question, but a concretely scoped, unimplemented gap.** Verified against the resolved
+`jvm-libp2p:1.3.5-RELEASE` jar: Circuit-Relay v2
+(`io.libp2p.protocol.circuit.{RelayTransport,CircuitHopProtocol,CircuitStopProtocol}`) and AutoNAT
+are both PRESENT in the library but UNVERDRAHTET in `LapisNode` (which wires only TCP + Noise +
+Mplex + mDNS — see that class's own module). `dcutr` (hole punching) is ABSENT from the jar
+entirely — no package of that name exists. This means: relay-based NAT traversal is a realistic,
+scoped follow-up wave (wire the existing Circuit-Relay/AutoNAT classes — relay-reservation, candidate-
+relay discovery, relay addresses in `PeerRecord`, relay-side resource limits, an open Virtus-
+compensation question for who runs the relay); a `dcutr`-based direct-hole-punch fallback is NOT realistic without
+first implementing that protocol from scratch. See "1:1 calls over WebRTC (V0.8.7)" below for the
+concrete wave (audio calls) this distinction blocked from claiming a `dcutr` fallback it cannot
+deliver.
 
 == Storage (V0.1.4)
 
@@ -3051,10 +3063,12 @@ cross-path `recentlyDeliveredDedupKeys` pre-check `processInboundDmEnvelope` run
 
 === Explicit, deliberate scope cuts for this wave
 
-* **No delivery receipts, no typing indicators** — not even as stubs. `DmMessageType.RECEIPT`/
-  `CALL_SIGNAL` exist on the wire but are rejected outright at every layer that can reject them
-  (the envelope's own constructor, the codec, and `DmSessionManager`'s inbound handler) — mirrors
-  `EncryptionMode.MLS_ARCHIVE`'s precedent.
+* **No delivery receipts, no typing indicators** — not even as stubs. `DmMessageType.RECEIPT`
+  exists on the wire but is rejected outright at every layer that can reject it (the envelope's own
+  constructor, the codec, and `DmSessionManager`'s inbound handler) — mirrors
+  `EncryptionMode.MLS_ARCHIVE`'s precedent. `DmMessageType.CALL_SIGNAL` was ALSO reserved this way
+  in V0.8.4 — **since V0.8.7, it is active, not reserved** — see "1:1 calls over WebRTC (V0.8.7)"
+  below.
 * **No NAT traversal.** A documented gap since V0.1.3/networking, unchanged by this wave. Only
   direct-dialable peers (same-LAN, or otherwise directly reachable) are supported.
 * **No offline/mailbox redelivery in THIS wave (V0.8.4)** — V0.8.5's job, since landed; see
@@ -3664,6 +3678,36 @@ arrives quarantined; once the local node replies to them, their SECOND message a
 — the reachable version of the escape path `DmAcceptancePolicy.decide`'s design depends on. In-memory
 only, same scope cut as `DmStore` below — a process restart forgets every accept decision.
 
+**`sendCallSignal`'s `marksAcceptance` parameter — SECURITY (round-11 review finding, 2026-09-03;
+tightened round-12, 2026-09-03).**
+Unlike `prepareEnvelopeLocked`'s unconditional `accept()` call above, `prepareCallEnvelopeLocked`
+(the call-signal equivalent, V0.8.7) only calls `DmAcceptedContacts.accept` when its caller passes
+`marksAcceptance = true` — because a call signal, unlike a TEXT/`sendAuto` send, is not always the
+product of a local user decision. `CallManager` emits several call signals entirely on its own
+(a BUSY/SDP-policy auto-reject in `handleInboundInvite`, a ring/connect-timeout HANGUP/REJECT, a
+media-failure HANGUP) — none of those are the "deliberate local decision" this class's own doc
+comment above requires. Before the round-11 fix, EVERY `sendCallSignal` call flipped `isAccepted`
+unconditionally, so a remote peer could force its own permanent promotion to accepted contact merely
+by getting this node to auto-reply once (e.g. inviting and letting `CallConfig.ringTimeout` elapse) —
+permanently bypassing every configured `DmAcceptancePolicy` gate for that peer's later DMs and
+mailbox pickups, with no local user ever having decided anything about them.
+`CallSignalTransport.send`/`sendSignalAsync` forward the same flag verbatim from `CallManager`'s own
+call sites. The round-11 fix still sent `true` for every `rejectCall`/`hangUp` call reachable from a
+real user action, including hanging up or rejecting a still-ringing `INCOMING` call the user never
+answered — the round-12 finding is that dismissing an unanswered incoming call is itself a decision
+NOT to communicate with that peer, the opposite of what `DmAcceptedContacts` promotion should mean.
+The current, tightened rule: `true` only for `placeCall`'s INVITE, `acceptCall`'s ACCEPT, and a
+user-initiated `hangUp` of a call this node itself placed (OUTGOING) or already answered
+(CONNECTING/ACTIVE) — `false` for every automatically emitted signal, for every `rejectCall`
+(`rejectCallOnStateThread` always sends `false` — a REJECT can, by construction, only apply to a
+still-ringing, never-answered INCOMING call), and for a `hangUp` of a still-ringing, never-answered
+INCOMING call (which must behave like a REJECT for `DmAcceptedContacts` purposes).
+`DmSessionManagerCallSignalTest`'s dedicated `marksAcceptance` test and
+`CallManagerStateMachineTest`'s three `marksAcceptance:` tests pin this end to end, and
+`CallManagerDmWiringIntegrationTest` covers the `CallManager.attach` DM-listener wiring itself, and
+also pins `DmCallSignalTransport.send`'s `marksAcceptance` forwarding end to end in both directions
+(the accept-flow test asserts `true`, the reject-flow test asserts `false`).
+
 === `DmStore`: in-memory conversation history, a future caller's job to populate
 
 Bounded, per-peer, in-memory-only conversation history (`MAX_HISTORY_PER_PEER` = 500 entries,
@@ -3683,6 +3727,201 @@ already established, carried forward unchanged.
   gates" above.
 * **Unbounded attachment fetch, inherited from `NabuStorage`** — see `DmAttachmentFetcher`'s own
   section above; not a regression this wave introduces, but not fixed by it either.
+
+== 1:1 calls over WebRTC (V0.8.7)
+
+The fifth sub-wave of the V0.8 (direct messages and calls) arc: real-time 1:1 audio calls, layered
+entirely on top of V0.8.4's `DmProtocol`/`DmSessionManager` for signaling and a new module,
+`lapis-net-call`, for call-control state and the actual media path
+(`dev.onvoid.webrtc:webrtc-java`, Apache-2.0, bundled libwebrtc BSD-3 — verified on Maven Central,
+0.16.0 as of this wave, bytecode target Java 8, runs on JDK 25 including with headless audio).
+
+=== Signaling architecture — a new opaque payload inside an existing envelope, not a new protocol
+
+```
+lapis-net-call        semantics + media
+   CallManager, CallSignal/CallSignalCodec, CallSdpPolicy,
+   CallMediaEngine  <-- implemented by --  WebRtcCallMediaEngine (sole dev.onvoid.webrtc consumer)
+        |
+        | DmSessionManager.sendCallSignal(peer, ByteArray, marksAcceptance) / addCallSignalListener { DmInboundCallSignal }
+        v
+lapis-net-dm           transport + crypto — UNCHANGED at its core
+   /lapis/dm/1.1.0  ->  Double Ratchet  ->  the SDP inside a CallSignal is now identity-bound
+```
+
+`DmMessageType.CALL_SIGNAL` (wire value 3) has been reserved since V0.8.4 specifically for this
+moment — activating it needed **no `DmEnvelopeCodec` wire-format bump, and no `/lapis/dm/1.1.0` ->
+`1.2.0` protocol-id bump**. The `TEXT`/`X3DH_INITIAL` plaintext contract (a `DmContentCodec` frame)
+does not change; a `CALL_SIGNAL` envelope's ratchet plaintext is a *different*, `lapis-net-call`-owned
+frame (`CallSignalCodec`) instead — the ratchet-plaintext contract has been `messageType`-dependent
+since this wave, documented at `DmEnvelopeCodec`'s own class doc comment. A peer still on a pre-V0.8.7
+build rejects an inbound `CALL_SIGNAL` cleanly and early (before `senderIdentity` is even parsed) —
+graceful degradation, never a misparse. `PeerCapability.CALL` (bit `0x02`, reserved since V0.8.1) lets
+a caller learn in advance whether a contact's advertised node even claims call support, though this
+claim is — like every `PeerCapability` bit — unverified self-reporting until the wire proves it.
+
+=== `CallSignal`/`CallSignalCodec` — exact wire layout
+
+This is the *ratchet plaintext* of a `CALL_SIGNAL` envelope — see `CallSignalCodec`'s own class doc
+comment for the fully authoritative version; summarized here:
+
+```
+off   len  field
+  0     4  magic "LNCS"
+  4     1  version = 0x01
+  5     1  type      (0=INVITE 1=ACCEPT 2=REJECT 3=HANGUP; 4=ICE_CANDIDATE 5=RINGING 6=RENEGOTIATE
+                       reserved+rejected — Non-Trickle/no distinct-ringing-signal/no-renegotiation
+                       this wave)
+  6     1  flags     reserved, must be zero
+  7    16  callId    128-bit, must not be all-zero
+ 23     8  createdAtEpochMillis
+ 31     8  notValidAfterEpochMillis
+ 39     1  mediaKind (0=AUDIO; 1=AUDIO_VIDEO reserved+rejected — no video this wave)
+ 40     1  reason    (CallEndReason wire value; must be NONE unless type is REJECT/HANGUP)
+ 41     2  sdpLen
+ 43     N  sdp       US-ASCII; N>0 iff type is INVITE/ACCEPT
+```
+
+`MAGIC` is not a security boundary here (same caveat `DmContentCodec` already carries) — these bytes
+are only ever decoded after `DoubleRatchetSession.decrypt` has already authenticated them.
+
+=== The DTLS-fingerprint identity-binding argument — why this wave needs no Insertable-Streams E2EE
+
+The SDP a `CallSignal.INVITE`/`ACCEPT` carries includes `a=fingerprint:sha-256 <hex>` — the hash of
+the DTLS certificate the sender's `RTCPeerConnection` will present during the handshake. Because that
+SDP travels **inside the same Double Ratchet AEAD ciphertext as a text DM**, it is bound to the exact
+secp256k1 identity pair that session's X3DH handshake established — the identical
+`(sender, us)`-pair binding `X3dh`'s own associated-data construction already provides for every DM.
+`webrtc-java`'s own DTLS stack then enforces, independently, that the certificate actually presented
+during the handshake matches that exact fingerprint. The result: the media path is MITM-resistant with
+**zero additional trust infrastructure** — no signaling server, no STUN/TURN server, no separate
+certificate authority — the entire chain of trust is the SAME Double Ratchet session that already
+authenticates every text message with this contact. **Empirically verified, not just argued**: `
+WebRtcCallMediaEngineTest`'s tampered-fingerprint test flips one hex character in a real answer SDP
+and proves the connection never completes (`onMediaConnected` never fires within a generous bounded
+wait) — the identity binding is load-bearing in the running code, not only in this prose.
+
+Insertable Streams (frame-level E2EE on top of DTLS-SRTP) is, for exactly this reason, functionally
+unnecessary for a 1:1 call: there is no third relay party for it to defend against (see "reines P2P,
+keine dritte Partei" in the scope cuts below), and `webrtc-java` 0.16.0 does not expose the
+`FrameEncryptor`/insertable-streams API family regardless (verified against the resolved jar's class
+list) — a moot point either way for THIS wave, though it would become a real question the moment a
+future wave adds a relay or a group call.
+
+=== `CallSdpPolicy` — why a remote peer's SDP still needs validating even though its SENDER is proven
+
+AEAD authentication proves *who* sent an SDP, not that its *contents* are safe to act on. A
+compromised or malicious CONTACT (not a stranger — an already-trusted session) could hand-craft an
+SDP whose `a=candidate:` lines name arbitrary addresses this node's ICE stack would then send traffic
+toward — the WebRTC-specific shape of the SSRF/portscan class this codebase's security checklist
+already covers for every other network-touching feature. `CallSdpPolicy.validateRemote` rejects:
+anything but exactly one `m=audio` section (an `m=video` section is `UNSUPPORTED_MEDIA`; an
+`m=application` — a DataChannel/SCTP section — would let an "audio call" carry an arbitrary
+bidirectional data tunnel, rejected outright); anything but exactly one well-formed
+`a=fingerprint:sha-256` line plus an `a=setup:` line; more than 30 `a=candidate:` lines; any candidate
+whose transport is not `udp` (`tcp` is rejected outright, case-insensitively — this node itself never
+gathers anything but UDP candidates either, via `WebRtcCallMediaEngine`'s own
+`PORTALLOCATOR_DISABLE_TCP` flag; without this check a compromised contact could hand-craft `tcp`
+candidates that make this node's ICE stack dial out to arbitrary third-party addresses); any candidate
+whose `typ` is not `host` (no `srflx`/`prflx`/`relay` — this node itself never gathers anything but
+host candidates either, via `WebRtcCallMediaEngine`'s own `PORTALLOCATOR_DISABLE_STUN`/`_RELAY`
+flags); and any candidate address that is `0.0.0.0`/`::` (unspecified), broadcast, multicast, IPv4
+loopback (`127.0.0.0/8`) or IPv6 loopback (`::1`), IPv4 link-local/APIPA (`169.254.0.0/16`) or IPv6
+link-local (`fe80::/10`) — never a real REMOTE peer's own address in any deployment shape this project
+supports, unlike RFC 1918/site-local, which stays allowed as the expected same-LAN call peer address
+space — or, more generally, not a numeric IPv4/IPv6 literal at all (a `.local` mDNS hostname or any
+other hostname, e.g. an attacker-chosen DNS name: rejected without ever attempting to resolve it,
+since resolution itself would be the online-presence leak/SSRF vector this whole policy exists to
+close). Every rule has its own adversarial test in `CallSdpPolicyTest`. **Known open gap** (tracked,
+not yet fixed): a `typ host` UDP candidate's address and port are otherwise unrestricted — any
+public-unicast address/port is accepted — so a compromised contact can still steer this node's ICE
+stack to send a bounded number (at most 30) of UDP STUN binding requests toward a third party of its
+choosing; see `CallSdpPolicy`'s own class doc comment and `validateCandidateLine`'s inline comment.
+
+=== Concurrency model — three executors, strict division of labor
+
+`CallManager` (`lapis-net-call`) uses three executors:
+
+1. **State thread** (single-threaded, daemon) — every mutation of call state and every `CallEvent`
+   emission happens here, and only here; single-threaded FIFO ordering is the entire synchronization
+   story, no explicit locks needed.
+2. **Media thread** (single-threaded, daemon) — everything that blocks: ICE-gathering waits inside
+   `CallMediaSession.createOffer`/`acceptOfferAndCreateAnswer`/`applyAnswer`, `CallMediaSession.close`,
+   and every `CallSignalTransport.send` (a real send dials the peer via `DmSessionManager
+   .sendCallSignal`, which can block up to `DmSessionManager.DIAL_TIMEOUT`, 15 seconds). One
+   deliberate, narrow exception to `CallMediaSession.close` running here: `CallManager
+   .attachMediaSessionOrCloseIfEnded`'s already-ended-call fallback normally re-queues the close onto
+   the media executor like every other close; it closes a session inline, on the state thread, ONLY
+   when that hand-off is itself rejected because `stop()` has already shut the media executor down —
+   safe specifically in that one case, because the call ended before the attach ever reached it and no
+   `createOffer`/`acceptOfferAndCreateAnswer`/`applyAnswer` for that session can still be in flight
+   (see that function's own doc comment). No other call site closes a session off the media thread —
+   `CallManager.endCallOnStateThread`/`handleInboundAccept` used to each have their own inline
+   fallback for a rejected media-executor hand-off, until a MAJOR review-round finding (2026-09-02)
+   showed those two fallbacks could race an in-flight media-thread close of the SAME session and
+   removed them without replacement (see each function's own doc comment) — `WebRtcCallMediaSession
+   .close` is additionally `compareAndSet`-guarded against a double-close regardless, defense in
+   depth rather than reliance on this invariant alone.
+3. **Timeout scheduler** — a bare `ScheduledThreadPoolExecutor(1)` with `removeOnCancelPolicy = true`,
+   NOT `Executors.newSingleThreadScheduledExecutor` (which wraps the real executor in a delegate that
+   can never be cast back to set that policy) — the exact trap `DmProtocolHandler`'s own scheduler
+   field already documents hitting once in V0.8.4.
+
+**The single most important rule**: `DmSessionManager.addCallSignalListener`'s callback runs from
+INSIDE `DmSessionManager.withPeerLock(sender)` — a `synchronized` (reentrant) monitor. A listener that
+synchronously called `sendCallSignal` back to the SAME peer would not deadlock, but it would run a
+network dial (up to 15s) while holding that peer's stripe lock, blocking every OTHER DM operation
+(text messages, mailbox delivery) for that peer for the duration. `CallManager.onInboundCallSignal`
+therefore does nothing but decode-free dispatch onto the state thread and returns immediately; every
+outbound send in `CallManager` runs on the media thread, never inline from a signal-handling callback.
+
+=== Explicit, deliberate scope cuts for this wave
+
+* **No `dcutr` hole punching, and no Circuit-Relay fallback.** See the NAT-traversal note near the top
+  of this document (revised this wave) — `dcutr` is entirely absent from `jvm-libp2p:1.3.5-RELEASE`;
+  Circuit-Relay v2/AutoNAT are present but unwired in `LapisNode`. **Consequence**: a call only
+  connects between DIRECTLY DIALABLE peers — the same reach as V0.8.4/V0.8.5's own text-DM
+  limitation, no better and no worse. The media path uses ONLY ICE host candidates — no STUN/TURN
+  server is ever contacted, structurally enforced by `WebRtcCallMediaEngine`'s
+  `PORTALLOCATOR_DISABLE_STUN`/`_RELAY` flags, not merely by leaving `iceServers` empty (an empty list
+  alone does not prove nothing could ever populate it later — the port-allocator flags are the actual
+  structural guarantee). This is also the concrete meaning of the concept note's "reines P2P, keine
+  dritte Partei" requirement for the 1:1 case: a relay, even a well-intentioned one, WOULD be a third
+  party in the media path — deliberately not introduced this wave.
+* **No Circuit-Relay v2 fallback for calls behind NAT** — a realistically scoped follow-up wave (the
+  library classes exist), but the Virtus-compensation question for who runs a relay is open, and a
+  relay-carried call is not "reines P2P" for the 1:1 case the way a direct connection is — worth its
+  own design discussion, not a default to reach for silently.
+* **Audio only, no video.** `CallMediaKind.AUDIO_VIDEO` is reserved and rejected outright at the
+  `CallSignalCodec` layer — a video call needs a capture device (absent in CI/headless environments)
+  and a render surface (absent from a browser control-panel UI), neither of which this wave builds.
+* **Non-Trickle ICE.** Full local candidate gathering completes (or `CallConfig
+  .iceGatheringTimeout` elapses) before an `INVITE`/`ACCEPT`'s SDP is ever sent —
+  `CallSignalType.ICE_CANDIDATE` is reserved and rejected outright. Simpler state machine, at the cost
+  of slightly slower call setup than a Trickle-ICE implementation would offer; acceptable given no
+  STUN/TURN round trip is ever needed either.
+* **No delivery via the offline Nabu mailbox — structurally, not merely by convention.**
+  `DmSessionManager.sendCallSignal` never calls the offline-deposit path at all, and
+  `DmSessionManager.handleOfflineEnvelope` independently rejects a hand-crafted `CALL_SIGNAL` blob
+  BEFORE any decrypt attempt, as defense in depth. Two reasons: (1) a call ringing hours later, once a
+  recipient happens to poll their mailbox, is a malfunction, not a feature; (2) a mailbox blob is
+  referenced by a PUBLICLY gossiped `MailboxPointer` — the plaintext `messageType` byte of a fetched,
+  still-undecrypted envelope would tell an observer "a call was signaled here," a metadata leak this
+  node's ordinary DM traffic never produces.
+* **`autoRejectQuarantined` (default `true`): a quarantined caller is silently dropped, never sent a
+  `REJECT`.** The metadata-minimization argument mirrors point (2) above — replying at all would leak
+  this node's online presence to a sender its own `DmAcceptancePolicy` has already decided not to
+  trust. Accepted cost: a legitimate stranger's first-contact call attempt simply rings out to
+  `CallEndReason.RING_TIMEOUT` with no explanation, worse UX than an explicit decline.
+* **No V0.8.7b browser control surface in this wave** — deliberately, following the V0.8.6/V0.8.6b
+  precedent of shipping the engine and its production wiring separately from a browser UI, so this
+  wave is not "finished plumbing with no caller" the way an earlier review round criticized. A
+  browser-driven remote control (the call's actual audio still runs in the JVM process — the web page
+  is a remote control, not a browser-native WebRTC call) is a named follow-up, not an open question.
+* **`maxConcurrentCalls = 1` by default** — no call waiting, no hold. A second inbound `INVITE` while
+  one call is active is answered `REJECT(BUSY)`; the ongoing call is untouched.
+* **Call history (`CallLog`) is in-memory-only** — mirrors `DmStore`'s own "nothing persisted to disk"
+  discipline; a call log is at least as sensitive as a message history.
 
 == Diagrams
 

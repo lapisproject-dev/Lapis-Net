@@ -27,7 +27,7 @@ import java.nio.ByteBuffer
  *   0      4   magic "LNDM"  (Lapis Net Direct Message)
  *   4      1   version = 1
  *   5      1   flags - reserved, must be zero
- *   6      1   messageType  (wire byte: 0=TEXT, 1=X3DH_INITIAL, 2=RECEIPT reserved, 3=CALL_SIGNAL reserved)
+ *   6      1   messageType  (wire byte: 0=TEXT, 1=X3DH_INITIAL, 2=RECEIPT reserved, 3=CALL_SIGNAL - active since V0.8.7)
  *   7     33   senderIdentity              (secp256k1 compressed public key)
  *  40      1   x3dhInitialHeaderPresent    (0 or 1; MUST equal 1 iff messageType == X3DH_INITIAL)
  *  41     32   x3dhInitiatorX25519PublicKey            (all-zero when absent)
@@ -55,12 +55,23 @@ import java.nio.ByteBuffer
  * "sometimes-present" fields. Costs 137 extra bytes on every `TEXT` envelope (negligible relative to
  * a <=65 KB ratchet payload) in exchange for zero offset arithmetic to get wrong.
  *
+ * **The ratchet-plaintext contract this outer envelope's `ratchetMessage` decrypts to is
+ * `messageType`-dependent since V0.8.7, not a single format for every envelope.** `TEXT`/
+ * `X3DH_INITIAL` carry a [DmContentCodec]-encoded frame; `CALL_SIGNAL` carries a
+ * `net.lapisphilosophorum.lapisnet.call.CallSignalCodec`-encoded frame instead. This codec itself
+ * stays entirely agnostic to that distinction - it never looks inside the ratchet plaintext - but the
+ * distinction is stated here because a reader of this class's own decode-order doc comment below
+ * could otherwise assume every `messageType` this codec accepts feeds the same downstream decoder.
+ *
  * Decode order (cheapest/most-selective first):
  * 1. `bytes.size > MAX_ENVELOPE_BYTES` - rejected on the first line, before any stream is opened.
  * 2. Too-short-to-be-structurally-valid - rejected next.
  * 3. magic/version/flags.
- * 4. `messageType` - if `RECEIPT`/`CALL_SIGNAL`/unrecognized wire byte, rejected immediately,
- *    BEFORE parsing `senderIdentity` or anything downstream (cheapest possible rejection point).
+ * 4. `messageType` - if `RECEIPT`/unrecognized wire byte, rejected immediately, BEFORE parsing
+ *    `senderIdentity` or anything downstream (cheapest possible rejection point). `CALL_SIGNAL` is
+ *    accepted here (active since V0.8.7) - it is [DmSessionManager]'s job, not this codec's, to
+ *    reject a `CALL_SIGNAL` arriving somewhere it should not (e.g. the offline mailbox - see
+ *    [DmSessionManager.handleOfflineEnvelope]).
  * 5. `senderIdentity` - [Secp256k1PublicKey]'s own constructor throws for a non-curve-point,
  *    funnelled by the blanket catch below.
  * 6. `x3dhInitialHeaderPresent` - cross-checked against `messageType`; mismatch is rejected.
@@ -208,14 +219,16 @@ object DmEnvelopeCodec {
             val flags = input.readUnsignedByte()
             if (flags != 0) throw MalformedDmEnvelopeException("reserved flag bits must be zero: $flags")
 
-            // messageType is checked - and RECEIPT/CALL_SIGNAL/unknown rejected - BEFORE
-            // senderIdentity or anything downstream is even parsed: the cheapest possible rejection
-            // point, and what the CALL_SIGNAL adversarial test asserts the ordering of.
+            // messageType is checked - and RECEIPT/unknown rejected - BEFORE senderIdentity or
+            // anything downstream is even parsed: the cheapest possible rejection point. CALL_SIGNAL
+            // is active since V0.8.7 and accepted here - see this object's own class doc comment for
+            // why rejecting it in the WRONG context (e.g. the offline mailbox) is DmSessionManager's
+            // job, not this structural codec's.
             val messageTypeByte = input.readByte()
             val messageType =
                 DmMessageType.fromWireValue(messageTypeByte)
                     ?: throw MalformedDmEnvelopeException("unknown dm messageType wire value $messageTypeByte")
-            if (messageType == DmMessageType.RECEIPT || messageType == DmMessageType.CALL_SIGNAL) {
+            if (messageType == DmMessageType.RECEIPT) {
                 throw MalformedDmEnvelopeException("messageType $messageType is reserved and rejected outright")
             }
 

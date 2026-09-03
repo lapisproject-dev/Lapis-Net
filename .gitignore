@@ -14,3 +14,7 @@ build/
 
 # Logs
 *.log
+
+# JVM crash artifacts (e.g. a native-library SIGSEGV under lapis-net-call's webrtc-java tests)
+hs_err_pid*.log
+core.[0-9]*
