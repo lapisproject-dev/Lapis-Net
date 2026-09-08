@@ -1,16 +1,16 @@
 [versions]
-kotlin = "2.4.10"
+kotlin = "2.4.20"
 ktlint-gradle = "14.2.0"
-slf4j = "2.0.18"
+slf4j = "2.0.19"
 kotlin-logging = "8.0.4"
-kotest = "6.2.2"
+kotest = "6.2.4"
 logback = "1.5.38"
-secp256k1-kmp = "0.23.0"
-bouncycastle = "1.85"
+secp256k1-kmp = "0.24.0"
+bouncycastle = "1.85.2"
 jvm-libp2p = "1.3.5-RELEASE"
 nabu = "v0.8.0"
-java-cid = "v1.3.8"
-ktor = "3.5.1"
+java-cid = "v1.3.10"
+ktor = "3.5.2"
 kotlinx-serialization-json = "1.11.0"
 electrum-client = "0.3.0"
 bitcoin-kmp = "0.31.0"
@@ -22,10 +22,10 @@ zxing = "3.5.4"
 lightning-kmp = "1.8.4"
 # V0.9.3 - pure-Java headless browser (executes real JS/DOM, no native browser binary), added
 # test-only to lapis-net-browser so MailXssRenderingTest.kt can prove mail.js's rendering function
-# actually escapes an injected <script>/onerror payload, not just describe the intent. Verified
-# current on Maven Central as of this wave (2026-08-04) via maven-metadata.xml - re-verify at a
-# later implementation time, versions drift.
-htmlunit = "5.3.0"
+# actually escapes an injected <script>/onerror payload, not just describe the intent. Bumped
+# 5.3.0 -> 5.5.0 during the 2026-09-08 dependency-maintenance wave; verified current on Maven
+# Central via maven-metadata.xml at that time - re-verify at a later implementation time, versions drift.
+htmlunit = "5.5.0"
 # V0.8.7 - libwebrtc JNI bindings (Apache-2.0; gebundeltes libwebrtc BSD-3), used exclusively by
 # lapis-net-call/WebRtcCallMediaEngine.kt. Bytecode target Java 8, verified runnable on JDK 25
 # (Temurin 25.0.4) via an executable probe on 2026-09-02 - two RTCPeerConnections in one JVM process,
