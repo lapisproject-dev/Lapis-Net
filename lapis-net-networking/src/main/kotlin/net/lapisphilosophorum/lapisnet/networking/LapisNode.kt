@@ -8,12 +8,22 @@ import io.libp2p.core.PeerId
 import io.libp2p.core.PeerInfo
 import io.libp2p.core.dsl.host
 import io.libp2p.core.multiformats.Multiaddr
+import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.mux.StreamMuxerProtocol
 import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.security.noise.NoiseXXSecureChannel
 import io.libp2p.transport.tcp.TcpTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopBinding
+import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopProtocol
+import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopBinding
+import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopProtocol
+import net.lapisphilosophorum.lapisnet.networking.relay.LapisRelayTransport
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationRegistry
 import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
@@ -129,6 +139,22 @@ class LapisNodeException(
 class LapisNode private constructor(
     val host: Host,
     private val mdns: MDnsDiscovery,
+    /**
+     * Circuit-Relay-v2 NAT traversal for this node: obtain and hold reservations on other peers'
+     * relays so peers that cannot dial this node directly can still reach it through one. Always
+     * present, but entirely inert until a caller asks for a reservation - see
+     * [net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig].
+     */
+    val relayClient: RelayReservationClient,
+    /**
+     * Handlers notified about **relayed inbound** connections. Such a connection is accepted by the
+     * circuit-relay stop protocol, not by a listening transport, so it never travels through
+     * `io.libp2p.network.NetworkImpl`'s own connection-handler broadcast the way every direct
+     * connection does - a handler registered only via [Host.addConnectionHandler] would silently
+     * never see it. [addConnectionHandler] registers on both paths; each connection only ever
+     * traverses one of them, so a handler is invoked exactly once per connection either way.
+     */
+    private val relayInboundHandlers: ConnectionHandler.Broadcast,
 ) {
     private val discovered = BoundedPeerCache(MAX_DISCOVERED_PEERS)
     private val stopped = AtomicBoolean(false)
@@ -157,7 +183,28 @@ class LapisNode private constructor(
 
     val peerId: PeerId get() = host.peerId
 
+    /**
+     * Every address this node currently claims to be reachable at, direct **and** relayed. Once
+     * [relayClient] holds a reservation, this list additionally contains one
+     * `<relay>/p2p-circuit/p2p/<this node>` entry per relay address - the address a peer behind
+     * NAT publishes so others can dial it. See [directListenAddresses] for the direct-only subset.
+     */
     fun listenAddresses(): List<Multiaddr> = host.listenAddresses()
+
+    /** [listenAddresses] minus every relayed (`/p2p-circuit`) entry. */
+    fun directListenAddresses(): List<Multiaddr> = host.listenAddresses().filterNot { it.has(Protocol.P2PCIRCUIT) }
+
+    /**
+     * Registers [handler] for **every** connection this node makes or accepts, direct or relayed -
+     * see [relayInboundHandlers] for why `host.addConnectionHandler` alone is not equivalent. Any
+     * protocol that reacts to connection-established events (GossipSub above all) must register
+     * here rather than on [host] directly, or it will simply not exist as far as a peer reachable
+     * only through a relay is concerned.
+     */
+    fun addConnectionHandler(handler: ConnectionHandler) {
+        host.addConnectionHandler(handler)
+        relayInboundHandlers += handler
+    }
 
     /** Peers discovered via mDNS so far. Never auto-dialed - see the class doc. */
     fun discoveredPeers(): List<PeerInfo> = discovered.values()
@@ -205,6 +252,11 @@ class LapisNode private constructor(
      */
     fun stop(timeout: Duration = DEFAULT_TIMEOUT) {
         if (!stopped.compareAndSet(false, true)) return
+        // Stop renewing relay reservations before anything else: the renewal task dials, and a
+        // dial racing a host shutdown is pure noise. Never fatal - a failure here must not stop the
+        // host's own shutdown, same reasoning as the mDNS/host split below.
+        runCatching { relayClient.stop() }
+            .onFailure { logger.warn(it) { "failed to stop relay reservation renewal cleanly" } }
         val mdnsFailure = runCatching { awaitOrWrap("stop mDNS discovery", timeout) { mdns.stop() } }.exceptionOrNull()
         if (mdnsFailure != null) {
             logger.warn(mdnsFailure) { "failed to stop mDNS discovery cleanly, stopping host anyway" }
@@ -231,11 +283,37 @@ class LapisNode private constructor(
         }
 
     companion object {
+        /**
+         * Builds an unstarted node.
+         *
+         * [relayConfig] controls Circuit-Relay-v2 NAT traversal. The default
+         * ([RelayConfig.CLIENT_ONLY]) makes this node able to *use* relays - it can dial
+         * `/p2p-circuit` addresses and can ask for a reservation via [relayClient] - while never
+         * acting as a relay for anyone else. Carrying strangers' traffic requires
+         * [RelayConfig.relayServer] explicitly; see that class's doc comment for why the split
+         * matters.
+         */
         fun create(
             identity: DualKeyIdentity,
             listenAddress: Multiaddr = DEFAULT_LISTEN_ADDRESS,
+            relayConfig: RelayConfig = RelayConfig.CLIENT_ONLY,
         ): LapisNode {
             val privKey = identity.deriveLibp2pPrivKey()
+            val connectionCap = ConnectionCapHandler()
+            // Relayed inbound connections never pass through NetworkImpl's own connection handler
+            // (they are accepted by the stop protocol, not by a listening transport), so the
+            // connection cap has to be reachable from there too. The SAME handler instance is used
+            // on both paths, and each connection only ever traverses one of them, so a connection
+            // is counted exactly once either way.
+            val relayInboundHandlers = ConnectionHandler.createBroadcast(listOf(connectionCap))
+
+            val registry = RelayReservationRegistry(relayConfig.serverLimits)
+            val stopProtocol = LapisCircuitStopProtocol(relayConfig.clientLimits)
+            val stopBinding = LapisCircuitStopBinding(stopProtocol)
+            val hopProtocol = LapisCircuitHopProtocol(relayConfig, registry, stopBinding) { Instant.now() }
+            val hopBinding = LapisCircuitHopBinding(hopProtocol)
+            lateinit var relayTransport: LapisRelayTransport
+
             val builtHost =
                 host {
                     identity {
@@ -243,6 +321,10 @@ class LapisNode private constructor(
                     }
                     transports {
                         add(::TcpTransport)
+                        add { upgrader ->
+                            LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits)
+                                .also { relayTransport = it }
+                        }
                     }
                     secureChannels {
                         add(::NoiseXXSecureChannel)
@@ -250,16 +332,28 @@ class LapisNode private constructor(
                     muxers {
                         add(StreamMuxerProtocol.Mplex)
                     }
+                    protocols {
+                        add(hopBinding)
+                        add(stopBinding)
+                    }
                     network {
                         listen(listenAddress.toString())
                     }
                 }
+            hopProtocol.setHost(builtHost)
+            relayTransport.setHost(builtHost)
+            stopProtocol.onCircuitAccepted = { stream, initiator ->
+                relayTransport.acceptCircuit(stream, initiator, relayInboundHandlers)
+            }
+            val relayClient = RelayReservationClient(builtHost, hopBinding, relayConfig.clientLimits)
+            relayTransport.circuitAddresses = relayClient::circuitAddresses
+            stopProtocol.holdsReservationWith = relayClient::holdsReservationWith
             // Registered BEFORE start() - see MAX_CONCURRENT_CONNECTIONS's own doc comment for why
             // that ordering matters here (no "attached too late" gap, unlike GossipPubSub.attach's
             // documented must-be-before-connect() precondition).
-            builtHost.addConnectionHandler(ConnectionCapHandler())
+            builtHost.addConnectionHandler(connectionCap)
             val mdns = MDnsDiscovery(builtHost)
-            val node = LapisNode(builtHost, mdns)
+            val node = LapisNode(builtHost, mdns, relayClient, relayInboundHandlers)
             mdns.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {
                     logger.info { "mDNS discovered peer ${peerInfo.peerId}" }

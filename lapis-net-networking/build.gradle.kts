@@ -22,6 +22,9 @@ dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
     api(rootProject.libs.jvm.libp2p)
+    // See the `netty` entry in gradle/libs.versions.toml: jvm-libp2p exposes these codecs only at
+    // runtime scope, and relay/CircuitRelayProtocols.kt needs them at compile time.
+    implementation(rootProject.libs.netty.codec.protobuf)
 
     // Test-only concrete SLF4J backend, so GossipPubSubConnectOrderTest can attach a Logback
     // ListAppender and assert on actual WARN-level log events (round-2 N1 regression test) - this

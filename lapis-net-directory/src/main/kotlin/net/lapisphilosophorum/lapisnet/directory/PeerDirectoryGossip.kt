@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.directory
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.libp2p.core.PeerId
+import io.libp2p.core.PeerInfo
 import io.libp2p.core.pubsub.PubsubSubscription
 import io.libp2p.core.pubsub.ValidationResult
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
@@ -89,6 +90,43 @@ class PeerDirectoryGossip private constructor(
         return if (record.notValidAfterEpochSecond < nowEpochSecond) null else record
     }
 
+    /**
+     * Candidate Circuit-Relay-v2 relays currently visible in this node's directory view: identities
+     * whose latest still-valid record advertises [PeerCapability.RELAY] **and** carries at least one
+     * directly-dialable address (a relay reachable only through another relay is useless - and
+     * relay chaining is refused by the relay server itself, see
+     * `net.lapisphilosophorum.lapisnet.networking.relay.HopReceiver`).
+     *
+     * **Candidates, not choices, and nothing acts on them automatically.** The returned
+     * [io.libp2p.core.PeerInfo]s are exactly what
+     * `net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient.reserve` takes, but
+     * the decision to reserve stays with the caller. [PeerCapability.RELAY] is self-reported and
+     * unverified like every other capability bit, so this list is a starting point for an
+     * attempt, never an assertion that any entry works.
+     *
+     * Capped at [limit] because the underlying index is fed by gossip from strangers: an attacker
+     * can mint arbitrarily many identities all claiming to relay, and a caller iterating an
+     * unbounded candidate list would be doing exactly the attacker's bidding. Ordering is the
+     * index's own and carries no ranking - a Madli-informed preference order is a plausible
+     * follow-up, deliberately not invented here.
+     */
+    fun relayCandidates(
+        limit: Int = DEFAULT_RELAY_CANDIDATE_LIMIT,
+        nowEpochSecond: Long = Instant.now().epochSecond,
+    ): List<PeerInfo> {
+        require(limit > 0) { "limit must be > 0, was $limit" }
+        return index
+            .allIdentities()
+            .asSequence()
+            .mapNotNull { lookup(it, nowEpochSecond) }
+            .filter { PeerCapability.RELAY in it.capabilities }
+            .mapNotNull { record ->
+                val dialable = record.directAddresses
+                if (dialable.isEmpty()) null else PeerInfo(record.peerId, dialable)
+            }.take(limit)
+            .toList()
+    }
+
     /** Unsubscribes from the gossip topic. No other sub-resources to release - mirrors
      * `VeritasGossip.stop` exactly. */
     fun stop() {
@@ -101,6 +139,11 @@ class PeerDirectoryGossip private constructor(
          * tag, mirroring `VeritasGossip.VERITAS_GRANT_GOSSIP_TOPIC`'s identical "topic name and
          * signing tag are different kinds of thing" precedent. */
         const val PEER_RECORD_GOSSIP_TOPIC = "LapisNet:peer-record-gossip:v1"
+
+        /** Default cap on [relayCandidates]' result - see its doc comment for why an unbounded
+         * candidate list would be an attacker-controlled work queue. A handful is plenty:
+         * `RelayClientLimits.maxReservations` defaults to four reservations total. */
+        const val DEFAULT_RELAY_CANDIDATE_LIMIT = 16
 
         /** Attaches directory-specific GossipSub wiring on top of an already-[GossipPubSub.attach]-ed
          * [pubsub] and an already-[NabuStorage.attach]-ed [storage]. Subscribes to

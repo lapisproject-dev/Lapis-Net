@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.directory
 
 import io.libp2p.core.PeerId
 import io.libp2p.core.multiformats.Multiaddr
+import io.libp2p.core.multiformats.Protocol
 import io.libp2p.crypto.keys.unmarshalEd25519PublicKey
 import net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
@@ -387,3 +388,33 @@ fun PeerRecord.verifyBinding(): Boolean = IdentityBinding.verify(identity, bindi
  * for the same reason [verifyBinding] is one: call sites read as `record.verifyPossession()`. */
 fun PeerRecord.verifyPossession(): Boolean =
     binding.ed25519PublicKey.verify(possessionDigest(identity), possessionProof)
+
+/**
+ * The subset of [PeerRecord.addresses] that reaches this identity **through a Circuit-Relay-v2
+ * relay** rather than directly - i.e. those carrying a `/p2p-circuit` component. This is how a peer
+ * behind NAT publishes its reachability: it obtains a relay reservation
+ * (`net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient.reserve`), asks its node
+ * for `LapisNode.listenAddresses()`, and announces the result in the usual way.
+ *
+ * **Deliberately a derived view, not a new wire field.** The NAT-traversal wave was scoped to add
+ * "optional relay addresses" to this record, and the honest implementation of that turned out to be
+ * *nothing at all* on the wire: [PeerRecord.addresses] is already a list of arbitrary
+ * [Multiaddr]s, a circuit address is a perfectly ordinary multiaddr, and it is self-identifying by
+ * its `/p2p-circuit` component. [PeerRecordCodec]'s own `MAX_MULTIADDR_BYTES` comment already sized
+ * its cap around exactly such an address. A parallel `relayAddresses` field would have duplicated
+ * information already present, needed its own codec version bump, and - the reason that actually
+ * settles it - added a second, independently-forgeable place for an attacker to put addresses into
+ * a record whose signature discipline took four audit rounds to get right. This wave's real
+ * additions to this module are therefore [PeerCapability.RELAY] (genuinely new information: "I am
+ * willing to relay for others", which is *not* derivable from any address) and these two accessors.
+ *
+ * Unverified like every other address in this record - see this class's "no reachability
+ * verification of advertised addresses" scope cut, which relay addresses do not change.
+ */
+val PeerRecord.relayAddresses: List<Multiaddr>
+    get() = addresses.filter { it.has(Protocol.P2PCIRCUIT) }
+
+/** [PeerRecord.addresses] minus [relayAddresses] - the directly-dialable subset. A caller that
+ * wants to try a direct dial first and fall back to a relayed one reads these two in that order. */
+val PeerRecord.directAddresses: List<Multiaddr>
+    get() = addresses.filterNot { it.has(Protocol.P2PCIRCUIT) }

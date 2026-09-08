@@ -35,12 +35,36 @@ enum class PeerCapability(
      * capability gate: any identity can always be mailed via its gossip topic regardless of this
      * flag, and this bit is never verified (see this enum's class doc comment). */
     MAILBOX(0x04),
+
+    /**
+     * This identity's node is willing to act as a **Circuit-Relay-v2 relay** for other peers, so a
+     * peer behind NAT may ask it for a reservation
+     * (`net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient.reserve`).
+     *
+     * Added in the NAT-traversal wave, using exactly the forward-compatibility path this enum's own
+     * doc comment anticipated: a new bit `0x08`, no codec version change, no invalidation of any
+     * record already on the wire. Records minted before this wave simply do not set it. Older
+     * *readers* reject a record that does set it as a reserved-bits violation - the intended,
+     * documented meaning of the reserved-bits rule, and the reason capability bits are the right
+     * place for this rather than a new codec field would have been.
+     *
+     * **Self-reported and unverified like every other bit here** - see this enum's class doc
+     * comment. A peer that advertises this and then refuses every reservation costs the asker one
+     * refused request, nothing more; a peer that advertises it honestly is simply a *candidate*,
+     * and choosing which candidate to actually use stays the caller's decision. Nothing in this
+     * codebase auto-reserves on the strength of this flag.
+     *
+     * **No compensation is implied.** Relay service is, in this wave, purely reputational
+     * (Madli, `lapis-net-madli`) - see
+     * `net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig`'s doc comment.
+     */
+    RELAY(0x08),
     ;
 
     companion object {
         /** Every currently-defined bit OR-ed together - [PeerRecordCodec.decode] rejects any
          * other set bit as a reserved-bits violation. */
-        const val KNOWN_BITS_MASK = 0x07
+        const val KNOWN_BITS_MASK = 0x0F
 
         fun setFromBits(bits: Int): Set<PeerCapability> = entries.filterTo(mutableSetOf()) { bits and it.bit != 0 }
 

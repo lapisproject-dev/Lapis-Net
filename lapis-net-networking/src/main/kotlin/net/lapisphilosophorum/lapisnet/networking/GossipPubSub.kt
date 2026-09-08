@@ -216,7 +216,10 @@ class GossipPubSub private constructor(
             // NabuStorage's Bitswap/Kademlia wiring, minus the AddressBookConsumer step (see this
             // class's doc comment: GossipSub never dials on its own).
             host.addProtocolHandler(gossip)
-            host.addConnectionHandler(gossip)
+            // node.addConnectionHandler, NOT host.addConnectionHandler: the latter misses relayed
+            // inbound connections entirely, which would make a peer reachable only through a
+            // circuit-relay invisible to GossipSub. See LapisNode.addConnectionHandler.
+            node.addConnectionHandler(gossip)
             val seqNo = AtomicLong(System.currentTimeMillis())
             val publisher = gossip.createPublisher(host.privKey) { seqNo.incrementAndGet() }
             logger.info { "attached GossipSub to host ${host.peerId}" }

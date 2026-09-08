@@ -80,7 +80,7 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 Known, deliberate gaps — not oversights, each documented at the point it was cut:
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
-* *No NAT traversal beyond directly-dialable peers* — Circuit-Relay v2/AutoNAT exist in `jvm-libp2p` but are unwired; `dcutr` hole punching is absent from the library entirely.
+* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are compensated only in reputation (Madli), not payment.
 * *No browser control surface for calls (V0.8.7b)* — a 1:1 call's audio runs in the JVM node process; a browser page would only remote-control it, not carry browser-native WebRTC.
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.

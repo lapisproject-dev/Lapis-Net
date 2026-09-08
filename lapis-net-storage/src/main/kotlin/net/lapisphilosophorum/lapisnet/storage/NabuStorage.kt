@@ -365,7 +365,13 @@ class NabuStorage private constructor(
             // both failures are swallowed silently inside Bitswap.sendWants's try/catch.
             bitswap.setAddressBook(host.addressBook)
             host.addProtocolHandler(bitswap)
-            host.addConnectionHandler(bitswap)
+            // node.addConnectionHandler, NOT host.addConnectionHandler: a relayed inbound
+            // connection is accepted by the circuit-relay stop protocol rather than by a listening
+            // transport, so it never reaches jvm-libp2p's own connection-handler broadcast. A
+            // Bitswap registered on the Host alone would simply not know that a peer reachable only
+            // through a relay exists, and would never answer or send wants to it - the same gap
+            // GossipPubSub.attach closes the same way. See LapisNode.addConnectionHandler.
+            node.addConnectionHandler(bitswap)
 
             val ourPeerId = Multihash.deserialize(host.peerId.bytes)
             val kademliaEngine =

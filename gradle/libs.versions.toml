@@ -30,6 +30,14 @@ bouncycastle = "1.85.2"
 # "Cross-node DHT provider discovery". No dependency coordinate changed in that repair, so the
 # fork-exclusion/bytecode-compatibility verification recorded below still stands unmodified.
 jvm-libp2p = "1.3.5-RELEASE"
+# Netty's protobuf codec. jvm-libp2p already pulls this in, but only at *runtime* scope, so the
+# classes are present when the process runs and absent when this project compiles. That is fine for
+# jvm-libp2p's own (precompiled) circuit-relay handlers and not fine for
+# lapis-net-networking/relay/CircuitRelayProtocols.kt, which has to strip those very codecs off a
+# stream when a relay control stream becomes a raw byte pipe. Declared explicitly, pinned to the
+# version jvm-libp2p:1.3.5-RELEASE itself resolves (verified via the runtimeClasspath report) so the
+# compile and runtime classpaths cannot drift apart - re-check when jvm-libp2p is next bumped.
+netty = "4.2.10.Final"
 nabu = "v0.8.0"
 java-cid = "v1.3.10"
 ktor = "3.5.2"
@@ -59,6 +67,7 @@ webrtc-java = "0.16.0"
 
 [libraries]
 jvm-libp2p = { group = "io.libp2p", name = "jvm-libp2p", version.ref = "jvm-libp2p" }
+netty-codec-protobuf = { group = "io.netty", name = "netty-codec-protobuf", version.ref = "netty" }
 nabu = { group = "com.github.peergos", name = "nabu", version.ref = "nabu" }
 java-cid = { group = "com.github.ipld", name = "java-cid", version.ref = "java-cid" }
 kotlin-logging = { group = "io.github.oshai", name = "kotlin-logging-jvm", version.ref = "kotlin-logging" }

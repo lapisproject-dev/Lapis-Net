@@ -166,19 +166,18 @@ Consensys artifacts) that must all be declared as repositories, since its own tr
 dependencies (`java-multibase`, `noise-java`) are split across them.
 
 GossipSub pub/sub and NAT traversal are explicitly out of scope for this wave; GossipSub lands in
-V0.1.7 (see below). **NAT traversal update (V0.8.7, 2026-09-02): no longer an open research
-question, but a concretely scoped, unimplemented gap.** Verified against the resolved
-`jvm-libp2p:1.3.5-RELEASE` jar: Circuit-Relay v2
+V0.1.7 (see below). **NAT traversal update: relay-based traversal is IMPLEMENTED (see
+"NAT traversal over Circuit Relay v2" below); `dcutr` hole punching remains absent.** The earlier
+statement of this gap (V0.8.7, 2026-09-02) recorded that Circuit-Relay v2
 (`io.libp2p.protocol.circuit.{RelayTransport,CircuitHopProtocol,CircuitStopProtocol}`) and AutoNAT
-are both PRESENT in the library but UNVERDRAHTET in `LapisNode` (which wires only TCP + Noise +
-Mplex + mDNS — see that class's own module). `dcutr` (hole punching) is ABSENT from the jar
-entirely — no package of that name exists. This means: relay-based NAT traversal is a realistic,
-scoped follow-up wave (wire the existing Circuit-Relay/AutoNAT classes — relay-reservation, candidate-
-relay discovery, relay addresses in `PeerRecord`, relay-side resource limits, an open Virtus-
-compensation question for who runs the relay); a `dcutr`-based direct-hole-punch fallback is NOT realistic without
-first implementing that protocol from scratch. See "1:1 calls over WebRTC (V0.8.7)" below for the
-concrete wave (audio calls) this distinction blocked from claiming a `dcutr` fallback it cannot
-deliver.
+were PRESENT in `jvm-libp2p:1.3.5-RELEASE` but unwired in `LapisNode`, while `dcutr` was ABSENT from
+the jar entirely. That reading of the jar was correct as far as it went, but presence turned out not
+to imply usability: wiring the relay classes up revealed that the library's own hop and stop
+handlers cannot carry a working circuit at all (three independent defects, enumerated below), so
+this project now implements the Circuit-Relay-v2 handler logic itself on top of jvm-libp2p's wire
+types. `dcutr` remains genuinely absent and out of reach without implementing that protocol from
+scratch. See "1:1 calls over WebRTC (V0.8.7)" below for the wave this distinction originally blocked
+from claiming a `dcutr` fallback it could not deliver.
 
 == Storage (V0.1.4)
 
@@ -3952,8 +3951,10 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
 === Explicit, deliberate scope cuts for this wave
 
 * **No `dcutr` hole punching, and no Circuit-Relay fallback.** See the NAT-traversal note near the top
-  of this document (revised this wave) — `dcutr` is entirely absent from `jvm-libp2p:1.3.5-RELEASE`;
-  Circuit-Relay v2/AutoNAT are present but unwired in `LapisNode`. **Consequence**: a call only
+  of this document — `dcutr` is entirely absent from `jvm-libp2p:1.3.5-RELEASE`. (Circuit-Relay v2
+  was "present but unwired" when this wave shipped; it has since been implemented — see "NAT
+  traversal over Circuit Relay v2" — but `lapis-net-call` was deliberately left untouched by that
+  wave, so this bullet still describes the call path as it stands.) **Consequence**: a call only
   connects between DIRECTLY DIALABLE peers — the same reach as V0.8.4/V0.8.5's own text-DM
   limitation, no better and no worse. The media path uses ONLY ICE host candidates — no STUN/TURN
   server is ever contacted, structurally enforced by `WebRtcCallMediaEngine`'s
@@ -3962,10 +3963,11 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
   structural guarantee). This is also the concrete meaning of the concept note's "reines P2P, keine
   dritte Partei" requirement for the 1:1 case: a relay, even a well-intentioned one, WOULD be a third
   party in the media path — deliberately not introduced this wave.
-* **No Circuit-Relay v2 fallback for calls behind NAT** — a realistically scoped follow-up wave (the
-  library classes exist), but the Virtus-compensation question for who runs a relay is open, and a
-  relay-carried call is not "reines P2P" for the 1:1 case the way a direct connection is — worth its
-  own design discussion, not a default to reach for silently.
+* **No Circuit-Relay v2 fallback for calls behind NAT** — still true of `lapis-net-call` even now
+  that the network layer has one. Routing a call over a relay is not "reines P2P" for the 1:1 case
+  the way a direct connection is, so it stays a deliberate design question rather than something to
+  switch on silently; the compensation question for relay operators is answered (reputation via
+  Madli, no payment) but the media-path question is not.
 * **Audio only, no video.** `CallMediaKind.AUDIO_VIDEO` is reserved and rejected outright at the
   `CallSignalCodec` layer — a video call needs a capture device (absent in CI/headless environments)
   and a render surface (absent from a browser control-panel UI), neither of which this wave builds.
@@ -3996,6 +3998,241 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
   one call is active is answered `REJECT(BUSY)`; the ongoing call is untouched.
 * **Call history (`CallLog`) is in-memory-only** — mirrors `DmStore`'s own "nothing persisted to disk"
   discipline; a call log is at least as sensitive as a message history.
+
+== NAT traversal over Circuit Relay v2
+
+This wave closes the oldest usability gap in the project: until now a peer was reachable only if it
+was directly dialable — same LAN, or a public address — which the DM, mail and call modules all
+document as an accepted limitation. A node can now instead reserve a slot on a **Circuit-Relay-v2**
+relay and publish a `/p2p-circuit` address; a peer holding only that address dials it *through* the
+relay and ends up with an ordinary, fully Noise-encrypted, muxed `Connection`.
+
+Scope is deliberately the network layer alone (`lapis-net-networking`, plus an additive change in
+`lapis-net-directory`). `lapis-net-dm`, `lapis-net-mail`, `lapis-net-call` and `lapis-net-ratchet`
+are untouched: they all benefit automatically wherever they already dial a `PeerRecord`'s addresses,
+but none of them was redesigned around relayed reachability, and `lapis-net-call` in particular
+still refuses to route media over a relay on purpose (see its own scope cuts above).
+
+=== Why the library's Circuit-Relay classes could not simply be wired up
+
+The V0.8.7 survey of `jvm-libp2p:1.3.5-RELEASE` recorded that `RelayTransport`, `CircuitHopProtocol`
+and `CircuitStopProtocol` exist. They do — and they are not usable as they stand. All three defects
+below were found by reading the library sources against the resolved jar and confirmed against
+`1.3.6-RELEASE`, whose `io/libp2p/protocol/circuit` tree is byte-for-byte identical, so no dependency
+bump avoids any of them:
+
+. **The 2 KiB traffic limiter is never removed.** `ProtocolHandler.initChannel` installs an
+  `InboundTrafficLimitHandler(2048)` on every hop and stop stream, and neither
+  `CircuitHopProtocol.HopRemover` nor `CircuitStopProtocol.StopRemover` removes it when the stream
+  stops being a control stream and becomes the circuit's raw byte pipe. A relayed connection would
+  therefore be torn down with a `ProtocolViolationException` partway through its own Noise handshake.
+. **The hop responder throws on every successful reservation.** `CircuitHopProtocol.Receiver.onMessage`
+  is a Java `switch` with no `break` after its `RESERVE` case, so a *granted* reservation falls
+  through into the `CONNECT` case and evaluates `new PeerId(msg.getPeer().getId().toByteArray())` on
+  an empty peer field — `IllegalArgumentException: Invalid peerId length: 0`, on the one path that
+  has to work.
+. **The stop responder has an unfinished line in it.** `CircuitStopProtocol.Receiver.onMessage`
+  calls `RelayTransport.upgradeStream(..., connHandler)` with a literal
+  `ConnectionHandler connHandler = null; // TODO`, so accepting a relayed connection ends in a
+  `NullPointerException` instead of handing anything to the host.
+
+Two further problems make `RelayTransport` itself unusable as the reservation driver, independent of
+the above: `ensureEnoughCurrentRelays` stores a blank `RelayState` (no addresses, no controller, no
+renewal deadline) for every relay it reserves with, so the next `listenAddresses()` or renewal pass
+dereferences `null`; and its `dial` blocks the calling thread on `join()` three times, which
+deadlocks when the caller is a Netty event-loop thread — which, for a transport invoked from
+`NetworkImpl.connect`, it can be.
+
+Consequently `lapis-net-networking/relay` implements the hop and stop protocol handlers and the
+`/p2p-circuit` transport itself, reusing from the library exactly what is sound: the generated
+`Circuit.*` protobuf wire types, `CircuitHopProtocol.createVoucher` (the one self-contained piece of
+its hop implementation — it does nothing but build and sign the reservation envelope), and
+`RelayTransport.upgradeStream` — the shared helper that performs the end-to-end Noise handshake and
+muxer negotiation, and therefore the reason a relay sees only ciphertext.
+
+[NOTE]
+====
+**Interop with foreign relay clients is intended but unverified.** Reusing the generated `Circuit.*`
+wire types and issuing a real `libp2p-relay-rsvp` reservation voucher removes the two things that
+would make a go-libp2p or rust-libp2p client reject this relay outright — a standard client treats a
+reservation without a voucher as not granted at all. But nothing in this repository has ever spoken
+to one: every test here is Lapis Net node to Lapis Net node. Treat cross-implementation interop as a
+claim about the wire format, not as a tested property.
+
+An earlier revision of this document asserted that `createVoucher` was already being reused while
+`HopReceiver.handleReserve` in fact returned no voucher at all. That gap is closed; the "untested
+against other implementations" caveat stands on its own and is not closed by it.
+====
+
+=== Shape of the implementation
+
+`RelayConfig` splits the two roles that a single "relay support" flag would have conflated:
+
+* **Client role** — always available and inert until used. Any node can dial a `/p2p-circuit`
+  address, and can ask a named relay for a reservation through `LapisNode.relayClient`
+  (`RelayReservationClient`). Nothing happens on a timer; the only automatic behaviour is *renewal*
+  of a reservation that already exists, because a lapsed reservation would leave the node
+  advertising an address that no longer resolves.
+* **Server role** — `serverEnabled`, **false by default**. A node that has not opted in answers
+  every `RESERVE` with `PERMISSION_DENIED` and every `CONNECT` with `NO_RESERVATION`. This is the
+  single most important property in the module: a relay spends the operator's bandwidth and IP
+  address on attacker-chosen traffic to attacker-chosen third parties, so it must never be an
+  accidental default.
+
+`RelayReservationRegistry` is the relay-side reservation table, replacing
+`CircuitHopProtocol.RelayManager.limitTo` (which never expires an entry and hands out a
+4 096-byte / 120-second circuit budget that cannot carry a handshake). Its ceilings live in
+`RelayServerLimits` and every one of them exists because a remote party can otherwise grow something
+without bound — the same discipline as `MAX_CONCURRENT_CONNECTIONS`, `BoundedRecordStore` and
+`lapis-net-dm`'s `MAX_LIVE_SESSIONS`:
+
+[cols="1,1,3"]
+|===
+| Limit | Default | What it bounds
+
+| `maxConcurrentReservations` | 64 | Peers simultaneously reachable through this relay; each costs a held-open connection and a map entry. Expired entries are pruned on every reservation call, so abandoned slots recover with no background timer.
+| `reservationTtl` | 15 min | How long a peer that silently went away keeps occupying a slot.
+| `maxConcurrentCircuits` | 128 | Total forwarded connections, across all reservations.
+| `maxCircuitsPerReservation` | 8 | Stops one reserved peer (or anyone attacking it) from consuming the whole circuit budget and starving the others.
+| `maxReservationsPerSourceAddress` | 4 | Sybil floor. `maxConcurrentReservations` is counted per `PeerId`, and a `PeerId` costs one Ed25519 keygen — so one machine could otherwise mint identities until it held every slot. Counting per source IP as well makes that flood cost network locations instead. Deliberately crude, and deliberately not the whole answer (see below).
+| `maxConnectAttemptsPerWindow` / `connectRateLimitWindow` | 30 / 1 min | Per-initiator `CONNECT` rate. A `CONNECT` is nearly free to send and costs the *target* a full Noise handshake, so an unlimited rate turns this relay into a CPU amplifier aimed at whoever reserved here. Checked before any stop stream is opened, so a refused attempt never reaches the target.
+| `circuitMaxBytes` | 64 MiB | Bytes forwarded in one direction of one circuit before teardown. A *lifetime* budget, not a memory budget — see the flow-control note below.
+| `circuitMaxDuration` | 10 min | Wall-clock circuit lifetime, so near-idle parked circuits cannot evade the byte cap.
+| `circuitSetupTimeout` | 20 s | Deadline on reaching the destination over the stop protocol, so a destination that accepts and goes silent cannot pin a claimed circuit slot.
+|===
+
+**Forwarding is flow-controlled, and that — not `circuitMaxBytes` — is what bounds the relay's
+memory.** `CircuitProxyHandler` stops reading from one leg as soon as the other leg's transport is
+over an explicit write-buffer high water mark (64 KiB low / 256 KiB high), and `CircuitReadResumer`
+lifts the pause when it drains. Without that, a peer that opens circuits and then simply never reads
+makes the relay queue everything the other side sends — up to `circuitMaxBytes` per circuit times
+`maxConcurrentCircuits`, several GiB at the defaults, paid entirely by the relay operator. The node
+multiplexes with mplex, which unlike yamux has no send-buffer bound of its own, so nothing below
+this layer would have caught it. Both handlers necessarily act on the *connection* channels rather
+than on the mplex substreams: a substream's outbound buffer is always empty (`MuxChannel.doWrite`
+hands each buffer straight to the parent) and a substream cannot be paused (`doBeginRead` is a
+no-op). Pausing a whole connection is coarser than pausing one circuit — **not merely a brief
+stall**: a single unread circuit can pause every other circuit and reservation-renewal control
+message on that connection for as long as the slow leg stays unread, up to `circuitMaxDuration`
+(10 minutes at the defaults), which can eat far enough into `reservationTtl` (15 minutes) to cost
+the paused peer its reservation. This is a bounded, connection-scoped head-of-line stall traded
+deliberately against the alternative of unbounded relay-operator heap growth — the right direction
+to err in, but a real availability cost, not a cosmetic one. A tighter fix (aborting the slow
+circuit once its pause exceeds some threshold, rather than pausing indefinitely) is a documented
+follow-up, not yet built. `CircuitProxyBackpressureTest` proves both backpressure halves against a
+real TCP peer that never reads; it does not exercise the connection-wide stall itself.
+
+A refused hop or stop request closes its stream rather than answering and leaving it open, so
+sending requests that get refused does not accumulate free substreams on the refusing node.
+
+`RelayClientLimits` is the mirror image — protection against a **malicious relay** rather than
+malicious clients. A relay cannot read a relayed payload (the Noise session is end to end), but it
+does choose the numbers it announces, so none of them is trusted: the node caps inbound bytes per
+circuit locally, clamps a relay-announced reservation expiry into a sane window (a relay claiming a
+century would otherwise suppress renewal forever), bounds how many reservations it holds at once,
+and derives its published circuit addresses from the addresses it *dialled* rather than the ones the
+relay announced about itself.
+
+It also bounds inbound circuits it has *accepted but not yet finished upgrading*
+(`maxConcurrentInboundCircuits`, 32; `circuitAcceptTimeout`, 20 s). This is a separate counter on
+purpose: `MAX_CONCURRENT_CONNECTIONS` / `ConnectionCapHandler` only ever observes a `Connection`
+that already exists, i.e. one whose Noise handshake completed, so a relay that offers circuits and
+stalls every handshake is invisible to it while holding a stream and a half-built Noise session per
+circuit. `InboundCircuitAdmissionTest` exercises both the cap and the timeout release against a
+handshake that never completes.
+
+Beyond the resource ceilings, the hop responder refuses: a `RESERVE` or `CONNECT` arriving over an
+already-relayed connection (no relay chaining, which would otherwise let an attacker build an
+amplification chain out of volunteer relays), a `CONNECT` naming the initiator itself or the relay
+itself, a `CONNECT` naming a target that holds no reservation, and any structurally malformed peer
+id. `splitCircuitAddress` likewise rejects an address carrying more than one `/p2p-circuit`
+component.
+
+=== Two consequences worth knowing about
+
+**Relayed inbound connections bypass `NetworkImpl`.** A circuit's destination side is accepted by
+the stop protocol, not by a listening transport, so such a connection never reaches jvm-libp2p's own
+connection-handler broadcast or its `connections` list. `LapisNode.addConnectionHandler` therefore
+registers on both paths (each connection traverses exactly one of them, so a handler still fires
+exactly once per connection), and both `GossipPubSub.attach` and `NabuStorage.attach` were moved
+onto it — without that, a peer reachable only through a relay would be invisible to GossipSub and to
+Bitswap, which would never answer or send wants to it. **Any protocol reacting to
+connection-established events must register through `LapisNode.addConnectionHandler`, never through
+`host.addConnectionHandler`.** The transport keeps its own list of
+live relayed connections so `LapisNode.stop()` closes them rather than leaking them. What remains
+unfixed is `NetworkImpl.connect`'s existing-connection short-circuit: it does not know about an
+accepted relayed connection, so a node that was reached over a relay and later dials that same peer
+opens a second connection instead of reusing the first.
+
+**A continuation that writes on a freshly-negotiated stream must not run inline.** A
+`CompletableFuture` from `Host.newStream` is completed from inside jvm-libp2p's own multistream
+negotiation stack, on the stream's event loop, at a point where that stream's outbound protobuf
+encoder is not yet reachable from the pipeline tail. A `writeAndFlush` issued inline from such a
+continuation is silently dropped — no exception, no log, the peer simply never answers and the
+exchange dies at a timeout. This bit both halves of circuit setup while this wave was being built
+(the dialler's `CONNECT` and the relay's `STOP CONNECT`); a `RESERVE` sent from an ordinary caller
+thread after `get()` was never affected, which is what made it look mysterious. Every such
+continuation now hops onto `relayControlExecutor` first, and both call sites carry a comment
+pointing at that reasoning.
+
+=== Directory integration (`lapis-net-directory`)
+
+Two additive changes, and deliberately nothing else — this module's signature and possession-proof
+logic took four audit rounds to get right and was not touched:
+
+* **`PeerCapability.RELAY` (bit `0x08`)** — genuinely new information ("I am willing to relay for
+  others") that no address can express. It rides exactly the forward-compatibility path
+  `PeerCapability`'s own doc comment always described: a new bit, no codec version change, no
+  invalidation of any record already on the wire. `PeerDirectoryGossip.relayCandidates` surfaces
+  identities advertising it that also have a directly-dialable address, capped (an attacker can mint
+  arbitrarily many identities all claiming to relay, and an unbounded candidate list would be an
+  attacker-controlled work queue). It returns *candidates*: nothing auto-reserves.
++
+[IMPORTANT]
+======
+**Readers must be upgraded before writers.** "No invalidation of any record already on the wire"
+holds in one direction only: an *old* record stays readable by a new node, but a record carrying the
+new `RELAY` bit is rejected outright by an *old* node, because `PeerCapability`'s `KNOWN_BITS_MASK`
+treats any unknown bit as a malformed record rather than as something to ignore. That is the
+deliberate design — silently dropping unknown capability bits would let an attacker strip a
+capability claim undetected — and its price is a rollout order: deploy the reading side everywhere
+first, and only then let any node start advertising `RELAY`. A node that advertises it too early
+becomes invisible to every peer still on the old build, not merely un-relayed by them. This is not a
+code defect and needs no fix; it is a deployment constraint that has to be honoured each time a new
+capability bit is added.
+======
+* **`PeerRecord.relayAddresses` / `directAddresses`** — derived views, not new wire fields. A relay
+  address is an ordinary `Multiaddr`, self-identifying by its `/p2p-circuit` component, already
+  carried by the existing signed `addresses` list and already sized for by `PeerRecordCodec`'s
+  `MAX_MULTIADDR_BYTES` comment. A parallel field would have duplicated information, needed a codec
+  version bump, and added a second independently-forgeable place to put addresses into this record.
+  Because relay addresses live in the signed body, a relay cannot strip or rewrite them undetected —
+  a property `PeerRecordRelayAddressTest` asserts directly.
+
+=== What this wave deliberately did not do
+
+* **No `dcutr` hole punching.** Absent from `jvm-libp2p` entirely; implementing a protocol from
+  scratch is a wave of its own. Every relayed connection therefore stays relayed for its whole life,
+  and two NAT'd peers never upgrade to a direct path.
+* **AutoNAT is not wired, and that is a considered refusal rather than an omission.**
+  `AutonatProtocol.Receiver` does not implement AutoNAT's dial-back semantics at all: it answers
+  based on `InetAddress.isReachable` — an ICMP/echo probe — against an address it has already
+  required to share the connection's observed remote IP. That can neither prove nor disprove libp2p
+  dialability, so wiring it would produce a confidently wrong reachability verdict. Relay use is
+  therefore explicit configuration, not an automatic reaction to a self-diagnosis this library
+  cannot make.
+* **No Madli metric for relay service quality, and no payment.** Relay operation earns reputation,
+  not compensation — the same answer already settled for storage replication. A dedicated Madli
+  metric for relay reliability is a plausible follow-up; the raw network capability ships first.
+  Reputation-weighted *admission* is the same follow-up seen from the other side:
+  `maxReservationsPerSourceAddress` stops a one-machine Sybil flood and nothing more — an attacker
+  holding a /64 of IPv6 or a botnet still gets one reservation slot per address, and a genuine NAT
+  gateway with many clients behind it is refused along with them. Neither shortcoming is a reason to
+  leave the trivial case unguarded, and neither is fixed by this cap.
+* **No automatic relay selection.** `relayCandidates` lists, the caller chooses. A Madli-informed
+  preference order over candidates is exactly the shape the follow-up above would take.
+* **Messaging modules untouched.** Routing DMs, mail or calls over relays — and the design questions
+  each raises — is a separate wave.
 
 == Diagrams
 
