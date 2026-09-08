@@ -84,7 +84,7 @@ Known, deliberate gaps — not oversights, each documented at the point it was c
 * *No browser control surface for calls (V0.8.7b)* — a 1:1 call's audio runs in the JVM node process; a browser page would only remote-control it, not carry browser-native WebRTC.
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
-* *No DHT-based peer/mailbox discovery* — `Kademlia.dialPeer` has been broken since V0.1.4; every subsequent wave routes discovery over GossipSub instead.
+* *No DHT-based peer/mailbox discovery in the messaging modules* — `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` publish and discover over GossipSub. They were built that way because cross-node DHT provider discovery was broken from V0.1.4 onwards. V0.9.8 repaired that at the storage layer — `NabuStorage.provide()`/`findProviders()` now work across nodes, and `get()` fetches a block from a peer it learned about through the DHT alone (see `docs/architecture.adoc`) — but migrating those four modules onto it is a separate wave that has not happened yet.
 
 == Modules
 

@@ -56,12 +56,14 @@ internal fun deriveBodyCid(bytes: ByteArray): Cid {
  * `sha256`-derived (via Nabu's blockstore) content addressing is a pure function of the bytes
  * alone, with no dependency on which node computed it or when. So a node that receives the full
  * [PostAnnouncement.bodyBytes] over gossip and calls `storage.put()` on them locally always
- * arrives at exactly the same [Cid] the original author got. This sidesteps
- * [net.lapisphilosophorum.lapisnet.storage.NabuStorage]'s documented cross-node-discovery gap
- * (`NabuStorage.provide()`/`findProviders()` - DHT provider announcement/discovery - has not been
- * verified working end-to-end in this project, see that class's doc comment) completely: a bare
- * [Cid] pointer gossiped without the underlying bytes would be undiscoverable by any other node,
- * because there is no reliable way for a peer to ask "who has this Cid" and get a real answer.
+ * arrives at exactly the same [Cid] the original author got. This design was chosen to sidestep
+ * [net.lapisphilosophorum.lapisnet.storage.NabuStorage]'s then-documented cross-node-discovery
+ * gap: until the V0.9.8 repair (see `NabuStorage.provide()`'s doc comment) DHT provider
+ * announcement/discovery did not work at all, so a bare [Cid] pointer gossiped without the
+ * underlying bytes would have been undiscoverable by any other node - there was no reliable way
+ * for a peer to ask "who has this Cid" and get a real answer. That gap is now closed at the
+ * storage layer, but this module deliberately keeps its self-contained gossip design: migrating
+ * it onto DHT-backed publication is a separate wave, and the property below holds either way.
  * Embedding the actual bytes in the gossiped announcement and having each node independently
  * re-derive the [Cid] closes that gap entirely - nothing here ever depends on DHT provider
  * discovery working. This mirrors

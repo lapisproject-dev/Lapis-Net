@@ -7,6 +7,7 @@ import io.ipfs.multihash.Multihash
 import io.libp2p.core.Host
 import io.libp2p.core.PeerId
 import io.libp2p.core.multiformats.Multiaddr
+import io.libp2p.core.multiformats.Protocol
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import org.peergos.BlockRequestAuthoriser
 import org.peergos.PeerAddresses
@@ -32,6 +33,16 @@ private val DEFAULT_TIMEOUT: Duration = Duration.ofSeconds(10)
 private const val DEFAULT_PROVIDER_STORE_CAPACITY = 1024
 private const val DEFAULT_RECORD_STORE_CAPACITY = 1024
 private const val DEFAULT_DESIRED_PROVIDER_COUNT = 4
+
+/**
+ * How many of the closest-known peers a [NabuStorage.provide] call announces to. Matches the
+ * fan-out Nabu's own `Kademlia.provideBlock` uses, and doubles as the bound that keeps a single
+ * `provide` call from fanning out over an arbitrarily large routing table.
+ */
+private const val DHT_PROVIDE_FANOUT = 20
+
+/** Per-peer cap inside [NabuStorage.provide], so one unresponsive peer can't eat the whole budget. */
+private val PER_PEER_ANNOUNCE_TIMEOUT: Duration = Duration.ofSeconds(2)
 
 /** Thrown when a storage or DHT operation fails or times out. */
 class NabuStorageException(
@@ -73,7 +84,8 @@ class NabuStorage private constructor(
      * **V0.8.6 addition, for exactly one shape of caller: "is this blob already on my own disk?"**
      * (`lapis-net-dm`'s `DmAttachmentFetcher`). Neither of [get]'s own two forms answers that
      * question correctly: `get(cid, peers = emptySet())` falls through to [findProviders] on a
-     * local miss - broken since V0.1.4 (see [provide]'s doc comment) - and `get(cid, peers =
+     * local miss - which costs a full DHT round trip, and, before the V0.9.8 repair described on
+     * [provide], never resolved anything at all - and `get(cid, peers =
      * setOf(somePeer))` forces a real Bitswap dial-and-timeout against a peer that may not even be
      * reachable, just to answer a question [get]'s own first line (`blockstore.get(cid)`) already
      * answers for free. This method is exactly that first line, exposed directly.
@@ -132,36 +144,108 @@ class NabuStorage private constructor(
     }
 
     /**
-     * Announces to the DHT that this node has [cid] available for retrieval.
+     * Announces to the DHT that this node has [cid] available for retrieval: sends an
+     * `ADD_PROVIDER` RPC naming this node to each of the [DHT_PROVIDE_FANOUT] peers closest to
+     * [cid] in the Kademlia keyspace, as found by walking this node's routing table. A later
+     * [findProviders] call for [cid] by any node that can reach one of those peers then resolves
+     * back to this node. Peers that can't be dialled, or that time out, are skipped - the
+     * announcement is best-effort by nature (that is what a DHT publish is), so this only throws
+     * if the routing-table walk itself fails.
      *
-     * **Known limitation (as of V0.1.4, Nabu v0.8.0):** cross-node provider announcement and
-     * discovery via [provide]/[findProviders] has not been verified working end-to-end in this
-     * project. A diagnostic spike isolated a GET_PROVIDERS RPC round trip (`Kademlia.dialPeer`
-     * → `KademliaController.getProviders`) returning empty even via Nabu's own
-     * always-succeeds-if-the-block-is-local auto-provide path in
-     * `KademliaEngine.receiveRequest`'s `GET_PROVIDERS` case - i.e. this reproduces without any
-     * involvement of [provide]/`ADD_PROVIDER` at all, so the issue is in the RPC/dial mechanism
-     * shared by both message types, not specific to provider announcement. See
-     * docs/architecture.adoc for the full investigation. What *is* verified working: local
-     * put/get ([NabuStorageLocalRoundTripTest]), Bitswap fetch given an explicit peer
-     * ([TwoNodeBitswapDirectFetchTest]), and DHT routing-table population via
-     * [connectToDhtPeer] ([MultiNodeDhtProviderDiscoveryTest]). Do not rely on this method for
-     * discovery-driven [get] calls until this is root-caused.
+     * **Why this does not call Nabu's own `Kademlia.provideBlock` (V0.9.8 repair, Nabu v0.8.0).**
+     * `provideBlock` chains the announcement onto the dial as
+     * `dialPeer(peer, host).thenCompose { it.provide(...) }`, so `KademliaController.provide`'s
+     * `stream.writeAndFlush(...)` executes *inside the `getController()` completion callback*,
+     * i.e. on the Netty event-loop thread that just completed that future - and the write is
+     * silently dropped there. Nothing surfaces it: `KademliaProtocol.ReplyHandler.send` is
+     * fire-and-forget (it returns `completedFuture(true)` without ever observing the write's own
+     * future), so `provideBlock` reports success for an RPC that never reached the wire. Verified
+     * by a three-way diagnostic spike against real loopback nodes: identical peer, identical
+     * addresses, identical message - `thenCompose` (on-loop) delivered nothing, while both
+     * `thenComposeAsync` on a separate executor and a plain blocking
+     * `dial(...).controller.get()` followed by `provide(...)` delivered the `ADD_PROVIDER`
+     * every time. This method therefore does the dial-then-announce itself, off the event loop,
+     * using only Nabu's public API (no fork, no vendoring). See docs/architecture.adoc.
      */
     fun provide(
         cid: Cid,
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
-        awaitOrWrap("provide block to DHT", timeout) {
-            kademlia.provideBlock(cid, host, PeerAddresses.fromHost(host))
+        val us = PeerAddresses.fromHost(host)
+        val closest =
+            try {
+                kademlia.findClosestPeers(cid, DHT_PROVIDE_FANOUT, host)
+            } catch (e: Exception) {
+                throw NabuStorageException("failed to find DHT peers to announce $cid to", e)
+            }
+        val deadline = System.nanoTime() + timeout.toNanos()
+        var announced = 0
+        for (peer in closest) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) {
+                logger.debug { "ran out of time announcing $cid after $announced of ${closest.size} peers" }
+                break
+            }
+            if (announceTo(cid, peer, us, remaining)) announced++
         }
-        logger.info { "announced $cid to the DHT" }
+        logger.info { "announced $cid to $announced of ${closest.size} DHT peers" }
     }
 
     /**
-     * Looks up which known peers have announced [cid] via [provide]. See [provide]'s doc comment
-     * for a known limitation: this has not been verified to actually find remote providers
-     * end-to-end as of V0.1.4.
+     * Sends one `ADD_PROVIDER` for [cid] to [peer], synchronously on the calling thread (see
+     * [provide]'s doc comment for why this must not run on a Netty event-loop thread). Returns
+     * `false` - rather than throwing - for every per-peer failure: an unparseable address, an
+     * unreachable peer or a timeout is an ordinary outcome of a best-effort DHT publish, not a
+     * fault of this node.
+     */
+    private fun announceTo(
+        cid: Cid,
+        peer: PeerAddresses,
+        us: PeerAddresses,
+        remainingNanos: Long,
+    ): Boolean {
+        // Tolerate addresses this node can't parse or dial rather than failing the whole
+        // announcement: `peer` came out of the routing table, i.e. ultimately from a remote
+        // peer's FIND_NODE response, so its address list is untrusted input. DNS-form addresses
+        // are dropped for the same reason Nabu's own dialPeer drops them - this transport stack
+        // does not resolve them.
+        val addresses =
+            peer.addresses
+                .mapNotNull { runCatching { Multiaddr.fromString(it.toString()) }.getOrNull() }
+                .filterNot { it.has(Protocol.DNS) || it.has(Protocol.DNS4) || it.has(Protocol.DNS6) }
+        if (addresses.isEmpty()) return false
+        val peerId = runCatching { PeerId.fromBase58(peer.peerId.toBase58()) }.getOrNull() ?: return false
+        val perPeerNanos = minOf(remainingNanos, PER_PEER_ANNOUNCE_TIMEOUT.toNanos())
+        return try {
+            val controller =
+                kademlia
+                    .dial(host, peerId, *addresses.toTypedArray())
+                    .controller
+                    .get(perPeerNanos, TimeUnit.NANOSECONDS)
+            controller.provide(cid, us).get(perPeerNanos, TimeUnit.NANOSECONDS)
+            true
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        } catch (e: Exception) {
+            logger.debug(e) { "could not announce $cid to ${peer.peerId} - skipping this peer" }
+            false
+        }
+    }
+
+    /**
+     * Looks up which known peers have announced [cid] via [provide], by walking this node's
+     * Kademlia routing table and issuing `GET_PROVIDERS` RPCs. Also resolves peers that never
+     * called [provide] but simply hold [cid] in their local blockstore - Nabu's responder side
+     * adds itself to any `GET_PROVIDERS` reply for a block it already has.
+     *
+     * Returns only peer IDs. A caller that needs dialable addresses too (i.e. [get]) uses the
+     * private raw form, which keeps the [PeerAddresses] and registers them in the address book.
+     * Note that on a loopback-only deployment those addresses can come back empty for the
+     * "responder holds the block itself" case: `KademliaEngine`'s `GET_PROVIDERS` handler filters
+     * its own advertised addresses to publicly-routable ones, which loopback addresses are not.
+     * Provider entries that arrived through a real [provide]/`ADD_PROVIDER` are not filtered and
+     * do carry their addresses.
      */
     fun findProviders(
         cid: Cid,
@@ -294,6 +378,23 @@ class NabuStorage private constructor(
             val kademlia = Kademlia(kademliaEngine, localDht)
             kademlia.setAddressBook(host.addressBook)
             host.addProtocolHandler(kademlia)
+
+            // Register this node's own listen addresses in its own address book. Nabu's
+            // KademliaEngine looks its own addresses up there - not from the Host - when it
+            // answers a GET_PROVIDERS for a block it holds locally:
+            //
+            //     addressBook.getAddrs(PeerId.fromBase58(ourPeerId.toBase58())).join()
+            //         .stream().filter(a -> isPublic(a)) ...
+            //
+            // jvm-libp2p's address book returns *null* (not an empty collection) for a peer it
+            // has never heard of, and a plain `host { }`-built Host never records its own
+            // addresses there - only Nabu's own unused HostBuilder installs a connection handler
+            // that populates the address book. So without this line that `.stream()` call throws
+            // NPE inside receiveRequest, the responder writes no reply at all, and the asking
+            // node's GET_PROVIDERS just times out into an empty provider list. That is the
+            // "cross-node DHT provider discovery does not work" defect documented since V0.1.4;
+            // see docs/architecture.adoc and MultiNodeDhtProviderDiscoveryTest.
+            host.addressBook.addAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
 
             return NabuStorage(host, blockstore, bitswap, kademlia)
         }

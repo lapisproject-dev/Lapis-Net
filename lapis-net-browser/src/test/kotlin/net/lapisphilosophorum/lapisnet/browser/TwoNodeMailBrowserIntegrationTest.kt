@@ -52,11 +52,14 @@ private fun recipientHexFor(identity: DualKeyIdentity): String =
  * `GET /api/mail` HTTP API - mirrors [TwoNodeKarmaBrowserIntegrationTest]'s established real-HTTP,
  * real-two-node, bounded-polling-against-one-deadline pattern exactly.
  *
- * **Scoping note, matching a documented, pre-existing limitation (see [NabuStorage.get]'s doc
- * comment; `MailApi.kt`'s `GET /api/mail/attachment/{cid}` route repeats it): this test does NOT
- * assert that node B can successfully fetch the attachment CROSS-NODE.** `NabuStorage.get()`'s
- * cross-node fetch path (`Kademlia.dialPeer`/provider-discovery) has been documented broken since
- * V0.1.4 - a node can only reliably retrieve a blob it already has locally. This test instead
+ * **Scoping note: this test does NOT assert that node B can successfully fetch the attachment
+ * CROSS-NODE.** Historically it could not: `NabuStorage.get()`'s cross-node fetch path
+ * (provider discovery) was documented broken from V0.1.4 onwards, so a node could only reliably
+ * retrieve a blob it already had locally. V0.9.8 repaired that at the storage layer (see
+ * [NabuStorage.provide] and docs/architecture.adoc), but this mail path still publishes the blob
+ * over gossip rather than announcing it to the DHT - migrating `lapis-net-mail` onto DHT-backed
+ * publication is deliberately deferred to its own wave, so a cross-node fetch here would still
+ * have nothing to discover. Extending this test belongs to that wave. This test instead
  * asserts (a) the attachment's METADATA (name/mime/size/encrypted) round-trips correctly to B via
  * gossip, and (b) node A - the node that actually has the blob locally - can fetch its own
  * just-sent attachment via its own `GET /api/mail/attachment/{cid}` (the realistic end-to-end proof

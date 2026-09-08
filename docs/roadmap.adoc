@@ -1518,3 +1518,23 @@ import gateway, no Markdown-to-HTML rendering in the browser UI (V0.9.3's delibe
 choice), and no market-based pinning economy (carved out of V0.9.4, this section above). None of
 these block the arc's own stated target; each remains a candidate for a future, separately-planned
 wave outside the V0.9 arc.
+
+== V0.9.8 — DHT provider discovery repair (post-arc maintenance)
+
+Every "gossip-only, because `Kademlia.dialPeer` documented broken since V0.1.4" note across this
+document (`lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm`, `lapis-net-ratchet`) describes a
+real historical constraint that shaped those waves' design and remains an accurate account of why
+they chose gossip over DHT. That underlying storage-layer defect is now fixed, at the
+`lapis-net-storage` level only — see `docs/architecture.adoc`'s "Cross-node DHT provider discovery:
+broken V0.1.4–V0.9.7, repaired in V0.9.8" section for the two root causes (a responder-side NPE
+answering `GET_PROVIDERS`, and Nabu's own `Kademlia.provideBlock` silently dropping its
+`ADD_PROVIDER` write on the Netty event-loop thread) and how each was verified. `NabuStorage.provide()`/
+`findProviders()` now work end-to-end, proven by a real 3-node loopback test
+(`MultiNodeDhtProviderDiscoveryTest`), with no Nabu version bump and no fork/vendoring.
+
+**Deliberately not done this wave:** migrating `lapis-net-directory`/`-mail`/`-dm`/`-ratchet` off
+GossipSub onto the now-working DHT path. Those are already-shipped, security-audited modules with
+their own review/audit history; a migration is a separately-planned wave with its own review and
+security loop, not a side effect of this storage-layer fix. Until that migration happens, every
+"gossip-only" note elsewhere in this document stays correct as a description of current behavior —
+only the *reason* ("because the DHT path is broken") is now historical rather than current.

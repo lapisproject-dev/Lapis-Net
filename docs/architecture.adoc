@@ -215,31 +215,106 @@ regardless of whether this project's own API ever publishes an IPNS record itsel
 `lapis-net-storage`'s own `BoundedRecordStore` (LRU-capped, mirroring Nabu's own
 `RamProviderStore`) is used instead to prevent unbounded remote-triggered heap growth.
 
-**Known limitation: cross-node DHT provider discovery does not currently work.**
-`NabuStorage.provide()`/`findProviders()` wrap Nabu's real `Kademlia.provideBlock`/
-`findProviders` API correctly (verified via `javap` against the real jar), and the underlying
-DHT routing-table bootstrap (`connectToDhtPeer`, wrapping `Kademlia.bootstrapRoutingTable`) is
-verified working — a 3-node loopback chain reliably populates each node's routing table with its
-explicitly-connected peer. However, the actual provider announcement/discovery round trip does
-not: a standalone diagnostic spike (four isolated runs, outside the test suite, against real
-loopback nodes) found that a `GET_PROVIDERS` RPC returns an empty provider list even via Nabu's
-own trivial "I already have this block locally" auto-provide path in
-`KademliaEngine.receiveRequest`'s `GET_PROVIDERS` case — i.e. this reproduces with zero
-involvement of `provide()`/`ADD_PROVIDER` at all, so the fault is in the RPC/dial mechanism
-`Kademlia` uses for both message types (`Kademlia.dialPeer`), not specific to provider
-announcement. The failure is reproducible, not flaky (unlike V0.1.3's mDNS multicast issue,
-which has a genuine external cause) — root cause not identified within this wave's practical
-debugging budget; suspected candidates include an interaction between `/ipfs/` vs. `/p2p/`
-peer-id multiaddr component naming (routing-table entries carry `/ipfs/`-form addresses) and
-`dial()`'s peer-id validation, or a Nabu v0.8.0-specific issue. `lapis-net-storage`'s test suite
-pins this with an explicit "KNOWN ISSUE" test
-(`MultiNodeDhtProviderDiscoveryTest`) asserting the current (broken) empty result, so a future
-fix shows up as a test failure prompting an update, rather than the regression going unnoticed.
-What remains fully verified and usable for V0.1.5+: local put/get, and Bitswap fetch given an
-explicit peer (the `TwoNodeBitswapDirectFetchTest` path) — i.e. `get(cid, peers = ...)` with a
-peer set obtained by some other means (a future wave's own peer-list, GossipSub-announced peers,
-etc.) is safe to build on; relying on `findProviders()` to return non-empty is not, until this is
-root-caused.
+=== Cross-node DHT provider discovery: broken V0.1.4–V0.9.7, repaired in V0.9.8
+
+Between V0.1.4 and V0.9.7 this section documented cross-node DHT provider discovery as broken
+with an unidentified root cause: a `GET_PROVIDERS` RPC came back with an empty provider list even
+via Nabu's own trivial "I already have this block locally" auto-provide path, so the fault was
+assumed to sit in the dial/RPC mechanism shared by all Kademlia message types
+(`Kademlia.dialPeer`), with `/ipfs/` vs. `/p2p/` multiaddr component naming and "some Nabu
+v0.8.0 issue" as the leading suspects. `lapis-net-storage`'s test suite pinned the broken
+behaviour with an explicit "KNOWN ISSUE" test.
+
+**That diagnosis was wrong on both counts, and the defect is now fixed.** V0.9.8 re-ran the
+investigation with per-node instrumentation (a throwaway `KademliaEngine`/`ProviderStore`
+subclass logging every inbound RPC and every provider-store write, against real loopback nodes)
+and found *two independent* defects — both in **this project's own wiring and call pattern**,
+neither in Nabu's dial path, and neither related to `/ipfs/` vs. `/p2p/` naming. The routing
+table's `/ipfs/`-form addresses dial perfectly well; that suspicion was a red herring.
+
+**Defect 1 — the responder NPEs while answering `GET_PROVIDERS`, so it never replies at all.**
+`KademliaEngine.receiveRequest`'s `GET_PROVIDERS` case looks *its own* addresses up from the
+address book, not from the `Host`:
+
+[source,java]
+----
+addressBook.getAddrs(PeerId.fromBase58(ourPeerId.toBase58())).join()
+        .stream().filter(a -> isPublic(a)) ...
+----
+
+`jvm-libp2p`'s address book returns **`null`**, not an empty collection, for a peer it has never
+heard of — and a `Host` built through this project's plain `host { }` DSL (`LapisNode.create()`)
+never records its own listen addresses there. Only Nabu's own (unused) `org.peergos.HostBuilder`
+installs a connection handler that populates the address book. So `.stream()` threw
+`NullPointerException` inside `receiveRequest`, the responder wrote no reply, and the asking
+node's `getProviders(...)` call simply hit its 2-second timeout and degraded to an empty list.
+That is exactly why the failure reproduced through the auto-provide path with zero involvement
+of `provide()`/`ADD_PROVIDER` — and why it looked like a dial fault rather than a responder
+fault. **Fix:** `NabuStorage.attach()` now registers the host's own listen addresses in its own
+address book, one line, mirroring what `HostBuilder` would have done.
+
+**Defect 2 — `Kademlia.provideBlock` writes `ADD_PROVIDER` on the Netty event loop, where the
+write is silently dropped.** `provideBlock` chains the announcement onto the dial as
+`dialPeer(peer, host).thenCompose(contr -> contr.provide(block, ourAddrs))`, so
+`KademliaController.provide`'s `stream.writeAndFlush(...)` runs *inside the `getController()`
+completion callback* — on the event-loop thread that just completed that future. Nothing surfaces
+the loss, because `KademliaProtocol.ReplyHandler.send` is fire-and-forget: it returns
+`completedFuture(true)` without ever observing the write's own future, so `provideBlock` reports
+success for an RPC that never reached the wire. Verified by a three-way spike against the same
+pair of loopback nodes, with identical peer, addresses and message: the `thenCompose` (on-loop)
+form delivered nothing, while both `thenComposeAsync` on a separate executor and a plain blocking
+`dial(...).controller.get()` followed by `provide(...)` delivered the `ADD_PROVIDER` every time.
+**Fix:** `NabuStorage.provide()` no longer calls `Kademlia.provideBlock`. It performs the same
+walk-and-announce itself — `Kademlia.findClosestPeers` for the fan-out, then a blocking dial and
+`ADD_PROVIDER` per peer, off the event loop — using only Nabu's **public** API. No fork, no
+vendoring, no patched Nabu classes on the classpath.
+
+**Nabu was not bumped.** `v0.8.1` is a real upstream tag whose changes do touch this area
+("Tolerate multiaddrs we can't parse in handling kademlia responses", "Make sure we close
+connections in kademlia after queries"), so it was the first hypothesis tested — but it is
+*unobtainable*: Nabu is consumed through JitPack, JitPack's build for the `v0.8.1` tag fails to
+compile (build status `Error`; `nabu-v0.8.1.pom` 404s), and Nabu publishes nothing to Maven
+Central. Re-verified on 2026-09-08. It would not have helped anyway: neither defect above is in
+the code `v0.8.1` changes. The project stays on `nabu v0.8.0` with the official
+`io.libp2p:jvm-libp2p 1.3.5-RELEASE`, so the fragile cross-jar/fork exclusion described above is
+untouched and needed no re-verification — no dependency coordinate changed in this repair.
+
+**What is verified working as of V0.9.8.** `MultiNodeDhtProviderDiscoveryTest` is now a real
+regression test rather than a "KNOWN ISSUE" pin: three loopback nodes A, B, C, where A and C each
+know only B and never learn about each other by any other means; A `put`s and `provide`s a block,
+C's `findProviders()` resolves it back to A through B, and C's `get()` — with **no** explicit
+peer hint — then fetches the actual bytes over Bitswap. Stable across repeated runs, not flaky.
+Local put/get and explicit-peer Bitswap fetch (`TwoNodeBitswapDirectFetchTest`) remain verified as
+before.
+
+**One residual loopback-only caveat, not a defect.** `KademliaEngine`'s `GET_PROVIDERS` handler
+filters the addresses it advertises *for itself* down to publicly-routable ones, so on a
+loopback-only deployment the "responder holds the block itself" auto-provide case returns a
+provider peer ID with an *empty* address list. Provider entries that arrived through a real
+`provide()`/`ADD_PROVIDER` are not filtered and do carry their addresses, which is why the
+end-to-end fetch above works. In a real deployment with routable addresses the distinction
+disappears.
+
+**Security note.** Working provider discovery means remote peers can now genuinely find and fetch
+blocks this node holds — previously they practically never could. That does not change the trust
+model, but it does make the existing one load-bearing rather than theoretical: the always-allow
+`BlockRequestAuthoriser` documented above still applies (unguessable 256-bit content-hash CIDs are
+the access control), and `BoundedRecordStore`'s LRU cap on the IPNS record store is unchanged.
+`NabuStorage.provide()`'s own fan-out is bounded (20 peers, matching Nabu's), carries an overall
+deadline plus a 2-second per-peer cap so one unresponsive peer cannot consume the budget, and
+tolerates unparseable addresses from the routing table instead of failing the whole announcement —
+routing-table entries originate in remote `FIND_NODE` responses and are treated as untrusted input.
+
+**Follow-up, deliberately NOT done in V0.9.8: downstream modules still route over GossipSub.**
+`lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` all publish and
+discover over GossipSub, each citing this now-fixed `Kademlia.dialPeer` limitation as the reason.
+V0.9.8 fixes the capability at the `lapis-net-storage` layer only and leaves every one of those
+modules untouched. Migrating them to DHT-backed publication/discovery is a real behavioural change
+to already-shipped, separately security-audited code — it belongs in its own wave with its own
+review and security loops, and would need its own answers on record lifetime, replication factor,
+and DHT-record authentication (the DHT gives no equivalent of the gossip validators those modules
+rely on today). Until that wave happens, the gossip paths in those modules are correct as written;
+only their stated *reason* is now historical.
 
 == Trust: Veritas trust-edge grant (V0.1.5)
 

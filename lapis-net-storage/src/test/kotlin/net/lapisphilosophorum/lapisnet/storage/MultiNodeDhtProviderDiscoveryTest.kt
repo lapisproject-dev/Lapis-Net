@@ -1,8 +1,8 @@
 package net.lapisphilosophorum.lapisnet.storage
 
 import io.kotest.core.spec.style.FunSpec
-import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import java.nio.file.Files
@@ -10,21 +10,17 @@ import java.nio.file.Files
 /**
  * Three local nodes (A, B, C) in a chain - A and C are each explicitly connected to B's DHT
  * routing table via [NabuStorage.connectToDhtPeer] (not mDNS, not real bootstrap infra, same
- * "explicit local peer" reasoning as [TwoNodeBitswapDirectFetchTest]).
+ * "explicit local peer" reasoning as [TwoNodeBitswapDirectFetchTest]). Neither A nor C ever
+ * learns about the other by any means other than the DHT: they are never connected to each
+ * other and never given each other's address.
  *
- * This originally attempted a full round trip: node A `put`s a block and `provide`s it to the
- * DHT, node C calls `get` with no explicit peer hint, relying on [NabuStorage.findProviders] to
- * discover node A via B. That part does not currently work - see the **known limitation** noted
- * on [NabuStorage.provide]'s doc comment and docs/architecture.adoc: a standalone diagnostic
- * spike isolated the underlying `GET_PROVIDERS` RPC round trip returning empty even via Nabu's
- * own trivial "I already have this block locally" auto-provide path, i.e. reproducing with zero
- * involvement of [NabuStorage.provide]/`ADD_PROVIDER`. This is a reproducible, non-flaky
- * failure (confirmed across 4 isolated spike runs), not the kind of environment-dependent
- * flakiness [net.lapisphilosophorum.lapisnet.networking.TwoNodeMdnsDiscoveryTest] soft-degrades
- * for - silently passing here would hide a real, unresolved gap rather than a genuinely
- * unavoidable one, so this test only asserts what has actually been verified working
- * ([NabuStorage.connectToDhtPeer]'s routing-table bootstrap) and does not assert on
- * provider discovery.
+ * **This suite used to pin a known-broken behaviour.** From V0.1.4 until V0.9.8 the second test
+ * here asserted that `findProviders(...)` came back *empty*, because cross-node provider
+ * discovery did not work at all. Both underlying defects are fixed in V0.9.8 (see
+ * [NabuStorage.attach]'s self-address registration and [NabuStorage.provide]'s off-event-loop
+ * announcement, plus docs/architecture.adoc), so these are now real assertions on real
+ * behaviour: the discovery round trip has to actually resolve C -> B -> A, and the block has to
+ * actually arrive.
  */
 class MultiNodeDhtProviderDiscoveryTest :
     FunSpec({
@@ -52,10 +48,8 @@ class MultiNodeDhtProviderDiscoveryTest :
         }
 
         test(
-            "KNOWN ISSUE: findProviders does not currently discover a provider announced by another " +
-                "node via the DHT - this test pins the current (broken) behavior so a future fix shows " +
-                "up as a test failure here, prompting this test (and NabuStorage's doc comments) to be " +
-                "updated rather than the regression going unnoticed",
+            "findProviders discovers, via B, the provider A announced with provide() - " +
+                "and get() then fetches the block with no explicit peer hint",
         ) {
             val nodeA = LapisNode.create(DualKeyIdentity.generate())
             val nodeB = LapisNode.create(DualKeyIdentity.generate())
@@ -70,13 +64,25 @@ class MultiNodeDhtProviderDiscoveryTest :
                 val storageC = NabuStorage.attach(nodeC, Files.createTempDirectory("nabu-storage-c"))
 
                 val bAddress = nodeB.listenAddresses().first().withP2P(nodeB.peerId)
-                storageA.connectToDhtPeer(bAddress)
-                storageC.connectToDhtPeer(bAddress)
+                storageA.connectToDhtPeer(bAddress) shouldBe true
+                storageC.connectToDhtPeer(bAddress) shouldBe true
 
-                val cid = storageA.put("known-issue tracking payload".toByteArray())
+                val payload = "cross-node DHT provider discovery payload".toByteArray()
+                val cid = storageA.put(payload)
+                // C holds no copy of its own, and has no idea A exists, before the DHT lookup.
+                storageC.getLocal(cid) shouldBe null
+
                 storageA.provide(cid)
 
-                storageC.findProviders(cid).shouldBeEmpty()
+                // The announcement travelled A -> B (ADD_PROVIDER); the lookup travels
+                // C -> B (GET_PROVIDERS) and must name A.
+                storageC.findProviders(cid) shouldBe setOf(nodeA.peerId)
+
+                // And the addresses that came back with it are good enough to actually fetch the
+                // block over Bitswap, without the caller passing any peer.
+                val fetched = storageC.get(cid)
+                fetched shouldNotBe null
+                fetched!!.toList() shouldBe payload.toList()
             } finally {
                 runCatching { nodeA.stop() }
                 runCatching { nodeB.stop() }
