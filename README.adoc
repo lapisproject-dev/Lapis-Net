@@ -86,6 +86,47 @@ Known, deliberate gaps — not oversights, each documented at the point it was c
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
 * *No DHT-based peer/mailbox discovery in the messaging modules* — `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` publish and discover over GossipSub. They were built that way because cross-node DHT provider discovery was broken from V0.1.4 onwards. V0.9.8 repaired that at the storage layer — `NabuStorage.provide()`/`findProviders()` now work across nodes, and `get()` fetches a block from a peer it learned about through the DHT alone (see `docs/architecture.adoc`) — but migrating those four modules onto it is a separate wave that has not happened yet.
 
+== Comparison
+
+How Lapis Net stands next to the five closest decentralized social protocols — full
+methodology and sources at https://net.lapisproject.dev/comparison[net.lapisproject.dev/comparison].
+
+[cols="3,1,1,1,1,1,1", options="header"]
+|===
+| Feature | Lapis Net | Nostr | Secure Scuttlebutt | Farcaster | Bluesky / AT Proto | Mastodon / Fediverse
+
+| Genuine peer-to-peer (no relay, hub, or homeserver)
+| ● | ◐ | ● | ○ | ○ | ○
+
+| Cryptographic identity instead of an account
+| ● | ● | ● | ◐ | ◐ | ○
+
+| Weighted web of trust (transitive trust paths)
+| ● | ◐ | ◐ | ○ | ○ | ○
+
+| Bitcoin/Lightning-native value layer
+| ● | ● | ○ | ○ | ○ | ○
+
+| Market-based visibility (real value at stake, not a black-box algorithm)
+| ● | ○ | ○ | ◐ | ○ | ○
+
+| End-to-end encrypted voice calls
+| ● | ○ | ○ | ○ | ○ | ○
+
+| Asynchronous long-lived messaging (e-mail replacement)
+| ● | ◐ | ◐ | ○ | ○ | ○
+
+| Machine-to-machine node reputation (infrastructure, not opinions)
+| ● | ○ | ○ | ○ | ○ | ○
+|===
+
+`●` yes · `◐` partial · `○` no
+
+Honest caveat: Nostr, Mastodon, Bluesky and Farcaster each already have millions of users
+and mature client ecosystems. Lapis Net is, as of this comparison, a working multi-wave
+prototype (V0.1–V0.9 implemented) without a public network yet — a real trade-off against
+the table above, not a detail to gloss over.
+
 == Modules
 
 [cols="1,3"]
