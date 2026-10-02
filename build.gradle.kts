@@ -8,7 +8,7 @@ plugins {
 
 allprojects {
     group = "net.lapisphilosophorum"
-    version = "0.9.5"
+    version = "0.9.9"
 
     repositories {
         mavenCentral()

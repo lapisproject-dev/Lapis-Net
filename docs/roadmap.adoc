@@ -1,5 +1,88 @@
 = Lapis Net Roadmap
 
+== Releases and version numbers
+
+Version numbers in this project are **wave identifiers assigned at design time**, not a
+chronological sequence: the V0.9 arc (asynchronous mail) shipped before the V0.8 arc (direct
+messages and calls), and the V0.8.5 hardening pass (with backports to index classes from V0.8.1, V0.8.2 and V0.9.1) was cut as `v0.8.8` on 2026-08-27,
+before `v0.8.6` and `v0.8.7` existed. The website's What's New page therefore sorts by release date,
+not by version number. Every row below is an annotated git tag on `master`.
+
+[cols="1,4,1,1"]
+|===
+| Tag | Content | Date | Commit
+
+| `v0.1.0`–`v0.6.0`
+| The six scoring/protocol waves V0.1–V0.6 (one tag each: Veritas, Virtus + Minimal-Browser, Karma, Genesis-Bootstrap + identity hardening, Madli, Lightning)
+| tagged 2026-08-05
+| see `git tag -n1`
+
+| `v0.9.1`–`v0.9.4`
+| The four mail sub-waves (envelope/body format, hybrid ECIES, threading + attachments + browser UI, spam protection)
+| tagged 2026-08-05
+| see `git tag -n1`
+
+| `v0.9.5`
+| Security hardening across five modules (CID-length memory-exhaustion fix)
+| tagged 2026-08-05
+| `4ed2502`
+
+| `v0.8.1`
+| Signed peer/presence directory records
+| 2026-08-05
+| `bf3aabd`
+
+| `v0.8.2`
+| X25519 encryption sub-key and X3DH handshake
+| 2026-08-06
+| `3fbc194`
+
+| `v0.8.3`
+| Double Ratchet
+| 2026-08-06
+| `0d62d46`
+
+| `v0.8.4`
+| Online direct-message stream (`/lapis/dm/1.0.0`)
+| 2026-08-11
+| `ef1d44d`
+
+| `v0.8.5`
+| Offline Nabu mailbox
+| 2026-08-27
+| `34b923c`
+
+| `v0.8.8`
+| Hardening of the direct-message and offline-mailbox path (reservation-leak backport, `NabuStorage` exception funnel)
+| 2026-08-27
+| `2b6641e`
+
+| `v0.8.6`
+| Encrypted DM attachments, acceptance policy (`lapis-net-policy`), browser UI for direct messages
+| 2026-09-02
+| `3a56f7e`
+
+| `v0.8.7`
+| 1:1 voice calls over WebRTC (`lapis-net-call`) plus the first real two-node call integration test
+| 2026-09-03
+| `f943b3a`
+
+| `v0.9.8`
+| Repair of cross-node DHT provider discovery (broken since V0.1.4)
+| 2026-09-08
+| `112cdf6`
+
+| `v0.9.9`
+| Relay-based NAT traversal over Circuit Relay v2 (landed 2026-09-08 in `e77969a`); the tag sits on the release commit that also carries the later documentation work and the `build.gradle.kts` version bump to `0.9.9`
+| landed 2026-09-08, tagged 2026-10-02
+| the release commit
+|===
+
+The tags `v0.8.1`–`v0.8.8` and `v0.9.8` were created retroactively on 2026-10-02 (the same
+treatment the earlier tags received on 2026-08-05), pointing at the last `master` commit of the
+respective release. The same numbers have been public on the website's What's New page since
+they were written, so the repository now matches the website instead of the other way round.
+
 == V0.1 — Protocol core + Veritas
 
 Target: first runnable prototype — network bootstrap plus Veritas (the first
@@ -311,7 +394,9 @@ same Double Ratchet AEAD as a text DM, binding its DTLS fingerprint to the same 
 conversation already trusts — empirically verified (not just argued) with a real tampered-fingerprint
 test. Audio only, Non-Trickle ICE, host-candidates-only (no STUN/TURN, no third party in the media
 path), direct-dialable peers only (no `dcutr` — absent from `jvm-libp2p:1.3.5-RELEASE` entirely;
-Circuit-Relay v2/AutoNAT present but unwired, a realistic follow-up). Implemented — see the dedicated
+Circuit-Relay v2/AutoNAT present but unwired, a realistic follow-up — relay-based reachability for
+nodes behind NAT was added afterwards in V0.9.9, though `lapis-net-call` still refuses relayed
+media on purpose). Implemented — see the dedicated
 V0.8.7 section below and docs/architecture.adoc's "1:1 calls over WebRTC (V0.8.7)" section for the
 full design. **A browser control surface (V0.8.7b) is NOT built this wave** — see that section's own
 "Deliberate scope cuts" for the reasoning, following the V0.8.6/V0.8.6b precedent.
@@ -749,7 +834,9 @@ here too, before AES-GCM decryption is ever attempted.
 * **No NAT traversal.** This repo has no working NAT traversal — a documented gap since
   V0.1.3/networking, unchanged by this wave. This wave supports only DIRECT-DIALABLE peers
   (same-LAN, or otherwise directly reachable); a peer behind NAT without port forwarding simply
-  cannot be reached.
+  cannot be reached. **Superseded in part by V0.9.9:** a node behind NAT can now publish a
+  `/p2p-circuit` address through a Circuit Relay v2 relay and be dialled over it; hole punching
+  (`dcutr`) is still absent, so every relayed connection stays relayed.
 * **No offline/mailbox redelivery in THIS wave** — V0.8.5's job, since implemented (see that
   section below). A forward-compatible dedup key (`DmDedupKey`,
   `SHA-256(domainTag || senderIdentity || ratchetPublicKey || messageNumber)`) is computed here in
@@ -1062,8 +1149,9 @@ independent of `maxConcurrentCalls`, and `CallSdpPolicy` validation on every inb
 
 **Explicit, deliberate scope cuts** (full reasoning in docs/architecture.adoc): no `dcutr` hole
 punching (absent from `jvm-libp2p:1.3.5-RELEASE` entirely) and no Circuit-Relay v2 fallback (present
-in the library, unwired in `LapisNode`, a realistically scoped follow-up) — direct-dialable peers
-only, same reach as V0.8.4/V0.8.5's own text-DM limitation; audio only, no video; Non-Trickle ICE;
+in the library, unwired in `LapisNode`, a realistically scoped follow-up — implemented afterwards in
+V0.9.9 for connectivity in general, while calls themselves still refuse relayed media) —
+direct-dialable peers only, same reach as V0.8.4/V0.8.5's own text-DM limitation at that time; audio only, no video; Non-Trickle ICE;
 `maxConcurrentCalls = 1` by default (no call waiting/hold); a quarantined caller is silently dropped,
 never sent a `REJECT` (metadata minimization, at the cost of a confusing `RING_TIMEOUT` for a
 legitimate stranger); `CallLog` is in-memory-only, mirroring `DmStore`'s own discipline; **no
@@ -1538,3 +1626,54 @@ their own review/audit history; a migration is a separately-planned wave with it
 security loop, not a side effect of this storage-layer fix. Until that migration happens, every
 "gossip-only" note elsewhere in this document stays correct as a description of current behavior —
 only the *reason* ("because the DHT path is broken") is now historical rather than current.
+
+**Review status:** unlike the feature waves, no independent review or security-audit round is documented for this repair (the commit records a green `clean check` and the three-node test only). Because it added bounded network fan-out in `NabuStorage.provide()`, a retroactive independent review and security audit of commit `112cdf6` is a recommended follow-up.
+
+== V0.9.9 — Relay-based NAT traversal (post-arc maintenance)
+
+Closes the oldest usability gap in the project: until this wave a peer was reachable only if it was
+directly dialable (same LAN or a public address), a limitation every messaging module documented.
+A node can now reserve a slot on a **Circuit Relay v2** relay, publish the resulting `/p2p-circuit`
+address in its signed `PeerRecord`, and be dialled through the relay by a peer that holds only that
+address. The relayed connection is an ordinary, end-to-end Noise-encrypted, muxed connection — the
+relay only ever sees ciphertext. Full design, the defects found in `jvm-libp2p`'s own circuit
+classes, and the resource boundaries: `docs/architecture.adoc`, "NAT traversal over Circuit Relay v2".
+
+**What landed (`lapis-net-networking` plus an additive change in `lapis-net-directory`):**
+`jvm-libp2p`'s hop/stop/transport classes are unfinished, not merely buggy (a traffic limiter that is
+never removed, a missing `break` that turns every granted reservation into an exception, a hard-coded
+`null // TODO` connection handler, blocking `join()` calls on the event loop), so this wave
+reimplements hop and stop handling and the `/p2p-circuit` transport itself and reuses only what is
+sound in the library (the generated protobufs and the end-to-end upgrade helper). Acting as a relay
+is opt-in and off by default; a new `PeerCapability.RELAY` bit advertises willingness to relay;
+`PeerDirectoryGossip.relayCandidates` lists candidates and never reserves automatically.
+
+**Review and security audit** (a full independent review and security audit, one fix round, and an independent verification pass over all fixes): the first audit found
+the authorization and cryptographic boundary sound but the resource boundary not — a critical
+unbounded forwarding buffer (several GiB per relay at the defaults, because `mplex` has no send-buffer
+bound), no cap on inbound circuits before the handshake, a Sybil-squattable reservation table, and
+unrate-limited `CONNECT` amplification. The fix round fixed all of them (real backpressure, a bounded
+pre-handshake counter, a per-source-address reservation cap, a sliding-window `CONNECT` limiter, a
+signed reservation voucher); the verification pass confirmed each fix against the code. Real multi-node
+tests, no mocks: a node reachable purely through a relay address exchanging live GossipSub traffic,
+a non-reading TCP peer against the forwarding buffers, inbound-circuit admission, the reservation
+registry, and relay addresses inside the signed record.
+
+**Deliberately not done:** no `dcutr` hole punching (absent from `jvm-libp2p` entirely — every
+relayed connection stays relayed); no AutoNAT (its dial-back semantics are unimplemented in the
+library, so wiring it would produce a confidently wrong reachability verdict — relay use is explicit
+configuration); no automatic relay selection; no payment for relay operators and no Madli metric for
+relay quality (no compensation for relay operators; reputation via Madli is the intended route, matching the storage-replication answer, but no relay metric exists yet);
+`lapis-net-dm`, `-mail`, `-ratchet` untouched, and `lapis-net-call` still refuses relayed media on
+purpose.
+
+**Rollout constraint:** a record carrying the new `RELAY` capability bit is rejected outright by an
+older node (unknown capability bits are treated as malformed on purpose, so an attacker cannot strip
+a capability claim undetected). Readers must therefore be upgraded everywhere before any node starts
+advertising `RELAY`.
+
+**Known follow-ups (not blocking):** the connection-wide head-of-line stall while a slow circuit leg
+is unread (a tighter fix aborts the slow circuit after a threshold), a duplicate connection when a
+node dials a peer it was already reached by over a relay, reservation admission that is still only a
+per-address cap (an IPv6 /64 or a shared NAT gateway defeats it), and the missing test for the
+connection-wide stall.

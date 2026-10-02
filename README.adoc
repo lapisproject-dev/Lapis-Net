@@ -28,9 +28,13 @@ requirements.
 
 == Status
 
-Every wave through *V0.9* is implemented and merged to `master` (V0.7 was never
-a standalone wave — its scope was folded into the incremental browser growth
-of V0.2–V0.5, see link:docs/roadmap.adoc[docs/roadmap.adoc]). Full technical
+Every wave through *V0.9* is implemented and merged to `master`, followed by two
+post-arc releases (V0.9.8 and V0.9.9, below). The current release is
+*v0.9.9*. V0.7 was never a standalone wave — its scope was folded into the
+incremental browser growth of V0.2–V0.5, see
+link:docs/roadmap.adoc[docs/roadmap.adoc]; the same document explains why version
+numbers here are wave identifiers rather than a chronological sequence and maps
+every tag to its content. Full technical
 detail for each module is in the Modules table below; the full wave-by-wave
 history — including scope cuts and hardening follow-ups — is in
 link:docs/roadmap.adoc[docs/roadmap.adoc] and
@@ -75,12 +79,20 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 | V0.9
 | Asynchronous messages / mail replacement: encryption, threading, attachments, spam protection
 | ✅
+
+| V0.9.8
+| Repair of cross-node DHT provider discovery at the storage layer (broken since V0.1.4)
+| ✅
+
+| V0.9.9
+| NAT traversal over Circuit Relay v2: a node behind NAT publishes a relay address and can be dialled through the relay (opt-in relay operation, no hole punching)
+| ✅
 |===
 
 Known, deliberate gaps — not oversights, each documented at the point it was cut:
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
-* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are compensated only in reputation (Madli), not payment.
+* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route, but no relay metric is built yet. Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`): there is no AutoNAT and no automatic relay selection, neither the CLI nor the browser calls it, and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
 * *No browser control surface for calls (V0.8.7b)* — a 1:1 call's audio runs in the JVM node process; a browser page would only remote-control it, not carry browser-native WebRTC.
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
@@ -95,7 +107,7 @@ methodology and sources at https://net.lapisproject.dev/comparison[net.lapisproj
 |===
 | Feature | Lapis Net | Nostr | Secure Scuttlebutt | Farcaster | Bluesky / AT Proto | Mastodon / Fediverse
 
-| Genuine peer-to-peer (no relay, hub, or homeserver)
+| Genuine peer-to-peer (no required relay, hub, or homeserver)
 | ● | ◐ | ● | ○ | ○ | ○
 
 | Cryptographic identity instead of an account
@@ -125,7 +137,7 @@ methodology and sources at https://net.lapisproject.dev/comparison[net.lapisproj
 Honest caveat: Nostr, Mastodon, Bluesky and Farcaster each already have millions of users
 and mature client ecosystems. Lapis Net is, as of this comparison, a working multi-wave
 prototype (V0.1–V0.9 implemented) without a public network yet — a real trade-off against
-the table above, not a detail to gloss over.
+the table above, not a detail to gloss over. One clarification on the first row: Lapis Net can use volunteer relays to reach nodes behind home routers; they forward only end-to-end-encrypted traffic and are never required for a node that is directly reachable.
 
 == Modules
 
@@ -140,13 +152,13 @@ the table above, not a detail to gloss over.
 | secp256k1 identity keypairs, Ed25519 dual-key binding for the libp2p peer ID, keystore encryption at rest (Argon2id + AES-256-GCM), and multi-device/pseudonym self-trust linking.
 
 | `lapis-net-storage`
-| DHT + Bitswap content storage via Nabu.
+| DHT + Bitswap content storage via Nabu. Cross-node provider discovery works since V0.9.8 (it had been broken since V0.1.4).
 
 | `lapis-net-trust`
 | Veritas (web-of-trust): trust-edge data model, shortest-path scoring algorithm, GossipSub propagation, Nabu persistence.
 
 | `lapis-net-networking`
-| libp2p node bootstrap, peer identity derivation, mDNS discovery, GossipSub, and the Genesis-bootstrap/QR-code connection flow.
+| libp2p node bootstrap, peer identity derivation, mDNS discovery, GossipSub, the Genesis-bootstrap/QR-code connection flow, and relay-based NAT traversal over Circuit Relay v2 (V0.9.9: reservation client, opt-in relay server, `/p2p-circuit` transport with backpressure and admission limits).
 
 | `lapis-net-virtus`
 | Virtus (the LTR micropayment economy): on-chain (OP_RETURN) and Lightning (BOLT-11) payment proofs, 10%/24h decay, view-specific accumulation.
@@ -176,7 +188,7 @@ the table above, not a detail to gloss over.
 | 1:1 audio calls over WebRTC (V0.8.7): `CallManager` (the call-control state machine — INVITE/ACCEPT/REJECT/HANGUP, a three-executor concurrency model, invite-flood rate limiting), `CallSignal`/`CallSignalCodec` (the wire frame carried as a `DmMessageType.CALL_SIGNAL` envelope's ratchet plaintext), `CallSdpPolicy` (SSRF-class defenses against a peer-supplied SDP), and `WebRtcCallMediaEngine` (the sole `dev.onvoid.webrtc:webrtc-java` consumer — host-ICE-candidates only, no STUN/TURN). Depends on `lapis-net-dm` for signaling transport and DTLS-fingerprint identity binding; `lapis-net-dm` itself stays entirely WebRTC-free.
 
 | `lapis-net-browser`
-| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma/Madli data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b).
+| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b).
 
 | `lapis-net-cli`
 | Entry point / multi-node demo harness proving trust propagation end to end.
@@ -192,12 +204,44 @@ the table above, not a detail to gloss over.
 
 Requires JDK 25.
 
+To run the reference node together with its minimal browser UI (main view, mail inbox, direct
+messages):
+
+[source,bash]
+----
+./gradlew :lapis-net-browser:run
+----
+
+It prints the local address to open in a browser and the identity fingerprint. The HTTP port is
+currently fixed at `7878` (there is no environment variable for it yet), so only one browser node can
+run per machine; a second instance on the same machine fails with "address already in use" and would
+also share the same identity and storage directory unless `LAPISNET_HOME` is changed. State lives under
+`$LAPISNET_HOME` (default `~/.lapisnet`). Environment variables: `LAPISNET_KEYSTORE_PASSPHRASE` encrypts
+the identity at rest (without it, and without an interactive console, the identity is stored
+unencrypted with POSIX file permissions only and a warning is logged); `LAPISNET_LISTEN_ADDR` sets the
+libp2p listen address (the default is loopback-only, so no other machine can reach the node until this
+is set); `LAPISNET_BOOTSTRAP_PEERS` is a comma-separated list of peer multiaddrs, each including
+`/p2p/<peerId>`, and entries in `$LAPISNET_HOME/bootstrap.peers` (one per line) are added to it.
+
+There is no public network yet, and connecting two real nodes is still a manual step. Set
+`LAPISNET_LISTEN_ADDR` to the machine's concrete LAN address, for example `/ip4/192.168.1.20/tcp/4001`.
+The main page shows a connect link (`lapisnet://connect?maddr=...&pk=...`) and the same link as a QR
+code; on the other node, paste that link into the "Paste a connect link" field of its main page, or
+enter the plain multiaddr, including `/p2p/<peerId>`, in the connect field in the page header. The
+peer ID is also logged at startup (`BrowserServer listening on ... (peer <peerId>)`). A wildcard such
+as `/ip4/0.0.0.0/tcp/4001` makes the node listen on every interface, but the QR code and connect link
+would then carry the wildcard, which another machine cannot dial; in that case type
+`/ip4/<LAN-IP>/tcp/4001/p2p/<peerId>` into the header connect field by hand, taking the peer ID from
+the log. Peers discovered through mDNS are only logged and
+cached, never dialled automatically and not shown in the UI. If you only have one machine,
+`./gradlew :lapis-net-cli:run` runs a multi-node trust-propagation demo inside a single process.
+
 == Development conventions
 
 * Code style is enforced by https://github.com/JLLeitschuh/ktlint-gradle[ktlint] and checked in CI.
 * Logging uses https://github.com/oshai/kotlin-logging[kotlin-logging]: `private val logger = KotlinLogging.logger {}` in every file that logs.
 * Documentation is written in AsciiDoc; diagrams (once introduced) use kUML via the `kuml` Asciidoctor macro — no PlantUML, Mermaid, or hand-drawn diagrams.
-* All identifiers (classes, interfaces, packages) are named in English. Domain terms (Veritas, Karma, Virtus, Madli) are the one exception, as they are Latin proper nouns used directly as identifiers.
+* All identifiers (classes, interfaces, packages) are named in English. Domain terms (Veritas, Karma, Virtus, Madli) are the one exception, as they are proper nouns from other languages used directly as identifiers: Veritas and Virtus are Latin, Karma is Sanskrit, and Madli is Georgian.
 
 See link:docs/architecture.adoc[docs/architecture.adoc] and link:docs/roadmap.adoc[docs/roadmap.adoc] for more.
 

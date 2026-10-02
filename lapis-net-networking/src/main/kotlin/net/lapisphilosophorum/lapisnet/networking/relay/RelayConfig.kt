@@ -13,7 +13,7 @@ import java.time.Duration
  *
  *  - **Client role** - always available, costs nothing until used. A node can always dial a
  *    `/p2p-circuit` multiaddr, and can ask a relay for a reservation via
- *    [net.lapisphilosophorum.lapisnet.networking.LapisNode.reserveRelaySlot]. Both are explicit,
+ *    [net.lapisphilosophorum.lapisnet.networking.LapisNode.relayClient] (`relayClient.reserve(relay)`). Both are explicit,
  *    caller-initiated actions: nothing happens on its own.
  *  - **Server role** - **opt-in, off by default** ([serverEnabled] `= false`). A node that has not
  *    switched this on answers every inbound `HOP RESERVE` with `PERMISSION_DENIED` and every

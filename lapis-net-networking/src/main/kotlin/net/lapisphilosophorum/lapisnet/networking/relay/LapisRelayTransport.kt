@@ -95,7 +95,7 @@ class LapisRelayTransport internal constructor(
         CompletableFuture.failedFuture(
             RelayException(
                 "cannot listen on $addr directly - obtain a relay reservation with " +
-                    "LapisNode.reserveRelaySlot(...) instead",
+                    "LapisNode.relayClient.reserve(...) instead",
             ),
         )
 

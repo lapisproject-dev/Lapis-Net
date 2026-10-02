@@ -227,8 +227,9 @@ behaviour with an explicit "KNOWN ISSUE" test.
 **That diagnosis was wrong on both counts, and the defect is now fixed.** V0.9.8 re-ran the
 investigation with per-node instrumentation (a throwaway `KademliaEngine`/`ProviderStore`
 subclass logging every inbound RPC and every provider-store write, against real loopback nodes)
-and found *two independent* defects — both in **this project's own wiring and call pattern**,
-neither in Nabu's dial path, and neither related to `/ipfs/` vs. `/p2p/` naming. The routing
+and found *two independent* defects — one in **this project's own wiring** and one in the **call pattern
+of Nabu's own `Kademlia.provideBlock`** (both fixed in this project's code, with no Nabu upgrade), neither
+in Nabu's dial path, and neither related to `/ipfs/` vs. `/p2p/` naming. The routing
 table's `/ipfs/`-form addresses dial perfectly well; that suspicion was a red herring.
 
 **Defect 1 — the responder NPEs while answering `GET_PROVIDERS`, so it never replies at all.**
@@ -3143,7 +3144,11 @@ cross-path `recentlyDeliveredDedupKeys` pre-check `processInboundDmEnvelope` run
   in V0.8.4 — **since V0.8.7, it is active, not reserved** — see "1:1 calls over WebRTC (V0.8.7)"
   below.
 * **No NAT traversal.** A documented gap since V0.1.3/networking, unchanged by this wave. Only
-  direct-dialable peers (same-LAN, or otherwise directly reachable) are supported.
+  direct-dialable peers (same-LAN, or otherwise directly reachable) are supported. *(Superseded in
+  part since V0.9.9: relay-based reachability over Circuit Relay v2 now exists — see "NAT traversal
+  over Circuit Relay v2" below; `dcutr` hole punching is still absent. The DM modules themselves were
+  not redesigned around relayed reachability — they benefit only wherever they already dial a
+  `PeerRecord`'s addresses.)*
 * **No offline/mailbox redelivery in THIS wave (V0.8.4)** — V0.8.5's job, since landed; see
   `DmDedupKey` above and the "DM stream protocol (V0.8.5)" section below.
 * **`DmStore` (conversation history) is in-memory-only** — see below.
@@ -3966,8 +3971,8 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
 * **No Circuit-Relay v2 fallback for calls behind NAT** — still true of `lapis-net-call` even now
   that the network layer has one. Routing a call over a relay is not "reines P2P" for the 1:1 case
   the way a direct connection is, so it stays a deliberate design question rather than something to
-  switch on silently; the compensation question for relay operators is answered (reputation via
-  Madli, no payment) but the media-path question is not.
+  switch on silently; the compensation question for relay operators is answered (no payment; reputation via
+  Madli is the intended route, but no relay metric exists yet) but the media-path question is not.
 * **Audio only, no video.** `CallMediaKind.AUDIO_VIDEO` is reserved and rejected outright at the
   `CallSignalCodec` layer — a video call needs a capture device (absent in CI/headless environments)
   and a render surface (absent from a browser control-panel UI), neither of which this wave builds.
@@ -4221,8 +4226,9 @@ capability bit is added.
   dialability, so wiring it would produce a confidently wrong reachability verdict. Relay use is
   therefore explicit configuration, not an automatic reaction to a self-diagnosis this library
   cannot make.
-* **No Madli metric for relay service quality, and no payment.** Relay operation earns reputation,
-  not compensation — the same answer already settled for storage replication. A dedicated Madli
+* **No Madli metric for relay service quality, and no payment.** Relay operators are not
+  compensated; reputation via Madli is the intended route — the same answer already settled for storage
+  replication — but no relay metric exists yet. A dedicated Madli
   metric for relay reliability is a plausible follow-up; the raw network capability ships first.
   Reputation-weighted *admission* is the same follow-up seen from the other side:
   `maxReservationsPerSourceAddress` stops a one-machine Sybil flood and nothing more — an attacker
