@@ -51,8 +51,8 @@ private fun possessionDigest(identity: Secp256k1PublicKey): ByteArray =
  * current network addresses through it.
  *
  * **Gossip-only, no DHT publication - the same accepted limitation as every V0.9 mail sub-wave.**
- * `org.peergos.protocol.dht.Kademlia.dialPeer` is documented broken since V0.1.4 (see
- * `docs/architecture.adoc`'s Storage section) - propagation is entirely via
+ * `org.peergos.protocol.dht.Kademlia.dialPeer` was documented broken from V0.1.4 until V0.9.8 (see
+ * `docs/architecture.adoc`'s Storage section; the reason is historical now) - propagation is entirely via
  * [PeerDirectoryGossip]'s GossipSub topic, mirroring
  * `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s identical precedent. A node offline during
  * the gossip window has no catch-up path.

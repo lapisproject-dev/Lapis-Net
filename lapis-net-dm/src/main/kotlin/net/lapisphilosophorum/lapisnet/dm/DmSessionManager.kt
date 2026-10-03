@@ -168,7 +168,7 @@ enum class DmSendOutcome {
  *   topic ([MailboxGossip]), periodically re-announced ([MailboxRedeliveryScheduler]) so a
  *   recipient who returns online later can still discover it; [MailboxPoller] fetches the
  *   referenced blob via a direct Bitswap request to the sender's currently-gossiped address, never
- *   via `NabuStorage.findProviders` (broken since V0.1.4), and routes a successful fetch through
+ *   via `NabuStorage.findProviders` (broken until V0.9.8), and routes a successful fetch through
  *   the SAME [processInboundDmEnvelope] core the online path uses. [DmDedupKey] - computed by this
  *   wave specifically so V0.8.5 would not have to retrofit one - is what [processInboundDmEnvelope]
  *   uses for the cross-path dedup pre-check; see that function's own doc comment.
@@ -664,15 +664,15 @@ class DmSessionManager private constructor(
      * remain reachable, or at least come back online periodically, for offline delivery to complete
      * at all** - not only to serve the eventual Bitswap fetch, but, more fundamentally, for the
      * recipient to ever discover the pointer in the first place. A real, inherent limitation of
-     * routing around the broken DHT (`NabuStorage.findProviders`, broken since V0.1.4) with gossip
-     * alone - not a bug.
+     * routing around the then-broken DHT (`NabuStorage.findProviders`, broken until V0.9.8) with
+     * gossip alone - not a bug.
      *
      * **Explicit, deliberate scope cuts for V0.8.5 (stated here rather than silently omitted,
      * mirroring this class's own established practice above):**
      * - **No onion routing for mailbox pointers.** The original DM concept note's own open question
      *   - left open here, not attempted.
-     * - **No DHT mailbox record** - same broken-Kademlia limitation as everything else in this
-     *   class; gossip + explicit peer-hint-based Bitswap fetch instead.
+     * - **No DHT mailbox record** - same (since repaired in V0.9.8) Kademlia limitation as everything
+     *   else in this class; gossip + explicit peer-hint-based Bitswap fetch instead.
      * - **No pin-lifetime management.** Nabu has no pin/GC anywhere in this project (V0.1.4's own
      *   documented state) - "pinning" a mailbox blob is currently a no-op, stated plainly rather than
      *   implying a pinning economy exists.

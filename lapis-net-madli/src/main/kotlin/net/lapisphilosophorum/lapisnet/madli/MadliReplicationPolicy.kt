@@ -4,9 +4,9 @@ import io.ipfs.cid.Cid
 
 /**
  * The signals a replication policy consumes for one candidate [Cid]. [currentProviderCount] comes
- * from DHT `findProviders`, which does NOT work end-to-end in this codebase today (a pre-existing
- * V0.1.4 limitation - see `docs/architecture.adoc`'s Storage section) - callers supply a
- * best-effort/`0` value until that is fixed. [authorVeritasMicros] is the observer's own Veritas
+ * from DHT `findProviders`, which did not work end-to-end until V0.9.8 (see
+ * `docs/architecture.adoc`'s Storage section; it now does, but no caller feeds this policy from it
+ * yet) - callers supply a best-effort/`0` value. [authorVeritasMicros] is the observer's own Veritas
  * standing of the content's author; [socialResonance] folds Karma/LTR standing (higher = more
  * likely to be requested by others).
  */

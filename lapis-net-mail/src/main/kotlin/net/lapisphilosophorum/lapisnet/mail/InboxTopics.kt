@@ -9,7 +9,7 @@ object InboxTopics {
      * `"LapisNet:inbox:<64 lowercase hex chars of sha256(compressed pubkey)>:v1"`.
      *
      * Topic-per-identity, gossip-based, deliberately NOT a DHT inbox record:
-     * `org.peergos.protocol.dht.Kademlia.dialPeer` is documented broken (see
+     * `org.peergos.protocol.dht.Kademlia.dialPeer` was documented broken until V0.9.8 (see
      * `net.lapisphilosophorum.lapisnet.storage.NabuStorage.provide`'s doc comment and the
      * architecture doc's V0.1.4 section), so this wave routes entirely through GossipSub, exactly
      * as `net.lapisphilosophorum.lapisnet.trust.VeritasGossip` already does for a different topic

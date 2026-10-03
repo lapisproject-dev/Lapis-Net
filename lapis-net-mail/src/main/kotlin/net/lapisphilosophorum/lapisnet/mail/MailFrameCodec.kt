@@ -40,7 +40,7 @@ class MailFrame internal constructor(
  * provider lookup on a local cache miss - a network call, which [InboxGossip]'s GossipSub
  * validator must never make (see that class's doc comment for the full "zero clock, zero network"
  * rule it shares with `KarmaGossip`/`MadliGossip`/`LtrGossip`). And even if that were allowed,
- * cross-node DHT provider discovery is documented broken since V0.1.4
+ * cross-node DHT provider discovery was documented broken from V0.1.4 until V0.9.8
  * (`net.lapisphilosophorum.lapisnet.storage.NabuStorage.provide`'s doc comment references the
  * architecture doc's investigation) - a receiving node could never reliably fetch a body it only
  * knows by CID. This is the exact same reasoning, and the exact same resolution, as

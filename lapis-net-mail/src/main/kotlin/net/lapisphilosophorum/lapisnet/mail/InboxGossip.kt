@@ -17,9 +17,9 @@ private val logger = KotlinLogging.logger {}
  *
  * **Scope cuts for V0.9.1 (stated here, this module's center of gravity, and referenced from
  * [MessageEnvelope]/[MailSender]):**
- *  - **No DHT inbox record.** Gossip-only, because `Kademlia.dialPeer` is documented broken since
- *    V0.1.4 (see `NabuStorage.provide`'s doc comment). A node offline during the gossip window has
- *    no catch-up path - a known, accepted limitation carried from
+ *  - **No DHT inbox record.** Gossip-only, because `Kademlia.dialPeer` was documented broken from
+ *    V0.1.4 until V0.9.8 (see `NabuStorage.provide`'s doc comment; the design stands). A node offline
+ *    during the gossip window has no catch-up path - a known, accepted limitation carried from
  *    `net.lapisphilosophorum.lapisnet.trust.VeritasGossip`'s best-effort-convergence precedent.
  *  - **No relay population.** GossipSub only forwards on topics a peer subscribes to, and an inbox
  *    topic is identity-scoped - so delivery effectively requires a live sender-to-recipient
@@ -45,8 +45,8 @@ private val logger = KotlinLogging.logger {}
  *    [HybridEcies.open] call.
  *  - **V0.9.3: attachment encryption exists** ([MailAttachmentCipher], [EncryptedAttachmentBlobCodec])
  *    - but attachment **fetching** over the network is still limited by the same
- *    `NabuStorage.get()`/`Kademlia.dialPeer` gap documented below: a node can only decrypt an
- *    attachment blob it already has locally. [AttachmentRef.size] remains declared, never checked
+ *    `NabuStorage.get()`/`Kademlia.dialPeer` gap (repaired in V0.9.8) documented below: a node can
+ *    only decrypt an attachment blob it already has locally. [AttachmentRef.size] remains declared, never checked
  *    against the real blob.
  *  - **V0.9.3: no self-delivery, but a local "sent" view now exists** ([SentFolder]). GossipSub
  *    still never delivers a node's own [GossipPubSub.publish] calls to its own
@@ -65,7 +65,7 @@ private val logger = KotlinLogging.logger {}
  *
  * **The gossip frame carries the body, not just a CID pointer** - see [MailFrameCodec]'s class doc
  * comment for the full reasoning (`NabuStorage.get()` falls through to a live DHT lookup on a
- * local miss, forbidden inside a validator; and provider discovery is documented broken anyway).
+ * local miss, forbidden inside a validator; and provider discovery was documented broken until V0.9.8).
  */
 class InboxGossip private constructor(
     private val pubsub: GossipPubSub,

@@ -93,7 +93,7 @@ private fun intToBigEndian4(value: Int): ByteArray =
  * - No PQXDH / post-quantum hybrid key exchange. X25519 only.
  * - No formal deniability analysis beyond X3DH's own published security properties.
  * - No DHT publication - gossip only (`PrekeyBundleGossip`, in `lapis-net-directory`), the same
- *   `Kademlia.dialPeer`-broken limitation as every prior wave.
+ *   `Kademlia.dialPeer`-broken limitation as every prior wave (historical: repaired in V0.9.8).
  * - Not yet wired into a live message-send path - this wave's deliverable is the handshake
  *   primitive and prekey publication/consumption machinery, callable and independently testable.
  *   V0.8.3 (Double Ratchet) and V0.8.4 (online DM) own that wiring.

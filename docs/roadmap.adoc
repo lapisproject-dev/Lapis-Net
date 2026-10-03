@@ -362,7 +362,7 @@ libp2p stream, with no GossipSub size ceiling backstopping the parser (implement
 reachable now" story with "recipient offline, deposit for later": a signed `MailboxPointer`
 gossiped on the recipient's own topic, referencing an encrypted `DmEnvelope` blob deposited in
 Nabu, fetched via a direct Bitswap request to the sender's currently-gossiped address (never via
-the still-broken `NabuStorage.findProviders`) and periodically re-announced so a later-starting
+the then-broken `NabuStorage.findProviders` - repaired in V0.9.8) and periodically re-announced so a later-starting
 recipient can still discover it (implemented — see below).
 
 | V0.8.6
@@ -437,7 +437,7 @@ two-cap eviction/persistence structure plus a THIRD, independently-sized, LRU-ev
 high-water-mark cap (`highestSequenceByIdentity`, hardened in round 2 after round 1's non-evicting
 version reopened an equivalent rollback path). `PeerDirectoryGossip` — a new GossipSub topic
 (`LapisNet:peer-record-gossip:v1`), gossip-only (no DHT publication — `Kademlia.dialPeer` documented
-broken since V0.1.4, same accepted limitation as every V0.9 mail sub-wave). `PeerPresenceAnnouncer`
+broken until it was repaired in V0.9.8, same accepted limitation as every V0.9 mail sub-wave). `PeerPresenceAnnouncer`
 — the enforced minimum-republish-interval (300s default) PARTIALLY mitigating this record type's
 metadata-exposure tension with the spec's own Metadaten-Minimierung principle (bounds only this
 node's own outbound republish rate — `PeerDirectoryGossip.announce` is unrate-limited and
@@ -574,7 +574,7 @@ handshake (V0.8.2)" section). Deliberate scope cuts, stated as such in the code'
 * **No PQXDH / post-quantum hybrid key exchange.** X25519 only.
 * **No formal deniability analysis** beyond X3DH's own published security properties.
 * **No DHT publication.** Gossip-only (`PrekeyBundleGossip`), same `Kademlia.dialPeer`-broken
-  limitation as every prior wave.
+  limitation as every prior wave (historical: repaired in V0.9.8).
 * **No wire codec for the X3DH initial-message header.** This wave's deliverable is the handshake
   primitive and prekey publication/consumption machinery, callable and independently testable — not
   yet wired into a live message-send path. V0.8.4 (online DM) owns that wiring.
@@ -865,7 +865,7 @@ here too, before AES-GCM decryption is ever attempted.
 Target: the offline-delivery path for 1:1 direct messages — completing the split V0.8.4 started:
 V0.8.4 covers "recipient reachable right now" (a live libp2p stream), this wave covers "recipient
 offline, deposit a message for later pickup." This wave's central mechanism is routing around the
-broken DHT (`NabuStorage.findProviders`, broken since V0.1.4 — see the Storage section below) via a
+broken DHT (`NabuStorage.findProviders`, broken from V0.1.4 until repaired in V0.9.8 — see the Storage section below) via a
 peer-hint-based direct Bitswap fetch — AND, less obviously but just as load-bearing, that pointer
 *discoverability itself* required inventing a new periodic-re-announcement mechanism, because
 GossipSub has no message replay (`GossipPubSub.subscribe`'s own doc comment: a node that publishes
@@ -1217,8 +1217,8 @@ checks, and every variable-length field length-validated BEFORE allocation, foll
 `VeritasGrantCodec`'s discipline verbatim. `EncryptionMode.HYBRID_ECIES`/`MLS_ARCHIVE` are
 wire-representable but rejected outright at three layers (constructor, decoder, validator),
 mirroring `LtrRecordCodec`'s pre-V0.6 `proofType = 2` precedent. `InboxTopics.forRecipient` — one
-GossipSub topic per recipient identity, gossip-only because `Kademlia.dialPeer` is documented
-broken (V0.1.4). `InboxGossip` — a single validator step doing decode → addressing check →
+GossipSub topic per recipient identity, gossip-only because `Kademlia.dialPeer` was documented
+broken (V0.1.4; repaired in V0.9.8, the design stands). `InboxGossip` — a single validator step doing decode → addressing check →
 signature → CID binding → dedup → persist → index, with zero clock and zero network calls, and
 envelopes not addressed to the local identity dropped without ever being persisted. `InboxIndex` —
 the established two-cap structure (evicting LRU tracking cap + separate non-evicting persistence
@@ -1234,8 +1234,8 @@ V0.9.1 is implemented (see `docs/architecture.adoc`'s "Asynchronous messages: ma
 body (V0.9.1)" section). Explicitly cut from this sub-wave, and stated as such in the code's own
 doc comments rather than silently omitted:
 
-* **No DHT inbox record** — gossip-only, because `Kademlia.dialPeer` is documented broken since
-  V0.1.4. A node offline during the gossip window has no catch-up path: best-effort convergence,
+* **No DHT inbox record** — gossip-only, because `Kademlia.dialPeer` was documented broken since
+  V0.1.4 (repaired in V0.9.8; the design stands). A node offline during the gossip window has no catch-up path: best-effort convergence,
   the same accepted limitation `VeritasGossip` already carries.
 * **No relay population.** GossipSub only forwards on topics a peer subscribes to, and an inbox
   topic is identity-scoped — so delivery effectively requires a live sender-to-recipient
@@ -1461,8 +1461,8 @@ comments rather than silently omitted:
   see `ThreadBuilder`'s own class doc comment for why (a genuine, honestly-constructible cycle in
   `replyTo` links, unlike the trust-grant chain `VeritasGrantResolver` walks).
 * **`GET /api/mail/attachment/{cid}`'s cross-node fetch is limited by the same pre-existing
-  `NabuStorage.get()`/`Kademlia.dialPeer` gap** every other cross-node fetch in this codebase has
-  carried since V0.1.4 — a node can only reliably retrieve an attachment blob it already has
+  `NabuStorage.get()`/`Kademlia.dialPeer` gap** every other cross-node fetch in this codebase carried
+  from V0.1.4 until its repair in V0.9.8 — a node can only reliably retrieve an attachment blob it already has
   locally (the sender's own node, or a node that fetched it some other way). Reflected in
   `TwoNodeMailBrowserIntegrationTest`'s own scoping: it asserts attachment *metadata* propagates to
   the recipient via gossip, and that the sender fetches its own attachment locally — not that the
@@ -1618,7 +1618,10 @@ broken V0.1.4–V0.9.7, repaired in V0.9.8" section for the two root causes (a r
 answering `GET_PROVIDERS`, and Nabu's own `Kademlia.provideBlock` silently dropping its
 `ADD_PROVIDER` write on the Netty event-loop thread) and how each was verified. `NabuStorage.provide()`/
 `findProviders()` now work end-to-end, proven by a real 3-node loopback test
-(`MultiNodeDhtProviderDiscoveryTest`), with no Nabu version bump and no fork/vendoring.
+(`MultiNodeDhtProviderDiscoveryTest`), with no Nabu version bump and no fork/vendoring. **Correction
+(V0.9.11):** that three-node test proves only the second of the two fixes (the off-loop announcement);
+the first (the responder's self-address registration) was never exercised by it, because the
+answering node never holds the block. A two-node test added in V0.9.11 covers it.
 
 **Deliberately not done this wave:** migrating `lapis-net-directory`/`-mail`/`-dm`/`-ratchet` off
 GossipSub onto the now-working DHT path. Those are already-shipped, security-audited modules with
@@ -1627,7 +1630,7 @@ security loop, not a side effect of this storage-layer fix. Until that migration
 "gossip-only" note elsewhere in this document stays correct as a description of current behavior —
 only the *reason* ("because the DHT path is broken") is now historical rather than current.
 
-**Review status:** unlike the feature waves, no independent review or security-audit round is documented for this repair (the commit records a green `clean check` and the three-node test only). Because it added bounded network fan-out in `NabuStorage.provide()`, a retroactive independent review and security audit of commit `112cdf6` is a recommended follow-up.
+**Review status:** unlike the feature waves, no independent review or security-audit round was documented when this repair landed (the commit recorded a green `clean check` and the three-node test only). The retroactive independent review and security audit of commit `112cdf6` was carried out on 2026-10-02. Both came back `approved=false` with no blocker, and found the major issues listed under V0.9.11 below (the unbounded `provide()` walk, leaked streams, unbounded address fan-out, the unbounded provider store, the unvalidated responder keys, the responder NPE) plus three minor review findings (M1-M3: the three-node test's claim about what it proves, the stale deadline and address-tolerance statements, and the stale reasons quoted across this document). They are fixed in V0.9.11.
 
 == V0.9.9 — Relay-based NAT traversal (post-arc maintenance)
 
@@ -1760,3 +1763,49 @@ and once a connection's budget is used up any circuit on it whose pause outlasts
 not only the attacker's; dials through `host.newStream` (`lapis-net-dm`, `lapis-net-storage`) and the
 `BrowserApi` peer list still do not see accepted relayed connections; per-address reservation
 admission and any relay reputation (Madli) are unchanged and belong to the Madli relay wave.
+
+== V0.9.11 — DHT layer hardening (post-arc maintenance)
+
+_Unreleased — no tag yet; the version stays `0.9.9`. Follow-up to the retroactive review and security audit of V0.9.8._
+
+**What is new** (`lapis-net-storage`; details and the limits table: `docs/architecture.adoc`, "DHT layer hardening (V0.9.11)"):
+
+* **`provide()`, `findProviders()` and the lookup inside `get()` have an absolute deadline** from the
+  first line of the call, an interruptible wait that `stop()` also ends, a cap on concurrent
+  operations (`DHT busy` beyond it) and no Nabu lookup method on their path. `provide()` now returns
+  the number of `ADD_PROVIDER` messages sent (`Int`, was `Unit`); the protocol gives no acknowledgement.
+* **Streams are closed**: initiator streams on success, failure and timeout, responder streams after
+  `ADD_PROVIDER`.
+* **Addresses from the DHT are sanitized** (at most 8 per peer, 2 per IP, no DNS form, no foreign
+  `/p2p/`, only dialable transports, public-only in WAN mode) before any dial or store, and merged into
+  the address book without ever displacing existing entries.
+* **A bounded provider store** replaces Nabu's: LRU over keys, 8 records per key, addresses capped.
+* **Inbound requests are validated** before Nabu's responder sees them (the multihash-length allocation
+  bug reachable by any connected peer), and the responder's NPE for a routing-table peer without an
+  address-book entry is fixed.
+* **`DhtLimits`** collects every bound; `NabuStorage.attach(..., limits = DhtLimits())`.
+* **`get()` fetches on a bounded pool**, connects to each provider with its own timeout first, and tries
+  at most 8 providers; a busy pool answers `null` at once. `connectToDhtPeer` takes a timeout and
+  closes its stream. After `stop()`, `provide`/`findProviders` throw and `get` consults only the local
+  blockstore.
+
+**Test evidence:** real loopback nodes, no network mocks; hostile peers are real libp2p nodes whose
+Kademlia responder is scripted by the test. `DhtProvideDeadlineTest` (30 sequential and 30 parallel
+`provide()` calls against a routing table holding a silent peer, interruption, `stop()`),
+`DhtStreamLifecycleTest` (stream counts of all three nodes return to baseline after hundreds of
+exchanges), `DhtAddressAmplificationTest` (counting TCP listeners behind a 400-address response),
+`PoisonedProviderGetTest` (80 hostile `ADD_PROVIDER`s, twelve identities, an honest provider among
+seven poisoned ones, a saturated fetch pool), `KademliaResponderMultihashOverflowTest`, the extended
+`MultiNodeDhtProviderDiscoveryTest` (adds a two-node test of the responder's self-registration and an
+assertion on the DHT key) and unit tests for the limits, sanitizer, request policy and provider store.
+Every fix was also checked by mutation: with the fix removed, the test named for it fails.
+
+**What remains:**
+
+* The block's bare multihash is revealed to the peers a lookup queries (up to 44 with the defaults);
+  the CID is the access token. DM and mail still call `get(cid)` without peers.
+* Sybil crowding of a key's eight provider slots (plain LRU), an address book without eviction, no
+  republish of provider records, protobuf decoding of up to 1 MiB before the entry caps apply.
+* Bitswap has no way to cancel a want: a timed-out fetch leaves its want and re-send thread behind
+  (five minutes against a single peer).
+* The gossip-only modules are not migrated onto the DHT; that remains a separately planned wave.

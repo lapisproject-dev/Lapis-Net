@@ -18,9 +18,9 @@ private const val SIGNATURE_SIZE = 64
  * driver.
  *
  * **Central mechanism, stated here because this is the type that carries it.** A bare CID alone is
- * not fetchable: `NabuStorage.findProviders` (DHT-based provider discovery) has been broken since
- * V0.1.4 (see `docs/architecture.adoc`), so this pointer carries [senderIdentity] - not an address,
- * which would go stale - as a routing HINT. The recipient resolves the sender's CURRENT address at
+ * not fetchable: `NabuStorage.findProviders` (DHT-based provider discovery) was broken from V0.1.4
+ * until V0.9.8 (see `docs/architecture.adoc`; the design stands, the reason is historical), so this
+ * pointer carries [senderIdentity] - not an address, which would go stale - as a routing HINT. The recipient resolves the sender's CURRENT address at
  * fetch time via `PeerDirectoryGossip.lookup(senderIdentity)` (V0.8.1) and does a direct Bitswap
  * fetch by explicit peer ([MailboxPoller.attemptOne]), never touching `findProviders`. This means
  * **the sender must remain reachable (or at least come back online periodically) for offline
@@ -28,7 +28,7 @@ private const val SIGNATURE_SIZE = 64
  * (GossipSub has no message replay - see `MailboxRedeliveryScheduler`'s own doc comment), to have
  * this pointer periodically re-announced so that a recipient whose node was not yet running at the
  * time of the original publish can ever learn the pointer exists at all. This is a real, inherent
- * limitation of routing around the broken DHT with gossip alone - documented plainly, not silently
+ * limitation of routing around the then-broken DHT with gossip alone - documented plainly, not silently
  * papered over, in `docs/roadmap.adoc`'s and `docs/architecture.adoc`'s V0.8.5 sections.
  *
  * **Metadata-minimization honesty note - a deliberate, necessary deviation from the original DM
@@ -39,7 +39,7 @@ private const val SIGNATURE_SIZE = 64
  * routing hint to fetch the blob without knowing WHOSE current address to look up, and
  * [MailboxGossip]'s validator cannot cheaply reject a forged pointer without a signer identity to
  * check it against. A fully metadata-blind mailbox record is not achievable under this wave's
- * broken-DHT-workaround fetch mechanism - anyone who can subscribe to
+ * (historical) broken-DHT-workaround fetch mechanism - anyone who can subscribe to
  * [MailboxTopics.forRecipient]`(X)` (i.e. anyone, since GossipSub topics are not access-controlled)
  * learns "someone claiming identity S deposited a message for X at time T", exactly the same
  * exposure `PeerRecord`'s own class doc comment already accepts for presence/address gossip. No

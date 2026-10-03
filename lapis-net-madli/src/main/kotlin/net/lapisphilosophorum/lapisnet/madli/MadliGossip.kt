@@ -33,8 +33,9 @@ private val logger = KotlinLogging.logger {}
  * **Publishes full vector bytes, not a `Cid` pointer** - same reasoning as
  * `KarmaGossip`/`LtrGossip`'s own doc comments (a [MadliDailyVectorCodec.MAX_BODY_SIZE]-bounded
  * vector plus a 64-byte signature is tiny relative to any reasonable gossip message-size ceiling,
- * and `NabuStorage.findProviders()` does not work end-to-end in this codebase - see
- * `docs/architecture.adoc`'s Storage section - so a bare-CID gossip message would be unfetchable).
+ * and `NabuStorage.findProviders()` did not work end-to-end when this was written (repaired in
+ * V0.9.8, see `docs/architecture.adoc`'s Storage section) - so a bare-CID gossip message would
+ * have been unfetchable).
  *
  * **Persistence lifecycle order is load-bearing, not stylistic** - identical to
  * `KarmaGossip`/`LtrGossip`:

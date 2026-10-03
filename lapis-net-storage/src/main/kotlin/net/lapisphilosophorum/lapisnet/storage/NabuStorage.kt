@@ -2,12 +2,11 @@ package net.lapisphilosophorum.lapisnet.storage
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
-import io.ipfs.multiaddr.MultiAddress
 import io.ipfs.multihash.Multihash
+import io.libp2p.core.Connection
 import io.libp2p.core.Host
 import io.libp2p.core.PeerId
 import io.libp2p.core.multiformats.Multiaddr
-import io.libp2p.core.multiformats.Protocol
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import org.peergos.BlockRequestAuthoriser
 import org.peergos.PeerAddresses
@@ -15,34 +14,36 @@ import org.peergos.Want
 import org.peergos.blockstore.Blockstore
 import org.peergos.blockstore.FileBlockstore
 import org.peergos.protocol.bitswap.Bitswap
-import org.peergos.protocol.bitswap.BitswapEngine
 import org.peergos.protocol.dht.Kademlia
-import org.peergos.protocol.dht.KademliaEngine
-import org.peergos.protocol.dht.RamProviderStore
+import org.peergos.protocol.dht.pb.Dht
 import java.nio.file.Path
 import java.time.Duration
+import java.util.Collections
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executor
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 private val logger = KotlinLogging.logger {}
 
 private val DEFAULT_TIMEOUT: Duration = Duration.ofSeconds(10)
-private const val DEFAULT_PROVIDER_STORE_CAPACITY = 1024
+private val DEFAULT_CONNECT_TIMEOUT: Duration = Duration.ofSeconds(5)
 private const val DEFAULT_RECORD_STORE_CAPACITY = 1024
 private const val DEFAULT_DESIRED_PROVIDER_COUNT = 4
+private const val RPC_POOL_SIZE = 4
 
-/**
- * How many of the closest-known peers a [NabuStorage.provide] call announces to. Matches the
- * fan-out Nabu's own `Kademlia.provideBlock` uses, and doubles as the bound that keeps a single
- * `provide` call from fanning out over an arbitrarily large routing table.
- */
-private const val DHT_PROVIDE_FANOUT = 20
-
-/** Per-peer cap inside [NabuStorage.provide], so one unresponsive peer can't eat the whole budget. */
-private val PER_PEER_ANNOUNCE_TIMEOUT: Duration = Duration.ofSeconds(2)
+/** How long a (block, peer) pair is not asked again by [NabuStorage.get]; matches Nabu's own want lifetime. */
+private val FETCH_REPEAT_WINDOW: Duration = Duration.ofMinutes(5)
+private const val RECENT_FETCH_CAPACITY = 4096
 
 /** Thrown when a storage or DHT operation fails or times out. */
 class NabuStorageException(
@@ -54,18 +55,104 @@ class NabuStorageException(
 private val allowAllReads =
     BlockRequestAuthoriser { _, _, _ -> CompletableFuture.completedFuture(true) }
 
+private fun daemonThreads(prefix: String): ThreadFactory {
+    val counter = AtomicInteger()
+    return ThreadFactory { task -> Thread(task, "$prefix-${counter.incrementAndGet()}").apply { isDaemon = true } }
+}
+
 /**
  * DHT (Kademlia) + Bitswap content storage, layered on an already-`start()`-ed [LapisNode]'s
  * libp2p [Host] (see [attach]). Domain-agnostic by design: [ByteArray]/[Cid] in and out - no
  * Veritas-specific structure lives here (that lands in a later wave, built on top of this).
+ *
+ * **The DHT layer is this project's own since V0.9.11** (see [DhtWalker], [LapisKademliaEngine],
+ * [BoundedProviderStore], [PeerAddressSanitizer], [InboundDhtRequestPolicy] and [DhtLimits]):
+ * Nabu supplies the wire protocol, the routing table and Bitswap, but none of its blocking lookup
+ * methods (`findClosestPeers`, `findProviders`, `getCloserPeers`, `provideBlock`,
+ * `bootstrapRoutingTable`, `publishValue`, `resolveValue`) is ever called, because they have no
+ * deadline, run on a non-daemon pool that wedges permanently, and parse untrusted responses with
+ * unbounded parsers. Every operation here has an absolute deadline measured from the start of the
+ * call.
  */
 class NabuStorage private constructor(
     private val host: Host,
     private val blockstore: Blockstore,
     private val bitswap: Bitswap,
+    private val bitswapEngine: RefreshableBitswapEngine,
     private val kademlia: Kademlia,
+    private val engine: LapisKademliaEngine,
+    private val limits: DhtLimits,
+    private val localDht: Boolean,
+    /** Nanosecond clock of the repeat window and the want lifetime; tests age both with it. */
+    private val clock: () -> Long = System::nanoTime,
 ) {
     private val stopped = AtomicBoolean(false)
+
+    /** Completed by [stop]; ends every blocking DHT wait early. */
+    private val stopSignal = CompletableFuture<Unit>()
+
+    private val operationPermits = Semaphore(limits.maxConcurrentDhtOperations)
+    private val addressLock = Any()
+
+    /** Runs the (non-blocking) write continuations of DHT exchanges, never the Netty event loop. */
+    private val rpcPool =
+        ThreadPoolExecutor(
+            RPC_POOL_SIZE,
+            RPC_POOL_SIZE,
+            30,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue(),
+            daemonThreads("lapis-dht-rpc"),
+        ).apply { allowCoreThreadTimeOut(true) }
+
+    /**
+     * A rejected task (after [stop]) is dropped instead of thrown: a [RejectedExecutionException]
+     * raised inside a `thenComposeAsync` step surfaces on the thread that completed the previous
+     * stage - the Netty event loop - and would leave the dependent future open forever. The
+     * exchange's own `orTimeout` cleans up.
+     */
+    private val rpcExecutor =
+        Executor { task ->
+            try {
+                rpcPool.execute(task)
+            } catch (_: RejectedExecutionException) {
+                logger.debug { "DHT exchange task dropped: storage is stopped" }
+            }
+        }
+
+    /**
+     * Runs the blocking part of a fetch (connecting to a provider, then Bitswap's `get`, which dials
+     * synchronously and starts a `Thread` per call that re-sends the want until it expires). Bounded
+     * twice: [DhtLimits.maxConcurrentFetches] run at once and a queue of one call's worth of providers
+     * per slot waits; beyond that [get] returns `null` at once ("busy"). Daemon threads - the inner
+     * Bitswap thread inherits that - so a stuck dial never pins the JVM.
+     */
+    private val fetchExecutor =
+        ThreadPoolExecutor(
+            limits.maxConcurrentFetches,
+            limits.maxConcurrentFetches,
+            30,
+            TimeUnit.SECONDS,
+            ArrayBlockingQueue(limits.maxConcurrentFetches * limits.maxProvidersPerKey),
+            daemonThreads("lapis-bitswap-fetch"),
+            ThreadPoolExecutor.AbortPolicy(),
+        ).apply { allowCoreThreadTimeOut(true) }
+
+    /** Number of Bitswap requests actually sent by [get]; lets tests observe the repeat window. */
+    internal val bitswapRequestsSent = AtomicInteger()
+
+    private val recentFetches: MutableMap<Pair<String, PeerId>, Long> =
+        Collections.synchronizedMap(
+            object : LinkedHashMap<Pair<String, PeerId>, Long>(16, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<String, PeerId>, Long>): Boolean =
+                    size > RECENT_FETCH_CAPACITY
+            },
+        )
+
+    private val walker =
+        DhtWalker(host, kademlia, engine, limits, localDht, rpcExecutor, stopSignal) { peer, addresses ->
+            mergeDhtLearned(peer, addresses)
+        }
 
     /** Stores [bytes] in the local blockstore (no network) and returns its [Cid]. */
     fun put(
@@ -73,7 +160,7 @@ class NabuStorage private constructor(
         timeout: Duration = DEFAULT_TIMEOUT,
     ): Cid {
         val cid = awaitOrWrap("put block", timeout) { blockstore.put(bytes, Cid.Codec.Raw) }
-        logger.info { "stored block $cid (${bytes.size} bytes)" }
+        logger.debug { "stored block $cid (${bytes.size} bytes)" }
         return cid
     }
 
@@ -101,56 +188,232 @@ class NabuStorage private constructor(
     /**
      * Returns the bytes for [cid], or `null` if it can't be found anywhere reachable. Checks
      * the local blockstore first (no network involved). If absent: fetches from [peers] via
-     * Bitswap if given, otherwise looks up providers via the DHT ([findProviders]) first and
-     * fetches from whatever it finds. A DHT lookup or Bitswap fetch that fails or times out is
-     * treated as "not found" (returns `null`) rather than propagating [NabuStorageException] -
-     * an unreachable/non-responding peer is exactly the "can't be found anywhere reachable"
-     * case this method documents, not a distinct error condition callers need to handle
-     * separately. A failure checking the *local* blockstore still throws, since that signals a
-     * real local fault (e.g. disk I/O), not a not-found result.
+     * Bitswap if given, otherwise looks up providers via the DHT first and fetches from whatever
+     * it finds. A DHT lookup or Bitswap fetch that fails or times out is treated as "not found"
+     * (returns `null`) rather than propagating [NabuStorageException] - an unreachable or
+     * non-responding peer is exactly the "can't be found anywhere reachable" case this method
+     * documents, not a distinct error condition callers need to handle separately. A failure
+     * checking the *local* blockstore still throws, since that signals a real local fault (e.g.
+     * disk I/O), not a not-found result. After [stop] only the local blockstore is consulted.
+     *
+     * **Bounds (V0.9.11).** [timeout] is an absolute deadline from the start of the call: a DHT
+     * lookup, if needed, gets the first half of it and the fetch wait whatever remains. At most
+     * [DhtLimits.maxProvidersPerKey] peers are tried, each dialled with at most
+     * [DhtLimits.maxAddressesPerPeer] addresses. Fetches run on a bounded pool; if every slot is
+     * busy this returns `null` immediately instead of queueing.
+     *
+     * **Known residual risk.** Nabu has no API to cancel a want. A fetch that times out leaves its
+     * want registered, and Bitswap's re-send thread for it keeps running - but only against the peer
+     * it was asked of, and only until five minutes after the want was last requested FROM THAT PEER
+     * ([RefreshableBitswapEngine] tracks wants per peer; activity for other peers or blocks does not
+     * keep the thread alive). The dial it makes is bounded only by libp2p's own limits (TCP connect
+     * 15 s, Noise read 5 s). The same (block, peer) pair is not requested again within five minutes,
+     * so repeated `get` calls do not multiply those threads; once the five minutes are over, the next
+     * `get` really sends the request again and renews the want's lifetime for that peer - Nabu alone
+     * would never send it again.
+     *
+     * **Address book.** What a DHT response says about a provider's addresses is unverified. It is
+     * used for this one fetch only; an address enters the address book only after a connection over
+     * it was made and the peer on the other end proved to be the provider ([connectForFetch]).
+     *
+     * **Information leak.** With `peers` empty, the block's bare multihash is sent to every peer
+     * the lookup queries (at most `walkParallelism x maxWalkRounds` plus the routing-table seeds).
+     * The CID is the access token for a block (reads are always authorised) - callers that must not
+     * reveal it to the DHT pass explicit `peers`.
      */
     fun get(
         cid: Cid,
         peers: Set<PeerId> = emptySet(),
         timeout: Duration = DEFAULT_TIMEOUT,
     ): ByteArray? {
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        val deadline = start + timeout.toNanos()
         val local = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
         if (local.isPresent) return local.get()
+        if (stopped.get()) return null
 
         return try {
-            val targetPeers =
-                peers.ifEmpty {
-                    // findProvidersRaw's addresses must be registered in the AddressBook before
-                    // Bitswap can dial a peer it only just learned about via the DHT - Bitswap's
-                    // dialPeer() looks addresses up from the AddressBook, it doesn't accept them
-                    // directly (see the wiring note in attach()'s doc comment).
-                    val discovered = findProvidersRaw(cid, timeout = timeout)
-                    discovered.forEach { peer ->
-                        host.addressBook.addAddrs(PeerId(peer.peerId.toBytes()), 0, *peer.addresses.toTypedArray())
-                    }
-                    discovered.map { PeerId(it.peerId.toBytes()) }.toSet()
+            // addresses the DHT named for a provider: unverified, they only serve this call's dials
+            val hints = HashMap<PeerId, List<Multiaddr>>()
+            val targets: List<PeerId> =
+                if (peers.isNotEmpty()) {
+                    peers.take(limits.maxProvidersPerKey)
+                } else {
+                    val discovered = lookupProviders(cid, limits.maxProvidersPerKey, start + timeout.toNanos() / 2)
+                    discovered.forEach { hints[it.peerId] = it.addresses }
+                    discovered.map { it.peerId }
                 }
-            if (targetPeers.isEmpty()) return null
-
-            val fetched =
-                awaitOrWrap("fetch block via bitswap", timeout) {
-                    bitswap.get(Want(cid), host, targetPeers, true)
-                }
-            fetched.block
+            if (targets.isEmpty()) return null
+            fetch(cid, targets, hints, deadline)
         } catch (e: NabuStorageException) {
-            logger.debug(e) { "get($cid) could not reach any peer within the timeout - treating as not found" }
+            logger.debug(e) { "get() could not reach any peer within the timeout - treating as not found" }
+            null
+        }
+    }
+
+    private fun fetch(
+        cid: Cid,
+        targets: List<PeerId>,
+        hints: Map<PeerId, List<Multiaddr>>,
+        deadlineNanos: Long,
+    ): ByteArray? {
+        // The want future is shared by every waiter for this block; it must never be cancelled here.
+        val want = bitswapEngine.getWant(Want(cid), true)
+        var submitted = 0
+        for (peer in targets) {
+            if (recentlyRequested(cid, peer)) continue
+            try {
+                fetchExecutor.execute {
+                    // a task that waited in the queue past this call's deadline has nobody left to serve
+                    val connected =
+                        System.nanoTime() < deadlineNanos && connectForFetch(peer, hints[peer].orEmpty(), deadlineNanos)
+                    if (connected && markRequested(cid, peer)) {
+                        // Nabu's want expires five minutes after its creation; a request that is really sent
+                        // starts a new lifetime, or a block whose first fetch failed could never be fetched again.
+                        // The want is registered for THIS peer only, so it is put in no other peer's wantlist.
+                        bitswapEngine.refresh(Want(cid), peer)
+                        bitswapRequestsSent.incrementAndGet()
+                        runCatching { bitswap.get(Want(cid), host, setOf(peer), true) }
+                            .onFailure { logger.debug { "bitswap request failed: ${it.javaClass.simpleName}" } }
+                    }
+                }
+                submitted++
+            } catch (_: RejectedExecutionException) {
+                logger.debug { "all bitswap fetch slots busy" }
+                if (submitted == 0) return null
+                break
+            }
+        }
+        // every target was asked recently: that request is already running its course, nothing to wait for
+        if (submitted == 0) return null
+        val remaining = deadlineNanos - System.nanoTime()
+        return try {
+            want.get(maxOf(remaining, 0), TimeUnit.NANOSECONDS).block
+        } catch (_: TimeoutException) {
+            null
+        } catch (e: ExecutionException) {
+            logger.debug { "bitswap want failed: ${e.cause?.javaClass?.simpleName}" }
+            null
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
             null
         }
     }
 
     /**
-     * Announces to the DHT that this node has [cid] available for retrieval: sends an
-     * `ADD_PROVIDER` RPC naming this node to each of the [DHT_PROVIDE_FANOUT] peers closest to
-     * [cid] in the Kademlia keyspace, as found by walking this node's routing table. A later
+     * Makes sure there is a live connection to [peer] BEFORE Bitswap is asked to use it, within
+     * [DhtLimits.fetchConnectTimeout]. Bitswap's own dial blocks without a bound of ours; this way a
+     * silent or unroutable provider costs one bounded wait and no re-send thread, and the pending
+     * dials are cancelled. With a connection in place Bitswap's dial returns immediately.
+     *
+     * [hints] are addresses a third party (a DHT response) claims for [peer]. They are tried after the
+     * addresses already on file and are NOT stored: only the address of a connection that really came
+     * up and whose far end authenticated as [peer] is put in the address book (Bitswap resolves
+     * addresses from there). So a responder cannot fill the address book with peers that never
+     * answered, nor push a victim's real addresses out of its capped entry with made-up ones.
+     */
+    private fun connectForFetch(
+        peer: PeerId,
+        hints: List<Multiaddr>,
+        deadlineNanos: Long,
+    ): Boolean {
+        val known =
+            host.addressBook
+                .getAddrs(peer)
+                .join()
+                .orEmpty()
+        host.network.connections.firstOrNull { it.secureSession().remoteId == peer }?.let { existing ->
+            // Bitswap resolves an address from the book before it dials - and then reuses this connection.
+            // The connection's own remote address is the one proven to belong to the peer (for an incoming
+            // connection it is no address to dial back, but the connection is what will be used).
+            if (known.isEmpty()) learnVerifiedAddress(peer, existing, listOf(existing.remoteAddress()))
+            return true
+        }
+        val addresses = (known + hints).distinctBy { it.toString() }.take(limits.maxAddressesPerPeer)
+        if (addresses.isEmpty()) return false
+        val timeoutNanos = minOf(limits.fetchConnectTimeout.toNanos(), deadlineNanos - System.nanoTime())
+        if (timeoutNanos <= 0) return false
+        val connecting = host.network.connect(peer, *addresses.toTypedArray())
+        return try {
+            val connection = connecting.get(timeoutNanos, TimeUnit.NANOSECONDS)
+            if (connection.secureSession().remoteId != peer) {
+                logger.debug { "a provider's address led to a different peer - not used" }
+                runCatching { connection.close() }
+                return false
+            }
+            learnVerifiedAddress(peer, connection, addresses)
+            true
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            connecting.cancel(true)
+            false
+        } catch (e: Exception) {
+            logger.debug { "could not connect to a provider: ${e.javaClass.simpleName}" }
+            connecting.cancel(true)
+            false
+        }
+    }
+
+    /**
+     * Puts into the address book the address [connection] to [peer] actually runs over, if it is one of
+     * [candidates] - the single address that is proven to belong to [peer].
+     */
+    private fun learnVerifiedAddress(
+        peer: PeerId,
+        connection: Connection,
+        candidates: List<Multiaddr>,
+    ) {
+        val remote = runCatching { connection.remoteAddress().withP2P(peer) }.getOrNull() ?: return
+        val match =
+            candidates
+                .mapNotNull { runCatching { it.withP2P(peer) }.getOrNull() }
+                .firstOrNull { it.toString() == remote.toString() } ?: return
+        mergeDhtLearned(peer, listOf(match))
+    }
+
+    /** Read-only: was a Bitswap request for this (block, peer) pair actually sent within the repeat window? */
+    private fun recentlyRequested(
+        cid: Cid,
+        peer: PeerId,
+    ): Boolean {
+        val last = synchronized(recentFetches) { recentFetches[cid.toString() to peer] } ?: return false
+        return clock() - last < FETCH_REPEAT_WINDOW.toNanos()
+    }
+
+    /**
+     * Called only when a Bitswap request is about to be sent (a connection exists): records the pair
+     * and returns `false` if another call did so within the repeat window. A pair whose connect failed,
+     * whose task was rejected or whose deadline passed in the queue is therefore never marked.
+     */
+    private fun markRequested(
+        cid: Cid,
+        peer: PeerId,
+    ): Boolean {
+        val key = cid.toString() to peer
+        val now = clock()
+        synchronized(recentFetches) {
+            val last = recentFetches[key]
+            if (last != null && now - last < FETCH_REPEAT_WINDOW.toNanos()) return false
+            recentFetches[key] = now
+            return true
+        }
+    }
+
+    /**
+     * Announces to the DHT that this node has [cid] available for retrieval: walks Kademlia's
+     * keyspace towards [cid]'s key (the bare multihash) and sends an `ADD_PROVIDER` RPC naming this
+     * node to each of the [DhtLimits.provideFanout] closest peers it found. A later
      * [findProviders] call for [cid] by any node that can reach one of those peers then resolves
      * back to this node. Peers that can't be dialled, or that time out, are skipped - the
-     * announcement is best-effort by nature (that is what a DHT publish is), so this only throws
-     * if the routing-table walk itself fails.
+     * announcement is best-effort by nature. Returns how many `ADD_PROVIDER` messages were SENT;
+     * **the protocol has no acknowledgement, so this is not a delivery count**. Returns 0 (and
+     * logs a warning) if no DHT peer is known.
+     *
+     * [timeout] is an absolute deadline from the first line of this call: the walk gets the first
+     * half, the announcement the rest. Throws [NabuStorageException] if the storage is stopped, if
+     * the DHT is busy ([DhtLimits.maxConcurrentDhtOperations]), if the thread is interrupted
+     * (the flag is restored) or if the walk itself fails.
      *
      * **Why this does not call Nabu's own `Kademlia.provideBlock` (V0.9.8 repair, Nabu v0.8.0).**
      * `provideBlock` chains the announcement onto the dial as
@@ -164,101 +427,101 @@ class NabuStorage private constructor(
      * addresses, identical message - `thenCompose` (on-loop) delivered nothing, while both
      * `thenComposeAsync` on a separate executor and a plain blocking
      * `dial(...).controller.get()` followed by `provide(...)` delivered the `ADD_PROVIDER`
-     * every time. This method therefore does the dial-then-announce itself, off the event loop,
-     * using only Nabu's public API (no fork, no vendoring). See docs/architecture.adoc.
+     * every time. The repair did the dial-then-announce itself, off the event loop.
+     *
+     * **V0.9.11:** that repair still used Nabu's `findClosestPeers` for the walk, which has no
+     * deadline and runs on a non-daemon pool. The walk is now [DhtWalker.closestPeers], also off
+     * the event loop and bounded. See docs/architecture.adoc.
      */
     fun provide(
         cid: Cid,
         timeout: Duration = DEFAULT_TIMEOUT,
-    ) {
+    ): Int {
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        val deadline = start + timeout.toNanos()
+        val walkDeadline = start + timeout.toNanos() / 2
+        failIfStopped()
         val us = PeerAddresses.fromHost(host)
-        val closest =
-            try {
-                kademlia.findClosestPeers(cid, DHT_PROVIDE_FANOUT, host)
-            } catch (e: Exception) {
-                throw NabuStorageException("failed to find DHT peers to announce $cid to", e)
+        return withOperationPermit(deadline) {
+            val closest =
+                try {
+                    walker.closestPeers(dhtKeyFor(cid), limits.provideFanout, walkDeadline)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw NabuStorageException("interrupted while finding DHT peers to announce to", e)
+                } catch (e: Exception) {
+                    throw NabuStorageException("failed to find DHT peers to announce to", e)
+                }
+            failIfStopped()
+            if (closest.peers.isEmpty()) {
+                logger.warn { "provide: no DHT peers known - nothing announced" }
+                return@withOperationPermit 0
             }
-        val deadline = System.nanoTime() + timeout.toNanos()
-        var announced = 0
-        for (peer in closest) {
-            val remaining = deadline - System.nanoTime()
-            if (remaining <= 0) {
-                logger.debug { "ran out of time announcing $cid after $announced of ${closest.size} peers" }
-                break
+            val sent =
+                try {
+                    walker.announce(cid, closest.peers, us, deadline)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw NabuStorageException("interrupted while announcing", e)
+                } catch (e: Exception) {
+                    throw NabuStorageException("failed to announce", e)
+                }
+            logger.info {
+                "provide: sent ADD_PROVIDER to $sent of ${closest.peers.size} candidate peers " +
+                    "(delivery unconfirmed: the protocol has no acknowledgement)"
             }
-            if (announceTo(cid, peer, us, remaining)) announced++
-        }
-        logger.info { "announced $cid to $announced of ${closest.size} DHT peers" }
-    }
-
-    /**
-     * Sends one `ADD_PROVIDER` for [cid] to [peer], synchronously on the calling thread (see
-     * [provide]'s doc comment for why this must not run on a Netty event-loop thread). Returns
-     * `false` - rather than throwing - for every per-peer failure: an unparseable address, an
-     * unreachable peer or a timeout is an ordinary outcome of a best-effort DHT publish, not a
-     * fault of this node.
-     */
-    private fun announceTo(
-        cid: Cid,
-        peer: PeerAddresses,
-        us: PeerAddresses,
-        remainingNanos: Long,
-    ): Boolean {
-        // Tolerate addresses this node can't parse or dial rather than failing the whole
-        // announcement: `peer` came out of the routing table, i.e. ultimately from a remote
-        // peer's FIND_NODE response, so its address list is untrusted input. DNS-form addresses
-        // are dropped for the same reason Nabu's own dialPeer drops them - this transport stack
-        // does not resolve them.
-        val addresses =
-            peer.addresses
-                .mapNotNull { runCatching { Multiaddr.fromString(it.toString()) }.getOrNull() }
-                .filterNot { it.has(Protocol.DNS) || it.has(Protocol.DNS4) || it.has(Protocol.DNS6) }
-        if (addresses.isEmpty()) return false
-        val peerId = runCatching { PeerId.fromBase58(peer.peerId.toBase58()) }.getOrNull() ?: return false
-        val perPeerNanos = minOf(remainingNanos, PER_PEER_ANNOUNCE_TIMEOUT.toNanos())
-        return try {
-            val controller =
-                kademlia
-                    .dial(host, peerId, *addresses.toTypedArray())
-                    .controller
-                    .get(perPeerNanos, TimeUnit.NANOSECONDS)
-            controller.provide(cid, us).get(perPeerNanos, TimeUnit.NANOSECONDS)
-            true
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        } catch (e: Exception) {
-            logger.debug(e) { "could not announce $cid to ${peer.peerId} - skipping this peer" }
-            false
+            logger.debug { "provide: announced $cid" }
+            sent
         }
     }
 
     /**
-     * Looks up which known peers have announced [cid] via [provide], by walking this node's
-     * Kademlia routing table and issuing `GET_PROVIDERS` RPCs. Also resolves peers that never
-     * called [provide] but simply hold [cid] in their local blockstore - Nabu's responder side
-     * adds itself to any `GET_PROVIDERS` reply for a block it already has.
+     * Looks up which known peers have announced [cid] via [provide], by walking Kademlia's
+     * keyspace with `GET_PROVIDERS` RPCs (first consulting this node's own provider store). Also
+     * resolves peers that never called [provide] but simply hold [cid] in their local blockstore -
+     * Nabu's responder side adds itself to any `GET_PROVIDERS` reply for a block it already has.
+     * [desiredCount] is clamped to [DhtLimits.maxProvidersPerKey].
      *
-     * Returns only peer IDs. A caller that needs dialable addresses too (i.e. [get]) uses the
-     * private raw form, which keeps the [PeerAddresses] and registers them in the address book.
-     * Note that on a loopback-only deployment those addresses can come back empty for the
-     * "responder holds the block itself" case: `KademliaEngine`'s `GET_PROVIDERS` handler filters
-     * its own advertised addresses to publicly-routable ones, which loopback addresses are not.
-     * Provider entries that arrived through a real [provide]/`ADD_PROVIDER` are not filtered and
-     * do carry their addresses.
+     * [timeout] is an absolute deadline from the start of the call; whatever was found when it
+     * passes is returned (possibly an empty set). Throws [NabuStorageException] if the storage is
+     * stopped, the DHT is busy, the thread is interrupted (the flag is restored) or the walk fails.
+     *
+     * Returns only peer IDs. [get] resolves the addresses itself and registers them. Note that on a
+     * loopback-only deployment those addresses can come back empty for the "responder holds the
+     * block itself" case: `KademliaEngine`'s `GET_PROVIDERS` handler filters its own advertised
+     * addresses to publicly-routable ones, which loopback addresses are not. Such entries are kept
+     * with an empty address list. Provider entries that arrived through a real
+     * [provide]/`ADD_PROVIDER` are not filtered and do carry their addresses.
+     *
+     * Like [get] without `peers`, this reveals the block's bare multihash to the peers it queries.
      */
     fun findProviders(
         cid: Cid,
         desiredCount: Int = DEFAULT_DESIRED_PROVIDER_COUNT,
         timeout: Duration = DEFAULT_TIMEOUT,
-    ): Set<PeerId> = findProvidersRaw(cid, desiredCount, timeout).map { PeerId(it.peerId.toBytes()) }.toSet()
+    ): Set<PeerId> {
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        failIfStopped()
+        return lookupProviders(cid, desiredCount, start + timeout.toNanos()).map { it.peerId }.toSet()
+    }
 
-    private fun findProvidersRaw(
+    private fun lookupProviders(
         cid: Cid,
-        desiredCount: Int = DEFAULT_DESIRED_PROVIDER_COUNT,
-        timeout: Duration = DEFAULT_TIMEOUT,
-    ): List<PeerAddresses> =
-        awaitOrWrap("find DHT providers", timeout) { kademlia.findProviders(cid, host, desiredCount) }
+        desired: Int,
+        deadlineNanos: Long,
+    ): List<DhtWalker.WalkPeer> =
+        withOperationPermit(deadlineNanos) {
+            try {
+                walker.findProviders(cid.bareMultihash(), desired, deadlineNanos)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw NabuStorageException("interrupted while finding DHT providers", e)
+            } catch (e: Exception) {
+                throw NabuStorageException("failed to find DHT providers", e)
+            }
+        }
 
     /**
      * Registers [address] (must include a `/p2p/<peerId>` component, e.g. via
@@ -269,6 +532,9 @@ class NabuStorage private constructor(
      * identify-based address-book population on connect, unlike Nabu's own (unused)
      * `org.peergos.HostBuilder`. Not needed when a peer's address is already known some other
      * way (e.g. via [connectToDhtPeer] or DHT-driven discovery inside [get]).
+     *
+     * The address is put FIRST in the peer's list; the list is capped at
+     * [DhtLimits.maxAddressesPerPeer], oldest dropped.
      */
     fun registerPeerAddress(
         address: Multiaddr,
@@ -277,33 +543,146 @@ class NabuStorage private constructor(
         val peerId =
             address.getPeerId()
                 ?: throw NabuStorageException("address is missing a /p2p/<peerId> component: $address")
-        awaitOrWrap("register peer address", timeout) { host.addressBook.addAddrs(peerId, 0, address) }
+        awaitOrWrap("register peer address", timeout) {
+            mergeExplicit(peerId, listOf(address))
+            CompletableFuture.completedFuture(Unit)
+        }
     }
 
     /**
      * Explicitly connects this node's DHT routing table to the peer listening at [address]
      * (must include a `/p2p/<peerId>` component, e.g. via [Multiaddr.withP2P]). A deterministic,
-     * loopback-friendly alternative to [Kademlia.startBootstrapThread]'s real-network-oriented
-     * periodic bootstrap - mirrors [LapisNode.connect]'s "explicit local peer" pattern. Returns
-     * `true` if the peer was reachable and added.
+     * loopback-friendly alternative to a real-network bootstrap - mirrors [LapisNode.connect]'s
+     * "explicit local peer" pattern. Returns `true` if the peer was reachable within [timeout] and
+     * added, `false` otherwise.
+     *
+     * Deliberately not Nabu's `bootstrapRoutingTable`: that one resolves DNS, runs on the
+     * non-daemon `ioExec` pool and leaves the stream it opens unclosed.
      */
-    fun connectToDhtPeer(address: Multiaddr): Boolean {
-        val connected =
-            kademlia.bootstrapRoutingTable(
-                host,
-                listOf(MultiAddress(address.toString())),
-                MATCH_ANY_PROTOCOL,
-            )
-        return connected > 0
+    fun connectToDhtPeer(
+        address: Multiaddr,
+        timeout: Duration = DEFAULT_CONNECT_TIMEOUT,
+    ): Boolean {
+        val peerId =
+            address.getPeerId()
+                ?: throw NabuStorageException("address is missing a /p2p/<peerId> component: $address")
+        mergeExplicit(peerId, listOf(address))
+        val promise =
+            try {
+                kademlia.dial(host, peerId, address)
+            } catch (e: Exception) {
+                logger.debug { "connectToDhtPeer: dial setup failed: ${e.javaClass.simpleName}" }
+                return false
+            }
+        // Close only once the exchange is over (controller done OR failed): the stream future
+        // completes when the channel exists, BEFORE protocol negotiation has finished, and
+        // resetting it that early would fail the negotiation itself.
+        promise.controller.whenComplete { _, _ -> promise.stream.thenAccept { it.close() } }
+        return try {
+            // Completing the controller is what adds the peer to the routing table (onStartInitiator).
+            promise.controller.get(timeout.toNanos(), TimeUnit.NANOSECONDS)
+            true
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        } catch (e: Exception) {
+            logger.debug { "connectToDhtPeer failed: ${e.javaClass.simpleName}" }
+            false
+        }
     }
 
     /**
-     * No independent sub-resources to release beyond [host], which [LapisNode] owns and stops
-     * on its own - this exists for lifecycle symmetry and forward compatibility with a future
-     * wave that starts [Kademlia.startBootstrapThread]. Idempotent: a second call is a no-op.
+     * Ends every blocking DHT wait early and stops accepting new network work: afterwards [provide]
+     * and [findProviders] throw and [get] only consults the local blockstore. The libp2p [Host] is
+     * owned by [LapisNode], which stops it on its own. Idempotent.
      */
     fun stop() {
-        stopped.compareAndSet(false, true)
+        if (stopped.compareAndSet(false, true)) {
+            stopSignal.complete(Unit)
+            fetchExecutor.shutdown()
+            rpcPool.shutdown()
+        }
+    }
+
+    /** How many inbound DHT requests [InboundDhtRequestPolicy] rejected (tests). */
+    internal fun inboundRejectedCount(): Long = engine.rejectedInboundRequests
+
+    /** How many inbound DHT requests passed validation but made Nabu's responder throw (tests). */
+    internal fun inboundFailedCount(): Long = engine.failedInboundRequests
+
+    /** The provider records this node itself holds for [cid] (tests). */
+    internal fun localProviderRecords(cid: Cid): List<Dht.Message.Peer> = engine.localProviders(cid.bareMultihash())
+
+    private fun failIfStopped() {
+        if (stopped.get()) throw NabuStorageException("storage is stopped")
+    }
+
+    private fun requirePositive(timeout: Duration) {
+        require(!timeout.isNegative && !timeout.isZero) { "timeout must be positive" }
+    }
+
+    private fun <T> withOperationPermit(
+        deadlineNanos: Long,
+        block: () -> T,
+    ): T {
+        val acquired =
+            try {
+                operationPermits.tryAcquire(maxOf(deadlineNanos - System.nanoTime(), 0), TimeUnit.NANOSECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw NabuStorageException("interrupted while waiting for a DHT slot", e)
+            }
+        if (!acquired) throw NabuStorageException("DHT busy")
+        try {
+            failIfStopped()
+            return block()
+        } finally {
+            operationPermits.release()
+        }
+    }
+
+    /** [address]es go first; the list is capped at [DhtLimits.maxAddressesPerPeer]. */
+    private fun mergeExplicit(
+        peer: PeerId,
+        addresses: List<Multiaddr>,
+    ) {
+        synchronized(addressLock) {
+            val existing =
+                host.addressBook
+                    .getAddrs(peer)
+                    .join()
+                    .orEmpty()
+            setCapped(peer, addresses + existing)
+        }
+    }
+
+    /**
+     * Existing addresses go first, new ones are appended up to the cap: a responder can neither
+     * displace the real addresses of an honest peer nor grow an entry past the cap by answering
+     * repeatedly. (A plain `setAddrs` with the new list would let a malicious responder replace
+     * them, and `addAddrs` grows without bound.)
+     */
+    private fun mergeDhtLearned(
+        peer: PeerId,
+        addresses: List<Multiaddr>,
+    ) {
+        if (addresses.isEmpty()) return
+        synchronized(addressLock) {
+            val existing =
+                host.addressBook
+                    .getAddrs(peer)
+                    .join()
+                    .orEmpty()
+            setCapped(peer, existing + addresses)
+        }
+    }
+
+    private fun setCapped(
+        peer: PeerId,
+        addresses: List<Multiaddr>,
+    ) {
+        val capped = addresses.distinctBy { it.toString() }.take(limits.maxAddressesPerPeer)
+        host.addressBook.setAddrs(peer, 0, *capped.toTypedArray()).join()
     }
 
     private fun <T> awaitOrWrap(
@@ -337,8 +716,6 @@ class NabuStorage private constructor(
         }
 
     companion object {
-        private val MATCH_ANY_PROTOCOL: (String) -> Boolean = { true }
-
         /**
          * Attaches Nabu's Bitswap + Kademlia DHT protocols to [node]'s already-`start()`-ed
          * libp2p [Host], storing blocks under [blockstoreDir]. Must be called after
@@ -346,17 +723,29 @@ class NabuStorage private constructor(
          * would register duplicate protocol/connection handlers on the shared [Host]. [localDht]
          * selects Kademlia's LAN vs WAN protocol ID - this project has no real WAN bootstrap
          * infrastructure yet ([LapisNode]'s bootstrap peers are non-functional
-         * documentation-range placeholders), so it defaults to `true`.
+         * documentation-range placeholders), so it defaults to `true`; with `false`, addresses
+         * learned from the DHT are additionally restricted to public ones. [limits] bounds every
+         * DHT operation, see [DhtLimits].
          */
         fun attach(
             node: LapisNode,
             blockstoreDir: Path,
             localDht: Boolean = true,
+            limits: DhtLimits = DhtLimits(),
+        ): NabuStorage = attachWithClock(node, blockstoreDir, localDht, limits, System::nanoTime)
+
+        /** [attach] with an injectable clock for the repeat window and the want lifetime (tests age both). */
+        internal fun attachWithClock(
+            node: LapisNode,
+            blockstoreDir: Path,
+            localDht: Boolean,
+            limits: DhtLimits,
+            clock: () -> Long,
         ): NabuStorage {
             val host = node.host
             val blockstore = FileBlockstore(blockstoreDir)
 
-            val bitswapEngine = BitswapEngine(blockstore, allowAllReads, Bitswap.MAX_MESSAGE_SIZE, false)
+            val bitswapEngine = RefreshableBitswapEngine(blockstore, allowAllReads, Bitswap.MAX_MESSAGE_SIZE, clock)
             val bitswap = Bitswap(bitswapEngine)
             // Bitswap implements both ConnectionHandler and AddressBookConsumer - mirroring
             // org.peergos.HostBuilder.build()'s own wiring exactly. addProtocolHandler alone is
@@ -374,14 +763,15 @@ class NabuStorage private constructor(
             node.addConnectionHandler(bitswap)
 
             val ourPeerId = Multihash.deserialize(host.peerId.bytes)
-            val kademliaEngine =
-                KademliaEngine(
+            val engine =
+                LapisKademliaEngine(
                     ourPeerId,
-                    RamProviderStore(DEFAULT_PROVIDER_STORE_CAPACITY),
+                    BoundedProviderStore(limits),
                     BoundedRecordStore(DEFAULT_RECORD_STORE_CAPACITY),
                     blockstore,
+                    limits,
                 )
-            val kademlia = Kademlia(kademliaEngine, localDht)
+            val kademlia = Kademlia(engine, localDht)
             kademlia.setAddressBook(host.addressBook)
             host.addProtocolHandler(kademlia)
 
@@ -399,10 +789,11 @@ class NabuStorage private constructor(
             // NPE inside receiveRequest, the responder writes no reply at all, and the asking
             // node's GET_PROVIDERS just times out into an empty provider list. That is the
             // "cross-node DHT provider discovery does not work" defect documented since V0.1.4;
-            // see docs/architecture.adoc and MultiNodeDhtProviderDiscoveryTest.
-            host.addressBook.addAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
+            // see docs/architecture.adoc and MultiNodeDhtProviderDiscoveryTest. setAddrs (not
+            // addAddrs) so that attaching twice or re-registering never duplicates entries.
+            host.addressBook.setAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
 
-            return NabuStorage(host, blockstore, bitswap, kademlia)
+            return NabuStorage(host, blockstore, bitswap, bitswapEngine, kademlia, engine, limits, localDht, clock)
         }
     }
 }

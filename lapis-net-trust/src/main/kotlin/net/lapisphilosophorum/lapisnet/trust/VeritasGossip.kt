@@ -20,8 +20,8 @@ private val logger = KotlinLogging.logger {}
  * **Publishes full grant bytes, not a [io.ipfs.cid.Cid] pointer.** A [VeritasGrant]'s encoded
  * size ([VeritasGrantCodec.MAX_BODY_SIZE] plus a 64-byte signature) is tiny relative to any
  * reasonable gossip message-size ceiling, and - decisively - `NabuStorage`'s documented known
- * limitation is that cross-node DHT provider discovery (`findProviders()`) does not currently
- * work (see the architecture doc's V0.1.4 section): a node receiving only a bare CID over gossip
+ * limitation was that cross-node DHT provider discovery (`findProviders()`) did not
+ * work (repaired in V0.9.8; see the architecture doc's V0.1.4 section): a node receiving only a bare CID over gossip
  * would have no reliable way to fetch the actual content. Publishing full bytes sidesteps that
  * broken discovery path entirely.
  *

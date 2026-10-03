@@ -18,8 +18,8 @@ private val logger = KotlinLogging.logger {}
  * [PeerRecord]s over a dedicated topic, persists every accepted record into [NabuStorage], and
  * exposes read access ([lookup]) to the resolved "current record per identity" view. Mirrors
  * `net.lapisphilosophorum.lapisnet.trust.VeritasGossip`'s shape (publishes full record bytes, not
- * a bare CID pointer - same `Kademlia.dialPeer`-broken reasoning, see this module's
- * `build.gradle.kts` comment) refined with `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s
+ * a bare CID pointer - same `Kademlia.dialPeer`-broken reasoning, historical since V0.9.8, see this
+ * module's `build.gradle.kts` comment) refined with `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s
  * more recently established `onGossipMessage` step ordering.
  *
  * **Publish-last ordering is load-bearing, mirroring every sibling `Gossip` class exactly**:
@@ -198,7 +198,8 @@ class PeerDirectoryGossip private constructor(
          * [PeerRecord.notValidAfterEpochSecond] is attacker-controlled and is NEVER consulted for an
          * accept/reject decision here - TTL is a pure [lookup]-time filter. There is also no
          * `storage.get`/`storage.findProviders` call - the record travels as full bytes, not a CID
-         * pointer, for the same `Kademlia.dialPeer`-broken reasoning as every sibling `Gossip` class.
+         * pointer, for the same `Kademlia.dialPeer`-broken reasoning (historical since V0.9.8) as every
+         * sibling `Gossip` class.
          *
          * **[PeerRecordIndex.canAccept] here predicts BOTH exact-content-id duplication AND
          * stale/rollback sequence numbers** - unlike every sibling index's purely-dedup `canAccept`,

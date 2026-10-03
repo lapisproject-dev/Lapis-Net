@@ -26,8 +26,8 @@ private val logger = KotlinLogging.logger {}
  * **Publishes full record bytes, not a [Cid] pointer** - same reasoning as
  * [net.lapisphilosophorum.lapisnet.trust.VeritasGossip]'s own doc comment (an
  * [LtrRecordCodec.MAX_BODY_SIZE]-bounded record plus a 64-byte signature is tiny relative to any
- * reasonable gossip message-size ceiling, and `NabuStorage.findProviders()` does not reliably work
- * cross-node as of this project's current state).
+ * reasonable gossip message-size ceiling, and `NabuStorage.findProviders()` did not reliably work
+ * cross-node when this was written - repaired in V0.9.8).
  *
  * **Persistence lifecycle order is load-bearing, not stylistic** - identical to
  * [net.lapisphilosophorum.lapisnet.trust.VeritasGossip]:

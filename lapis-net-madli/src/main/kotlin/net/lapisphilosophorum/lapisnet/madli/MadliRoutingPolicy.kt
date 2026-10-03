@@ -31,7 +31,8 @@ data class MadliRoutingProfile(
  * A pure, local, unit-testable peer-ordering function - the thing a future
  * `NabuStorage.get(cid, peers = orderedSet)` call would consume (see `docs/architecture.adoc`'s
  * Madli section for the honest scope note: this hook is structurally ready but not yet wired into
- * a live Bitswap fetch this wave, since `NabuStorage.findProviders()` does not work end-to-end).
+ * a live Bitswap fetch this wave, since `NabuStorage.findProviders()` did not work end-to-end then -
+ * repaired in V0.9.8, but the hook is still not wired).
  * No I/O.
  */
 object MadliRoutingPolicy {

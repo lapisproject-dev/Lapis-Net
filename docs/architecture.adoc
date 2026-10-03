@@ -35,8 +35,10 @@ ongoing, forward-secret, post-compromise-secure 1:1 session an X3DH handshake's 
 into (`DoubleRatchetSession`, its message codec, its bounded skipped-key store, and encrypted-at-rest
 session persistence) — the third V0.8 sub-wave, extending the same `lapis-net-ratchet` module
 (V0.8.3, see below) — is also implemented, still deliberately network-free and not yet wired into a
-live message-send path. Remaining modules are still skeletons. This document grows as modules gain
-real implementations.
+live message-send path. A hardening pass over the DHT layer of `lapis-net-storage` (V0.9.11, a local
+and still unreleased change - see "DHT layer hardening (V0.9.11)" below) closes the unbounded
+lookups and the unvalidated responder paths the V0.9.8 repair left in place. Remaining modules are
+still skeletons. This document grows as modules gain real implementations.
 
 == Layering
 
@@ -97,7 +99,7 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   and libp2p transport peer identity, propagated over a dedicated GossipSub topic
   (`PeerDirectoryGossip`, V0.8.1, see below) — the foundational discovery layer later V0.8 sub-waves
   resolve recipients' prekey bundles/current addresses through. Gossip-only, same
-  `Kademlia.dialPeer`-broken limitation as every V0.9 mail sub-wave. Deliberately takes NO
+  `Kademlia.dialPeer`-broken limitation as every V0.9 mail sub-wave (historical: the defect was repaired in V0.9.8, see the Storage section). Deliberately takes NO
   dependency on `lapis-net-trust` this wave (acceptance is purely structural, not Veritas-gated,
   unlike `lapis-net-mail`'s V0.9.4 addition) and NO dependency on `java-cid` (`PeerRecord` carries no
   `io.ipfs.cid.Cid` field at all). As of V0.8.2, also carries `PrekeyBundleIndex`/
@@ -267,7 +269,9 @@ form delivered nothing, while both `thenComposeAsync` on a separate executor and
 **Fix:** `NabuStorage.provide()` no longer calls `Kademlia.provideBlock`. It performs the same
 walk-and-announce itself — `Kademlia.findClosestPeers` for the fan-out, then a blocking dial and
 `ADD_PROVIDER` per peer, off the event loop — using only Nabu's **public** API. No fork, no
-vendoring, no patched Nabu classes on the classpath.
+vendoring, no patched Nabu classes on the classpath. (V0.9.11 later replaced that
+`findClosestPeers` call as well: it has no deadline and runs on a non-daemon pool. See "DHT layer
+hardening (V0.9.11)" below.)
 
 **Nabu was not bumped.** `v0.8.1` is a real upstream tag whose changes do touch this area
 ("Tolerate multiaddrs we can't parse in handling kademlia responses", "Make sure we close
@@ -284,6 +288,10 @@ regression test rather than a "KNOWN ISSUE" pin: three loopback nodes A, B, C, w
 know only B and never learn about each other by any other means; A `put`s and `provide`s a block,
 C's `findProviders()` resolves it back to A through B, and C's `get()` — with **no** explicit
 peer hint — then fetches the actual bytes over Bitswap. Stable across repeated runs, not flaky.
+**Correction (V0.9.11):** this three-node test proves only defect 2. B answers `GET_PROVIDERS`
+from the record A sent it, and B never holds the block itself, so B's own address-book entry is never
+read - mutating defect 1's fix away left the whole suite green. Defect 1 is covered since V0.9.11 by a
+two-node test (the responder holds the block itself, with no `provide()` involved).
 Local put/get and explicit-peer Bitswap fetch (`TwoNodeBitswapDirectFetchTest`) remain verified as
 before.
 
@@ -300,10 +308,14 @@ blocks this node holds — previously they practically never could. That does no
 model, but it does make the existing one load-bearing rather than theoretical: the always-allow
 `BlockRequestAuthoriser` documented above still applies (unguessable 256-bit content-hash CIDs are
 the access control), and `BoundedRecordStore`'s LRU cap on the IPNS record store is unchanged.
-`NabuStorage.provide()`'s own fan-out is bounded (20 peers, matching Nabu's), carries an overall
-deadline plus a 2-second per-peer cap so one unresponsive peer cannot consume the budget, and
-tolerates unparseable addresses from the routing table instead of failing the whole announcement —
-routing-table entries originate in remote `FIND_NODE` responses and are treated as untrusted input.
+`NabuStorage.provide()`'s own fan-out is bounded (20 peers, matching Nabu's), and the V0.9.8 text
+claimed an overall deadline plus a 2-second per-peer cap and tolerance of unparseable addresses.
+**Corrected in V0.9.11: that was only partly true.** The per-peer cap and the fan-out applied to the
+announcement loop, but the walk before it (`Kademlia.findClosestPeers`) had no deadline at all and
+the "overall deadline" never covered it, so one silent peer could hang `provide()` for good. The
+tolerance for unparseable addresses was not this project's code either: it was the DNS filter and
+exception handling inside Nabu's own `dialPeer`. Both claims are true of the code since V0.9.11, see
+"DHT layer hardening (V0.9.11)" below.
 
 **Follow-up, deliberately NOT done in V0.9.8: downstream modules still route over GossipSub.**
 `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` all publish and
@@ -315,6 +327,193 @@ review and security loops, and would need its own answers on record lifetime, re
 and DHT-record authentication (the DHT gives no equivalent of the gossip validators those modules
 rely on today). Until that wave happens, the gossip paths in those modules are correct as written;
 only their stated *reason* is now historical.
+
+=== DHT layer hardening (V0.9.11)
+
+_Status: implemented on a local feature branch, unreleased - `build.gradle.kts` still says `0.9.9`._
+
+Auditing the V0.9.8 repair found that the DHT layer of `lapis-net-storage` was still built on Nabu
+code that trusts the network. Two of the defects were reachable in production from the start, not
+latent: `NabuStorage.attach()` registers the Kademlia responder on every browser and CLI node, so any
+connected peer could trigger the multihash overflow and fill the provider store, and
+`BrowserApi`/`MailApi` call `storage.get(cid)` without a peer hint, which turns stored provider
+records into dial targets. V0.9.11 replaces the lookup, announce and responder paths with this
+project's own bounded code. Nabu still supplies the wire protocol, the routing table and Bitswap.
+
+No Nabu lookup method is called any more: `Kademlia.findClosestPeers`, `findProviders`,
+`getCloserPeers`, `provideBlock`, `bootstrapRoutingTable`, `publishValue` and `resolveValue` are all
+unused, because they have no deadline and run on a fixed 16-thread, **non-daemon** pool (`ioExec`)
+that a handful of hung calls wedges for good - and that would also keep the JVM from exiting.
+
+[cols="1,3,3",options="header"]
+|===
+|Finding |Defect |Fix
+
+|A
+|`provide()` could block forever: the walk had no deadline and silent peers were waited for with
+`join()`.
+|`DhtWalker`: an absolute `System.nanoTime()` deadline from the first line of the call (the walk gets
+the first half, the announcement the rest), a per-exchange timeout, a round cap, an interruptible wait
+that `stop()` also ends. Peers that fail or time out are dropped from the announcement target list.
+
+|B
+|Every exchange left streams open on both nodes (`closeWrite` only; nothing closed after
+`ADD_PROVIDER`).
+|Initiator streams are closed on success, failure and timeout; an announcement is `closeWrite`,
+then reset after a grace period if the responder does not close; the responder closes after
+`ADD_PROVIDER`.
+
+|C
+|A peer entry in a response could name any number of addresses and Nabu dials all of them in
+parallel; one foreign `/p2p/` address made the whole dial throw.
+|`PeerAddressSanitizer` (see below).
+
+|D
+|`ADD_PROVIDER` filled an unbounded provider store with unbounded address lists, and `get()` dialled
+them synchronously on the caller's thread.
+|`BoundedProviderStore`; fetches run on a bounded pool after a bounded connect; DHT-learned
+addresses never displace existing ones.
+
+|E
+|The responder passed request keys to `Multihash.deserialize` / `Cid.cast`, which allocate the
+declared length before checking it - a ten-byte key could trigger a multi-gigabyte allocation, on the
+Netty event loop.
+|`InboundDhtRequestPolicy` validates every inbound request before Nabu sees it; the same check guards
+IDs in responses.
+
+|F
+|`getKClosestPeers` threw an NPE for a routing-table peer without an address-book entry.
+|`LapisKademliaEngine` skips such entries and caps address lists.
+
+|G
+|Nothing configurable.
+|`DhtLimits`, one validated value object passed to `NabuStorage.attach()`.
+|===
+
+==== Limits
+
+All bounds live in `DhtLimits` and are validated at construction.
+
+[cols="2,1,4",options="header"]
+|===
+|Limit |Default |Meaning
+
+|`provideFanout`|20|peers a `provide` announces to; also the candidate window of a walk
+|`walkParallelism`|3|peers queried per walk round (Kademlia's alpha)
+|`maxWalkRounds`|8|hard cap on walk rounds
+|`perRpcTimeout`|2 s|one dial plus request/response
+|`maxCloserPeersPerResponse`|20|response entries looked at; the rest is dropped unparsed
+|`maxAddressesPerPeer`|8|addresses kept per peer, wherever stored, answered or dialled
+|`maxAddressesPerIp`|2|of those, per target IP (a circuit address counts against its relay's IP)
+|`maxAddressBytes`|256|serialized size above which one address is dropped unparsed
+|`maxProvidersPerKey`|8|provider records per DHT key, and providers tried per `get`
+|`providerStoreKeyCapacity`|1024|DHT keys in the provider store (LRU)
+|`maxConcurrentDhtOperations`|8|simultaneous `provide` / `findProviders` / lookup-driven `get`; more fail fast with "DHT busy"
+|`maxConcurrentFetches`|4|simultaneous Bitswap fetches; a queue of one call's worth per slot waits, beyond that `get` returns `null` at once
+|`fetchConnectTimeout`|5 s|connect budget per provider before a fetch gives up on it
+|`streamCloseGrace`|1 s|wait for the responder to close before the initiator resets
+|===
+
+==== Walk and deadline semantics
+
+The DHT key of a block is its **bare multihash** (`cid.bareMultihash().toBytes()`), the same point of
+the keyspace Nabu's responder hashes - not `cid.toBytes()`, which would place a CIDv1 and the CIDv0 of
+the same content at different keys. The walk is the standard iterative Kademlia lookup: seed from the
+local routing table, query the closest `walkParallelism` unqueried candidates per round, merge what
+they return, stop when every candidate in the closest `provideFanout` has been queried, the round cap
+is hit, the deadline passes or `stop()` is called. The candidate set is bounded to twice the window.
+
+`provide(cid, timeout)` and `findProviders(cid, timeout)` measure `timeout` from their first line. Every
+continuation that writes to a stream runs on a daemon pool via `thenComposeAsync`, never on the Netty
+event loop (the V0.9.8 defect), and exchange results are collected on the calling thread only, so no
+callback mutates shared state. `provide()` returns the number of `ADD_PROVIDER` messages **sent**; the
+protocol has no acknowledgement, so this is not a delivery count. `get()` gives a lookup the first half
+of its timeout and the fetch the remainder.
+
+==== Address rules
+
+`PeerAddressSanitizer` is applied to every address list that comes out of a DHT response or an
+`ADD_PROVIDER` record, in this order: look at only the first `4 x maxAddressesPerPeer` raw entries;
+drop entries over `maxAddressBytes`; parse (jvm-libp2p checks lengths before allocating); drop
+DNS-form addresses; drop addresses naming a different `/p2p/` peer; drop addresses no registered
+transport can dial; in WAN mode (`localDht = false`) drop non-public addresses (judged by this project's
+own `isPublicAddress`, not Nabu's `KademliaEngine.isPublic`, which accepts any address with an IPv6 zone
+and lets IPv6 unique-local, CGNAT, multicast, `0.0.0.0/8`, reserved and NAT64 addresses through: here
+everything outside global unicast is refused, and the IPv4 inside a mapped or 6to4 address decides);
+de-duplicate; at most
+`maxAddressesPerIp` per target IP; direct before circuit; at most `maxAddressesPerPeer`.
+
+In LAN mode (`localDht = true`, the default and the only mode in use) loopback and RFC 1918
+addresses are deliberately kept: that is the address space of a LAN DHT. **This is a documented
+deviation from a plain SSRF blocklist.** The residual risk is bounded port probing of internal hosts
+- at most 8 addresses per peer entry, 2 per IP, per exchange - not an unbounded fan-out.
+
+An address is **claimed**, not known, until a connection over it has proven it. Addresses that a DHT
+response names for a peer are used for the dials of that one `get()` and are NOT stored. They enter the
+jvm-libp2p address book (merged under a lock, existing entries first and capped, so nothing can displace
+the real addresses of an honest peer or grow an entry by answering repeatedly) only as the one address of a
+connection that came up and whose far end authenticated as that peer: after `connectForFetch` for a
+provider, and for a responder of a lookup only as the remote address of our own outgoing connection to it
+(`DhtWalker.verifiedAddresses`). Provider IDs are free to choose (no key is needed to make one up), so
+storing the claim would let a responder fill the address book with peers that never answered, and fill an
+honest peer's entry with made-up addresses before its real ones are known.
+
+A provider we are already connected to (typically one that announced itself to us) and have no address
+for gets the remote address of that connection, which is the one thing known to belong to it.
+
+==== Provider store
+
+`BoundedProviderStore` replaces Nabu's `RamProviderStore`: LRU over `providerStoreKeyCapacity` keys,
+at most `maxProvidersPerKey` records per key with one record per provider ID (the newest wins),
+addresses capped at storage time, `getProviders` returning a copy (Nabu's returns the live `HashSet`).
+Worst case with the defaults: 1024 x 8 x 8 x 256 B, roughly 16 MiB.
+
+==== Inbound request validation
+
+`InboundDhtRequestPolicy` runs before Nabu's `receiveRequest`: keys of `ADD_PROVIDER` /
+`GET_PROVIDERS` must be a safe multihash, provider IDs likewise, `GET_VALUE` / `PUT_VALUE` need the
+`/ipns/` prefix and a safe suffix (and a record whose key equals the request key), and an unknown
+message type is rejected instead of throwing on the event loop. A rejected or failed request resets
+the stream. The check is `CidBytesValidation` from `lapis-net-core`, the same guard the codecs use.
+
+Whatever the base class does with an accepted request is guarded: an exception - or a
+`StackOverflowError`, which Peergos' unbounded CBOR parser can throw for a deeply nested but validly
+signed IPNS record - resets the stream and is counted, instead of escaping onto the Netty event loop
+(other `VirtualMachineError`s are rethrown). A request that was ANSWERED (`FIND_NODE`, `GET_PROVIDERS`,
+`GET_VALUE`, `PUT_VALUE`) is half-closed and reset after `streamCloseGrace` unless the initiator closes
+its end first; one that was not answered (`ADD_PROVIDER`, `PING`, an invalid or stale `PUT_VALUE`) is
+reset at once. An initiator that never closes therefore cannot keep streams open.
+
+==== Residual risks (not fixed, on purpose)
+
+* **Information leak.** `provide()`, `findProviders()` and `get()` without explicit peers reveal the
+  block's bare multihash to up to `walkParallelism x maxWalkRounds` queried peers plus the announce
+  targets (44 with the defaults). The CID is the access token for a block (reads are always
+  authorised). Whether DM and mail should keep using `get(cid)` without peers is for the wave that
+  migrates them to the DHT.
+* **Sybil crowding.** A peer that keeps announcing under many identities can fill the 8 provider
+  slots of a key; eviction is plain LRU. The real defence is reputation (Madli), not a cleverer
+  eviction order. The address book (`MemoryAddressBook`) has no eviction either and grows with the
+  number of distinct peers that answered a query or that a fetch connected to (peers that were merely
+  named are not stored, see above).
+* **Bitswap cannot cancel a want.** A fetch that times out leaves its want registered and Bitswap's
+  re-send thread running - against the one peer it was asked of, and only until five minutes after the
+  want was last requested FROM THAT PEER; the dial is bounded only by libp2p's own limits (TCP connect
+  15 s, Noise read 5 s).
+  Once a request for a (block, peer) pair has actually been sent, it is not repeated within five
+  minutes (a pair that could not be connected, or whose task was dropped, is not counted), and the
+  connect is done by this project first so a dead provider never reaches Bitswap at all. Nabu
+  stamps a want once, at creation, and never sends it to a single peer again five minutes later;
+  `RefreshableBitswapEngine` keeps, per want, the peers it was really requested from and a "last
+  requested" stamp for each, which every really-sent request renews, so a block whose first fetch failed
+  can still be fetched once its provider becomes reachable, however late. Nabu's own `getWants(peer)`
+  returns every pending want of the process whichever peer it was asked for; that would have put the
+  CID of a direct-message attachment (asked of its sender) into the wantlist of any provider the DHT
+  named for another block, and would have kept every re-send thread alive for as long as any want
+  anywhere was fresh. Here a want is sent only to the peers it was requested from, at most 32 per want.
+* **Decode before the caps.** A response is decoded by protobuf (up to 1 MiB) before the entry caps
+  apply.
+* **No republish.** Provider records are held in memory and are lost on restart; nothing re-announces.
 
 == Trust: Veritas trust-edge grant (V0.1.5)
 
@@ -469,9 +668,10 @@ signature, and `GossipPubSub` never touches the latter.
 **Full grant bytes are published, not a CID pointer.** A `VeritasGrant`'s encoded size
 (`VeritasGrantCodec.MAX_BODY_SIZE` plus a 64-byte signature) is tiny relative to any reasonable
 gossip message-size ceiling, and — decisively — `NabuStorage`'s documented V0.1.4 known limitation
-is that cross-node DHT provider discovery (`findProviders()`) does not work: a node receiving only a
+is that cross-node DHT provider discovery (`findProviders()`) did not work (repaired in V0.9.8, see the Storage section): a node receiving only a
 bare CID over gossip would have no reliable way to fetch the actual content. Publishing full bytes
-sidesteps that broken discovery path entirely.
+sidesteps that broken discovery path entirely. (Historical: the discovery path was repaired in
+V0.9.8, see the Storage section; the design stands, the stated reason no longer applies.)
 
 **The GossipSub validator gates both structural and cryptographic acceptance in one step.**
 `VeritasGossip.onGossipMessage()` decodes (`VeritasGrantCodec.decode()`), then verifies
@@ -705,9 +905,9 @@ wholesale once V0.3's real Karma lands, not a commitment other vendors must adop
 
 **One deliberate structural deviation from `LtrRecord`'s precedent: the post body bytes travel with
 the announcement, not just a `Cid` reference.** `NabuStorage`'s own documented V0.1.4 known
-limitation is that cross-node DHT provider discovery (`findProviders()`) does not work — a
+limitation is that cross-node DHT provider discovery (`findProviders()`) did not work (repaired in V0.9.8, see the Storage section) — a
 `PostAnnouncement` that only carried a `Cid` would hit that same broken discovery path the moment a
-second node tries to render someone else's post. Embedding `bodyBytes` directly and having every
+second node tries to render someone else's post (historical: repaired in V0.9.8, see the Storage section). Embedding `bodyBytes` directly and having every
 node — sender and every receiver — independently derive its own `Cid` via `storage.put(bodyBytes)`
 sidesteps the gap entirely: content-addressing guarantees identical bytes hash to the identical
 `Cid` on every node, with no cross-node discovery step needed at all.
@@ -1136,7 +1336,7 @@ local replication hook, default `NEVER`, plus an `underServedImportant` referenc
 are both pure, local, and thoroughly unit-tested against synthetic peer sets and signals. They are
 not exercised end-to-end because: (a) `NabuStorage.findProviders()` does not work end-to-end in
 this codebase (a pre-existing V0.1.4 limitation, see that section above), so there is no live
-provider set to order in a real fetch; (b) Nabu exposes no Bitswap responder-side prioritization
+provider set to order in a real fetch (historical: discovery was repaired in V0.9.8, see the Storage section; the policies have still not been wired to it); (b) Nabu exposes no Bitswap responder-side prioritization
 hook ("serve high-Madli requesters faster" is not wireable at all without patching Nabu — out of
 scope); (c) no production consumer wires `orderPeers` into a `get(cid, peers=...)` call this wave.
 `orderPeers` deprioritizes a peer with no Madli history to sort last (the vault's bootstrap
@@ -1318,7 +1518,7 @@ the SPEC's original wording, forced by two facts about the existing codebase: `N
 falls through to a live Kademlia DHT provider lookup on a local cache miss, which a GossipSub
 validator must never do (see below); and cross-node DHT provider discovery has been documented
 broken since V0.1.4 (`Kademlia.dialPeer`, see the Storage section above), so a receiving node could
-never reliably fetch a body it only knew by CID anyway. `MailFrameCodec` therefore wraps both the
+never reliably fetch a body it only knew by CID anyway (historical: repaired in V0.9.8, see the Storage section; the inline-body design stands). `MailFrameCodec` therefore wraps both the
 `MessageEnvelopeCodec`-encoded envelope and the `MessageBodyCodec`-encoded body in one wire frame.
 This is the exact same reasoning, and the exact same resolution, as `VeritasGossip` publishing full
 grant bytes rather than a CID pointer in V0.1.7. The body is still independently stored as its own
@@ -1328,7 +1528,7 @@ the network.
 
 **One GossipSub topic per recipient identity.** `InboxTopics.forRecipient(key)` derives
 `"LapisNet:inbox:<64 lowercase hex chars of sha256(compressed pubkey)>:v1"`. Deliberately NOT a DHT
-inbox record — gossip-only, for the same `Kademlia.dialPeer`-is-broken reason above. A node offline
+inbox record — gossip-only, for the same `Kademlia.dialPeer`-is-broken reason above (historical: repaired in V0.9.8, see the Storage section; the gossip-only design stands). A node offline
 during the gossip window has no catch-up path: best-effort convergence, the same accepted
 limitation `VeritasGossip`'s single network-wide topic already carries, now applied to a
 per-identity topic instead.
@@ -1514,7 +1714,7 @@ second, independent source.
 **Wraps are always inline** — there is deliberately no CID-referenced "recipients blob" variant for
 high recipient counts. A CID-referenced blob is unfetchable in this codebase for exactly the reason
 `MailFrameCodec` already carries the body inline instead of a pointer (see that section above):
-`Kademlia.dialPeer` is documented broken since V0.1.4, and `InboxGossip`'s validator may make no
+`Kademlia.dialPeer` was documented broken from V0.1.4 until it was repaired in V0.9.8 (see the Storage section), and `InboxGossip`'s validator may make no
 network calls — a recipient could never reliably obtain their own wrap from a blob referenced only
 by CID. At `MAX_RECIPIENTS = 64` the worst-case wrap section is `2 + 65 × 81 = 5,267` bytes, which
 brings the largest possible signed envelope body from V0.9.1's ~2.6 KB to ~7.9 KB — about 12% of the
@@ -1762,7 +1962,7 @@ fetches its blob via `NabuStorage.get` (local blockstore only — see below), an
 `ContentType.parse`d with a safe fallback to `application/octet-stream`).
 
 **`GET /api/mail/attachment/{cid}`'s cross-node fetch is limited by the same pre-existing
-`NabuStorage.get()`/`Kademlia.dialPeer` gap documented since V0.1.4.** A node can only reliably
+`NabuStorage.get()`/`Kademlia.dialPeer` gap documented from V0.1.4 until its repair in V0.9.8 (see the Storage section) - the limit below describes the design as written, DHT discovery now works.** A node can only reliably
 retrieve an attachment blob it already has locally — the sender's own node, or a node that fetched
 it some other way. This is not a new limitation this wave introduces; it is the same gap every other
 cross-node fetch in this codebase already carries, simply now visible through a new route. Reflected
@@ -2053,8 +2253,8 @@ recipients' prekey bundles through, and V0.8.4 (online DM) resolves recipients' 
 addresses through.
 
 **Gossip-only, no DHT publication — the same accepted limitation as every V0.9 mail sub-wave.**
-`org.peergos.protocol.dht.Kademlia.dialPeer` has been documented broken since V0.1.4 (see the
-Storage section above) — propagation is entirely via `PeerDirectoryGossip`'s dedicated GossipSub
+`org.peergos.protocol.dht.Kademlia.dialPeer` was documented broken from V0.1.4 until V0.9.8 repaired the
+underlying defects (see the Storage section above; the stated reason is historical) — propagation is entirely via `PeerDirectoryGossip`'s dedicated GossipSub
 topic (`LapisNet:peer-record-gossip:v1`), mirroring `InboxGossip`'s identical precedent. A node
 offline during the gossip window has no catch-up path.
 
@@ -2263,7 +2463,7 @@ accepting new durable writes once exhausted rather than accepting unboundedly ma
 
 **`PeerDirectoryGossip` — GossipSub wiring on the new `LapisNet:peer-record-gossip:v1` topic,
 mirroring `VeritasGossip`'s shape (full record bytes over the wire, not a CID pointer — same
-`Kademlia.dialPeer`-broken reasoning) refined with `InboxGossip`'s more recently established
+`Kademlia.dialPeer`-broken reasoning, historical since V0.9.8) refined with `InboxGossip`'s more recently established
 validator step ordering.** `announce()` is `storage.put()` -> `index.add()` -> `pubsub.publish()`,
 publish always last — the same publish-last invariant every sibling `Gossip` class enforces, so a
 crash mid-sequence never leaves the network believing this node durably committed to something it
@@ -2618,7 +2818,7 @@ ever runs on untrusted header bytes.
 * **No PQXDH / post-quantum hybrid key exchange.** X25519 only.
 * **No formal deniability analysis** beyond X3DH's own published security properties.
 * **No DHT publication.** Gossip-only (`PrekeyBundleGossip`), same `Kademlia.dialPeer`-broken
-  limitation as every prior wave.
+  limitation as every prior wave (historical: repaired in V0.9.8, see the Storage section).
 * **No wire codec for the X3DH initial-message header (`X3dhPreKeyMessageHeader`).** This wave's
   deliverable is the handshake primitive and prekey publication/consumption machinery, callable and
   independently testable — not yet wired into a live message-send path. V0.8.4 (online DM) owns
@@ -3269,7 +3469,8 @@ message in Nabu for later pickup." Two DIFFERENT problems both need solving, and
 insight is that they are genuinely different — closing one does not close the other:
 
 1. **Blob fetchability.** A bare `Cid` alone is not fetchable: `NabuStorage.findProviders`
-   (DHT-based provider discovery) has been broken since V0.1.4 (see the Storage section above).
+   (DHT-based provider discovery) was broken from V0.1.4 until V0.9.8 (see the Storage section above;
+   repaired, but this design still does not rely on it).
    `MailboxPointer` carries the sender's IDENTITY — not an address, which would go stale — as a
    routing hint; the recipient resolves the sender's CURRENT address at fetch time via
    `PeerDirectoryGossip.lookup(senderIdentity)` (V0.8.1), registers it with `NabuStorage.registerPeerAddress`,
@@ -3617,7 +3818,7 @@ DIFFERENT ephemeral key and is never blocked by this registry.
 
 * **No onion routing for mailbox pointers.** The original DM concept note's own open question — left
   open here, not resolved.
-* **No DHT mailbox record** — the same broken-Kademlia limitation as every other V0.8/V0.9 wave;
+* **No DHT mailbox record** — the same (since repaired in V0.9.8) Kademlia limitation as every other V0.8/V0.9 wave;
   gossip plus explicit peer-hint-based Bitswap fetch instead.
 * **No pin-lifetime management.** Nabu has no pin/GC anywhere in this project (V0.1.4's own
   documented state, see the Storage section above) — "pinning" a mailbox blob is currently a no-op;

@@ -15,9 +15,9 @@ import java.io.DataOutputStream
  *
  * **Wraps are always inline - there is deliberately no CID-referenced "recipients blob" variant.**
  * A CID-referenced blob is unfetchable in this codebase for exactly the reason [MailFrameCodec]
- * carries the body inline instead of a pointer: `Kademlia.dialPeer` is documented broken since
- * V0.1.4, and [InboxGossip]'s gossip validator may make no network calls at all - a recipient could
- * never reliably obtain their own wrap from a blob referenced only by CID. At
+ * carries the body inline instead of a pointer: `Kademlia.dialPeer` was documented broken from
+ * V0.1.4 until V0.9.8 (the design stands, the reason is historical), and [InboxGossip]'s gossip
+ * validator may make no network calls at all - a recipient could never reliably obtain their own wrap from a blob referenced only by CID. At
  * `MAX_RECIPIENTS = 64` the worst-case section is `2 + 65*81 = 5,267` bytes, which is about 8% of
  * [MessageEnvelopeCodec.MAX_BODY_SIZE] - there is no size pressure a blob would relieve. A future
  * high-fan-out variant gets its own [EncryptionMode] wire value (the mechanism this codebase

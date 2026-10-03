@@ -14,7 +14,7 @@ private val logger = KotlinLogging.logger {}
  * [NabuStorage.getLocal] - no network, no [net.lapisphilosophorum.lapisnet.storage.NabuStorage.findProviders]
  * call), and if absent, a DIRECT Bitswap fetch against [sender]'s CURRENTLY-gossiped address via
  * [peerDirectory] - **NEVER `findProviders`**, mirroring [MailboxPoller.attemptOne]'s exact same
- * "broken DHT, use gossip + explicit peer hint instead" reasoning (see that method's own doc
+ * "broken DHT (until V0.9.8), use gossip + explicit peer hint instead" reasoning (see that method's own doc
  * comment).
  *
  * Address hygiene ([MultiaddrHygiene.isBlockedPrivateOrLocal]) is applied to every candidate

@@ -9,8 +9,9 @@
 // bundles through this directory; V0.8.4 (online DM) resolves recipients' current network
 // addresses through it.
 //
-// Kademlia.dialPeer is documented broken since V0.1.4 (see docs/architecture.adoc's Storage
-// section) - like every V0.9 mail sub-wave, this module is gossip-only, no DHT publication.
+// Kademlia.dialPeer was documented broken from V0.1.4 until V0.9.8 repaired the underlying defects
+// (see docs/architecture.adoc's Storage section; the reason is historical now) - like every V0.9
+// mail sub-wave, this module is gossip-only, no DHT publication.
 //
 // Dependency shape mirrors lapis-net-mail's stated house rule, not lapis-net-trust's older
 // transitive-reliance-on-lapis-net-storage's-own-api-edge approach: lapis-net-identity is `api`

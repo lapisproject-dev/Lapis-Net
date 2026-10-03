@@ -18,8 +18,8 @@ private val logger = KotlinLogging.logger {}
  * The recipient-side driver for V0.8.5's offline mailbox: for every pending [MailboxPointer] in
  * [mailboxGossip]'s index, resolves the sender's CURRENT address via
  * [PeerDirectoryGossip.lookup] (V0.8.1), registers it, and attempts a direct Bitswap fetch of the
- * referenced blob by explicit peer - never via `NabuStorage.findProviders`, which remains broken
- * since V0.1.4 (see [MailboxPointer]'s own class doc comment for the full "central mechanism"
+ * referenced blob by explicit peer - never via `NabuStorage.findProviders`, which was broken from
+ * V0.1.4 until V0.9.8 (see [MailboxPointer]'s own class doc comment for the full "central mechanism"
  * argument). On a successful fetch, the blob is structurally decoded as a [DmEnvelope] and handed
  * to [onDecodedEnvelope] (bound by the caller to `DmSessionManager::handleOfflineEnvelope`), which
  * routes it through the IDENTICAL session-resolution/decrypt/persist/dedup/listener-notification
