@@ -35,8 +35,8 @@ ongoing, forward-secret, post-compromise-secure 1:1 session an X3DH handshake's 
 into (`DoubleRatchetSession`, its message codec, its bounded skipped-key store, and encrypted-at-rest
 session persistence) — the third V0.8 sub-wave, extending the same `lapis-net-ratchet` module
 (V0.8.3, see below) — is also implemented, still deliberately network-free and not yet wired into a
-live message-send path. A hardening pass over the DHT layer of `lapis-net-storage` (V0.9.11, a local
-and still unreleased change - see "DHT layer hardening (V0.9.11)" below) closes the unbounded
+live message-send path. A hardening pass over the DHT layer of `lapis-net-storage` (V0.9.11, released in
+v0.10.0 - see "DHT layer hardening (V0.9.11)" below) closes the unbounded
 lookups and the unvalidated responder paths the V0.9.8 repair left in place. Remaining modules are
 still skeletons. This document grows as modules gain real implementations.
 
@@ -330,11 +330,11 @@ only their stated *reason* is now historical.
 
 === DHT layer hardening (V0.9.11)
 
-_Status: implemented on a local feature branch, unreleased - `build.gradle.kts` still says `0.9.9`._
+_Status: implemented and released in `v0.10.0`._
 
 Auditing the V0.9.8 repair found that the DHT layer of `lapis-net-storage` was still built on Nabu
 code that trusts the network. Two of the defects were reachable in production from the start, not
-latent: `NabuStorage.attach()` registers the Kademlia responder on every browser and CLI node, so any
+latent: `NabuStorage.attach()` registers the Kademlia responder on every browser node (and in the CLI demos), so any
 connected peer could trigger the multihash overflow and fill the provider store, and
 `BrowserApi`/`MailApi` call `storage.get(cid)` without a peer hint, which turns stored provider
 records into dial targets. V0.9.11 replaces the lookup, announce and responder paths with this

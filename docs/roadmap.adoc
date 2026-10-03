@@ -2,8 +2,8 @@
 
 == Releases and version numbers
 
-Version numbers in this project are **wave identifiers assigned at design time**, not a
-chronological sequence: the V0.9 arc (asynchronous mail) shipped before the V0.8 arc (direct
+Up to `v0.9.9`, version numbers in this project are **wave identifiers assigned at design time**,
+not a chronological sequence (from `v0.10.0` on they are chronological, see below): the V0.9 arc (asynchronous mail) shipped before the V0.8 arc (direct
 messages and calls), and the V0.8.5 hardening pass (with backports to index classes from V0.8.1, V0.8.2 and V0.9.1) was cut as `v0.8.8` on 2026-08-27,
 before `v0.8.6` and `v0.8.7` existed. The website's What's New page therefore sorts by release date,
 not by version number. Every row below is an annotated git tag on `master`.
@@ -76,7 +76,19 @@ not by version number. Every row below is an annotated git tag on `master`.
 | Relay-based NAT traversal over Circuit Relay v2 (landed 2026-09-08 in `e77969a`); the tag sits on the release commit that also carries the later documentation work and the `build.gradle.kts` version bump to `0.9.9`
 | landed 2026-09-08, tagged 2026-10-02
 | the release commit
+
+| `v0.10.0`
+| First chronologically numbered release. Contains the maintenance waves V0.9.10 (relay forwarding stall bound, relayed-connection reuse) and V0.9.11 (hardening of the DHT layer, including a fix for a memory-exhaustion defect in the Kademlia responder that any connected peer could trigger and that has been present in every earlier tag since V0.1.4)
+| 2026-10-03
+| the release commit
 |===
+
+**From `v0.10.0` on, version numbers are chronological** (semantic versioning, `0.MINOR.PATCH`): each
+release gets the next number in the order it ships, whatever wave identifiers it contains. Wave
+identifiers (V0.9.10, V0.9.11, ...) remain the names of the design units inside the release notes and
+this document, but they are no longer tags. Everything in the table above, `v0.9.9` and earlier,
+keeps its number as is; `v0.7` never existed and `v0.9.6`/`v0.9.7` were never assigned. Tags are
+annotated, and from `v0.10.0` on each is also published as a GitHub release (the earlier tags are not).
 
 The tags `v0.8.1`–`v0.8.8` and `v0.9.8` were created retroactively on 2026-10-02 (the same
 treatment the earlier tags received on 2026-08-05), pointing at the last `master` commit of the
@@ -1683,7 +1695,7 @@ the dials that bypass `LapisNode.connect` remain.
 
 == V0.9.10 — Relay forwarding stall bound and relayed-connection reuse (post-arc maintenance)
 
-_Unreleased — no tag yet; the version stays `0.9.9`. Follow-up to the V0.9.9 review and audit._
+_Released in `v0.10.0`. Follow-up to the V0.9.9 review and audit._
 
 **What is new:**
 
@@ -1764,9 +1776,15 @@ not only the attacker's; dials through `host.newStream` (`lapis-net-dm`, `lapis-
 `BrowserApi` peer list still do not see accepted relayed connections; per-address reservation
 admission and any relay reputation (Madli) are unchanged and belong to the Madli relay wave.
 
+**Known flaky test:** `CircuitProxyBackpressureTest`, "the same slow reader IS cut off once the grace is
+switched off", failed in two of five runs (a full `clean check` and an isolated rerun; expected one closure, saw none)
+and passed in the other three, two on the same code and one on the previous `master`. It depends on how fast a real TCP reader drains compared
+with the sender and was run under heavy machine load; the cause is not established. To be investigated and
+stabilized separately.
+
 == V0.9.11 — DHT layer hardening (post-arc maintenance)
 
-_Unreleased — no tag yet; the version stays `0.9.9`. Follow-up to the retroactive review and security audit of V0.9.8._
+_Released in `v0.10.0`. Follow-up to the retroactive review and security audit of V0.9.8._
 
 **What is new** (`lapis-net-storage`; details and the limits table: `docs/architecture.adoc`, "DHT layer hardening (V0.9.11)"):
 

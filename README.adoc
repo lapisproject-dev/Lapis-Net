@@ -28,13 +28,13 @@ requirements.
 
 == Status
 
-Every wave through *V0.9* is implemented and merged to `master`, followed by two
-post-arc releases (V0.9.8 and V0.9.9, below). The current release is
-*v0.9.9*. V0.7 was never a standalone wave — its scope was folded into the
-incremental browser growth of V0.2–V0.5, see
-link:docs/roadmap.adoc[docs/roadmap.adoc]; the same document explains why version
-numbers here are wave identifiers rather than a chronological sequence and maps
-every tag to its content. Full technical
+Every wave through *V0.9* is implemented and merged to `master`, followed by four
+post-arc maintenance waves (V0.9.8 to V0.9.11, below). The current release is
+*v0.10.0*, the first with a chronological version number: up to `v0.9.9` the tags
+are wave identifiers (V0.7 was never a standalone wave — its scope was folded into the
+incremental browser growth of V0.2–V0.5), from `v0.10.0` on they count releases in the
+order they ship. See link:docs/roadmap.adoc[docs/roadmap.adoc] for the
+explanation and a map of every tag to its content. Full technical
 detail for each module is in the Modules table below; the full wave-by-wave
 history — including scope cuts and hardening follow-ups — is in
 link:docs/roadmap.adoc[docs/roadmap.adoc] and
@@ -86,6 +86,14 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 
 | V0.9.9
 | NAT traversal over Circuit Relay v2: a node behind NAT publishes a relay address and can be dialled through the relay (opt-in relay operation, no hole punching)
+| ✅
+
+| V0.9.10
+| Relay hardening: a stalled circuit can no longer block the other circuits and reservation renewals sharing its connection (per-circuit stall timeout plus a per-connection stall budget), and a node reuses a relayed connection the peer already opened to it (released in v0.10.0)
+| ✅
+
+| V0.9.11
+| DHT layer hardening in `lapis-net-storage`: absolute deadlines and concurrency caps on provider lookups, bounded provider store, sanitized peer addresses, validated Kademlia requests (released in v0.10.0)
 | ✅
 |===
 
@@ -152,7 +160,7 @@ the table above, not a detail to gloss over. One clarification on the first row:
 | secp256k1 identity keypairs, Ed25519 dual-key binding for the libp2p peer ID, keystore encryption at rest (Argon2id + AES-256-GCM), and multi-device/pseudonym self-trust linking.
 
 | `lapis-net-storage`
-| DHT + Bitswap content storage via Nabu. Cross-node provider discovery works since V0.9.8 (it had been broken since V0.1.4).
+| DHT + Bitswap content storage via Nabu. Cross-node provider discovery works since V0.9.8 (it had been broken since V0.1.4); the DHT layer is bounded and validates untrusted input since V0.9.11.
 
 | `lapis-net-trust`
 | Veritas (web-of-trust): trust-edge data model, shortest-path scoring algorithm, GossipSub propagation, Nabu persistence.
