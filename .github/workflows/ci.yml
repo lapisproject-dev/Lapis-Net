@@ -15,6 +15,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -27,5 +28,50 @@ jobs:
           java-version: "25"
           cache: gradle
 
+      # The relay tests are timing-sensitive, so the hardware they ran on belongs in every log.
+      - name: Runner facts
+        run: |
+          nproc
+          free -m
+          java -version
+
       - name: Gradle build (check includes tests + ktlint)
         run: ./gradlew clean check --no-daemon
+
+      # Only when something failed: the XML results (with the captured test output) and the HTML
+      # reports are what is needed to see which assertion failed and why. The repository is public
+      # and artifacts are readable by anyone who can see the run: test output of this project holds
+      # no key material (checked against the XML of local runs), keep it that way.
+      - name: Upload the test reports of a failed build
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-reports
+          path: |
+            **/build/test-results/test/*.xml
+            **/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The release scripts are plain bash and are tested completely offline (no GitHub, no Gradle, no
+  # Java): this job runs that suite on every push and pull request, so a change to scripts/release/
+  # cannot first show its breakage during an actual release. RELEASE_TESTS_STRICT turns every case
+  # that would be skipped (python3 or a checksum tool missing, port 7878 busy) into a failure, so the
+  # job can never be green merely because the runner lost a dependency.
+  release-scripts:
+    name: Release script harness (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Offline tests of the release scripts
+        env:
+          RELEASE_TESTS_STRICT: "1"
+        run: scripts/release/test-release-scripts.sh

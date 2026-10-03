@@ -25,6 +25,7 @@ import io.netty.handler.codec.protobuf.ProtobufDecoder
 import io.netty.handler.codec.protobuf.ProtobufEncoder
 import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder
 import io.netty.handler.codec.protobuf.ProtobufVarint32LengthFieldPrepender
+import io.netty.util.ReferenceCountUtil
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
@@ -62,6 +63,25 @@ private val logger = KotlinLogging.logger {}
 internal val relayControlExecutor: java.util.concurrent.Executor by lazy {
     java.util.concurrent.Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "lapis-relay-control").apply { isDaemon = true }
+    }
+}
+
+/**
+ * Test-only observation point shared by the hop and stop protocol of one node. Counts the
+ * exceptions that reach a relay **control** stream - on a healthy circuit setup there are none, and
+ * the ones that do occur are exactly the ones nobody would otherwise see, because jvm-libp2p hands
+ * them to a callback that neither logs nor closes (see [HopReceiver.onException]).
+ */
+internal class RelayControlDiagnostics {
+    private val failures =
+        java.util.concurrent.atomic
+            .AtomicInteger()
+
+    /** Number of exceptions seen on this node's hop-receiver and stop-sender streams so far. */
+    val controlStreamFailures: Int get() = failures.get()
+
+    fun recordControlStreamFailure() {
+        failures.incrementAndGet()
     }
 }
 
@@ -127,6 +147,104 @@ private class ControlStreamClearer : ChannelInitializer<Channel>() {
         pipeline.remove(CONTROL_LIMIT_HANDLER_NAME)
         // This initializer removes itself: Netty's ChannelInitializer does that for us once
         // initChannel returns, so removing CONTROL_CLEARER_NAME here would be redundant.
+    }
+}
+
+/**
+ * Upper bound on what [HoldInboundUntilWired] keeps while the relay finishes wiring a circuit. The
+ * window is a few event-loop turns long and the first bytes a destination sends are a multistream
+ * header, so this is generous; it only exists so a peer that floods the stop stream in that window
+ * cannot make the relay hold an unbounded amount.
+ */
+private const val HOLD_UNTIL_WIRED_MAX_BYTES = 64 * 1024
+
+/**
+ * Keeps whatever a leg's peer sends **while the relay is still wiring the circuit** instead of
+ * letting it fall off the end of the pipeline.
+ *
+ * The destination starts its end-to-end handshake - it writes the multistream header - the moment it
+ * has sent its STOP "OK". The relay has to stop treating that stream as protobuf *before* it reads
+ * those bytes (see [StopSender.beginRawPipe], which does so on the stream's own event loop), but the
+ * rest of the wiring - the traffic limiters and the forwarding handler towards the other leg - is
+ * done from the hop stream's event loop, a moment later. Between the two, bytes arrive on a stream
+ * that is already a raw pipe but has no forwarder yet; this handler holds them and replays them in
+ * order into the forwarder once [release] is called. All of it runs on the stream's own event loop,
+ * so no locking is needed.
+ */
+private class HoldInboundUntilWired : ChannelInboundHandlerAdapter() {
+    private var ctx: ChannelHandlerContext? = null
+    private var held: java.util.ArrayDeque<Any>? = java.util.ArrayDeque()
+    private var heldBytes = 0
+
+    override fun handlerAdded(ctx: ChannelHandlerContext) {
+        this.ctx = ctx
+    }
+
+    override fun handlerRemoved(ctx: ChannelHandlerContext) {
+        discardHeld()
+    }
+
+    override fun channelInactive(ctx: ChannelHandlerContext) {
+        discardHeld()
+        ctx.fireChannelInactive()
+    }
+
+    override fun channelRead(
+        ctx: ChannelHandlerContext,
+        msg: Any,
+    ) {
+        val queue = held
+        if (queue == null) {
+            ctx.fireChannelRead(msg)
+            return
+        }
+        val size = (msg as? ByteBuf)?.readableBytes() ?: 0
+        if (heldBytes + size > HOLD_UNTIL_WIRED_MAX_BYTES) {
+            ReferenceCountUtil.release(msg)
+            logger.warn { "relay circuit leg sent too much before the circuit was wired - closing it" }
+            ctx.close()
+            return
+        }
+        queue.add(msg)
+        heldBytes += size
+    }
+
+    /** Replays everything held, in order, into the handlers that follow this one, and turns this
+     * handler into a pass-through. Safe to call from any thread; the work is done on the stream's
+     * event loop, queued behind the handler additions that precede it. */
+    fun release() {
+        val context = ctx ?: return
+        val executor = context.executor()
+        if (executor.inEventLoop()) {
+            replay(context)
+        } else {
+            try {
+                executor.execute { replay(context) }
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                // The loop is shutting down; the channel is going away together with what it held.
+                logger.debug(e) { "relay could not replay held circuit bytes - event loop is shutting down" }
+            }
+        }
+    }
+
+    private fun replay(context: ChannelHandlerContext) {
+        val queue = held ?: return
+        held = null
+        heldBytes = 0
+        if (queue.isEmpty()) return
+        while (true) {
+            context.fireChannelRead(queue.poll() ?: break)
+        }
+        context.fireChannelReadComplete()
+    }
+
+    private fun discardHeld() {
+        val queue = held ?: return
+        held = null
+        heldBytes = 0
+        while (true) {
+            ReferenceCountUtil.release(queue.poll() ?: break)
+        }
     }
 }
 
@@ -310,6 +428,9 @@ internal class HopReceiver(
     private val stopBinding: ProtocolBinding<CircuitStopControl>,
     private val clock: () -> Instant,
     private val flowStats: CircuitFlowStats,
+    /** Test hook, see [LapisCircuitHopProtocol.beforeCircuitWiring]. */
+    private val beforeCircuitWiring: () -> Unit = {},
+    private val diagnostics: RelayControlDiagnostics = RelayControlDiagnostics(),
 ) : ProtocolMessageHandler<Circuit.HopMessage>,
     CircuitHopControl {
     override fun onMessage(
@@ -328,6 +449,16 @@ internal class HopReceiver(
             logger.warn(e) { "relay hop request from ${runCatching { stream.remotePeerId() }.getOrNull()} failed" }
             runCatching { refuse(stream, Circuit.Status.MALFORMED_MESSAGE) }
         }
+    }
+
+    /**
+     * jvm-libp2p's `ProtocolMessageHandlerAdapter` hands every pipeline exception to this callback and
+     * does nothing else - it neither logs nor closes the stream - so without an override a decode
+     * failure on a hop stream vanishes without a trace.
+     */
+    override fun onException(cause: Throwable?) {
+        diagnostics.recordControlStreamFailure()
+        logger.debug(cause) { "relay hop stream raised an exception" }
     }
 
     /** Answers a refused hop request and closes the stream. A refusal ends the exchange, so leaving
@@ -458,6 +589,7 @@ internal class HopReceiver(
             refuse(stream, Circuit.Status.RESOURCE_LIMIT_EXCEEDED)
             return
         }
+        logger.debug { "relay CONNECT $initiator -> $target accepted for processing" }
         val now = clock()
         // Rate-limited BEFORE anything is looked up or dialled: a CONNECT costs the initiator
         // almost nothing and costs the target a full Noise handshake, so an unlimited CONNECT rate
@@ -527,30 +659,62 @@ internal class HopReceiver(
                     return@whenComplete
                 }
                 val (sender, reply) = result
+                logger.debug { "relay STOP reply for circuit $initiator -> $target: ${reply.status}" }
                 if (reply.status != Circuit.Status.OK) {
                     release()
                     runCatching { sender.stream.close() }
                     runCatching { refuse(hopStream, reply.status) }
                     return@whenComplete
                 }
-                runCatching {
-                    hopStream.writeAndFlush(
-                        Circuit.HopMessage
-                            .newBuilder()
-                            .setType(Circuit.HopMessage.Type.STATUS)
-                            .setStatus(Circuit.Status.OK)
-                            .build(),
-                    )
-                    spliceCircuit(hopStream, sender.stream, initiator, target, limits, release)
-                    logger.info {
-                        "relaying circuit $initiator -> $target " +
-                            "(${registry.circuitCount()}/${limits.maxConcurrentCircuits} circuits live)"
+                // The OK that tells the initiator the circuit is open and the wiring that turns the hop
+                // stream into a raw byte pipe must happen as ONE step on the hop stream's own event loop.
+                // This callback runs on a different thread (it is completed by the stop stream's loop),
+                // and the initiator starts its end-to-end handshake the moment it sees the OK: if those
+                // first bytes reach the hop stream before the control handlers are removed, the protobuf
+                // frame decoder swallows them and the hop receiver's decode failure goes nowhere (see
+                // [onException]) - the handshake then stalls until multistream's 10 s total timeout.
+                // Observed as relay dials that hang on slow or busy machines. The stop stream, the other
+                // leg, is handled on ITS loop in StopSender.beginRawPipe, because the destination speaks
+                // end-to-end right after its own OK; what it sends before this block has finished wiring
+                // the forwarders is held there and replayed in order.
+                val completeCircuit = {
+                    runCatching {
+                        logger.debug { "relay writing the circuit OK to the hop stream for $initiator -> $target" }
+                        hopStream.writeAndFlush(
+                            Circuit.HopMessage
+                                .newBuilder()
+                                .setType(Circuit.HopMessage.Type.STATUS)
+                                .setStatus(Circuit.Status.OK)
+                                .build(),
+                        )
+                        beforeCircuitWiring()
+                        spliceCircuit(hopStream, sender, initiator, target, limits, release)
+                        logger.debug { "relay spliced circuit $initiator -> $target" }
+                        logger.info {
+                            "relaying circuit $initiator -> $target " +
+                                "(${registry.circuitCount()}/${limits.maxConcurrentCircuits} circuits live)"
+                        }
+                    }.onFailure {
+                        logger.warn(it) { "relay failed to splice circuit $initiator -> $target" }
+                        release()
+                        runCatching { hopStream.close() }
+                        runCatching { sender.stream.close() }
                     }
-                }.onFailure {
-                    logger.warn(it) { "relay failed to splice circuit $initiator -> $target" }
-                    release()
-                    runCatching { hopStream.close() }
-                    runCatching { sender.stream.close() }
+                    Unit
+                }
+                val hopLoop = nettyChannelOf(hopStream)?.eventLoop()
+                if (hopLoop == null || hopLoop.inEventLoop()) {
+                    completeCircuit()
+                } else {
+                    try {
+                        hopLoop.execute { completeCircuit() }
+                    } catch (e: java.util.concurrent.RejectedExecutionException) {
+                        // The hop connection's loop is shutting down: nobody is left to relay for.
+                        logger.debug(e) { "relay could not hand circuit $initiator -> $target to the hop loop" }
+                        release()
+                        runCatching { hopStream.close() }
+                        runCatching { sender.stream.close() }
+                    }
                 }
             }
     }
@@ -567,14 +731,18 @@ internal class HopReceiver(
      */
     private fun spliceCircuit(
         a: Stream,
-        b: Stream,
+        sender: StopSender,
         initiator: PeerId,
         target: PeerId,
         limits: RelayServerLimits,
         release: () -> Unit,
     ) {
+        val b = sender.stream
         a.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
-        b.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
+        // b was already turned into a raw pipe on its own event loop when the destination's OK
+        // arrived (see StopSender.beginRawPipe) - only a is cleared here, on its own loop.
+        // Everything b received in the meantime is held until the forwarders below exist.
+        if (!sender.rawPipeStarted) b.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
         listOf(a, b).forEach { stream ->
             stream.pushHandler(InboundTrafficLimitHandler(limits.circuitMaxBytes))
             stream.pushHandler(TotalTimeoutHandler(limits.circuitMaxDuration))
@@ -585,7 +753,9 @@ internal class HopReceiver(
             // Should be unreachable in this build; forwarding without flow control is still better
             // than refusing an otherwise-valid circuit, but it must be visible if it ever happens.
             logger.warn { "circuit legs are not Netty-backed - forwarding without flow control" }
-            return spliceWithoutFlowControl(a, b, release)
+            spliceWithoutFlowControl(a, b, release)
+            sender.endRawPipeHold()
+            return
         }
         val aTransport = transportChannelOf(aChannel)
         val bTransport = transportChannelOf(bChannel)
@@ -653,6 +823,9 @@ internal class HopReceiver(
             unwireResumers()
             runCatching { a.close() }
         }
+        // Every handler of b's forwarding path is now queued on b's loop; the replay queued here runs
+        // after them, so what the destination sent right after its OK enters the pipe in order.
+        sender.endRawPipeHold()
     }
 
     private fun spliceWithoutFlowControl(
@@ -685,6 +858,7 @@ internal class LapisCircuitHopProtocol(
     private val registry: RelayReservationRegistry,
     private val stopBinding: ProtocolBinding<CircuitStopControl>,
     private val clock: () -> Instant,
+    internal val diagnostics: RelayControlDiagnostics = RelayControlDiagnostics(),
 ) : ProtobufProtocolHandler<CircuitHopControl>(
         Circuit.HopMessage.getDefaultInstance(),
         Long.MAX_VALUE,
@@ -695,6 +869,16 @@ internal class LapisCircuitHopProtocol(
 
     /** Forwarding-path gauges of this relay (one instance per node); see [CircuitFlowStats]. */
     internal val flowStats = CircuitFlowStats()
+
+    /**
+     * Test hook, a no-op in production: runs for every circuit right after the relay wrote the
+     * "circuit open" `OK` to the initiator and right before the relay starts wiring the two streams
+     * together. A test that sleeps in here widens the window in which the initiator's first end-to-end
+     * bytes can overtake the wiring, which is how the race that [HopReceiver] closes is reproduced
+     * deterministically instead of by luck of scheduling.
+     */
+    @Volatile
+    internal var beforeCircuitWiring: () -> Unit = {}
 
     fun setHost(host: Host) {
         this.host = host
@@ -719,7 +903,8 @@ internal class LapisCircuitHopProtocol(
 
     override fun onStartResponder(stream: Stream): CompletableFuture<CircuitHopControl> {
         val us = host ?: throw IllegalStateException("hop protocol used before its Host was set")
-        val receiver = HopReceiver(us, config, registry, stopBinding, clock, flowStats)
+        val receiver =
+            HopReceiver(us, config, registry, stopBinding, clock, flowStats, { beforeCircuitWiring() }, diagnostics)
         stream.pushHandler(CONTROL_HANDLER_NAME, io.libp2p.protocol.ProtocolMessageHandlerAdapter(stream, receiver))
         return CompletableFuture.completedFuture(receiver)
     }
@@ -739,20 +924,62 @@ internal interface CircuitStopControl
 /** Initiator half of the stop protocol - used by a relay to reach the circuit's destination. */
 internal class StopSender(
     val stream: Stream,
+    private val diagnostics: RelayControlDiagnostics = RelayControlDiagnostics(),
 ) : ProtocolMessageHandler<Circuit.StopMessage>,
     CircuitStopControl {
     private val pending = ConcurrentLinkedDeque<CompletableFuture<Circuit.StopMessage>>()
+
+    private var holdUntilWired: HoldInboundUntilWired? = null
+
+    /** `true` once [beginRawPipe] has turned this stream into a raw byte pipe. */
+    @Volatile
+    internal var rawPipeStarted = false
+        private set
 
     override fun onMessage(
         stream: Stream,
         msg: Circuit.StopMessage,
     ) {
-        pending.poll()?.complete(msg)
+        val waiter = pending.poll()
+        // The destination has accepted, and from its next byte on it speaks end-to-end, not
+        // protobuf. This callback runs on the stop stream's own event loop, in the very read that
+        // delivered the OK, so this is the one place where the stream can be made a raw pipe before
+        // anything the destination sends after the OK is read. Doing it later - from the thread that
+        // happens to complete the future, or from the hop stream's loop - loses that race: the
+        // destination's multistream header would be decoded as protobuf and silently dropped.
+        if (waiter != null && msg.type == Circuit.StopMessage.Type.STATUS && msg.status == Circuit.Status.OK) {
+            beginRawPipe()
+        }
+        waiter?.complete(msg)
+    }
+
+    /** Must be called on this stream's event loop. Turns the stop stream into a raw byte pipe and
+     * holds what arrives until [endRawPipeHold] (called once the circuit is wired). */
+    private fun beginRawPipe() {
+        if (rawPipeStarted) return
+        rawPipeStarted = true
+        val channel = nettyChannelOf(stream)
+        if (channel != null && channel.eventLoop().inEventLoop()) {
+            val hold = HoldInboundUntilWired()
+            holdUntilWired = hold
+            // The hold goes in first so that whatever the codecs being removed still carry is replayed
+            // into it rather than falling off the end of the pipeline.
+            stream.pushHandler(hold)
+        }
+        stream.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
+    }
+
+    /** Called when the circuit is fully wired (or abandoned): replays what was held. */
+    fun endRawPipeHold() {
+        holdUntilWired?.release()
     }
 
     override fun onClosed(stream: Stream) = failAll(IllegalStateException("relay stop stream closed"))
 
-    override fun onException(cause: Throwable?) = failAll(cause ?: IllegalStateException("relay stop stream failed"))
+    override fun onException(cause: Throwable?) {
+        diagnostics.recordControlStreamFailure()
+        failAll(cause ?: IllegalStateException("relay stop stream failed"))
+    }
 
     private fun failAll(cause: Throwable) {
         while (true) {
@@ -865,6 +1092,7 @@ internal class StopReceiver(
 /** See [LapisCircuitHopProtocol] for why the traffic limits are `Long.MAX_VALUE`. */
 internal class LapisCircuitStopProtocol(
     private val limits: RelayClientLimits,
+    private val diagnostics: RelayControlDiagnostics = RelayControlDiagnostics(),
 ) : ProtobufProtocolHandler<CircuitStopControl>(
         Circuit.StopMessage.getDefaultInstance(),
         Long.MAX_VALUE,
@@ -892,7 +1120,7 @@ internal class LapisCircuitStopProtocol(
     }
 
     override fun onStartInitiator(stream: Stream): CompletableFuture<CircuitStopControl> {
-        val sender = StopSender(stream)
+        val sender = StopSender(stream, diagnostics)
         stream.pushHandler(CONTROL_HANDLER_NAME, io.libp2p.protocol.ProtocolMessageHandlerAdapter(stream, sender))
         return CompletableFuture.completedFuture(sender)
     }

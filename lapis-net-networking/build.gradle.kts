@@ -32,3 +32,33 @@ dependencies {
     // comment: it is the only module that ships a concrete backend for real usage).
     testImplementation(rootProject.libs.logback.classic)
 }
+
+// Diagnostics for the timing-sensitive relay specs - inert unless asked for on the command line:
+//   -PlapisDiag=true                    relay DEBUG log (build/test-logs/relay.log), GC log (gc.log),
+//                                       diag.log (thread dumps on failures, per-spec thread/CPU/heap)
+//   -PlapisDiag=files                   only gc.log and diag.log; Logback stays at its default, so the
+//                                       timing is that of a normal build
+//   -PlapisLogConfig=logback-quiet.xml  swap Logback's default (everything at DEBUG on stdout) for a
+//                                       configuration from src/test/resources - for A/B runs
+// Without either property nothing here changes the test JVM.
+tasks.withType<Test>().configureEach {
+    val diagMode = providers.gradleProperty("lapisDiag").orNull
+    val diag = diagMode == "true" || diagMode == "files"
+    val logConfig = providers.gradleProperty("lapisLogConfig").orNull
+    val testLogs =
+        layout.buildDirectory
+            .dir("test-logs")
+            .get()
+            .asFile
+    if (diag) {
+        doFirst { testLogs.mkdirs() }
+        jvmArgs("-Xlog:gc*:file=${testLogs.absolutePath}/gc.log:time,uptime")
+        systemProperty("lapis.diag.logdir", testLogs.absolutePath)
+        if (diagMode == "true") {
+            systemProperty("logback.configurationFile", file("src/test/resources/logback-diag.xml").absolutePath)
+        }
+    }
+    if (logConfig != null) {
+        systemProperty("logback.configurationFile", file("src/test/resources/$logConfig").absolutePath)
+    }
+}

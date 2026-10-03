@@ -10,6 +10,7 @@ import io.libp2p.core.PeerId
 import io.libp2p.core.PeerInfo
 import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.pubsub.ValidationResult
+import io.libp2p.protocol.Ping
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayException
@@ -17,6 +18,7 @@ import net.lapisphilosophorum.lapisnet.networking.relay.RelayServerLimits
 import java.time.Duration
 import java.time.Instant
 import java.util.Collections
+import java.util.concurrent.TimeUnit
 
 private const val TEST_TOPIC = "lapis-net-test:circuit-relay:v1"
 
@@ -37,11 +39,6 @@ private const val TEST_TOPIC = "lapis-net-test:circuit-relay:v1"
 class MultiNodeCircuitRelayTest :
     FunSpec({
         fun relayInfo(relay: LapisNode) = PeerInfo(relay.peerId, relay.directListenAddresses())
-
-        // LapisNode.connect wraps the underlying failure, and the interesting detail (the relay's
-        // refusal status) lives in the cause chain rather than the top-level message.
-        fun causeChain(error: Throwable): String =
-            generateSequence(error) { it.cause }.mapNotNull { it.message }.joinToString(" | ")
 
         test("B advertises a /p2p-circuit address once it holds a reservation on R") {
             val relay = LapisNode.create(DualKeyIdentity.generate(), relayConfig = RelayConfig.relayServer())
@@ -104,7 +101,13 @@ class MultiNodeCircuitRelayTest :
 
                 // The ONLY address A is ever given for B is the relayed one. A holds no direct
                 // address for B and never dials one.
-                val connection = nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitAddress)), Duration.ofSeconds(45))
+                val connection =
+                    connectDiagnosed(
+                        nodeA,
+                        PeerInfo(nodeB.peerId, listOf(circuitAddress)),
+                        relay = relay,
+                        step = "A dials B through R",
+                    )
 
                 // The Noise session is end to end between A and B: the relay carried ciphertext and
                 // could not have impersonated either side.
@@ -128,6 +131,64 @@ class MultiNodeCircuitRelayTest :
                 subscriptionB.unsubscribe()
                 gossipA.stop()
                 gossipB.stop()
+            } finally {
+                runCatching { nodeA.stop() }
+                runCatching { nodeB.stop() }
+                runCatching { relay.stop() }
+            }
+        }
+
+        test("a circuit works even when the relay is slow to wire it up after telling the initiator it is open") {
+            // Regression test for a race that made relay dials hang for 10 s on slow or busy machines.
+            // The relay answers the initiator's CONNECT with "OK" and only then turns the hop stream
+            // into a raw byte pipe; the initiator starts its end-to-end handshake the moment it sees the
+            // OK. If those first bytes reach the hop stream while the relay still decodes it as protobuf,
+            // they are swallowed (the decode failure goes nowhere) and the handshake never completes.
+            // The hook below makes the relay dawdle between the OK and the wiring for half a second -
+            // far longer than the initiator needs to answer - so the race is lost every time instead of
+            // once in a while. A relay that writes the OK and wires the stream as one step on the hop
+            // stream's own event loop is unaffected: nothing is read from the hop stream meanwhile.
+            // The same race exists in the other direction: the destination writes its own end-to-end
+            // bytes (the multistream header) right after its STOP "OK", so the relay's stop stream must
+            // stop being a protobuf stream before it reads them. A swallowed frame does not break
+            // jvm-to-jvm dialling (the initiator tolerates a missing multistream header) but it does
+            // break every other libp2p implementation - hence the check on the relay's control-stream
+            // failures below, which is the only place a swallowed frame leaves a trace.
+            val relay = LapisNode.create(DualKeyIdentity.generate(), relayConfig = RelayConfig.relayServer())
+            val nodeA = LapisNode.create(DualKeyIdentity.generate())
+            val nodeB = LapisNode.create(DualKeyIdentity.generate())
+            try {
+                relay.start(bootstrapPeers = emptyList())
+                nodeA.start(bootstrapPeers = emptyList())
+                nodeB.start(bootstrapPeers = emptyList())
+                relay.relayHopProtocol.beforeCircuitWiring = { Thread.sleep(500) }
+
+                nodeB.relayClient.reserve(relayInfo(relay))
+                val circuitAddress = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
+
+                val connection =
+                    connectDiagnosed(
+                        nodeA,
+                        PeerInfo(nodeB.peerId, listOf(circuitAddress)),
+                        Duration.ofSeconds(45),
+                        relay,
+                        "A dials B through a slow-to-wire R",
+                    )
+                connection.secureSession().remoteId shouldBe nodeB.peerId
+                connection.remoteAddress().has(Protocol.P2PCIRCUIT) shouldBe true
+                // The circuit carries traffic both ways, not just the handshake. Every node that dials a
+                // protocol must have it registered locally too.
+                nodeA.host.addProtocolHandler(Ping())
+                nodeB.host.addProtocolHandler(Ping())
+                Ping()
+                    .dial(nodeA.host, nodeB.peerId, circuitAddress)
+                    .controller
+                    .get(30, TimeUnit.SECONDS)
+                    .ping()
+                    .get(30, TimeUnit.SECONDS)
+                // No decode failure on either of the relay's control streams (hop towards A, stop towards
+                // B): every byte either end sent right after its "OK" reached the other end.
+                relay.relayHopProtocol.diagnostics.controlStreamFailures shouldBe 0
             } finally {
                 runCatching { nodeA.stop() }
                 runCatching { nodeB.stop() }

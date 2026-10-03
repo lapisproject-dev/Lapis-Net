@@ -1833,3 +1833,84 @@ Every fix was also checked by mutation: with the fix removed, the test named for
 * Bitswap has no way to cancel a want: a timed-out fetch leaves its want and re-send thread behind
   (five minutes against a single peer).
 * The gossip-only modules are not migrated onto the DHT; that remains a separately planned wave.
+
+== Unreleased — Relay test stability and release-pipeline hardening (post-`v0.10.0` maintenance)
+
+_Not released and not tagged; there is no version number for it yet. Follow-up to the three red runs
+of 2026-10-03 (CI on the `v0.10.0` commit, CI on `58a76bc`, and a manual `Release` run whose build job runs
+the same tests): the V0.9.10 relay tests failing on a GitHub runner._
+
+**What was found** (all numbers: real loopback nodes, the whole `:lapis-net-networking:test` task or a
+probe of 40 fresh relay dials, pinned with `taskset`, one run at a time; GitHub's runner was not available
+for measurement, see "What is not proven"):
+
+* **A race in the relay that makes a relay dial hang.** The relay answers the initiator's `CONNECT` with
+  `OK` and only then turns the hop stream into a raw byte pipe. The code doing that runs on another
+  thread than the hop stream's event loop, and the initiator starts its Noise handshake as soon as it
+  sees the `OK`; if those bytes arrive first, the still-installed protobuf decoder swallows them. The
+  exception (`InvalidWireTypeException`, seen in the DEBUG log) goes to a callback that does nothing, so
+  both ends wait for multistream's 10 s total timeout (`TotalTimeoutException`) with no sign of a pause
+  or error on the relay. It affects plain relay dials, not only the stall tests: on two CPUs (two runs of
+  40 fresh dials each per variant) 8 of 80 dials failed without extra load and 17 of 80 with two busy
+  threads in the JVM; with the fix 0 of 80 and 0 of 80 failed. The same probe on the `v0.9.9` commit (before
+  any V0.9.10 code) failed 4 of 80 and 14 of 80, so **the race predates V0.10.0**; on four CPUs the
+  failure rate of the unloaded probe was 0 of 40 at `v0.9.9` but 10 of 40 and 7 of 40 at the V0.9.10 and
+  V0.9.11 commits. That V0.9.10 made the window wider (its wiring does more work between the `OK` and the
+  handler installation) fits the numbers, but samples this small do not prove it.
+* **`MultiNodeCircuitStallTest`, "a non-reader that reopens its circuit ...", failed in every run on one
+  and on two CPUs and never on four** (baseline, 5 of 5 on two CPUs, 3 of 3 on one, 0 of 3 on four).
+  This was not random: the test pauses for 150 ms after A resumes reading and then calls
+  `LapisNode.connect`, which returns an *open* connection to the same peer instead of dialling. The relay's
+  close of the cut circuit reaches A only after A has read and decrypted the megabytes the relay queued
+  toward it, which takes longer than 150 ms on a slow machine or with Logback's default (everything at
+  DEBUG on stdout, about 36 MiB per run). Logged with `-PlapisDiag=files`: in cycle 2 `connect` returned
+  the cycle-1 connection (same object, not yet closed), which closed 4 ms later; the flood stream opened
+  on it failed with `ConnectionClosedException` (or hung for 10 s). A test defect, not a product defect:
+  `NetworkImpl.connect` reuses connections the same way.
+* **Not the cause:** GC (89 ms of pauses in a whole run at a 512 MiB heap, at most about 180 MiB in use),
+  thread or heap leaks between specs (about 40 live threads, flat), the number of CPUs alone (one test
+  failed on four CPUs too). On one CPU a different, wall-clock-based test also failed once in three runs
+  (`CircuitProxyBackpressureTest`, the budget test); one CPU was only recorded, not made a target.
+
+**What changed:**
+
+* **Relay:** on the hop leg the `OK` and the wiring of the hop stream are one task on the hop stream's
+  own event loop (`HopReceiver.openCircuit`). On the stop leg `StopSender` turns the stop stream into a raw
+  pipe in the very read that delivers the destination's `OK` and holds early bytes (at most 64 KiB) until
+  the forwarders exist (`HoldInboundUntilWired`). `HopReceiver` and `StopSender` count the exceptions that
+  reach them (`RelayControlDiagnostics`), and the hop receiver logs them at DEBUG. A test hook
+  (`LapisCircuitHopProtocol.beforeCircuitWiring`, no-op in production) lets a test reproduce the race on
+  every run; the regression test fails with the hop-leg fix taken out and passes with it, and also asserts
+  that no control-stream failure was recorded on the relay. `v0.9.9` and `v0.10.0` both contain the race;
+  the fix is in no tag. Details: `docs/architecture.adoc`, "Circuit setup: the `OK` and the wiring are one
+  step on each leg".
+* **Test:** the stall test waits for the cut connection to be closed on A's side (it used to sleep 150 ms)
+  and asserts that `connect` returns a new connection. No assertion about the gates, budgets or timings
+  was changed; the helper functions moved into `MultiNodeTestSupport.kt`, whose `diagnosed` /
+  `connectDiagnosed` only add the failing step, elapsed time, relay gauges and cause chain to a failure.
+  Nothing is retried.
+* **Diagnostics** (inert unless asked for): DEBUG lines in the read gate, the hop receiver and
+  `LapisNode.connect`; `-PlapisDiag=true|files` and `-PlapisLogConfig=<file>` (see `CONTRIBUTING.adoc`);
+  failing tests print the full cause chain in Gradle's output.
+* **Release pipeline** (`docs/releasing.adoc`): `publish.sh` refuses to publish if the remote tag no longer
+  points at the commit the build verified (`--expect-commit`, mandatory for a real run, checked before
+  every change to the release); it never replaces an asset of a published release (missing assets are
+  uploaded without `--clobber`, identical ones are skipped, differing ones are replaced only on a draft);
+  the documented macOS checksum command, which failed whenever only one ZIP was downloaded, is replaced
+  by one that works; the harness's fake hanging CLI no longer leaves a `sleep 600` behind; the harness runs
+  in CI as its own job (`RELEASE_TESTS_STRICT=1`), and the build job uploads its test reports when it fails.
+
+**What is not proven:**
+
+* The stop-leg fix has no mutation check, and the case where the destination sends its `OK` and its
+  first end-to-end bytes in a single read is not covered (see `docs/architecture.adoc`).
+* The failures on GitHub's runner were not reproduced there; the diagnosis is from pinned local runs. The
+  repository is public, for which GitHub documents runners with four vCPUs; a `nproc` step now records
+  what a run actually got. The failure types of the red CI runs (the stall test at line 431, plain relay
+  dials running into the 10 s timeout) were all reproduced locally, but the CI logs themselves were not
+  re-read in this wave, so that they are the same defects on the runner is an inference.
+* That V0.9.10 raised the race's probability is a reading of small samples (see above).
+* The tag check was tested against local bare repositories and a stub `gh`, not against GitHub. The
+  macOS checksum command was run with the Perl `shasum` 6.04 on Linux, not on macOS.
+* A hop stream that raises a decode exception is still left open (see `docs/architecture.adoc`).
+

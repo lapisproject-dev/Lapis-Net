@@ -7,6 +7,10 @@
 # against deliberately broken copies and prove that a regression turns the matching test red).
 # Every case asserts the exit status AND a fragment of the message, so a case cannot pass for the
 # wrong reason. Needs: bash, git, python3 (the smoke-test cases are skipped without it).
+#
+# RELEASE_TESTS_STRICT=1 turns every skip that is caused by the machine (python3 missing, port 7878
+# busy, a checksum tool missing) into a failure - this is what CI sets. The exit status is non-zero
+# whenever a case failed.
 set -uo pipefail
 umask 077
 unset GITHUB_OUTPUT GITHUB_ACTIONS GH_TOKEN GH_BIN SHA256_TOOL KEEP_SMOKE_DIR SMOKE_SKIP_JAVA_CHECK
@@ -37,6 +41,17 @@ bad() {
   return 0
 }
 skip() { SKIP=$((SKIP + 1)); printf '  skip  %s (%s)\n' "$1" "$2"; }
+# skip_env: a case that cannot run because of the machine (python3 missing, port 7878 busy, a
+# checksum tool missing). A normal run only reports it; with RELEASE_TESTS_STRICT=1 (CI) it is a
+# failure, so a runner that silently lost a dependency can never turn the harness green by skipping.
+# `skip` stays for cases that are skipped on purpose (the real ZIPs without --with-dist).
+skip_env() {
+  if [[ "${RELEASE_TESTS_STRICT:-}" == "1" ]]; then
+    bad "$1" "cannot run: $2 (RELEASE_TESTS_STRICT=1 does not allow skipping it)"
+  else
+    skip "$1" "$2"
+  fi
+}
 
 OUT="" RC=0
 run() { OUT=$("$@" 2>&1) && RC=0 || RC=$?; }
@@ -230,7 +245,51 @@ if command -v shasum >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; th
   if [[ "$d1" == "$d2" ]]; then ok "sha256sum and shasum agree"; else bad "sha256sum and shasum agree"; fi
   expect_ok "verify works with shasum only" "checksums OK" env SHA256_TOOL=shasum "$S/checksums.sh" verify "$CS"
 else
-  skip "sha256sum/shasum agreement" "one of the tools is missing"
+  skip_env "sha256sum/shasum agreement" "one of the tools is missing"
+fi
+
+# ================================================================================================
+echo "== documented checksum commands (README.adoc, docs/releasing.adoc)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+DOC_SHA256SUM='sha256sum -c --ignore-missing SHA256SUMS'
+DOC_SHASUM='awk '"'"'$2 == "<file>"'"'"' SHA256SUMS | shasum -a 256 -c -'
+for doc in README.adoc docs/releasing.adoc; do
+  if grep -qF -- "$DOC_SHA256SUM" "$REPO_ROOT/$doc"; then ok "$doc documents: $DOC_SHA256SUM"; else bad "$doc documents: $DOC_SHA256SUM"; fi
+  if grep -qF -- "$DOC_SHASUM" "$REPO_ROOT/$doc"; then ok "$doc documents the awk | shasum command"; else bad "$doc documents the awk | shasum command"; fi
+done
+# The downloader holds ONE of the two ZIPs, SHA256SUMS lists both: that is the case the commands exist for.
+DL="$T/dl"
+mkdir -p "$DL"
+printf 'cli-bytes' >"$DL/lapis-net-cli-1.2.3.zip"
+printf 'browser-bytes' >"$DL/lapis-net-browser-1.2.3.zip"
+"$S/checksums.sh" generate "$DL" "$DL/lapis-net-browser-1.2.3.zip" "$DL/lapis-net-cli-1.2.3.zip" >/dev/null 2>&1
+rm "$DL/lapis-net-browser-1.2.3.zip"
+doc_cmd() { local cmd="${1//<file>/$2}"; ( cd "$DL" && bash -c "$cmd" ) 2>&1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  run doc_cmd "$DOC_SHA256SUM" lapis-net-cli-1.2.3.zip
+  if [[ $RC -eq 0 && "$OUT" == *"lapis-net-cli-1.2.3.zip: OK"* ]]; then ok "sha256sum command: matching file passes"; else bad "sha256sum command: matching file passes" "rc=$RC $OUT"; fi
+else
+  skip_env "sha256sum documented command" "sha256sum not found"
+fi
+if command -v shasum >/dev/null 2>&1; then
+  run doc_cmd "$DOC_SHASUM" lapis-net-cli-1.2.3.zip
+  if [[ $RC -eq 0 && "$OUT" == *"lapis-net-cli-1.2.3.zip: OK"* ]]; then ok "shasum command: matching file passes"; else bad "shasum command: matching file passes" "rc=$RC $OUT"; fi
+  run doc_cmd "$DOC_SHASUM" lapis-net-cli-1.2.4.zip
+  if [[ $RC -ne 0 ]]; then ok "shasum command: a mistyped name is an error, not a silent success"; else bad "shasum command: a mistyped name is an error, not a silent success" "rc=$RC $OUT"; fi
+  # a name that is a regex-prefix of another must not select it ('.' is literal in awk's string comparison)
+  run doc_cmd "$DOC_SHASUM" 'lapis-net-cli-1x2.3.zip'
+  if [[ $RC -ne 0 ]]; then ok "shasum command: the name is matched literally"; else bad "shasum command: the name is matched literally" "rc=$RC $OUT"; fi
+  cp "$DL/lapis-net-cli-1.2.3.zip" "$T/cli.orig"
+  printf 'X' >>"$DL/lapis-net-cli-1.2.3.zip"
+  run doc_cmd "$DOC_SHASUM" lapis-net-cli-1.2.3.zip
+  if [[ $RC -ne 0 && "$OUT" == *"FAILED"* ]]; then ok "shasum command: a tampered file fails"; else bad "shasum command: a tampered file fails" "rc=$RC $OUT"; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    run doc_cmd "$DOC_SHA256SUM" lapis-net-cli-1.2.3.zip
+    if [[ $RC -ne 0 && "$OUT" == *"FAILED"* ]]; then ok "sha256sum command: a tampered file fails"; else bad "sha256sum command: a tampered file fails" "rc=$RC $OUT"; fi
+  fi
+  cp "$T/cli.orig" "$DL/lapis-net-cli-1.2.3.zip"
+else
+  skip_env "shasum documented command" "shasum not found"
 fi
 
 # ================================================================================================
@@ -278,7 +337,9 @@ case "${FAKE_CLI:-ok}" in
   ok) echo "identity binding verifies:      true"; echo "Final resolved trust score A -> C on node C: 0.9" ;;
   nomarker) echo "identity binding verifies:      null"; echo "Final resolved trust score A -> C on node C: null" ;;
   fail) echo "boom"; exit 3 ;;
-  hang) sleep 600 ;;
+  # exec: the shell is replaced by sleep, so the TERM that smoke-test-dist.sh sends to this PID hits
+  # the sleep itself. Without it only the shell dies and an orphaned `sleep 600` outlives the run.
+  hang) [ -n "${FAKE_PIDFILE:-}" ] && echo $$ >"$FAKE_PIDFILE"; exec sleep 600 ;;
 esac
 SHEOF
 cat >"$FAKE/browser.sh" <<'SHEOF'
@@ -314,7 +375,7 @@ with zipfile.ZipFile(out, "w") as z:
 PYEOF
 }
 if ! $HAVE_PY; then
-  skip "synthetic smoke-test cases" "python3 not found"
+  skip_env "synthetic smoke-test cases" "python3 not found"
 else
   mkzip "$ZD/cli.zip" lapis-net-cli-0.2.0 cli
   mv "$ZD/cli.zip" "$ZD/lapis-net-cli-0.2.0.zip"
@@ -346,12 +407,25 @@ else
 
   # --- cases that start fake distributions; they need the fixed browser port 7878
   if (exec 3<>/dev/tcp/127.0.0.1/7878) 2>/dev/null; then
-    skip "cases that need port 7878" "port 7878 is busy on this machine"
+    skip_env "cases that need port 7878" "port 7878 is busy on this machine"
   else
     expect_ok "complete run with fake distributions" "smoke test passed" sm "$GOOD_CLI" "$GOOD_BROWSER"
     expect_fail "CLI without success markers" "success marker" sm "$GOOD_CLI" "$GOOD_BROWSER" FAKE_CLI=nomarker
     expect_fail "CLI exit status" "exited with status 3" sm "$GOOD_CLI" "$GOOD_BROWSER" FAKE_CLI=fail
-    expect_fail "CLI hang hits the deadline" "did not finish within" env SMOKE_SKIP_JAVA_CHECK=1 FAKE_CLI=hang "$S/smoke-test-dist.sh" --cli-zip "$GOOD_CLI" --browser-zip "$GOOD_BROWSER" --cli-timeout 3 --browser-timeout 10
+    expect_fail "CLI hang hits the deadline" "did not finish within" env SMOKE_SKIP_JAVA_CHECK=1 FAKE_CLI=hang FAKE_PIDFILE="$T/hang.pid" "$S/smoke-test-dist.sh" --cli-zip "$GOOD_CLI" --browser-zip "$GOOD_BROWSER" --cli-timeout 3 --browser-timeout 10
+    # The pid file holds the pid of the hanging fake CLI (the sleep itself, thanks to exec). It must be
+    # gone: checking this pid, not `pgrep -f "sleep 600"`, cannot hit an unrelated process.
+    hang_pid=$(cat "$T/hang.pid" 2>/dev/null || true)
+    if [[ "$hang_pid" =~ ^[0-9]+$ ]]; then
+      if kill -0 "$hang_pid" 2>/dev/null; then
+        bad "no orphaned sleep after the CLI hang" "pid $hang_pid is still alive"
+        kill -KILL "$hang_pid" 2>/dev/null
+      else
+        ok "no orphaned sleep after the CLI hang"
+      fi
+    else
+      bad "no orphaned sleep after the CLI hang" "the fake CLI did not record its pid"
+    fi
     expect_fail "passphrase leaked into the log" "passphrase appears" sm "$GOOD_CLI" "$GOOD_BROWSER" FAKE_LEAK=1
     assert_lacks "... and the log is not printed" "$OUT" "passphrase is "
     expect_fail "identity file with the wrong mode" "not 0600" sm "$GOOD_CLI" "$GOOD_BROWSER" FAKE_BAD_PERM=1
@@ -390,6 +464,18 @@ printf '%s\n' '== Heading' '' 'Plenty of ordinary text so that the length check 
 LINKNOTES="$T/notes-link.adoc"
 printf '%s\n' 'Plenty of ordinary text so that the length check is not what fails here, see link:foo.adoc[the docs].' >"$LINKNOTES"
 
+# A remote for the tag check of publish.sh. v0.2.0 is an annotated tag on C1 (the commit "the build
+# verified"), v0.2.1 is lightweight, v0.2.2 does not exist. $C_OTHER is any other commit.
+PORIGIN="$T/porigin.git"
+git init -q --bare "$PORIGIN"
+C_OTHER=$(g rev-parse HEAD)
+[[ "$C_OTHER" != "$C1" ]] || echo "test setup error: need a second commit" >&2
+set_ptag() { g tag -f -a "$1" -m "$1 test" "$2" >/dev/null 2>&1 && g push -q -f "$PORIGIN" "refs/tags/$1" 2>/dev/null; }
+set_ptag v0.2.0 "$C1"
+g push -q -f "$PORIGIN" refs/tags/v0.2.1 2>/dev/null
+mk_assets "$T/assets-0.2.1" 0.2.1
+mk_assets "$T/assets-0.2.2" 0.2.2
+
 pub_dry() { env GH_BIN=/nonexistent/gh "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo owner/name --dry-run "$@"; }
 expect_ok "dry run, new release: draft create, then publish" "DRY-RUN: gh release create v0.2.0" pub_dry --assume-exists no --notes-file "$GOODNOTES" --title "v0.2.0 - test"
 assert_contains "... created as a draft" "$OUT" "--draft"
@@ -402,8 +488,9 @@ expect_fail "dry run, new release, too short notes" "empty or too short" pub_dry
 assert_lacks "... and no create is emitted" "$OUT" "release create"
 expect_fail "AsciiDoc heading is rejected" "AsciiDoc-only" pub_dry --assume-exists no --notes-file "$HEADNOTES"
 expect_fail "AsciiDoc inline link is rejected" "AsciiDoc-only" pub_dry --assume-exists no --notes-file "$LINKNOTES"
-expect_ok "dry run, existing release, no notes: only assets" "release upload v0.2.0" pub_dry --assume-exists yes
-assert_contains "... with --clobber" "$OUT" "--clobber"
+expect_ok "dry run, existing release, no notes: only assets" "would compare the assets already on the release by SHA-256" pub_dry --assume-exists yes
+assert_contains "... published assets are never replaced" "$OUT" "published assets are never replaced"
+assert_lacks "... no blind upload is emitted" "$OUT" "DRY-RUN: gh release upload"
 assert_lacks "... notes untouched" "$OUT" "--notes-file"
 assert_lacks "... title untouched" "$OUT" "--title"
 assert_lacks "... not re-created" "$OUT" "release create"
@@ -411,6 +498,11 @@ expect_ok "dry run, existing release, notes file missing: keep notes" "keeping t
 assert_lacks "... still no notes edit" "$OUT" "--notes-file"
 expect_ok "dry run, existing release, notes file present: notes updated" "release edit v0.2.0 --repo owner/name --notes-file" pub_dry --assume-exists yes --notes-file "$GOODNOTES"
 expect_fail "dry run requires --assume-exists" "--assume-exists" pub_dry
+expect_ok "dry run with --expect-commit checks the tag on the remote" "DRY-RUN: gh release create v0.2.0" pub_dry --assume-exists no --notes-file "$GOODNOTES" --expect-commit "$C1" --remote "$PORIGIN"
+expect_fail "dry run with a wrong --expect-commit refuses" "now points to $C1" pub_dry --assume-exists no --notes-file "$GOODNOTES" --expect-commit "$C_OTHER" --remote "$PORIGIN"
+expect_fail "--expect-commit must be a full 40-hex commit" "40-character" pub_dry --assume-exists no --notes-file "$GOODNOTES" --expect-commit "abc123"
+expect_fail "--expect-commit rejects upper case and branch names" "40-character" pub_dry --assume-exists no --notes-file "$GOODNOTES" --expect-commit "master"
+expect_fail "a real run without --expect-commit fails closed" "--expect-commit is required" env GH_BIN=/nonexistent/gh GH_TOKEN=dummy "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo owner/name --notes-file "$GOODNOTES"
 expect_fail "non-dry run requires GH_TOKEN" "GH_TOKEN is not set" "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo owner/name --notes-file "$GOODNOTES"
 expect_fail "malformed tag" "vX.Y.Z" "$S/publish.sh" --tag v0.2 --assets-dir "$A" --repo owner/name --dry-run --assume-exists yes
 expect_fail "malformed repo" "OWNER/NAME" "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo 'owner/name;x' --dry-run --assume-exists yes
@@ -433,7 +525,7 @@ echo "gh $*" >>"$STUB_LOG"
 [[ "${1:-}" == release ]] || exit 2
 sub="${2:-}"
 shift 2
-tag="" files="" skip_next=false positional=0 notes="" dir="" draft=false
+tag="" files="" skip_next=false positional=0 notes="" dir="" draft=false pattern="" clobber=false
 for a in "$@"; do
   if $skip_next; then
     skip_next=false
@@ -454,6 +546,8 @@ prev=""
 for a in "$@"; do
   [[ "$prev" == "--notes-file" ]] && notes="$a"
   [[ "$prev" == "--dir" ]] && dir="$a"
+  [[ "$prev" == "--pattern" ]] && pattern="$a"
+  [[ "$a" == "--clobber" ]] && clobber=true
   [[ "$a" == "--draft" ]] && draft=true
   prev="$a"
 done
@@ -465,10 +559,21 @@ case "$sub" in
     printf '%s\t%s\tfalse\n' "$tag" "$draft" >>"$STUB_STATE/releases.tsv"
     [[ -n "$notes" ]] && cp "$notes" "$STUB_STATE/notes-$tag.md"
     while IFS= read -r f; do [[ -n "$f" ]] && cp "$f" "$STUB_STATE/remote/"; done <<<"$files"
+    # test hook: something happens right after the release was created (e.g. the tag is moved)
+    [[ -n "${STUB_AFTER_CREATE:-}" ]] && "$STUB_AFTER_CREATE"
     ;;
   upload)
-    while IFS= read -r f; do [[ -n "$f" ]] && cp "$f" "$STUB_STATE/remote/"; done <<<"$files"
+    # like the real gh: an asset that already exists is only replaced with --clobber
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      if [[ -e "$STUB_STATE/remote/$(basename "$f")" && "$clobber" != true ]]; then
+        echo "HTTP 422: asset under the same name already exists: $(basename "$f")" >&2
+        exit 1
+      fi
+      cp "$f" "$STUB_STATE/remote/"
+    done <<<"$files"
     ;;
+  view) ls "$STUB_STATE/remote/" ;;
   edit)
     [[ -n "$notes" ]] && cp "$notes" "$STUB_STATE/notes-$tag.md"
     for a in "$@"; do
@@ -479,7 +584,11 @@ case "$sub" in
     done
     ;;
   download)
-    cp "$STUB_STATE/remote/"* "$dir/"
+    if [[ -n "$pattern" && "$pattern" != "*" ]]; then
+      [[ -f "$STUB_STATE/remote/$pattern" ]] && cp "$STUB_STATE/remote/$pattern" "$dir/"
+    else
+      cp "$STUB_STATE/remote/"* "$dir/"
+    fi
     if [[ "${STUB_TAMPER:-}" == "1" ]]; then
       for z in "$dir"/*.zip; do printf 'x' >>"$z"; break; done
     fi
@@ -490,7 +599,14 @@ exit 0
 STUBEOF
 chmod +x "$STUB"
 new_state() { rm -rf "$T/state"; mkdir -p "$T/state"; : >"$T/state.log"; if [[ -n "${1:-}" ]]; then printf '%b' "$1" >"$T/state/releases.tsv"; fi; }
-pub_real() { env GH_BIN="$STUB" GH_TOKEN=dummy STUB_LOG="$T/state.log" STUB_STATE="$T/state" "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo owner/name "$@"; }
+pub_real() { env GH_BIN="$STUB" GH_TOKEN=dummy STUB_LOG="$T/state.log" STUB_STATE="$T/state" "$S/publish.sh" --tag v0.2.0 --assets-dir "$A" --repo owner/name --expect-commit "$C1" --remote "$PORIGIN" "$@"; }
+# the same for another tag / assets directory / expected commit
+pub_tag() {
+  local t="$1" dir="$2" commit="$3"
+  shift 3
+  env GH_BIN="$STUB" GH_TOKEN=dummy STUB_LOG="$T/state.log" STUB_STATE="$T/state" "$S/publish.sh" --tag "$t" --assets-dir "$dir" --repo owner/name --expect-commit "$commit" --remote "$PORIGIN" "$@"
+}
+seed_remote() { mkdir -p "$T/state/remote" && cp "$1"/* "$T/state/remote/"; }
 log_line() { grep -n "$1" "$T/state.log" | head -n 1 | cut -d: -f1; }
 
 new_state 'v0.1.0\tfalse\tfalse\n'
@@ -512,10 +628,8 @@ calls=$(cat "$T/state.log")
 assert_lacks "stub: second run does not create again" "$calls" "release create"
 assert_lacks "stub: second run does not touch the notes" "$calls" "--notes-file"
 assert_lacks "stub: second run does not touch Latest" "$calls" "--latest"
-assert_contains "stub: second run re-uploads with --clobber" "$calls" "release upload v0.2.0 --repo owner/name --clobber"
-c=$(grep -n 'SHA256SUMS' "$T/state.log" | grep upload | head -n 1 | cut -d: -f1)
-z=$(grep -n 'lapis-net-browser' "$T/state.log" | grep upload | head -n 1 | cut -d: -f1)
-if [[ -n "$c" && -n "$z" && "$z" -lt "$c" ]]; then ok "stub: SHA256SUMS is uploaded last"; else bad "stub: SHA256SUMS is uploaded last" "$z $c"; fi
+assert_lacks "stub: second run uploads nothing (all assets are identical)" "$calls" "release upload"
+assert_contains "stub: second run reports the assets as unchanged" "$OUT" "asset lapis-net-cli-0.2.0.zip is unchanged"
 
 new_state 'v0.99.0\tfalse\tfalse\nv0.1.0\tfalse\tfalse\n'
 expect_ok "stub: older release created while a higher one exists" "done" pub_real --notes-file "$GOODNOTES"
@@ -543,6 +657,106 @@ export STUB_TAMPER=1
 expect_fail "stub: tampered download is detected before publishing" "mismatch" pub_real --notes-file "$GOODNOTES"
 unset STUB_TAMPER
 assert_lacks "stub: ... draft stays unpublished" "$(cat "$T/state.log")" "draft=false"
+
+# ================================================================================================
+echo "== publish: the tag must still point at the verified commit"
+# A tag that was force-moved after the build verified it must never be published. The stub records
+# every gh call, so "nothing was changed" is asserted on the log, not on a message.
+set_ptag v0.2.0 "$C1"
+new_state ''
+expect_ok "tag check: an unmoved annotated tag is published" "done" pub_real --notes-file "$GOODNOTES"
+assert_contains "tag check: ... release was created" "$(cat "$T/state.log")" "release create v0.2.0"
+
+set_ptag v0.2.0 "$C_OTHER"
+new_state ''
+expect_fail "tag check: tag moved after the verification is refused" "now points to $C_OTHER, the build verified $C1" pub_real --notes-file "$GOODNOTES"
+calls=$(cat "$T/state.log")
+assert_lacks "tag check: ... no release was created" "$calls" "release create"
+assert_lacks "tag check: ... nothing was uploaded" "$calls" "release upload"
+assert_lacks "tag check: ... nothing was published" "$calls" "release edit"
+
+new_state 'v0.2.0\ttrue\tfalse\n'
+expect_fail "tag check: an existing draft is not changed or published for a moved tag" "now points to" pub_real
+calls=$(cat "$T/state.log")
+assert_lacks "tag check: ... no upload to the draft" "$calls" "release upload"
+assert_lacks "tag check: ... draft not published" "$calls" "draft=false"
+
+# moved between "release created" and "draft published": the check right before the publish call catches it
+MOVE="$T/move-tag.sh"
+cat >"$MOVE" <<MOVEEOF
+#!/usr/bin/env bash
+git -C "$REPO" tag -f -a v0.2.0 -m "moved after create" "$C_OTHER" >/dev/null 2>&1
+git -C "$REPO" push -q -f "$PORIGIN" refs/tags/v0.2.0 2>/dev/null
+MOVEEOF
+chmod +x "$MOVE"
+set_ptag v0.2.0 "$C1"
+new_state ''
+export STUB_AFTER_CREATE="$MOVE"
+expect_fail "tag check: tag moved between create and publish is caught" "now points to $C_OTHER" pub_real --notes-file "$GOODNOTES"
+unset STUB_AFTER_CREATE
+calls=$(cat "$T/state.log")
+assert_contains "tag check: ... the draft had been created" "$calls" "release create v0.2.0"
+assert_lacks "tag check: ... but it was never published" "$calls" "draft=false"
+assert_contains "tag check: ... and stays a draft" "$(cat "$T/state/releases.tsv")" "$(printf 'v0.2.0\ttrue')"
+set_ptag v0.2.0 "$C1"
+
+new_state ''
+expect_fail "tag check: a lightweight tag is refused" "not an annotated tag" pub_tag v0.2.1 "$T/assets-0.2.1" "$C1" --notes-file "$GOODNOTES"
+assert_lacks "tag check: ... nothing was created" "$(cat "$T/state.log")" "release create"
+new_state ''
+expect_fail "tag check: a tag that does not exist is refused" "missing or not an annotated tag" pub_tag v0.2.2 "$T/assets-0.2.2" "$C1" --notes-file "$GOODNOTES"
+assert_lacks "tag check: ... nothing was created" "$(cat "$T/state.log")" "release create"
+new_state ''
+expect_fail "tag check: an unreachable remote is an error, not a pass" "cannot query" pub_tag v0.2.0 "$A" "$C1" --notes-file "$GOODNOTES" --remote "$T/does-not-exist.git"
+assert_lacks "tag check: ... nothing was created" "$(cat "$T/state.log")" "release create"
+
+# ================================================================================================
+echo "== publish: existing assets (no blind --clobber)"
+new_state 'v0.2.0\tfalse\tfalse\n'
+seed_remote "$A"
+expect_ok "assets: identical assets on a published release are left alone" "unchanged" pub_real
+calls=$(cat "$T/state.log")
+assert_lacks "assets: ... nothing uploaded" "$calls" "release upload"
+assert_lacks "assets: ... nothing edited" "$calls" "release edit"
+
+new_state 'v0.2.0\tfalse\tfalse\n'
+seed_remote "$A"
+printf 'a different build of the cli' >"$T/state/remote/lapis-net-cli-0.2.0.zip"
+expect_fail "assets: a differing asset on a PUBLISHED release is refused" "refusing to replace published asset lapis-net-cli-0.2.0.zip" pub_real
+calls=$(cat "$T/state.log")
+assert_lacks "assets: ... never uploaded with --clobber" "$calls" "--clobber"
+assert_lacks "assets: ... nothing uploaded at all" "$calls" "release upload"
+assert_contains "assets: ... the published file is untouched" "$(cat "$T/state/remote/lapis-net-cli-0.2.0.zip")" "a different build of the cli"
+
+new_state 'v0.2.0\ttrue\tfalse\n'
+seed_remote "$A"
+printf 'half of a zip' >"$T/state/remote/lapis-net-cli-0.2.0.zip"
+expect_ok "assets: a differing asset on a DRAFT is replaced" "publishing leftover draft" pub_real
+calls=$(cat "$T/state.log")
+assert_contains "assets: ... with --clobber" "$calls" "release upload v0.2.0 --repo owner/name --clobber"
+uploads=$(grep 'gh release upload' "$T/state.log" || true)
+assert_lacks "assets: ... only the differing asset was uploaded" "$uploads" "lapis-net-browser-0.2.0.zip"
+assert_contains "assets: ... and the draft was published" "$calls" "draft=false"
+cmp -s "$T/state/remote/lapis-net-cli-0.2.0.zip" "$A/lapis-net-cli-0.2.0.zip" && ok "assets: ... the draft now holds the local build" || bad "assets: ... the draft now holds the local build"
+
+new_state 'v0.2.0\tfalse\tfalse\n'
+expect_ok "assets: a published release without assets is back-filled" "done" pub_real
+calls=$(cat "$T/state.log")
+assert_lacks "assets: ... without --clobber" "$calls" "--clobber"
+c=$(grep -n 'upload.*SHA256SUMS' "$T/state.log" | head -n 1 | cut -d: -f1)
+z=$(grep -n 'upload.*lapis-net-browser' "$T/state.log" | head -n 1 | cut -d: -f1)
+if [[ -n "$c" && -n "$z" && "$z" -lt "$c" ]]; then ok "assets: ... SHA256SUMS is uploaded last"; else bad "assets: ... SHA256SUMS is uploaded last" "$z $c"; fi
+assert_lacks "assets: ... a published release is not published again" "$calls" "draft=false"
+
+new_state 'v0.2.0\tfalse\tfalse\n'
+seed_remote "$A"
+rm "$T/state/remote/lapis-net-browser-0.2.0.zip"
+expect_ok "assets: only the missing asset is uploaded" "done" pub_real
+calls=$(cat "$T/state.log")
+assert_contains "assets: ... that one" "$calls" "release upload v0.2.0 --repo owner/name $A/lapis-net-browser-0.2.0.zip"
+uploads=$(grep 'gh release upload' "$T/state.log" || true)
+assert_lacks "assets: ... not the identical ones" "$uploads" "lapis-net-cli-0.2.0.zip"
+assert_lacks "assets: ... never with --clobber" "$calls" "--clobber"
 
 # ================================================================================================
 echo "== real distributions"

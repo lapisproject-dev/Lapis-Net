@@ -192,10 +192,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.build.outputs.tag }}
           TITLE: ${{ needs.build.outputs.title }}
+          # The commit the build job verified and built. publish.sh asks the remote where the tag
+          # points before every change to the release and refuses to go on if it was moved since.
+          VERIFIED_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           scripts/release/publish.sh \
             --tag "$TAG" \
             --assets-dir "$RUNNER_TEMP/dist" \
             --repo "$GITHUB_REPOSITORY" \
+            --expect-commit "$VERIFIED_COMMIT" \
             --notes-file "docs/release-notes/$TAG.adoc" \
             --title "$TITLE"

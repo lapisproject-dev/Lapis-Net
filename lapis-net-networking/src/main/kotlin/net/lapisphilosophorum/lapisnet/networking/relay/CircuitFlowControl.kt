@@ -319,6 +319,10 @@ internal class TransportReadGate private constructor(
         timerRef.set(timer)
         paused[leg] = timer
         stats.onLegPaused()
+        logger.debug {
+            "gate ${transport.id().asShortText()}: paused ${leg.circuit.description} " +
+                "(${paused.size} paused, autoRead=${transport.config().isAutoRead}, timeout=$delayMillis ms)"
+        }
     }
 
     private fun nanosToMillisCeil(nanos: Long): Long = maxOf(1L, (nanos + 999_999L) / 1_000_000L)
@@ -330,6 +334,10 @@ internal class TransportReadGate private constructor(
         timer.cancel(false)
         stats.onLegUnpaused()
         if (paused.isEmpty()) transport.config().isAutoRead = true
+        logger.debug {
+            "gate ${transport.id().asShortText()}: resumed ${leg.circuit.description} " +
+                "(${paused.size} paused, autoRead=${transport.config().isAutoRead})"
+        }
     }
 
     private fun onStallTimer(
@@ -338,6 +346,7 @@ internal class TransportReadGate private constructor(
     ) {
         // A timer that was cancelled-and-replaced must not act on the leg's newer pause.
         if (paused[leg] !== timer) return
+        logger.debug { "gate ${transport.id().asShortText()}: stall timer fired for ${leg.circuit.description}" }
         // Close FIRST, resume second: resuming first would let the source read straight away and
         // pause again under a brand-new timer.
         if (closeForStall(leg)) {

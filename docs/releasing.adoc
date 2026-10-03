@@ -3,7 +3,10 @@
 
 How a release is cut and how the downloadable files reach GitHub. The pipeline lives in
 `.github/workflows/release.yml`; the logic is in `scripts/release/` so that it can be tested without
-GitHub (`scripts/release/test-release-scripts.sh`).
+GitHub (`scripts/release/test-release-scripts.sh`). The same offline suite runs on every push and pull
+request as the `release-scripts` job of `.github/workflows/ci.yml` with `RELEASE_TESTS_STRICT=1`, which
+turns every case that the machine could not run (python3 or a checksum tool missing, port 7878 busy)
+into a failure instead of a silent skip.
 
 == Overview
 
@@ -17,7 +20,8 @@ Pushing an annotated tag `vX.Y.Z` makes the `Release` workflow:
 . write `SHA256SUMS`;
 . keep the three files as a workflow artifact (always, also for dry runs);
 . create the GitHub release as a draft with the three files, download them again, compare, and only
-  then publish it.
+  then publish it. Before every one of these calls `publish.sh` asks the remote where the tag points
+  _now_ and stops if that is not the commit the build verified (see <<tag-binding>>).
 
 The release consists of exactly these files: `lapis-net-browser-<version>.zip`,
 `lapis-net-cli-<version>.zip` and `SHA256SUMS`.
@@ -77,12 +81,22 @@ foreign process. Only `ubuntu-latest` is tested.
 
 == Idempotency
 
-* Re-running the workflow (or pushing nothing new and using _Run workflow_ for the same tag) is safe.
-* If a run died after the draft was created, the next run finds the draft, replaces the assets and
-  publishes it.
-* If the release already exists, only the assets are replaced (`--clobber`; `SHA256SUMS` goes last).
-  The title and text are replaced **only** if `docs/release-notes/<tag>.adoc` exists; otherwise they are
-  left untouched. A published release never has its _Latest_ marker changed.
+* Re-running the workflow (or pushing nothing new and using _Run workflow_ for the same tag) is safe (it
+  never replaces a published file; see the last paragraph of this section for the one case in which it stops
+  with an error).
+* If a run died after the draft was created, the next run finds the draft and handles each asset
+  separately (below), then publishes it.
+* If the release already exists, every expected asset is handled on its own (`SHA256SUMS` last):
+** **missing**: uploaded **without** `--clobber`, so GitHub refuses if it appeared in the meantime;
+** **byte-identical** (SHA-256 of the file on the release against the local one): left alone,
+   logged as `unchanged`;
+** **different, release is a draft**: replaced (`--clobber`), because nothing was ever published;
+** **different, release is published**: **error** (`refusing to replace published asset ...`). A
+   download somebody already verified must never change silently. If an asset really has to be
+   replaced (for example one that a crashed run left half uploaded), delete it from the release by
+   hand first, then re-run.
+* The release text is replaced **only** if `docs/release-notes/<tag>.adoc` exists; otherwise it is left
+  untouched. The title of an existing release is never changed. A published release never has its _Latest_ marker changed.
 * Stale extra assets on a release are reported but not deleted.
 * After the upload the assets are downloaded again, their checksums are verified and they are compared
   byte for byte with what the build produced. Only then is a draft published.
@@ -90,9 +104,34 @@ foreign process. Only `ubuntu-latest` is tested.
 * _Latest_: GitHub marks the most recently _created_ release as Latest, not the highest version. The
   pipeline sets it explicitly (only if the tag is the highest published, non-pre-release version).
 
+What this means for a second run after a successful publish: it rebuilds the ZIPs, finds identical
+assets and changes nothing, **if** the new build is byte-identical to the published one. Two clean
+builds on one machine were identical (checked again in this wave: both archives, built twice with
+Gradle 9.7.1, have the same SHA-256; Gradle writes constant entry timestamps). That was **not** checked
+across machines or JDK builds. If a re-run on a different runner produces a different ZIP, the run
+fails loudly at that asset instead of replacing a published file: the intended behaviour, but a
+maintainer has to know it.
+
 Release notes are read from the checkout of the workflow run, not from the tagged commit: a tag push
 runs on the tagged commit itself, a manual run on `master`. That is what allows a manual run to
 correct or add notes for an older tag later.
+
+[[tag-binding]]
+== The tag must not move between build and publish
+
+The `build` job verifies the tag (annotated, on `master`, version matches) and builds the commit it
+points to; its output `commit` is that commit. The `publish` job passes it to `publish.sh` as
+`--expect-commit`. Before **every** call that changes the release (create, notes edit, asset upload,
+un-draft) the script runs `git ls-remote origin 'refs/tags/<tag>^{}'` and compares the answer with it.
+A tag that was force-moved, deleted and re-created as a lightweight tag, or cannot be queried stops the
+run before anything is changed. The option is mandatory for a real run (fail closed); in a dry run it
+is optional, and when given the check is executed for real (`git ls-remote` is read-only).
+
+The residual risk is documented here rather than hidden: `gh release create/edit` binds a release to the
+tag _name_, and GitHub offers no way to bind a release to a commit for an existing tag. A tag that is
+moved in the few milliseconds between the last check and GitHub processing the call cannot be
+excluded by this script. The tag-protection ruleset recommended under <<not-automated>> closes that gap;
+the check narrows it. It was tested against local bare repositories and a stub `gh`, not against GitHub.
 
 == Dry runs
 
@@ -131,15 +170,27 @@ This is a one-time manual action for the maintainer; nothing in the repository t
 [[verifying-checksums]]
 == Verifying checksums
 
+`SHA256SUMS` lists both ZIPs. Someone who downloaded only one of them must limit the check to that file,
+otherwise the other one is reported as missing and the command fails. `<file>` is the name of the
+downloaded ZIP, for example `lapis-net-cli-X.Y.Z.zip`.
+
 [source,bash]
 ----
 # Linux
-sha256sum -c SHA256SUMS --ignore-missing
-# macOS
-shasum -a 256 -c SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+# macOS (shasum has no --ignore-missing, so select the line of your file)
+awk '$2 == "<file>"' SHA256SUMS | shasum -a 256 -c -
 # Windows (PowerShell or cmd), compare by eye with the line in SHA256SUMS
 certutil -hashfile lapis-net-cli-X.Y.Z.zip SHA256
 ----
+
+The `awk` filter compares the second field exactly (the format written by `scripts/release/checksums.sh`
+is `<hex>` two spaces `<name>`), so dots in the name need no escaping. If the name is mistyped, nothing is
+selected and `shasum` fails with "no properly formatted SHA checksum lines found" instead of reporting
+success. The harness `scripts/release/test-release-scripts.sh` runs these exact commands against generated
+checksum files (matching file, tampered file, mistyped name) and checks that both documents still contain
+them. They were run with the Perl `shasum` 6.04 on Linux; this is the same implementation that macOS ships,
+but the commands have **not** been run on macOS itself.
 
 The checksums protect against damaged or truncated downloads. They do **not** protect against a
 compromised release account or a compromised build: the files are not signed, and `SHA256SUMS` is
@@ -171,8 +222,9 @@ uploaded to the same place as the ZIPs.
 * **No tag protection.** Recommended, but a repository setting for the maintainer: a ruleset that
   restricts creating and deleting `v*` tags.
 * **No check of the Gradle wrapper** (`gradle-wrapper.jar` checksum validation).
-* **Reproducible builds** are not guaranteed. Two clean builds on one machine produced identical ZIPs;
-  that was observed, not verified across machines or JDK builds.
+* **Reproducible builds** are not guaranteed. Two clean builds on one machine produced identical ZIPs
+  (observed again with Gradle 9.7.1); that was not verified across machines or JDK builds. See
+  <<_idempotency>> for what a differing rebuild means.
 * **The workflow itself is tested only through its scripts.** `scripts/release/test-release-scripts.sh`
   covers the scripts offline; the YAML and the GitHub-side behaviour (`gh`, artifacts, permissions)
   are exercised for the first time by a real run.

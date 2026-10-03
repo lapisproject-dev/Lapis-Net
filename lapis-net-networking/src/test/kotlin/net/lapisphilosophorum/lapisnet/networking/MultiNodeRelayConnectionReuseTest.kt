@@ -52,7 +52,12 @@ class MultiNodeRelayConnectionReuseTest :
 
                 nodeB.relayClient.reserve(relayInfo(relay))
                 val circuitToB = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "A dials B through R",
+                )
 
                 val accepted = awaitAccepted(nodeB, nodeA.peerId)
                 // The premise: NetworkImpl never saw it.
@@ -89,7 +94,12 @@ class MultiNodeRelayConnectionReuseTest :
 
                 nodeB.relayClient.reserve(relayInfo(relay))
                 val circuitToB = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "A dials B through R",
+                )
                 val accepted = awaitAccepted(nodeB, nodeA.peerId)
 
                 accepted.close().get()
@@ -121,8 +131,18 @@ class MultiNodeRelayConnectionReuseTest :
 
                 nodeB.relayClient.reserve(relayInfo(relay))
                 val circuitToB = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
-                nodeC.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "A dials B through R",
+                )
+                connectDiagnosed(
+                    nodeC,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "C dials B through R",
+                )
                 val fromA = awaitAccepted(nodeB, nodeA.peerId)
                 val fromC = awaitAccepted(nodeB, nodeC.peerId)
                 (fromA === fromC) shouldBe false
@@ -154,7 +174,12 @@ class MultiNodeRelayConnectionReuseTest :
 
                 nodeB.relayClient.reserve(relayInfo(relay))
                 val circuitToB = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "A dials B through R",
+                )
                 val relayed = awaitAccepted(nodeB, nodeA.peerId)
 
                 // Go around LapisNode.connect (which would now reuse the relayed one) to get B a real

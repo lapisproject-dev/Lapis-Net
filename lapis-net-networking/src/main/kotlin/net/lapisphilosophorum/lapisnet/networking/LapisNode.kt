@@ -21,6 +21,7 @@ import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopBinding
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopProtocol
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisRelayTransport
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayControlDiagnostics
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationRegistry
 import java.time.Duration
@@ -163,6 +164,9 @@ class LapisNode private constructor(
     /** Owns every relayed connection of this node, including the ones a peer opened *to* us through
      * a relay - see [connect]. */
     internal val relayTransport: LapisRelayTransport,
+    /** The hop protocol of this node's relay server role. Only for tests (they widen the window in
+     * which a circuit is being wired up) - not a public API. */
+    internal val relayHopProtocol: LapisCircuitHopProtocol,
 ) {
     private val discovered = BoundedPeerCache(MAX_DISCOVERED_PEERS)
     private val stopped = AtomicBoolean(false)
@@ -245,8 +249,18 @@ class LapisNode private constructor(
         val known =
             host.network.connections
                 .filter { it.secureSession().remoteId == peer.peerId && !it.closeFuture().isDone }
-        (known.firstOrNull { !it.remoteAddress().has(Protocol.P2PCIRCUIT) } ?: known.firstOrNull())?.let { return it }
-        relayTransport.liveConnectionTo(peer.peerId)?.let { return it }
+        (known.firstOrNull { !it.remoteAddress().has(Protocol.P2PCIRCUIT) } ?: known.firstOrNull())?.let {
+            logger.debug {
+                "connect to ${peer.peerId}: reusing a connection from the network table " +
+                    "(relayed=${it.remoteAddress().has(Protocol.P2PCIRCUIT)})"
+            }
+            return it
+        }
+        relayTransport.liveConnectionTo(peer.peerId)?.let {
+            logger.debug { "connect to ${peer.peerId}: reusing an accepted relayed connection" }
+            return it
+        }
+        logger.debug { "connect to ${peer.peerId}: dialling" }
         return awaitOrWrap("connect to ${peer.peerId}", timeout) {
             host.network.connect(peer.peerId, *peer.addresses.toTypedArray())
         }
@@ -340,9 +354,11 @@ class LapisNode private constructor(
             val relayInboundHandlers = ConnectionHandler.createBroadcast(listOf(connectionCap))
 
             val registry = RelayReservationRegistry(relayConfig.serverLimits)
-            val stopProtocol = LapisCircuitStopProtocol(relayConfig.clientLimits)
+            val controlDiagnostics = RelayControlDiagnostics()
+            val stopProtocol = LapisCircuitStopProtocol(relayConfig.clientLimits, controlDiagnostics)
             val stopBinding = LapisCircuitStopBinding(stopProtocol)
-            val hopProtocol = LapisCircuitHopProtocol(relayConfig, registry, stopBinding) { Instant.now() }
+            val hopProtocol =
+                LapisCircuitHopProtocol(relayConfig, registry, stopBinding, { Instant.now() }, controlDiagnostics)
             val hopBinding = LapisCircuitHopBinding(hopProtocol)
             lateinit var relayTransport: LapisRelayTransport
 
@@ -394,6 +410,7 @@ class LapisNode private constructor(
                     hopProtocol.flowStats,
                     registry,
                     relayTransport,
+                    hopProtocol,
                 )
             mdns.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {

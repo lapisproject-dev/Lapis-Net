@@ -151,38 +151,6 @@ private fun pingThrough(
     return Duration.between(started, Instant.now())
 }
 
-/** Whether [condition] held continuously for [stableFor] before [timeout] elapsed. */
-private fun awaitStably(
-    timeout: Duration,
-    stableFor: Duration,
-    condition: () -> Boolean,
-): Boolean {
-    val deadline = Instant.now().plus(timeout)
-    var since: Instant? = null
-    while (Instant.now().isBefore(deadline)) {
-        if (condition()) {
-            val start = since ?: Instant.now().also { since = it }
-            if (!Instant.now().isBefore(start.plus(stableFor))) return true
-        } else {
-            since = null
-        }
-        Thread.sleep(20)
-    }
-    return false
-}
-
-private fun awaitTrue(
-    timeout: Duration,
-    condition: () -> Boolean,
-): Boolean {
-    val deadline = Instant.now().plus(timeout)
-    while (Instant.now().isBefore(deadline)) {
-        if (condition()) return true
-        Thread.sleep(20)
-    }
-    return condition()
-}
-
 /**
  * Real nodes, real TCP, no mocks: proves that **one** peer that stops reading cannot hold the
  * relay's connection-wide read pause for longer than `circuitStallTimeout`, and that closing that
@@ -233,12 +201,24 @@ class MultiNodeCircuitStallTest :
 
                 // Warm-up: C reaches B through the relay, so a healthy relayed connection exists
                 // and is the bystander whose traffic must survive the stall.
-                nodeC.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
-                pingThrough(nodeC, nodeB.peerId, circuitToB)
+                connectDiagnosed(
+                    nodeC,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "warm-up connect C -> B",
+                )
+                diagnosed("warm-up ping C -> B", relay) { pingThrough(nodeC, nodeB.peerId, circuitToB) }
 
                 // A opens the flood stream and then stops reading its connection to the relay.
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
-                FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "connect A -> B",
+                )
+                diagnosed("flood stream A -> B", relay) {
+                    FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                }
                 val aToRelay = directChannel(nodeA, relay.peerId)
                 aChannelToRelay = aToRelay
                 aToRelay.config().isAutoRead = false
@@ -335,10 +315,18 @@ class MultiNodeCircuitStallTest :
                 val circuitToC = nodeC.circuitAddressOf()
 
                 // A floods B through the relay while B (the receiving end) stops reading.
-                val aToB = nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
+                val aToB =
+                    connectDiagnosed(
+                        nodeA,
+                        PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                        relay = relay,
+                        step = "connect A -> B",
+                    )
                 // The stream is opened (negotiated) BEFORE B stops reading - a stream cannot be
                 // negotiated with a peer that no longer reads - and the pump starts shortly after.
-                SinkBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                diagnosed("sink stream A -> B", relay) {
+                    SinkBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                }
                 val bToRelay = directChannel(nodeB, relay.peerId)
                 bChannelToRelay = bToRelay
                 bToRelay.config().isAutoRead = false
@@ -350,10 +338,15 @@ class MultiNodeCircuitStallTest :
                 // A's second circuit, to C, rides the paused connection: it can only complete once the
                 // stall bound has fired - and it must complete.
                 val started = Instant.now()
-                nodeA.connect(PeerInfo(nodeC.peerId, listOf(circuitToC)), Duration.ofSeconds(45))
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeC.peerId, listOf(circuitToC)),
+                    relay = relay,
+                    step = "connect A -> C behind the stall",
+                )
                 val connectTook = Duration.between(started, Instant.now())
                 (connectTook.toMillis() < STALL_TIMEOUT.toMillis() + STALL_TOLERANCE_MILLIS) shouldBe true
-                pingThrough(nodeA, nodeC.peerId, circuitToC)
+                diagnosed("ping A -> C", relay) { pingThrough(nodeA, nodeC.peerId, circuitToC) }
                 Duration.between(t0, Instant.now()).toMillis() shouldBeGreaterThanOrEqual
                     (STALL_TIMEOUT.toMillis() - 200)
 
@@ -411,6 +404,7 @@ class MultiNodeCircuitStallTest :
                 // the connection budget every cycle pauses B's connection for a full stall timeout
                 // (about 98 % of the time at the defaults, 84 % measured with a 2 s timeout).
                 val cycles = 5
+                var previousConnection: Connection? = null
                 for (i in 1..cycles) {
                     if (i > 1) {
                         awaitTrue(
@@ -419,7 +413,18 @@ class MultiNodeCircuitStallTest :
                             true
                     }
                     aToRelay?.config()?.isAutoRead = true
-                    Thread.sleep(150)
+                    // The relay's close of the cut circuit reaches A only after A has read (and decrypted)
+                    // everything the relay had queued toward it ahead of that close - several MiB of flood
+                    // data - so how long that takes depends on the machine, not on the code under test.
+                    // The next connect() must not run before A knows the old connection is dead: until
+                    // then it hands that old connection back (an open one is reused, see
+                    // LapisNode.connect), and the flood stream below is opened on a connection that is
+                    // just about to close. A real attacker reopening its circuit cannot do that either.
+                    previousConnection?.let { previous ->
+                        withClue("cycle $i: the cut relayed connection closes on A's side once A reads again") {
+                            awaitTrue(Duration.ofSeconds(30)) { previous.closeFuture().isDone } shouldBe true
+                        }
+                    }
                     awaitTrue(Duration.ofSeconds(20)) { relay.relayFlowStats.pausedLegs() == 0 } shouldBe true
                     if (i >
                         1
@@ -427,8 +432,20 @@ class MultiNodeCircuitStallTest :
                         awaitTrue(Duration.ofSeconds(20)) { directChannel(relay, nodeA.peerId).isWritable } shouldBe
                             true
                     }
-                    nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
-                    FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                    val connection =
+                        connectDiagnosed(
+                            nodeA,
+                            PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                            relay = relay,
+                            step = "cycle $i: connect A -> B",
+                        )
+                    withClue("cycle $i: connect() returned the connection of the previous cycle") {
+                        (connection === previousConnection) shouldBe false
+                    }
+                    previousConnection = connection
+                    diagnosed("cycle $i: flood stream A -> B", relay) {
+                        FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                    }
                     aToRelay = directChannel(nodeA, relay.peerId)
                     aToRelay.config().isAutoRead = false
                     if (sampler == null) {
@@ -512,8 +529,15 @@ class MultiNodeCircuitStallTest :
 
                 // A floods itself through the relay from B, then stops reading - the relay's write
                 // queue toward A fills up and stays over the high water mark.
-                nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitToB)), Duration.ofSeconds(45))
-                FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                connectDiagnosed(
+                    nodeA,
+                    PeerInfo(nodeB.peerId, listOf(circuitToB)),
+                    relay = relay,
+                    step = "connect A -> B",
+                )
+                diagnosed("flood stream A -> B", relay) {
+                    FloodBinding().dial(nodeA.host, nodeB.peerId, circuitToB).controller.get(30, TimeUnit.SECONDS)
+                }
                 val aToRelay = directChannel(nodeA, relay.peerId)
                 aChannelToRelay = aToRelay
                 aToRelay.config().isAutoRead = false

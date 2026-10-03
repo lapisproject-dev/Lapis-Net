@@ -1,0 +1,15 @@
+<!--
+  Used only by `-PlapisLogConfig=logback-quiet.xml`: everything at WARN and above on the console, nothing
+  else. It exists for A/B comparisons of how much the (unconfigured, DEBUG-everything) default Logback
+  output costs the timing-sensitive relay specs; it is not used by a normal build.
+-->
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <root level="WARN">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

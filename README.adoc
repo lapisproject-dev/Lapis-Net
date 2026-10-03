@@ -267,9 +267,19 @@ The ZIPs also contain `.bat` start scripts for Windows; those are not tested. Th
 variables described under <<Building>>, in particular `LAPISNET_HOME` and
 `LAPISNET_KEYSTORE_PASSPHRASE`, apply to the unpacked distributions as well.
 
-Verify a download against `SHA256SUMS` (Linux: `sha256sum -c SHA256SUMS --ignore-missing`,
-macOS: `shasum -a 256 -c SHA256SUMS`). The artifacts are not signed; the checksums only detect
-corrupted downloads. How releases are built and published: link:docs/releasing.adoc[docs/releasing.adoc].
+Verify a download against `SHA256SUMS`, which lists both ZIPs, so the check has to be limited to the
+file you actually downloaded (`<file>` is its name, for example `lapis-net-cli-<version>.zip`):
+
+[source,bash]
+----
+# Linux
+sha256sum -c --ignore-missing SHA256SUMS
+# macOS (shasum has no --ignore-missing, so select the line of your file)
+awk '$2 == "<file>"' SHA256SUMS | shasum -a 256 -c -
+----
+
+The artifacts are not signed; the checksums only detect corrupted downloads. How releases are built and
+published: link:docs/releasing.adoc[docs/releasing.adoc].
 
 == Development conventions
 

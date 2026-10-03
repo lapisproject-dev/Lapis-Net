@@ -1,0 +1,37 @@
+<!--
+  Diagnostic Logback configuration, used ONLY with `-PlapisDiag=true` (see the module's build file).
+  Relay forwarding and connection-reuse decisions at DEBUG with millisecond timestamps and thread names go
+  to build/test-logs/relay.log; the console only gets WARN and above. No key material is ever logged by
+  the relay code (peer ids and channel ids only).
+-->
+<configuration>
+  <appender name="RELAY_FILE" class="ch.qos.logback.core.FileAppender">
+    <file>${lapis.diag.logdir}/relay.log</file>
+    <append>true</append>
+    <immediateFlush>true</immediateFlush>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>WARN</level>
+    </filter>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{20} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- additivity stays on: GossipPubSubConnectOrderTest attaches its ListAppender to the ROOT logger and
+       needs this package's WARN events to reach it. The console appender only lets WARN+ through. -->
+  <logger name="net.lapisphilosophorum.lapisnet.networking" level="DEBUG">
+    <appender-ref ref="RELAY_FILE"/>
+  </logger>
+  <logger name="io.libp2p.multistream" level="DEBUG" additivity="false">
+    <appender-ref ref="RELAY_FILE"/>
+  </logger>
+
+  <root level="WARN">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

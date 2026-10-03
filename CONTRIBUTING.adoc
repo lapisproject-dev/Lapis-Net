@@ -19,6 +19,22 @@ cd Lapis-Net
 * All class/interface/package names in English (Veritas/Karma/Virtus/Madli are the documented exception).
 * Documentation in AsciiDoc, English only. Diagrams in kUML via the `[kuml]` macro — no PlantUML/Mermaid/ASCII-art.
 
+== Diagnosing a timing-sensitive test
+
+The real-node relay specs in `lapis-net-networking` (`MultiNodeCircuit*Test`, `MultiNodeRelay*Test`) depend on
+how fast the machine is. A failure names the step that failed, how long it took, the relay's flow-control
+gauges and the full cause chain (see `MultiNodeTestSupport.kt`). To reproduce on a slow machine, pin the build
+to few CPUs (Linux; `taskset` does not exist on macOS), for example `taskset -c 0,1 ./gradlew :lapis-net-networking:clean :lapis-net-networking:test
+--no-daemon --no-build-cache --rerun-tasks`. Two switches (inert unless given) help to find out why:
+
+* `-PlapisDiag=true` writes the relay's DEBUG log, a GC log and per-spec thread/CPU/heap snapshots to
+  `lapis-net-networking/build/test-logs/`; `-PlapisDiag=files` writes only the latter two and leaves Logback
+  alone, so the timing stays that of a normal build.
+* `-PlapisLogConfig=logback-quiet.xml` swaps Logback's default (everything at DEBUG on stdout, tens of MiB per
+  run) for a configuration from `src/test/resources`, for A/B comparisons.
+
+Never make such a test pass by retrying it or by loosening what it asserts; find what the slow machine exposes.
+
 == Pull requests
 
 1. Ensure `./gradlew clean check` passes locally.
