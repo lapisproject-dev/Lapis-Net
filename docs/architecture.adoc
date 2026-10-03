@@ -4104,6 +4104,9 @@ without bound — the same discipline as `MAX_CONCURRENT_CONNECTIONS`, `BoundedR
 | `circuitMaxBytes` | 64 MiB | Bytes forwarded in one direction of one circuit before teardown. A *lifetime* budget, not a memory budget — see the flow-control note below.
 | `circuitMaxDuration` | 10 min | Wall-clock circuit lifetime, so near-idle parked circuits cannot evade the byte cap.
 | `circuitSetupTimeout` | 20 s | Deadline on reaching the destination over the stop protocol, so a destination that accepts and goes silent cannot pin a claimed circuit slot.
+| `circuitStallTimeout` | 30 s | Longest one circuit leg may keep its source connection paused (forwarding blocked because the other leg's connection is over its write-buffer high water mark) before that one circuit is closed. Bounds ONE pause episode only; it does not bound repeated episodes from a peer that reopens its circuit — that is `connectionStallBudget`. See the flow-control note below. A value at or above `circuitMaxDuration` disables this per-episode bound in practice.
+| `connectionStallBudget` / `connectionStallBudgetWindow` | 60 s / 10 min | Cumulative time ONE relay connection may spend paused by circuit forwarding within a sliding window (a leaky bucket: paused time fills it, elapsed time drains it). Summed over all circuits and all peers on that connection, so the charged part is not escaped by reopening circuits or by using several identities. Only the part of a pause episode beyond the episode's free grace (`connectionStallGrace`, see below) is charged. Once used up, a leg that would pause the connection again may pause for at most the free grace and is closed if it is still paused after that. Long-run share of time stalled by *charged* pauses is at most `budget / window` (10 % at the defaults), after an initial burst of up to the budget; pauses within the free grace are not charged, and their bound is the one given for `connectionStallGrace`. The budget belongs to the *connection*: once it is used up, every circuit of that connection whose pause outlasts the grace is closed, whoever caused the stall.
+| `connectionStallGrace` | 1 s | Free part of every pause episode. Ordinary millisecond-scale backpressure from an honest receiver that reads steadily but slower than the sender costs nothing, and with the budget used up still is not cut. Zero charges every paused nanosecond and closes immediately once the budget is used up. A new episode that begins less than one grace after a circuit of the same connection was closed for stalling gets only as much free grace as the connection has been readable since that closure, so circuits chained from several identities whose pauses each end in a stall closure do not each get a full grace straight after the previous one was cut. The price: with the budget used up an attacker can still pause the victim connection for up to the grace per pause, uncharged. For a chain whose pauses end in a stall closure this holds it paused for at most about half of the time, not for `budget / window` of it; the cap does not apply to pauses that end any other way (the peer reads, or the attacker resets its own stream or drops its own relay connection, which needs no reading and, with several identities, lets the next prepared circuit start a full grace at once): there the connection can be paused almost all of the time in pieces of up to the grace, a bounded latency per pause but not a bounded share (see the note below).
 |===
 
 **Forwarding is flow-controlled, and that — not `circuitMaxBytes` — is what bounds the relay's
@@ -4113,19 +4116,129 @@ lifts the pause when it drains. Without that, a peer that opens circuits and the
 makes the relay queue everything the other side sends — up to `circuitMaxBytes` per circuit times
 `maxConcurrentCircuits`, several GiB at the defaults, paid entirely by the relay operator. The node
 multiplexes with mplex, which unlike yamux has no send-buffer bound of its own, so nothing below
-this layer would have caught it. Both handlers necessarily act on the *connection* channels rather
+this layer would have caught it. The handlers necessarily act on the *connection* channels rather
 than on the mplex substreams: a substream's outbound buffer is always empty (`MuxChannel.doWrite`
 hands each buffer straight to the parent) and a substream cannot be paused (`doBeginRead` is a
-no-op). Pausing a whole connection is coarser than pausing one circuit — **not merely a brief
-stall**: a single unread circuit can pause every other circuit and reservation-renewal control
-message on that connection for as long as the slow leg stays unread, up to `circuitMaxDuration`
-(10 minutes at the defaults), which can eat far enough into `reservationTtl` (15 minutes) to cost
-the paused peer its reservation. This is a bounded, connection-scoped head-of-line stall traded
-deliberately against the alternative of unbounded relay-operator heap growth — the right direction
-to err in, but a real availability cost, not a cosmetic one. A tighter fix (aborting the slow
-circuit once its pause exceeds some threshold, rather than pausing indefinitely) is a documented
-follow-up, not yet built. `CircuitProxyBackpressureTest` proves both backpressure halves against a
-real TCP peer that never reads; it does not exercise the connection-wide stall itself.
+no-op).
+
+**The pause is bounded per episode and per connection, and exactly scoped.** Pausing a whole connection is coarser than
+pausing one circuit: a single unread circuit pauses every other circuit and reservation-renewal
+control message on that connection. Left unbounded (up to `circuitMaxDuration`, 10 minutes, which can
+eat far enough into `reservationTtl` to cost the paused peer its reservation) that was a real
+availability cost. Three mechanisms now contain it:
+
+* A per-connection `TransportReadGate` keeps the *set* of paused circuit legs instead of letting each
+  leg flip Netty's single `autoRead` switch. Reading resumes only when no leg is paused, so one
+  circuit's "target drained" can no longer un-pause a different circuit that is still blocked on the
+  same connection, and a circuit's end removes exactly its own pause. All gate state is confined to
+  the connection's event loop (a substream is registered on its parent connection's loop).
+* Each paused leg carries a timer of `circuitStallTimeout` (30 s by default). When it fires, that one
+  circuit is closed — never the connection — exactly once, and the source connection resumes. The
+  timer is armed when a leg becomes paused and never re-armed while it stays paused, and a stale
+  timer cannot act on a newer pause. This bounds one pause *episode* only: a peer that never reads
+  can have its circuit closed and simply open the next one, and measured against a real relay with a
+  single attacker identity that kept the victim's connection paused in 84 % of the samples (about
+  98 % extrapolated to the 30 s default), with the `CONNECT` rate limit no obstacle at roughly two
+  circuits a minute.
+* A **connection-wide stall budget** (`connectionStallBudget` per `connectionStallBudgetWindow`, 60 s
+  per 10 min by default) closes that gap. The gate keeps a leaky bucket of the time its connection
+  has recently spent paused; paused time fills it, elapsed time drains it. A new pause episode's
+  timer is shortened to the remaining budget, and once the bucket is full a leg that would pause the
+  connection again gets only the grace period (`connectionStallGrace`, 1 s) and has its circuit
+  closed if it is still paused after that. The account is per *connection* (the victim's), not per
+  attacker, so reopening circuits or using several identities does not buy more charged time. The
+  grace itself is not renewed for free right after a closure: an episode that begins within one grace
+  of a stall closure on the same connection gets only as much free time as the connection has been
+  readable since. Only the part of a
+  pause episode beyond the grace is charged: without that, an honest receiver that reads steadily
+  but slower than the sender — whose pause episodes last milliseconds but never stop — filled the
+  bucket and was then cut, a regression against the pre-budget behaviour in which such a receiver
+  was merely throttled. Additionally, a `CONNECT` is refused (`RESOURCE_LIMIT_EXCEEDED`) while the
+  initiator's own connection to the relay is over its write high water mark — a peer that is not
+  draining its own connection is the precondition for the attack.
+
+The same change closes a lost-wakeup that existed before: the forwarder read the target as
+unwritable, the target drained and fired its resumer, and only then did the forwarder pause the
+source — which then stayed paused until something unrelated woke it. Pausing now re-checks the
+target's writability afterwards, and both steps run on the source's event loop, so exactly one
+order ends with reading enabled. Without that fix the new timer would have turned this race into
+spurious circuit closures.
+
+*What this deliberately does not fix.* The stall is bounded, not eliminated. Other streams on the
+connection still wait up to `circuitStallTimeout` for a stall to be resolved (the default 30 s is
+longer than the 20 s `RelayClientLimits.controlTimeout`, so a reservation renewal that starts
+mid-stall fails once and succeeds on the next 30 s renewal tick), and the budget allows a burst: a
+reserved peer can be stalled for up to `connectionStallBudget` (60 s) at the start of an attack, and
+afterwards for up to `budget / window` (10 %) of the time, because the bucket drains continuously. In
+that residual share a non-reader still delays relayed operations with the victim by up to a stall
+timeout per round trip, and multi-step exchanges (multistream plus `RESERVE`, a bystander's Noise
+handshake) can exceed `controlTimeout` or `circuitAcceptTimeout` during it. The claim is therefore
+"the time a non-reader keeps a connection stalled *beyond the free grace* is at most `budget / window`
+in the long run, and once the budget is used up no single pause lasts longer than the grace", not
+"at most `budget / window` of the time is stalled" and not "the reservation can never be lost": a
+burst that lands on a renewal window can still cost a renewal, which the next tick repairs. Pause time
+within the free grace is not charged. Once the budget is used up a circuit whose pause outlasts the
+grace is closed, so continuing is cheap for the relay but still blocks the victim's connection for
+the drained share, plus the uncharged grace. How much uncharged grace an attacker can chain is bounded
+twice: reopening is bounded per identity by `maxConnectAttemptsPerWindow` (30 a minute) and by the
+refusal of a `CONNECT` from an initiator that is not draining its own connection, so a real attacker
+has to read, and then re-flood, between rounds; and the grace is *per connection*, not per identity:
+an episode that starts within one grace after a stall closure gets only as much free time as has
+passed since the last stall closure, so circuits chained from several identities (an identity costs one
+key generation, and the rate limit is per identity) whose pauses each end in a stall closure cannot each
+have a full grace right after the previous cut. For such a closure chain a pause of length p has at least
+p of time since the previous closure before it, which caps the closure-cycling share of paused time at
+about 50 %, and at nothing for episodes that follow each other directly. This is a bound on closure
+cycling only, not on the `budget / window` share, and it reads nothing but stall closures. It does not
+cover pauses that end any other way, and the 50 % figure must not be quoted for them: (a) a peer that
+ends each pause itself by reading just before the grace expires, and (b) an attacker that ends its own
+pause by resetting its stream or closing its own relay connection - this needs no reading, goes through
+the ordinary circuit-end path that charges nothing and leaves no timestamp, and with several
+identities (one prepared circuit each) the next circuit starts a new episode with a full grace at once.
+Such pauses are neither charged nor closed. In regime (a) the result is the throttling regime
+described below (about 190 KiB/s of throughput at the defaults, with a head-of-line delay of up to one
+grace per pause); in regime (b) the victim connection can be paused almost all of the time in pieces of
+up to the grace - bounded latency per pause, not a bounded share of time. `CircuitProxyBackpressureTest`
+pins regime (b) as known behavior. A free-credit bucket per connection (uncharged pause time uses up
+credit, unpaused time refills it) would bound the uncharged share however the pause ends, at the cost
+of re-checking the honest-slow-reader trade-off; it is not implemented. A per-initiator cool-down was
+considered and left out, because it is reputation policy and belongs with the Madli relay work. Raising or
+lowering the trade-off is a matter of the three config values.
+
+*Collateral of the budget.* The budget cannot tell a slow honest receiver from a peer that trickles
+just enough reads to resume repeatedly, and it belongs to the connection, not to the peer that
+caused the stall. Three consequences, stated plainly rather than as "only the attacker loses":
+(1) an honest receiver that keeps draining slower than roughly (high − low water mark) / grace
+(192 KiB / 1 s, about 190 KiB/s at the defaults) is in pause episodes longer than the grace most of
+the time, is charged for the excess, and is eventually cut once the budget is used up — it is
+throttled first and cut later, not throttled forever (receivers faster than that are in episodes
+that stay below the grace and are never charged, which `CircuitProxyBackpressureTest` pins with a
+production-shaped budget-to-window ratio); (2) once the budget of a connection is used up, *any*
+circuit of that connection — not just the attacker's — is closed if its pause outlasts the grace,
+so an honest sender whose receiver is merely slow can lose its circuit because a different peer
+earlier spent the victim connection's budget; (3) a receiver that reads just enough to drain below
+the low water mark starts a new pause episode each time and is throttled to a few KiB/s, which also
+spends the budget, so a very slow reader on a stalled path is cut off rather than merely throttled.
+And the bytes already queued for
+the non-reading peer — at most the high water mark plus what was in flight through the muxers when
+the pause took effect — stay on its connection until it reads or the connection ends: bounded, but
+not zero. `CircuitProxyBackpressureTest` proves the mechanism against real TCP peers that never read
+(gate isolation across legs, a single exact closure, no timer re-arm, a slow-but-reading peer never
+cut off by the per-episode timer, timer cancel, `ByteBuf` release after a closure, the budget cutting
+reopened circuits and draining again, a slow-but-reading peer not cut off under a budget with the
+production 1:10 budget-to-window shape and the same peer being cut once the grace is switched off,
+only the excess over the grace being charged, a brief pause within the grace left alone while a
+longer one is closed once the budget is used up, a chain of circuits on one connection that is cut
+straight after each other not getting a full free grace each, and - as a pinned limitation - a circuit
+ended by its own peer just before the grace running out not stopping the next circuit from getting a
+full grace); `MultiNodeCircuitStallTest` proves the connection-wide effect
+with a real relay, a reserved peer and a bystander, in both directions: the bystander's traffic and a
+reservation renewal complete within the bound, only the stalled circuit is closed, the relay's queue
+toward the non-reading peer stays small, and a single attacker identity that reopens its circuit five
+times keeps the victim's connection paused for no more than the budget (plus slack) instead of
+roughly five stall timeouts, and that a `CONNECT` from an initiator whose relay connection is not
+draining is answered `RESOURCE_LIMIT_EXCEEDED` without the target ever seeing a stop stream or the
+relay claiming a circuit slot.
 
 A refused hop or stop request closes its stream rather than answering and leaving it open, so
 sending requests that get refused does not accumulate free substreams on the refusing node.
@@ -4164,10 +4277,18 @@ onto it — without that, a peer reachable only through a relay would be invisib
 Bitswap, which would never answer or send wants to it. **Any protocol reacting to
 connection-established events must register through `LapisNode.addConnectionHandler`, never through
 `host.addConnectionHandler`.** The transport keeps its own list of
-live relayed connections so `LapisNode.stop()` closes them rather than leaking them. What remains
-unfixed is `NetworkImpl.connect`'s existing-connection short-circuit: it does not know about an
-accepted relayed connection, so a node that was reached over a relay and later dials that same peer
-opens a second connection instead of reusing the first.
+live relayed connections so `LapisNode.stop()` closes them rather than leaking them. `LapisNode.connect` now
+hands back an accepted relayed connection to the peer instead of dialling a second one: it looks in
+`NetworkImpl`'s table first (an existing direct connection wins) and then in the relay transport's
+list, matching only on the Noise-authenticated remote id and only open connections, so a relay
+cannot cause one peer's connection to be returned for another. What remains unfixed is every dial
+that bypasses `LapisNode.connect`: `host.newStream` (used by `lapis-net-dm`'s `DmProtocol.dial` and
+by `lapis-net-storage`'s `NabuStorage`) goes straight through `NetworkImpl.connect` and still opens a
+second connection to a peer that reached this node over a relay, and the peer list in `BrowserApi`
+(`host.network.connections`) does not list accepted relayed connections. Closing that completely
+would mean registering accepted relayed connections in `NetworkImpl`'s own table (it exposes a
+mutable list through its public implementation type) — not done, as it ties the module to that
+implementation detail.
 
 **A continuation that writes on a freshly-negotiated stream must not run inline.** A
 `CompletableFuture` from `Host.newStream` is completed from inside jvm-libp2p's own multistream

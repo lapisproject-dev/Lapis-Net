@@ -14,6 +14,7 @@ import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.security.noise.NoiseXXSecureChannel
 import io.libp2p.transport.tcp.TcpTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.relay.CircuitFlowStats
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopBinding
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopProtocol
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopBinding
@@ -155,6 +156,13 @@ class LapisNode private constructor(
      * traverses one of them, so a handler is invoked exactly once per connection either way.
      */
     private val relayInboundHandlers: ConnectionHandler.Broadcast,
+    /** Forwarding-path gauges of this node's relay server role. Only for tests and logging - not a
+     * public API. */
+    internal val relayFlowStats: CircuitFlowStats,
+    private val relayRegistry: RelayReservationRegistry,
+    /** Owns every relayed connection of this node, including the ones a peer opened *to* us through
+     * a relay - see [connect]. */
+    internal val relayTransport: LapisRelayTransport,
 ) {
     private val discovered = BoundedPeerCache(MAX_DISCOVERED_PEERS)
     private val stopped = AtomicBoolean(false)
@@ -183,6 +191,9 @@ class LapisNode private constructor(
 
     val peerId: PeerId get() = host.peerId
 
+    /** Circuits this node currently relays for others (server role). Only for tests and logging. */
+    internal fun relayCircuitCount(): Int = relayRegistry.circuitCount()
+
     /**
      * Every address this node currently claims to be reachable at, direct **and** relayed. Once
      * [relayClient] holds a reservation, this list additionally contains one
@@ -209,12 +220,33 @@ class LapisNode private constructor(
     /** Peers discovered via mDNS so far. Never auto-dialed - see the class doc. */
     fun discoveredPeers(): List<PeerInfo> = discovered.values()
 
-    /** Explicitly dial a peer (bootstrap or mDNS-discovered). */
+    /**
+     * Explicitly dial a peer (bootstrap or mDNS-discovered), or return the connection to it that
+     * already exists.
+     *
+     * **Reuses a relayed connection a peer opened to us.** A connection accepted through a relay
+     * (see [relayInboundHandlers]) is not in `io.libp2p.network.NetworkImpl`'s own connection table,
+     * so `host.network.connect` cannot see it and would dial a second, redundant connection to the
+     * same peer. This looks in `NetworkImpl`'s table first - so an existing *direct* connection
+     * always wins over a relayed one - and then in the relay transport's, matching on the
+     * Noise-authenticated remote id only.
+     *
+     * The reuse covers calls through this method. Dials that go straight through the host
+     * (`host.newStream`, which `lapis-net-dm` and `lapis-net-storage` use) still do not see an
+     * accepted relayed connection - see `docs/architecture.adoc`.
+     */
     fun connect(
         peer: PeerInfo,
         timeout: Duration = DEFAULT_TIMEOUT,
     ): Connection {
+        // Counted before the reuse shortcut on purpose: a reused connection that was accepted before
+        // GossipSub attached is equally one GossipSub never saw.
         if (!gossipAttached) connectsBeforeGossipAttach.incrementAndGet()
+        val known =
+            host.network.connections
+                .filter { it.secureSession().remoteId == peer.peerId && !it.closeFuture().isDone }
+        (known.firstOrNull { !it.remoteAddress().has(Protocol.P2PCIRCUIT) } ?: known.firstOrNull())?.let { return it }
+        relayTransport.liveConnectionTo(peer.peerId)?.let { return it }
         return awaitOrWrap("connect to ${peer.peerId}", timeout) {
             host.network.connect(peer.peerId, *peer.addresses.toTypedArray())
         }
@@ -353,7 +385,16 @@ class LapisNode private constructor(
             // documented must-be-before-connect() precondition).
             builtHost.addConnectionHandler(connectionCap)
             val mdns = MDnsDiscovery(builtHost)
-            val node = LapisNode(builtHost, mdns, relayClient, relayInboundHandlers)
+            val node =
+                LapisNode(
+                    builtHost,
+                    mdns,
+                    relayClient,
+                    relayInboundHandlers,
+                    hopProtocol.flowStats,
+                    registry,
+                    relayTransport,
+                )
             mdns.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {
                     logger.info { "mDNS discovered peer ${peerInfo.peerId}" }

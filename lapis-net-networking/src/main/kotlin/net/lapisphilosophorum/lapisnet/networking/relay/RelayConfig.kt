@@ -123,7 +123,8 @@ data class RelayServerLimits(
      * other leg's transport is over its write-buffer high water mark, so a circuit occupies at most
      * a small constant amount of buffered data no matter how much of this budget it eventually
      * spends. Before that flow control existed, this number was the only ceiling, which meant a
-     * slow or deliberately non-reading peer could park [circuitMaxBytes] of heap per circuit. */
+     * slow or deliberately non-reading peer could park [circuitMaxBytes] of heap per circuit.
+     * What bounds the *time* such a peer can hold the flow control is [circuitStallTimeout]. */
     val circuitMaxBytes: Long = 64L * 1024 * 1024,
     /** Wall-clock lifetime of one circuit, regardless of how few bytes it moved. Stops an attacker
      * from parking [maxConcurrentCircuits] near-idle circuits indefinitely, which
@@ -134,8 +135,77 @@ data class RelayServerLimits(
      * and then goes silent would pin a claimed circuit slot indefinitely - the exact shape of
      * resource exhaustion [maxConcurrentCircuits] exists to bound. */
     val circuitSetupTimeout: Duration = Duration.ofSeconds(20),
+    /** Longest a single circuit leg may keep its source connection paused (forwarding blocked
+     * because the other leg's connection is over its write-buffer high water mark) before the relay
+     * closes that ONE circuit. Bounds ONE pause episode of the connection-wide head-of-line stall a
+     * non-reading circuit peer imposes on every other stream (other circuits, reservation renewals)
+     * of the connection it shares - mplex has no per-stream flow control, so pausing one circuit
+     * pauses the whole connection. It does NOT bound repeated episodes (a non-reader that reopens
+     * its circuit): that is [connectionStallBudget]'s job. A value at or above [circuitMaxDuration]
+     * switches this per-episode bound off in practice. Must be positive. */
+    val circuitStallTimeout: Duration = Duration.ofSeconds(30),
+    /** Cumulative time ONE relay connection may spend paused by circuit forwarding within a sliding
+     * window of [connectionStallBudgetWindow] (a leaky bucket: paused time fills it, the passing of
+     * time drains it). [circuitStallTimeout] only bounds a single pause episode, and a peer that
+     * never reads can simply reopen its circuit to start the next one; this budget bounds the sum
+     * over all circuits and all peers on that connection. Once it is used up, a circuit leg that
+     * would pause the connection again is allowed to pause for at most [connectionStallGrace] and is
+     * closed if it is still paused after that. The long-run share of time a connection can be
+     * stalled by *charged* pauses (the part beyond the free grace) is therefore at most
+     * `budget / window` (10 % at the defaults), after an initial burst of up to the budget. Pause
+     * time within the free grace is not charged; see [connectionStallGrace] for what bounds it.
+     *
+     * **What counts, and the collateral this has.** Only the part of a pause episode that exceeds
+     * [connectionStallGrace] is charged, so ordinary millisecond-scale backpressure from an honest
+     * receiver costs nothing. The relay cannot tell a *slow* honest receiver from a peer that
+     * trickles just enough reads to resume repeatedly: a receiver that keeps draining slower than
+     * roughly `(high water mark - low water mark) / connectionStallGrace` (about 190 KiB/s at the
+     * defaults) spends most of its time in episodes longer than the grace, is charged for the
+     * excess, and eventually has its circuits cut once the budget is used up - an honest slow
+     * receiver is throttled, then cut, not throttled forever. The budget also belongs to the
+     * *connection*, not to the peer that caused the stall: once it is used up, any circuit of that
+     * connection whose pause outlasts the grace is closed, whoever is to blame. */
+    val connectionStallBudget: Duration = Duration.ofSeconds(60),
+    /** The window [connectionStallBudget] is measured over. Must be longer than the budget. */
+    val connectionStallBudgetWindow: Duration = Duration.ofMinutes(10),
+    /** How long one pause episode of a connection is free: only the part beyond this is charged to
+     * [connectionStallBudget], and once the budget is used up a leg may still pause the connection
+     * this long before its circuit is closed. Keeps the short, constant backpressure of an honest
+     * receiver that merely reads slower than the sender from eating the budget (or, with the budget
+     * exhausted, from being cut at its first pause). A zero grace charges every paused nanosecond and
+     * closes immediately once the budget is used up. Must not be negative.
+     *
+     * The grace is per connection, not per identity: an episode that begins less than one grace
+     * after a circuit of the same connection was closed for stalling gets only as much free time as
+     * the connection has been readable since that closure. So circuits chained from several
+     * identities (the [maxConnectAttemptsPerWindow] limit is per identity) cannot each have a full
+     * free grace straight after the previous cut.
+     *
+     * The price of a positive grace: pauses of up to this long are not charged. With the budget used
+     * up no single pause lasts longer, and a chain of circuits whose pauses each END IN A STALL
+     * CLOSURE holds the connection paused for at most about half of the time - not for
+     * `budget / window` of it, which only bounds the charged part. That cap does not cover a pause
+     * that ends any other way: a peer that reads just before the grace expires, or an attacker that
+     * ends its own pause by resetting its stream or closing its own relay connection (no reading
+     * needed; with several identities the next prepared circuit then gets a full grace at once) is
+     * neither charged nor cut. In that regime the connection can be paused almost all of the time in
+     * pieces of up to the grace: bounded latency per pause, not a bounded share (the peer is
+     * throttled, not stopped). Reopening is bounded per identity by
+     * [maxConnectAttemptsPerWindow] and by the refusal of a `CONNECT` from an initiator that is not
+     * draining its own connection. */
+    val connectionStallGrace: Duration = Duration.ofSeconds(1),
 ) {
     init {
+        require(!connectionStallBudget.isNegative && !connectionStallBudget.isZero) {
+            "connectionStallBudget must be positive"
+        }
+        require(connectionStallBudgetWindow > connectionStallBudget) {
+            "connectionStallBudgetWindow must be longer than connectionStallBudget"
+        }
+        require(!connectionStallGrace.isNegative) { "connectionStallGrace must not be negative" }
+        require(!circuitStallTimeout.isNegative && !circuitStallTimeout.isZero) {
+            "circuitStallTimeout must be positive"
+        }
         require(!circuitSetupTimeout.isNegative && !circuitSetupTimeout.isZero) {
             "circuitSetupTimeout must be positive"
         }

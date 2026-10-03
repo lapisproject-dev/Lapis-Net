@@ -144,76 +144,6 @@ internal const val CIRCUIT_WRITE_BUFFER_LOW_WATER_MARK_BYTES = 64 * 1024
 internal const val CIRCUIT_WRITE_BUFFER_HIGH_WATER_MARK_BYTES = 256 * 1024
 
 /**
- * Forwards raw inbound bytes from one leg of a circuit onto the other, **with real backpressure**.
- *
- * Ownership of each [ByteBuf] passes to the target channel's write, which releases it (including
- * when that write fails because the other leg is already gone).
- *
- * **Why this needs flow control at all.** Without it, a peer that reads slowly (or simply never
- * reads) makes the relay queue everything the other side sends: up to
- * [RelayServerLimits.circuitMaxBytes] per circuit, times
- * [RelayServerLimits.maxConcurrentCircuits], all of it live heap on the relay - several GiB at the
- * defaults, from peers that spend nothing. The node multiplexes with mplex, which unlike yamux has
- * no send-buffer bound of its own, so nothing below this layer would have caught it either.
- *
- * **How it works** - the standard Netty proxy-splicing shape, adapted to libp2p's channel
- * structure:
- *  - [target] is the *stream* (mplex substream) the bytes are written to.
- *  - [targetTransport] is the connection channel that stream rides on. Bytes queue there, not on
- *    the substream: `MuxChannel.doWrite` hands each buffer straight to the parent connection, so the
- *    substream's own outbound buffer is always empty and its `isWritable` is always `true`. The
- *    connection channel is therefore the only place where writability means anything.
- *  - [sourceTransport] is the connection channel the bytes arrive on. Turning its `autoRead` off is
- *    what actually stops the flow: a substream cannot be paused on its own either, since
- *    `AbstractChildChannel.doBeginRead` is a no-op and inbound frames are pushed at it by the muxer.
- *
- * Pausing a whole connection is coarser than pausing one circuit, and briefly stalls other streams
- * to that same peer. That is inherent to mplex having no per-stream flow control, and it is the
- * conservative direction to be coarse in: the alternative is unbounded heap.
- */
-internal class CircuitProxyHandler(
-    private val target: Channel,
-    private val targetTransport: Channel,
-    private val sourceTransport: Channel,
-) : ChannelInboundHandlerAdapter() {
-    override fun channelRead(
-        ctx: ChannelHandlerContext,
-        msg: Any,
-    ) {
-        if (msg !is ByteBuf) {
-            ctx.fireChannelRead(msg)
-            return
-        }
-        target.writeAndFlush(msg)
-        if (!targetTransport.isWritable) {
-            // Stop pulling bytes in until CircuitReadResumer says the far side drained. The next
-            // read after a premature resume re-arms this immediately, so a resume triggered by an
-            // unrelated circuit on the same connection costs at most one further chunk.
-            sourceTransport.config().isAutoRead = false
-        }
-    }
-}
-
-/**
- * Sits on a circuit leg's **transport** channel and lets the opposite leg start reading again once
- * this one has drained below its low water mark - the other half of [CircuitProxyHandler]'s
- * backpressure.
- *
- * It has to live on the transport channel rather than on the substream because writability events
- * are fired on the channel whose write buffer changed, and that is never the substream (see
- * [CircuitProxyHandler]'s doc comment).
- */
-internal class CircuitReadResumer(
-    private val sourceTransport: Channel,
-) : ChannelInboundHandlerAdapter() {
-    override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
-        // Setting autoRead back to true makes Netty issue a read() itself, so no explicit kick.
-        if (ctx.channel().isWritable) sourceTransport.config().isAutoRead = true
-        ctx.fireChannelWritabilityChanged()
-    }
-}
-
-/**
  * Degenerate fallback used only if a circuit leg turns out not to be Netty-backed, which no
  * transport in this build produces. Identical to what this file did everywhere before flow control
  * existed, and kept solely so an unexpected [Stream] implementation degrades rather than crashes.
@@ -379,6 +309,7 @@ internal class HopReceiver(
     private val registry: RelayReservationRegistry,
     private val stopBinding: ProtocolBinding<CircuitStopControl>,
     private val clock: () -> Instant,
+    private val flowStats: CircuitFlowStats,
 ) : ProtocolMessageHandler<Circuit.HopMessage>,
     CircuitHopControl {
     override fun onMessage(
@@ -518,6 +449,15 @@ internal class HopReceiver(
             refuse(stream, Circuit.Status.PERMISSION_DENIED)
             return
         }
+        // An initiator that is not draining its own connection (the relay's outbound buffer toward
+        // it is over the high water mark) is the precondition for the stall attack: its circuits'
+        // return traffic would pause the target's connection. Refuse before anything reaches the
+        // target. Cheap, and costs an honest, reading peer nothing.
+        if (nettyChannelOf(stream)?.let { transportChannelOf(it).isWritable } == false) {
+            logger.debug { "refusing relay CONNECT from $initiator: its connection is not draining" }
+            refuse(stream, Circuit.Status.RESOURCE_LIMIT_EXCEEDED)
+            return
+        }
         val now = clock()
         // Rate-limited BEFORE anything is looked up or dialled: a CONNECT costs the initiator
         // almost nothing and costs the target a full Noise handshake, so an unlimited CONNECT rate
@@ -601,7 +541,7 @@ internal class HopReceiver(
                             .setStatus(Circuit.Status.OK)
                             .build(),
                     )
-                    spliceCircuit(hopStream, sender.stream, limits, release)
+                    spliceCircuit(hopStream, sender.stream, initiator, target, limits, release)
                     logger.info {
                         "relaying circuit $initiator -> $target " +
                             "(${registry.circuitCount()}/${limits.maxConcurrentCircuits} circuits live)"
@@ -628,6 +568,8 @@ internal class HopReceiver(
     private fun spliceCircuit(
         a: Stream,
         b: Stream,
+        initiator: PeerId,
+        target: PeerId,
         limits: RelayServerLimits,
         release: () -> Unit,
     ) {
@@ -654,24 +596,53 @@ internal class HopReceiver(
                     CIRCUIT_WRITE_BUFFER_HIGH_WATER_MARK_BYTES,
                 )
         }
-        a.pushHandler(CircuitProxyHandler(bChannel, bTransport, aTransport))
-        b.pushHandler(CircuitProxyHandler(aChannel, aTransport, bTransport))
+        val state =
+            CircuitState("$initiator -> $target") {
+                runCatching { a.close() }
+                runCatching { b.close() }
+            }
+        // a -> b reads from aTransport and writes to bTransport; b -> a is the mirror image.
+        val legAB = CircuitLeg(aTransport, bTransport, state)
+        val legBA = CircuitLeg(bTransport, aTransport, state)
+        val gateA =
+            TransportReadGate.of(
+                aTransport,
+                limits.circuitStallTimeout,
+                flowStats,
+                limits.connectionStallBudget,
+                limits.connectionStallBudgetWindow,
+                limits.connectionStallGrace,
+            )
+        val gateB =
+            TransportReadGate.of(
+                bTransport,
+                limits.circuitStallTimeout,
+                flowStats,
+                limits.connectionStallBudget,
+                limits.connectionStallBudgetWindow,
+                limits.connectionStallGrace,
+            )
+        a.pushHandler(CircuitProxyHandler(bChannel, legAB, gateA))
+        b.pushHandler(CircuitProxyHandler(aChannel, legBA, gateB))
         // b drained -> a may read again, and vice versa. Installed on the transport channels, which
         // outlive this circuit, so both are removed again when the circuit ends.
-        val resumeA = CircuitReadResumer(aTransport)
-        val resumeB = CircuitReadResumer(bTransport)
-        bTransport.pipeline().addLast(resumeA)
-        aTransport.pipeline().addLast(resumeB)
+        val resumeAB = CircuitReadResumer(legAB, gateA)
+        val resumeBA = CircuitReadResumer(legBA, gateB)
+        bTransport.pipeline().addLast(resumeAB)
+        aTransport.pipeline().addLast(resumeBA)
         val unwireResumers = {
-            runCatching { bTransport.pipeline().remove(resumeA) }
-            runCatching { aTransport.pipeline().remove(resumeB) }
-            // A leg that was paused when its circuit died must not stay paused: nothing would ever
-            // resume it, and the connection carries other streams.
-            runCatching { aTransport.config().isAutoRead = true }
-            runCatching { bTransport.config().isAutoRead = true }
+            state.markEnded()
+            runCatching { bTransport.pipeline().remove(resumeAB) }
+            runCatching { aTransport.pipeline().remove(resumeBA) }
+            // Drop exactly this circuit's pause (and its timer). A pause held by ANOTHER circuit
+            // sharing the same connection is left alone - the gate resumes reading only once no
+            // leg is paused any more.
+            gateA.remove(legAB)
+            gateB.remove(legBA)
         }
         // Either leg dying must tear down the other, or the survivor would sit there holding a
-        // circuit slot and a stream forever.
+        // circuit slot and a stream forever. A stall closure (CircuitState.closeForStall) ends up
+        // here too, through the streams it closes, so the slot is released exactly once.
         a.closeFuture().whenComplete { _, _ ->
             release()
             unwireResumers()
@@ -722,6 +693,9 @@ internal class LapisCircuitHopProtocol(
     @Volatile
     private var host: Host? = null
 
+    /** Forwarding-path gauges of this relay (one instance per node); see [CircuitFlowStats]. */
+    internal val flowStats = CircuitFlowStats()
+
     fun setHost(host: Host) {
         this.host = host
     }
@@ -745,7 +719,7 @@ internal class LapisCircuitHopProtocol(
 
     override fun onStartResponder(stream: Stream): CompletableFuture<CircuitHopControl> {
         val us = host ?: throw IllegalStateException("hop protocol used before its Host was set")
-        val receiver = HopReceiver(us, config, registry, stopBinding, clock)
+        val receiver = HopReceiver(us, config, registry, stopBinding, clock, flowStats)
         stream.pushHandler(CONTROL_HANDLER_NAME, io.libp2p.protocol.ProtocolMessageHandlerAdapter(stream, receiver))
         return CompletableFuture.completedFuture(receiver)
     }

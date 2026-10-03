@@ -1672,8 +1672,91 @@ older node (unknown capability bits are treated as malformed on purpose, so an a
 a capability claim undetected). Readers must therefore be upgraded everywhere before any node starts
 advertising `RELAY`.
 
-**Known follow-ups (not blocking):** the connection-wide head-of-line stall while a slow circuit leg
-is unread (a tighter fix aborts the slow circuit after a threshold), a duplicate connection when a
-node dials a peer it was already reached by over a relay, reservation admission that is still only a
-per-address cap (an IPv6 /64 or a shared NAT gateway defeats it), and the missing test for the
-connection-wide stall.
+**Known follow-ups (not blocking):** reservation admission that is still only a per-address cap (an
+IPv6 /64 or a shared NAT gateway defeats it). The connection-wide head-of-line stall (now bounded per
+circuit), the missing test for it, and the duplicate connection when a node dials a peer it was
+already reached by over a relay (now handled in `LapisNode.connect`) were addressed in V0.9.10 below;
+the dials that bypass `LapisNode.connect` remain.
+
+== V0.9.10 — Relay forwarding stall bound and relayed-connection reuse (post-arc maintenance)
+
+_Unreleased — no tag yet; the version stays `0.9.9`. Follow-up to the V0.9.9 review and audit._
+
+**What is new:**
+
+* **`circuitStallTimeout` (default 30 s) in `RelayServerLimits`.** A circuit leg that keeps its source
+  connection paused (because the other leg's connection is over the write-buffer high water mark) for
+  longer than this has its circuit closed — that one circuit, once — and the connection resumes. Before,
+  one non-reading peer could hold the pause, and with it every other circuit and reservation renewal on
+  the shared connection, for up to `circuitMaxDuration`.
+* **A connection-wide stall budget (`connectionStallBudget` 60 s per `connectionStallBudgetWindow`
+  10 min) in `RelayServerLimits`** (added after the V0.9.10 audit). `circuitStallTimeout` bounds one
+  pause episode only; a non-reading peer that reopens its circuit started a fresh episode each time
+  and, with a single identity, kept the reserved victim's connection paused in 84 % of the samples
+  (about 98 % at the defaults). The gate now accounts the cumulative paused time per connection in a
+  leaky bucket; once it is used up, a leg that would pause the connection again may pause for at most
+  `connectionStallGrace` and is closed if it is still paused after that. `HOP CONNECT` is also
+  refused while the initiator's own connection to the relay is unwritable.
+* **`connectionStallGrace` (default 1 s) in `RelayServerLimits`** (added after the second audit round).
+  The first version of the budget charged every paused nanosecond, so an honest receiver that reads
+  steadily but slower than the sender — pause episodes of milliseconds, but constantly — used the
+  budget up and had its circuit closed (reproduced with real TCP: closed after 181 episodes of about
+  9 ms each when the budget-to-window ratio was the production 1:10), where before it was merely
+  throttled. Now only the part of an episode beyond the grace is charged, and with the budget used up
+  a brief pause that drains within the grace is left alone.
+* **The grace is not renewed for free after a stall closure** (added after the third audit round). With
+  the budget used up, circuits from two or more identities (the `CONNECT` rate limit is per identity)
+  could each pause the victim connection for a full uncharged grace right after the previous one was
+  cut, keeping it paused almost all of the time. A pause episode that begins less than one grace after a
+  stall closure on the same connection now gets only as much free time as the time since that closure,
+  so a chain whose pauses each end in a stall closure is limited to about half of the time (and to
+  nothing when the episodes follow each other directly). The cap sees only stall closures: a pause that
+  ends any other way - the peer reads, or the attacker resets its own stream or drops its own relay
+  connection (no reading needed, several identities) - leaves no timestamp, so the next circuit gets a
+  full grace and the connection can be paused almost all of the time in grace-length pieces (bounded
+  latency per pause, not a bounded share; wording corrected after the fourth audit round, behavior
+  pinned by a gate-level test). Covered by a gate-level test that chains circuits on one connection with
+  the budget used up.
+* **A per-connection read gate** (`TransportReadGate`) replaces flipping `autoRead` per leg, so one
+  circuit's resume can no longer un-pause another circuit still blocked on the same connection.
+* **A lost wakeup that predated this wave is fixed**: the forwarder could pause its source *after* the
+  target had already drained and fired its resumer, leaving the source paused until something else woke
+  it. The new threshold would have turned that into false circuit closures, so the two are fixed together.
+* **`LapisNode.connect` reuses a relayed connection the peer already opened to this node** instead of
+  dialling a second one; an existing direct connection is preferred. Matching is on the
+  Noise-authenticated peer id only.
+
+**Test evidence:** real nodes and real TCP, no mocks. `MultiNodeCircuitStallTest` (a non-reading
+circuit peer, in both directions, with a real relay, a reserved peer and a bystander),
+`CircuitProxyBackpressureTest`, `RelayServerLimitsTest` and `MultiNodeRelayConnectionReuseTest`; the stall
+budget is covered by a multi-node test with one reopening attacker identity (fails with the budget
+disabled) and gate-level tests for cut-off and drain. The slow-reader test that had hidden the
+regression ran with no budget at all; the new one runs the same reader profile under a
+production-shaped budget (1:10 of the window) and grace, and a sibling test shows the same reader is
+cut once the grace is switched off. The `CONNECT` refusal for a not-draining initiator has its own
+multi-node test (relay, a not-reading initiator, a reserved target that must never see a stop stream).
+Each mechanism was also checked by mutation: with the stall timer disabled the multi-node tests fail
+at the 20 s control timeout, and with the connection reuse removed the reuse tests fail.
+
+**What remains:** the stall is bounded, not eliminated. Other streams on the connection still wait up
+to the stall timeout; a burst of up to `connectionStallBudget` (60 s) is possible at the start of an
+attack and afterwards up to `budget / window` (10 %) of the time, during which multi-step relayed
+exchanges with the victim can exceed `controlTimeout`/`circuitAcceptTimeout` and a reservation renewal
+can fail until the next tick (the earlier wording that the reservation "is not lost" holds for a
+single stall episode, not for this residual share); a peer whose circuit was closed can still open
+another (once the budget is spent each pause gets at most `connectionStallGrace` of uncharged time,
+and an episode within one grace after a stall closure gets only the time since it, so a chain
+of circuits from several identities whose pauses end in a stall closure holds the connection paused for
+at most about half of the time, not for `budget / window`; pauses that end any other way - the peer
+reads just before the grace expires, or the attacker resets its own stream or drops its own relay
+connection (no reading needed, several identities) - are neither charged nor closed, are not covered by
+the half-of-the-time cap, and can keep the connection paused almost all of the time in grace-length
+pieces (bounded latency per pause, not a bounded share) - for the reading case the throttling regime of about 190 KiB/s with up to one grace of
+head-of-line delay per pause; a per-initiator cool-down is Madli reputation work); the budget **cannot tell a slow honest receiver
+from a trickling attacker and belongs to the connection, not to the peer that caused the stall**:
+an honest receiver that keeps draining slower than about 190 KiB/s at the defaults is charged for
+the part of its pause episodes beyond the grace and is eventually cut (throttled first, cut later),
+and once a connection's budget is used up any circuit on it whose pause outlasts the grace is closed,
+not only the attacker's; dials through `host.newStream` (`lapis-net-dm`, `lapis-net-storage`) and the
+`BrowserApi` peer list still do not see accepted relayed connections; per-address reservation
+admission and any relay reputation (Madli) are unchanged and belong to the Madli relay wave.

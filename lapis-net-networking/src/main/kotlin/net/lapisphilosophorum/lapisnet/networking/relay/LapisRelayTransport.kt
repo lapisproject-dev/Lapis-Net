@@ -6,6 +6,7 @@ import io.libp2p.core.Connection
 import io.libp2p.core.ConnectionHandler
 import io.libp2p.core.Host
 import io.libp2p.core.P2PChannel
+import io.libp2p.core.PeerId
 import io.libp2p.core.Stream
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
@@ -179,7 +180,7 @@ class LapisRelayTransport internal constructor(
      */
     internal fun acceptCircuit(
         stream: Stream,
-        initiator: io.libp2p.core.PeerId,
+        initiator: PeerId,
         connHandler: ConnectionHandler,
     ) {
         requireHost()
@@ -205,6 +206,18 @@ class LapisRelayTransport internal constructor(
             },
         )
     }
+
+    /**
+     * An open relayed connection to [peer] this transport owns (dialled or accepted), or `null`.
+     *
+     * Matched on the **Noise-authenticated** remote id of the connection - never on an address a
+     * relay reported - so a relay cannot make one peer's connection be handed out for another.
+     * A linear scan is fine: [liveConnections] is bounded by `MAX_CONCURRENT_CONNECTIONS`
+     * (`ConnectionCapHandler` closes anything over the cap, and each connection's `closeFuture`
+     * removes it), so there is no structure here an attacker can grow.
+     */
+    internal fun liveConnectionTo(peer: PeerId): Connection? =
+        liveConnections.firstOrNull { !it.closeFuture().isDone && it.secureSession().remoteId == peer }
 
     private fun track(connection: Connection) {
         liveConnections += connection
