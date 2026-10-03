@@ -12,6 +12,7 @@ import io.netty.util.ResourceLeakDetector
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Hard stop for the feeding loop. If flow control did not engage, the test would push this much
@@ -39,6 +40,7 @@ private class LegRig(
     stallBudget: Duration? = null,
     stallBudgetWindow: Duration = Duration.ofHours(1),
     stallGrace: Duration = Duration.ZERO,
+    nanoClock: () -> Long = System::nanoTime,
 ) : AutoCloseable {
     private val sourceLink: NonReadingLink? =
         if (sourceTransport == null) {
@@ -49,7 +51,7 @@ private class LegRig(
     val source: Channel = sourceTransport ?: sourceLink!!.client
     val state = CircuitState("test-initiator -> test-target") { closes.incrementAndGet() }
     val leg = CircuitLeg(source, target.client, state)
-    val gate = TransportReadGate.of(source, stallTimeout, stats, stallBudget, stallBudgetWindow, stallGrace)
+    val gate = TransportReadGate.of(source, stallTimeout, stats, stallBudget, stallBudgetWindow, stallGrace, nanoClock)
     val sourceStream = EmbeddedChannel(CircuitProxyHandler(target.client, leg, gate))
 
     init {
@@ -302,8 +304,51 @@ class CircuitProxyBackpressureTest :
             }
         }
 
+        /**
+         * The reader profile of the real-TCP test above, replayed against the gate on a manual clock:
+         * the connection is paused for [pauseMillis] and runs for [runMillis], [cycles] times, so it
+         * is paused most of the time in short episodes. The accounting is deterministic on purpose: how
+         * large the paused share of a real slow reader is depends on how fast the sender can feed the
+         * socket, and under CPU load the kernel's socket buffers absorb the sender and the paused share
+         * falls below the budget's drain rate - then nothing is ever cut, which says nothing about the
+         * gate. Only the gate's own stall timer still runs on real time: once the budget is used up the
+         * level sits just below the cap at each pause, so the circuit is cut by the timer a millisecond
+         * or so into the next episode. After each pause the replay therefore gives that timer
+         * [timerWaitMillis] of real time before it lifts the pause; a late timer only delays the cut
+         * by a cycle, it cannot prevent it.
+         */
+        fun replaySlowReader(
+            rig: LegRig,
+            clock: AtomicLong,
+            cycles: Int,
+            timerWaitMillis: Long,
+            pauseMillis: Long = 8,
+            runMillis: Long = 2,
+        ) {
+            val loop = rig.source.eventLoop()
+            repeat(cycles) {
+                if (rig.closes.get() == 0) {
+                    loop.submit { rig.gate.pause(rig.leg) }.get()
+                    awaitCondition(Duration.ofMillis(timerWaitMillis)) { rig.closes.get() == 1 }
+                    loop
+                        .submit {
+                            if (rig.closes.get() == 0) {
+                                clock.addAndGet(pauseMillis * 1_000_000L)
+                                rig.gate.resume(rig.leg)
+                                clock.addAndGet(runMillis * 1_000_000L)
+                            }
+                        }.get()
+                }
+            }
+        }
+
         test("the same slow reader IS cut off once the grace is switched off - the test above is sensitive") {
+            // Same budget shape as the test above (a tenth of the window). The profile is paused 80 % of
+            // the time in 8 ms episodes: well above the budget's drain rate, so without a grace every
+            // episode is charged in full and the budget runs dry after a few dozen of them (about 0.7 s
+            // of manual-clock time, so 400 cycles are plenty); with the production-shaped grace no episode is charged at all.
             withGroup { group ->
+                val clock = AtomicLong(0)
                 LegRig(
                     group,
                     Duration.ofSeconds(1),
@@ -311,9 +356,30 @@ class CircuitProxyBackpressureTest :
                     stallBudget = Duration.ofMillis(500),
                     stallBudgetWindow = Duration.ofSeconds(5),
                     stallGrace = Duration.ZERO,
+                    nanoClock = clock::get,
                 ).use { rig ->
-                    driveSlowReader(rig, Duration.ofSeconds(15))
+                    replaySlowReader(rig, clock, cycles = 400, timerWaitMillis = 30)
                     rig.closes.get() shouldBe 1
+                    rig.stats.stallClosures() shouldBe 1L
+                }
+            }
+        }
+
+        test("the same slow reader profile is never cut off with the production-shaped grace") {
+            withGroup { group ->
+                val clock = AtomicLong(0)
+                LegRig(
+                    group,
+                    Duration.ofSeconds(1),
+                    target = NonReadingLink(group, smallBuffers = false),
+                    stallBudget = Duration.ofMillis(500),
+                    stallBudgetWindow = Duration.ofSeconds(5),
+                    stallGrace = Duration.ofSeconds(1),
+                    nanoClock = clock::get,
+                ).use { rig ->
+                    replaySlowReader(rig, clock, cycles = 150, timerWaitMillis = 30)
+                    rig.closes.get() shouldBe 0
+                    rig.stats.stallClosures() shouldBe 0L
                 }
             }
         }

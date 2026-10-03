@@ -1776,11 +1776,15 @@ not only the attacker's; dials through `host.newStream` (`lapis-net-dm`, `lapis-
 `BrowserApi` peer list still do not see accepted relayed connections; per-address reservation
 admission and any relay reputation (Madli) are unchanged and belong to the Madli relay wave.
 
-**Known flaky test:** `CircuitProxyBackpressureTest`, "the same slow reader IS cut off once the grace is
-switched off", failed in two of five runs (a full `clean check` and an isolated rerun; expected one closure, saw none)
-and passed in the other three, two on the same code and one on the previous `master`. It depends on how fast a real TCP reader drains compared
-with the sender and was run under heavy machine load; the cause is not established. To be investigated and
-stabilized separately.
+**Flaky test, fixed after v0.10.0:** `CircuitProxyBackpressureTest`, "the same slow reader IS cut off once the
+grace is switched off", failed in two of five runs and, under 32 busy CPU loops, reproducibly. The cause was in
+the test, not in the gate: it relied on a real TCP sender outpacing a real slow reader, and under CPU load the
+kernel's socket buffers absorb the sender, so the paused share of time fell below the budget's drain rate (10 %)
+and nothing was ever charged enough to be cut. The control now replays the same reader profile (paused 80 % of the
+time in 8 ms episodes) against the gate on a manual clock, so the accounting is deterministic, and a sibling test
+pins that the same profile is never cut with the production-shaped grace. Verified by mutation (grace enabled in
+the control makes it fail) and by two runs under 32 busy loops. The real-TCP "slow but reading peer is not cut off"
+test is unchanged.
 
 == V0.9.11 — DHT layer hardening (post-arc maintenance)
 
