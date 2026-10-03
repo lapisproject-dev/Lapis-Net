@@ -1,0 +1,201 @@
+# Release pipeline. See docs/releasing.adoc.
+#
+#   push of an annotated tag vX.Y.Z  ->  verify, build, test, smoke-test, publish the GitHub release
+#   manual run, no tag               ->  snapshot dry run of master (nothing is published)
+#   manual run, tag, publish=false   ->  the same checks and build for an existing tag, no publishing
+#   manual run, tag, publish=true    ->  also publishes; this is how a release created earlier
+#                                        (v0.10.0) is back-filled with its downloadable files
+#
+# Security notes: no pull_request trigger; manual runs only from master; every `${{ }}` that carries
+# data goes through `env:` and never into a `run:` script; third-party code is limited to
+# actions/* pinned to full commit SHAs; the only job with write access is `publish`.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing annotated tag vX.Y.Z (empty = snapshot dry run of master)"
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: "Publish to the GitHub release (requires a tag)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.ctx.outputs.mode }}
+      tag: ${{ steps.ctx.outputs.tag }}
+      publish: ${{ steps.ctx.outputs.publish }}
+      version: ${{ steps.src.outputs.version }}
+      commit: ${{ steps.src.outputs.commit }}
+      title: ${{ steps.verify.outputs.title }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve what this run does
+        id: ctx
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: scripts/release/resolve-context.sh
+
+      # actions/checkout has turned annotated tags into lightweight ones before; fetching the tag
+      # object explicitly (and master, for the reachability check) makes the checks below reliable.
+      # The repository is public, so no credentials are needed (and none are persisted).
+      - name: Fetch the tag object and master
+        if: steps.ctx.outputs.mode == 'tag'
+        env:
+          TAG: ${{ steps.ctx.outputs.tag }}
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/heads/master:refs/remotes/origin/master" \
+            "+refs/tags/${TAG}:refs/tags/${TAG}"
+
+      - name: Verify the tag
+        id: verify
+        if: steps.ctx.outputs.mode == 'tag'
+        env:
+          TAG: ${{ steps.ctx.outputs.tag }}
+        run: scripts/release/verify-tag.sh --tag "$TAG" --master-ref refs/remotes/origin/master
+
+      # The scripts come from the workflow checkout (the v0.10.0 commit has none), the product is
+      # built from the exact commit that was verified, addressed by SHA and not by tag name.
+      - name: Select the source tree
+        id: src
+        env:
+          MODE: ${{ steps.ctx.outputs.mode }}
+          VERIFIED_COMMIT: ${{ steps.verify.outputs.commit }}
+        run: |
+          set -euo pipefail
+          . scripts/release/lib.sh
+          if [[ "$MODE" == "tag" ]]; then
+            [[ "$VERIFIED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "verified commit is not a full SHA"
+            commit="$VERIFIED_COMMIT"
+            git worktree add --detach "$RUNNER_TEMP/src" "$commit"
+            src_dir="$RUNNER_TEMP/src"
+          else
+            commit=$(git rev-parse HEAD)
+            src_dir="$GITHUB_WORKSPACE"
+          fi
+          version=$(project_version_from "$commit")
+          set_output version "$version"
+          set_output commit "$commit"
+          set_output src_dir "$src_dir"
+
+      # No dependency cache: a release build must not depend on (or be poisoned through) earlier runs.
+      - name: Set up JDK 25
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Build, test and package (clean check distZip)
+        env:
+          SRC: ${{ steps.src.outputs.src_dir }}
+        run: |
+          cd "$SRC"
+          ./gradlew clean check :lapis-net-browser:distZip :lapis-net-cli:distZip --no-daemon --no-build-cache
+
+      - name: Collect the distribution ZIPs
+        env:
+          SRC: ${{ steps.src.outputs.src_dir }}
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist"
+          for mod in browser cli; do
+            f="$SRC/lapis-net-$mod/build/distributions/lapis-net-$mod-$VERSION.zip"
+            [[ -f "$f" ]] || { echo "::error::missing $f"; exit 1; }
+            cp "$f" "$dist/"
+          done
+          ls -l "$dist"
+
+      - name: Smoke-test the distributions
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          scripts/release/smoke-test-dist.sh \
+            --cli-zip "$RUNNER_TEMP/dist/lapis-net-cli-$VERSION.zip" \
+            --browser-zip "$RUNNER_TEMP/dist/lapis-net-browser-$VERSION.zip"
+
+      - name: Generate and verify SHA256SUMS
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          scripts/release/checksums.sh generate "$dist" \
+            "$dist/lapis-net-browser-$VERSION.zip" "$dist/lapis-net-cli-$VERSION.zip"
+          scripts/release/checksums.sh verify "$dist"
+          cat "$dist/SHA256SUMS"
+
+      - name: Upload the release assets (also the dry-run evidence)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lapis-net-${{ steps.ctx.outputs.mode }}-${{ steps.src.outputs.version }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true' && needs.build.outputs.mode == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the built assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lapis-net-${{ needs.build.outputs.mode }}-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/dist
+          digest-mismatch: error
+
+      - name: Verify the checksums again
+        run: scripts/release/checksums.sh verify "$RUNNER_TEMP/dist"
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+          TITLE: ${{ needs.build.outputs.title }}
+        run: |
+          scripts/release/publish.sh \
+            --tag "$TAG" \
+            --assets-dir "$RUNNER_TEMP/dist" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file "docs/release-notes/$TAG.adoc" \
+            --title "$TITLE"

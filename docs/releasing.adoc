@@ -1,0 +1,178 @@
+= Releasing Lapis Net
+:toc:
+
+How a release is cut and how the downloadable files reach GitHub. The pipeline lives in
+`.github/workflows/release.yml`; the logic is in `scripts/release/` so that it can be tested without
+GitHub (`scripts/release/test-release-scripts.sh`).
+
+== Overview
+
+Pushing an annotated tag `vX.Y.Z` makes the `Release` workflow:
+
+. check the tag (format, annotated, reachable from `master`, and `version` in `build.gradle.kts` at
+  the tagged commit equals the tag);
+. build that exact commit with `./gradlew clean check :lapis-net-browser:distZip :lapis-net-cli:distZip`
+  on JDK 25, without a dependency cache;
+. unpack both ZIPs and actually run them (smoke test, see below);
+. write `SHA256SUMS`;
+. keep the three files as a workflow artifact (always, also for dry runs);
+. create the GitHub release as a draft with the three files, download them again, compare, and only
+  then publish it.
+
+The release consists of exactly these files: `lapis-net-browser-<version>.zip`,
+`lapis-net-cli-<version>.zip` and `SHA256SUMS`.
+
+What the pipeline does **not** do is listed under <<not-automated>>. In particular it does not sign
+anything, and it does not build native installers or a bundled Java runtime: a JDK 25 has to be
+installed to run the ZIPs.
+
+=== The smoke test
+
+`scripts/release/smoke-test-dist.sh` is what makes the pipeline more than "the ZIPs exist":
+
+* both archives are integrity-checked (`unzip -t`) and must contain exactly one root directory
+  `lapis-net-<module>-<version>/` with an executable `bin/lapis-net-<module>` and `lib/*.jar`;
+* the CLI is run from the unpacked archive. The demo ends by itself after about ten seconds and must
+  exit with status 0 and print the identity-binding and the trust-score success lines;
+* the browser node is started from the unpacked archive with a generated keystore passphrase. `/`,
+  `/api/identity` and `/api/peers` must answer, the node is stopped with SIGTERM (exit status 143 is
+  the expected, successful outcome), the encrypted identity file must exist with mode `0600`, and the
+  passphrase must not appear in the log.
+
+Every run uses a fresh `LAPISNET_HOME` inside a private temporary directory, so the identity under
+`~/.lapisnet` of whoever runs it locally is never touched. The browser's HTTP port `7878` is fixed
+in the application; the script refuses to start if something already listens there and never kills a
+foreign process. Only `ubuntu-latest` is tested.
+
+== Release checklist
+
+. **Release map.** Add the row to the table in `docs/roadmap.adoc` ("Releases and version
+  numbers"). There is no separate `CHANGELOG`; that table plus the release notes are the history.
+. **Release notes.** Write `docs/release-notes/vX.Y.Z.adoc`. The workflow refuses to create a release
+  without it. The file is AsciiDoc (the documentation format of this repository), but GitHub shows
+  release text as Markdown, so only the common subset is allowed: paragraphs, `*` lists,
+  `` `code` ``, `**bold**` and bare URLs. No headings (`==`), no `[source]` blocks, no `link:` or
+  `xref:`, no attributes. `publish.sh` rejects anything else, because GitHub would display it as raw
+  text. A footer about the downloads and the missing signatures is appended automatically.
+. **Version.** Set `version = "X.Y.Z"` in `build.gradle.kts` (the `allprojects` block). The version is
+  a hard-coded string, not derived from the tag; check with `./gradlew properties -q | grep '^version:'`.
+  The workflow rejects a tag whose version differs from the code. (kUML pushed a `v0.53.0` tag with
+  `version = "0.52.0"` in the code; its Docker push failed. This check is the lesson from that.)
+. **README.** Update the Status section (current release, newly shipped waves).
+. **Documentation gate.** Review README, `docs/roadmap.adoc` and the website for correctness,
+  completeness and consistency; no surface may promise more than the code and the release notes
+  prove.
+. **Local verification.** `./gradlew clean check`, then
+  `./gradlew clean :lapis-net-browser:distZip :lapis-net-cli:distZip` and
+  `scripts/release/smoke-test-dist.sh --cli-zip lapis-net-cli/build/distributions/lapis-net-cli-X.Y.Z.zip --browser-zip lapis-net-browser/build/distributions/lapis-net-browser-X.Y.Z.zip`
+  (needs port 7878 free and JDK 25). `scripts/release/test-release-scripts.sh` runs the offline tests
+  of the release scripts themselves.
+. **Merge.** Squash-merge the feature branch into `master` locally, then `git push origin master`.
+. **Tag.** `git tag -a vX.Y.Z -m "vX.Y.Z - <title>"`. The first line of the annotation becomes the
+  release title; an annotated tag is mandatory.
+. **Push the tag, and only that tag.** `git push origin refs/tags/vX.Y.Z`.
+. **Watch** the `Release` run under _Actions_.
+. **Verify.** `gh release view vX.Y.Z`, `gh release list` (check which release is marked _Latest_),
+  and the checksums as described in <<verifying-checksums>>.
+
+== Idempotency
+
+* Re-running the workflow (or pushing nothing new and using _Run workflow_ for the same tag) is safe.
+* If a run died after the draft was created, the next run finds the draft, replaces the assets and
+  publishes it.
+* If the release already exists, only the assets are replaced (`--clobber`; `SHA256SUMS` goes last).
+  The title and text are replaced **only** if `docs/release-notes/<tag>.adoc` exists; otherwise they are
+  left untouched. A published release never has its _Latest_ marker changed.
+* Stale extra assets on a release are reported but not deleted.
+* After the upload the assets are downloaded again, their checksums are verified and they are compared
+  byte for byte with what the build produced. Only then is a draft published.
+* Concurrent runs for the same tag are serialised (`concurrency`, no cancellation).
+* _Latest_: GitHub marks the most recently _created_ release as Latest, not the highest version. The
+  pipeline sets it explicitly (only if the tag is the highest published, non-pre-release version).
+
+Release notes are read from the checkout of the workflow run, not from the tagged commit: a tag push
+runs on the tagged commit itself, a manual run on `master`. That is what allows a manual run to
+correct or add notes for an older tag later.
+
+== Dry runs
+
+_Actions_ -> _Release_ -> _Run workflow_, branch `master`:
+
+[cols="2,3"]
+|===
+| Inputs | Effect
+
+| `tag` empty
+| Snapshot of `master`: full build, tests, smoke test and `SHA256SUMS`. Nothing is published.
+
+| `tag` = `vX.Y.Z`, `publish` off
+| The tag is verified and built from exactly its commit; nothing is published.
+
+| `tag` = `vX.Y.Z`, `publish` on
+| As above, then the GitHub release is created or updated.
+|===
+
+The three files of every run are available for 14 days under _Actions_ -> the run -> _Artifacts_.
+Manual runs from any branch other than `master` are refused.
+
+== Back-filling v0.10.0
+
+`v0.10.0` is a published GitHub release (hand-written text, no files attached), created before this
+pipeline existed. To attach the two ZIPs and `SHA256SUMS` to it:
+
+. _Actions_ -> _Release_ -> _Run workflow_, branch `master`, `tag` = `v0.10.0`, `publish` on
+  (or `gh workflow run release.yml -f tag=v0.10.0 -f publish=true`);
+. the workflow builds the tag's commit (`c7ca04d`), runs the smoke test and uploads the assets.
+
+The existing title and text are kept, because there is no `docs/release-notes/v0.10.0.adoc`, and
+_Latest_ is not touched. Do not add that file unless the hand-written text is meant to be replaced.
+This is a one-time manual action for the maintainer; nothing in the repository triggers it.
+
+[[verifying-checksums]]
+== Verifying checksums
+
+[source,bash]
+----
+# Linux
+sha256sum -c SHA256SUMS --ignore-missing
+# macOS
+shasum -a 256 -c SHA256SUMS
+# Windows (PowerShell or cmd), compare by eye with the line in SHA256SUMS
+certutil -hashfile lapis-net-cli-X.Y.Z.zip SHA256
+----
+
+The checksums protect against damaged or truncated downloads. They do **not** protect against a
+compromised release account or a compromised build: the files are not signed, and `SHA256SUMS` is
+uploaded to the same place as the ZIPs.
+
+== Known pitfalls
+
+* `git push --follow-tags` pushes annotated tags only; a lightweight tag stays local. The pipeline
+  rejects lightweight tags anyway. Push the tag explicitly: `git push origin refs/tags/vX.Y.Z`.
+* GitHub does not start workflows when more than three tags are pushed at once (this also applies to
+  `git push --tags`). Push one tag at a time.
+* A release created with the workflow's `GITHUB_TOKEN` does not trigger further workflows.
+* A tag whose commit is not on `master` is rejected, as is a tag that does not match the version in
+  `build.gradle.kts`.
+* The browser node's port 7878 cannot be configured. A local smoke test fails fast with "port 7878
+  busy" if a node is already running.
+* The release workflow does not use a Gradle cache on purpose, so it is slower than the CI build.
+* Release text is Markdown on GitHub even though the notes are written as AsciiDoc; hence the
+  restricted subset described in the checklist.
+
+[[not-automated]]
+== Not automated (and not claimed)
+
+* **No signatures**: no GPG, no Sigstore, no build provenance attestation.
+* **No native installers** and no bundled Java runtime; JDK 25 must be installed.
+* **No Maven Central publication and no Docker image.**
+* **No Windows or macOS testing**; the smoke test runs on `ubuntu-latest` only. The `.bat` start
+  scripts inside the ZIPs are untested.
+* **No tag protection.** Recommended, but a repository setting for the maintainer: a ruleset that
+  restricts creating and deleting `v*` tags.
+* **No check of the Gradle wrapper** (`gradle-wrapper.jar` checksum validation).
+* **Reproducible builds** are not guaranteed. Two clean builds on one machine produced identical ZIPs;
+  that was observed, not verified across machines or JDK builds.
+* **The workflow itself is tested only through its scripts.** `scripts/release/test-release-scripts.sh`
+  covers the scripts offline; the YAML and the GitHub-side behaviour (`gh`, artifacts, permissions)
+  are exercised for the first time by a real run.

@@ -244,6 +244,33 @@ the log. Peers discovered through mDNS are only logged and
 cached, never dialled automatically and not shown in the UI. If you only have one machine,
 `./gradlew :lapis-net-cli:run` runs a multi-node trust-propagation demo inside a single process.
 
+== Download
+
+Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. Starting with the
+release pipeline added after `v0.10.0`, a release is published together with
+`lapis-net-browser-<version>.zip`, `lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases created
+before that, including `v0.10.0` until its files are back-filled, may have no downloadable files:
+check the release's asset list, and build from source (see <<Building>>) if none are attached.
+
+Prerequisite: JDK 25 on the `PATH` or in `JAVA_HOME`.
+
+[source,bash]
+----
+unzip lapis-net-browser-<version>.zip
+lapis-net-browser-<version>/bin/lapis-net-browser   # node plus minimal browser UI, see Building
+
+unzip lapis-net-cli-<version>.zip
+lapis-net-cli-<version>/bin/lapis-net-cli           # multi-node demo, ends by itself after a few seconds
+----
+
+The ZIPs also contain `.bat` start scripts for Windows; those are not tested. The environment
+variables described under <<Building>>, in particular `LAPISNET_HOME` and
+`LAPISNET_KEYSTORE_PASSPHRASE`, apply to the unpacked distributions as well.
+
+Verify a download against `SHA256SUMS` (Linux: `sha256sum -c SHA256SUMS --ignore-missing`,
+macOS: `shasum -a 256 -c SHA256SUMS`). The artifacts are not signed; the checksums only detect
+corrupted downloads. How releases are built and published: link:docs/releasing.adoc[docs/releasing.adoc].
+
 == Development conventions
 
 * Code style is enforced by https://github.com/JLLeitschuh/ktlint-gradle[ktlint] and checked in CI.

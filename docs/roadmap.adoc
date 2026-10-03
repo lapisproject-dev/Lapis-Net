@@ -89,6 +89,8 @@ identifiers (V0.9.10, V0.9.11, ...) remain the names of the design units inside 
 this document, but they are no longer tags. Everything in the table above, `v0.9.9` and earlier,
 keeps its number as is; `v0.7` never existed and `v0.9.6`/`v0.9.7` were never assigned. Tags are
 annotated, and from `v0.10.0` on each is also published as a GitHub release (the earlier tags are not).
+How a release is cut, and how its downloadable files are built and published, is described in
+link:releasing.adoc[docs/releasing.adoc].
 
 The tags `v0.8.1`–`v0.8.8` and `v0.9.8` were created retroactively on 2026-10-02 (the same
 treatment the earlier tags received on 2026-08-05), pointing at the last `master` commit of the
