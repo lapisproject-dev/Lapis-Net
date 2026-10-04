@@ -81,6 +81,11 @@ not by version number. Every row below is an annotated git tag on `master`.
 | First chronologically numbered release. Contains the maintenance waves V0.9.10 (relay forwarding stall bound, relayed-connection reuse) and V0.9.11 (hardening of the DHT layer, including a fix for a memory-exhaustion defect in the Kademlia responder that any connected peer could trigger and that has been present in every earlier tag since V0.1.4)
 | 2026-10-03
 | the release commit
+
+| `v0.10.1`
+| Fix release. Fixes a race in the relay's circuit setup that made relay connections hang for 10 s (present in `v0.9.9` and `v0.10.0`), adds diagnostics, makes the relay and slow-reader tests reliable, and adds the release pipeline (`release.yml`) that builds and publishes the downloadable files from the tag
+| 2026-10-04
+| the release commit
 |===
 
 **From `v0.10.0` on, version numbers are chronological** (semantic versioning, `0.MINOR.PATCH`): each
@@ -1834,9 +1839,9 @@ Every fix was also checked by mutation: with the fix removed, the test named for
   (five minutes against a single peer).
 * The gossip-only modules are not migrated onto the DHT; that remains a separately planned wave.
 
-== Unreleased — Relay test stability and release-pipeline hardening (post-`v0.10.0` maintenance)
+== Relay test stability and release-pipeline hardening (post-`v0.10.0` maintenance, released in `v0.10.1`)
 
-_Not released and not tagged; there is no version number for it yet. Follow-up to the three red runs
+_Released in `v0.10.1`. Follow-up to the three red runs
 of 2026-10-03 (CI on the `v0.10.0` commit, CI on `58a76bc`, and a manual `Release` run whose build job runs
 the same tests): the V0.9.10 relay tests failing on a GitHub runner._
 
@@ -1882,7 +1887,7 @@ for measurement, see "What is not proven"):
   (`LapisCircuitHopProtocol.beforeCircuitWiring`, no-op in production) lets a test reproduce the race on
   every run; the regression test fails with the hop-leg fix taken out and passes with it, and also asserts
   that no control-stream failure was recorded on the relay. `v0.9.9` and `v0.10.0` both contain the race;
-  the fix is in no tag. Details: `docs/architecture.adoc`, "Circuit setup: the `OK` and the wiring are one
+  the fix is in `v0.10.1`. Details: `docs/architecture.adoc`, "Circuit setup: the `OK` and the wiring are one
   step on each leg".
 * **Test:** the stall test waits for the cut connection to be closed on A's side (it used to sleep 150 ms)
   and asserts that `connect` returns a new connection. No assertion about the gates, budgets or timings

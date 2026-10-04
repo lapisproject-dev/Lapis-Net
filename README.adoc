@@ -29,11 +29,11 @@ requirements.
 == Status
 
 Every wave through *V0.9* is implemented and merged to `master`, followed by four
-post-arc maintenance waves (V0.9.8 to V0.9.11, below). The current release is
-*v0.10.0*, the first with a chronological version number: up to `v0.9.9` the tags
+post-arc maintenance waves (V0.9.8 to V0.9.11, below) and a fix release. The current release is
+*v0.10.1* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
 are wave identifiers (V0.7 was never a standalone wave — its scope was folded into the
 incremental browser growth of V0.2–V0.5), from `v0.10.0` on they count releases in the
-order they ship. See link:docs/roadmap.adoc[docs/roadmap.adoc] for the
+order they ship). See link:docs/roadmap.adoc[docs/roadmap.adoc] for the
 explanation and a map of every tag to its content. Full technical
 detail for each module is in the Modules table below; the full wave-by-wave
 history — including scope cuts and hardening follow-ups — is in
@@ -94,6 +94,10 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 
 | V0.9.11
 | DHT layer hardening in `lapis-net-storage`: absolute deadlines and concurrency caps on provider lookups, bounded provider store, sanitized peer addresses, validated Kademlia requests (released in v0.10.0)
+| ✅
+
+| v0.10.1
+| Fix release: a race in the relay's circuit setup (present in `v0.9.9` and `v0.10.0`) made relay connections hang for 10 s and fail without any log line; fixed on both legs, with a deterministic regression test. Adds the release pipeline: tag push builds, smoke-tests and publishes the downloadable ZIPs with `SHA256SUMS`
 | ✅
 |===
 
@@ -246,11 +250,11 @@ cached, never dialled automatically and not shown in the UI. If you only have on
 
 == Download
 
-Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. Starting with the
-release pipeline added after `v0.10.0`, a release is published together with
-`lapis-net-browser-<version>.zip`, `lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases created
-before that, including `v0.10.0` until its files are back-filled, may have no downloadable files:
-check the release's asset list, and build from source (see <<Building>>) if none are attached.
+Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. Starting with
+`v0.10.1`, a release is published together with `lapis-net-browser-<version>.zip`,
+`lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases before that, including `v0.10.0`, have no
+downloadable files: check the release's asset list, and build from source (see <<Building>>) if none
+are attached.
 
 Prerequisite: JDK 25 on the `PATH` or in `JAVA_HOME`.
 

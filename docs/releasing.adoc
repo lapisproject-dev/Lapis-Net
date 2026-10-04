@@ -154,18 +154,17 @@ _Actions_ -> _Release_ -> _Run workflow_, branch `master`:
 The three files of every run are available for 14 days under _Actions_ -> the run -> _Artifacts_.
 Manual runs from any branch other than `master` are refused.
 
-== Back-filling v0.10.0
+== Back-filling older releases
 
 `v0.10.0` is a published GitHub release (hand-written text, no files attached), created before this
-pipeline existed. To attach the two ZIPs and `SHA256SUMS` to it:
-
-. _Actions_ -> _Release_ -> _Run workflow_, branch `master`, `tag` = `v0.10.0`, `publish` on
-  (or `gh workflow run release.yml -f tag=v0.10.0 -f publish=true`);
-. the workflow builds the tag's commit (`c7ca04d`), runs the smoke test and uploads the assets.
-
-The existing title and text are kept, because there is no `docs/release-notes/v0.10.0.adoc`, and
-_Latest_ is not touched. Do not add that file unless the hand-written text is meant to be replaced.
-This is a one-time manual action for the maintainer; nothing in the repository triggers it.
+pipeline existed. It is **not** back-filled: it contains the relay circuit-setup race that `v0.10.1`
+fixes, and the workflow would build the tag's own commit (`c7ca04d`), i.e. attach downloads that still
+have the defect. Use `v0.10.1` or later. The mechanism exists (_Actions_ -> _Release_ -> _Run workflow_,
+branch `master`, `tag` = an existing tag, `publish` on, or
+`gh workflow run release.yml -f tag=vX.Y.Z -f publish=true`); the existing title and text of a release
+are kept unless `docs/release-notes/<tag>.adoc` exists, and _Latest_ is not touched for an existing
+release. A tag created before the pipeline also needs `version` in its `build.gradle.kts` to equal the
+tag, which is not the case for most tags before `v0.10.0`.
 
 [[verifying-checksums]]
 == Verifying checksums

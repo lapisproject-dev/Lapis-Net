@@ -1,0 +1,13 @@
+Fix release: a race in the relay's circuit setup, plus the release pipeline that now builds and publishes this release's downloadable files. No new user-facing features.
+
+**Please update if you use relays.** Reaching a node through a Circuit Relay v2 relay could hang for 10 seconds and then fail, without any error in the log. The relay wrote its `OK` and only then rewired the stream, on another thread, so the first handshake bytes of the connecting side could arrive in between and were silently dropped. The defect is also present in `v0.9.9` and `v0.10.0`. On two CPUs, plain relay connections failed in 8 of 80 attempts without the fix and in 0 of 80 with it; the same race exists in the opposite direction on the destination's leg and is fixed as well.
+
+* Relay: the `OK` and the wiring of the hop stream are one step on the stream's own event loop; on the destination's leg the stream becomes a raw pipe in the same read that delivers the `OK`, and early bytes are held (at most 64 KiB) until the circuit is wired.
+* A regression test reproduces the race deterministically; a counter for decode failures on the relay's control streams is asserted to stay at zero.
+* A stall test no longer sleeps for a fixed time and then receives the old connection back.
+* Test diagnostics that are inert unless switched on (`-PlapisDiag`, see CONTRIBUTING.adoc).
+* The slow-reader relay test from `v0.10.0` is deterministic now (a manual clock instead of a real TCP race).
+
+**Release pipeline.** Pushing an annotated tag now builds that exact commit, runs both distributions (smoke test), writes `SHA256SUMS` and publishes the release as a draft that is only published after the uploaded files were downloaded and compared. Publishing stops if the tag no longer points at the verified commit, and it never replaces a file of a published release. How it works: docs/releasing.adoc
+
+**Known limits.** If the destination sends its `OK` and the first bytes of its end-to-end handshake in a single read, those bytes can still be lost; this is not covered by a test and has not been observed. A control stream that raises a decode exception is still left open. The downloads are not signed. The GitHub release for `v0.10.0` has no files and is not back-filled, because it contains the race.
