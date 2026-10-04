@@ -97,7 +97,7 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 | ✅
 
 | v0.10.1
-| Fix release: a race in the relay's circuit setup (present in `v0.9.9` and `v0.10.0`) made relay connections hang for 10 s and fail without any log line; fixed on both legs, with a deterministic regression test. Adds the release pipeline: tag push builds, smoke-tests and publishes the downloadable ZIPs with `SHA256SUMS`
+| Fix release: a race in the relay's circuit setup (present in `v0.9.9` and `v0.10.0`) made relay connections hang for 10 s and fail with no warning or error in the log (the decoding exception was visible only in DEBUG output); fixed on both legs; a deterministic regression test covers the hop leg, and the destination's leg is covered only by an assertion that the relay's control-failure counter stays at zero. Adds the release pipeline: a tag push builds, smoke-tests and publishes the downloadable ZIPs with `SHA256SUMS`
 | ✅
 |===
 
@@ -250,7 +250,7 @@ cached, never dialled automatically and not shown in the UI. If you only have on
 
 == Download
 
-Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. Starting with
+Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. `v0.10.1` is the first release built by the release pipeline, whose publish step was tested only against local stand-ins before that run, not against GitHub itself. Starting with
 `v0.10.1`, a release is published together with `lapis-net-browser-<version>.zip`,
 `lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases before that, including `v0.10.0`, have no
 downloadable files: check the release's asset list, and build from source (see <<Building>>) if none

@@ -83,7 +83,7 @@ not by version number. Every row below is an annotated git tag on `master`.
 | the release commit
 
 | `v0.10.1`
-| Fix release. Fixes a race in the relay's circuit setup that made relay connections hang for 10 s (present in `v0.9.9` and `v0.10.0`), adds diagnostics, makes the relay and slow-reader tests reliable, and adds the release pipeline (`release.yml`) that builds and publishes the downloadable files from the tag
+| Fix release. Fixes a race in the relay's circuit setup that made relay connections hang for 10 s (present in `v0.9.9` and `v0.10.0`), adds diagnostics, makes the relay and slow-reader tests more deterministic, and adds the release pipeline (`release.yml`) that builds and publishes the downloadable files from the tag
 | 2026-10-04
 | the release commit
 |===
