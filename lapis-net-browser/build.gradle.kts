@@ -10,6 +10,15 @@ plugins {
 
 application {
     mainClass.set("net.lapisphilosophorum.lapisnet.browser.BrowserMainKt")
+    // V0.8.7b - webrtc-java loads a native library; JDK 25 warns (and will eventually block) native
+    // access from the unnamed module without this flag.
+    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
+}
+
+// V0.8.7b - every BrowserServer.start now probes WebRtcCallMediaEngine.isNativeAvailable(), so every
+// test that starts a BrowserServer needs native access, not only the call tests.
+tasks.withType<Test>().configureEach {
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
 }
 
 dependencies {
@@ -27,6 +36,9 @@ dependencies {
     implementation(project(":lapis-net-directory"))
     implementation(project(":lapis-net-ratchet"))
     implementation(project(":lapis-net-dm"))
+    // V0.8.7b - browser call remote control. The webrtc-java natives arrive transitively through
+    // lapis-net-call's runtimeOnly declaration.
+    implementation(project(":lapis-net-call"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)
@@ -39,6 +51,10 @@ dependencies {
     runtimeOnly(rootProject.libs.logback.classic)
 
     testImplementation(rootProject.libs.ktor.server.test.host)
+    // V0.8.7b - CallManagerBrowserIntegrationTest reuses lapis-net-dm's real two-node harness.
+    testImplementation(testFixtures(project(":lapis-net-dm")))
+    // V0.8.7b - CallSessionTokenTest attaches a logback ListAppender to prove the token is never logged.
+    testImplementation(rootProject.libs.logback.classic)
     // Test-only, deliberately NOT `implementation` - LightningLtrEndpointTest.kt needs to build a
     // real, in-process, cryptographically signed BOLT-11 invoice (via Bolt11Invoice.create) to
     // exercise POST /api/ltr/lightning end to end, exactly the way LightningProofVerifierTest does

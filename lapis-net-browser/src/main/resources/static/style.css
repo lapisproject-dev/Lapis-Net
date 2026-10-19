@@ -465,3 +465,32 @@ input[type="checkbox"] {
     --muted: #5a6270;
   }
 }
+
+/* V0.8.7b - call remote control (call.html / call.js) */
+#call-nav a { color: var(--accent); text-decoration: none; font-weight: 600; margin-right: 0.75rem; }
+#call-nav a:hover { text-decoration: underline; }
+main#call-main { max-width: 760px; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; gap: 1.25rem; }
+.call-panel { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+.call-panel h2 { margin: 0 0 0.6rem; font-size: 1.05rem; }
+.call-message { margin: 0; padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-bg); }
+.call-muted { color: var(--muted); font-size: 0.85rem; margin: 0; }
+.call-card-list { display: flex; flex-direction: column; gap: 0.6rem; }
+.call-card { display: flex; align-items: center; gap: 0.8rem; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; background: var(--bg); }
+.call-card--ringing { border-color: var(--accent); animation: lapis-flash 1.4s ease-out infinite; }
+.call-card-body { flex: 1; display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.call-card-peer { font-weight: 700; word-break: break-all; }
+.call-card-state { color: var(--muted); font-size: 0.9rem; }
+.call-card-actions { display: flex; gap: 0.5rem; }
+.call-card-actions button { min-width: 6.5rem; padding: 0.55rem 0.9rem; }
+button.call-accept { background: #1f7a3a; }
+button.call-reject, button.call-hangup { background: #b02a2a; }
+button:disabled { opacity: 0.5; cursor: default; }
+.call-badge { font-size: 0.8rem; color: var(--badge-low-text); font-style: italic; }
+#call-place-form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+#call-place-peer { flex: 1; min-width: 16rem; }
+.call-history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.call-history-item { display: flex; gap: 0.6rem; align-items: center; font-size: 0.9rem; }
+.call-history-peer { font-weight: 600; }
+.call-history-outcome, .call-history-time { color: var(--muted); }
+.call-history-time { margin-left: auto; }
+.call-history--blocked { opacity: 0.55; }

@@ -140,6 +140,9 @@ class DhtOutboxTest :
             e.payload[0] shouldBe 9.toByte()
             e.payload[0] = 0
             e.payload[0] shouldBe 9.toByte()
-            e.toString().contains("09") shouldBe false
+            // Only the length is shown. (A bare "09" check is flaky: the random recipient fingerprint can contain it.)
+            e.toString().contains("payloadBytes=3") shouldBe true
+            e.toString().contains("090909") shouldBe false
+            e.toString().contains("[9, 9, 9]") shouldBe false
         }
     })

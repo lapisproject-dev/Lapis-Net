@@ -4266,7 +4266,7 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
   this node's online presence to a sender its own `DmAcceptancePolicy` has already decided not to
   trust. Accepted cost: a legitimate stranger's first-contact call attempt simply rings out to
   `CallEndReason.RING_TIMEOUT` with no explanation, worse UX than an explicit decline.
-* **No V0.8.7b browser control surface in this wave** — deliberately, following the V0.8.6/V0.8.6b
+* **No V0.8.7b browser control surface in this wave (delivered afterwards, see "Call remote control (V0.8.7b)")** — deliberately, following the V0.8.6/V0.8.6b
   precedent of shipping the engine and its production wiring separately from a browser UI, so this
   wave is not "finished plumbing with no caller" the way an earlier review round criticized. A
   browser-driven remote control (the call's actual audio still runs in the JVM process — the web page
@@ -4275,6 +4275,110 @@ outbound send in `CallManager` runs on the media thread, never inline from a sig
   one call is active is answered `REJECT(BUSY)`; the ongoing call is untouched.
 * **Call history (`CallLog`) is in-memory-only** — mirrors `DmStore`'s own "nothing persisted to disk"
   discipline; a call log is at least as sensitive as a message history.
+
+== Call remote control (V0.8.7b)
+
+`lapis-net-browser` now exposes the calls of `lapis-net-call` through a small page, `/call.html`. The page is a
+**remote control**: the audio runs inside the node's JVM (`WebRtcCallMediaEngine`), the browser carries no
+WebRTC and holds no call truth. Every visible element is rebuilt from one state object that is fed by `GET
+/api/call/status` and a Server-Sent-Events stream; a button only asks the node to act, and the UI changes when
+the node's event arrives (no optimistic update).
+
+[kuml, call-remote-control, svg]
+----
+import dev.kuml.c4.dsl.c4Model
+
+c4Model(name = "CallRemoteControl") {
+    val user = person(name = "User")
+    val node = softwareSystem(name = "Lapis Net Node") {
+        container(name = "call.js") {
+            technology = "Browser page"
+        }
+        container(name = "CallApiGuard and CallApi") {
+            technology = "Ktor routes"
+        }
+        container(name = "CallEventHub") {
+            technology = "Kotlin"
+        }
+        container(name = "CallManager") {
+            technology = "lapis-net-call"
+        }
+        container(name = "DmSessionManager") {
+            technology = "lapis-net-dm"
+        }
+    }
+    relationship(source = user, target = node) { technology = "local browser" }
+    containerDiagram(name = "Call remote control") {
+        system = node
+    }
+}
+----
+
+=== Components
+
+* `CallRemote` is a narrow facade over `CallManager` (`CallManagerRemote` is a 1:1 delegation). `CallManager`'s
+  test seams are `internal` to `lapis-net-call`; the facade lets routes and hub be tested with a fake.
+* `CallEventHub` registers **exactly one** listener on the manager (it has no `removeCallListener`, so one listener
+  per SSE connection would leak) and fans events out to at most 4 subscribers. The listener runs on the call state
+  thread and therefore only maps the event, does a non-suspending `trySend` per subscriber (a subscriber whose
+  64-event buffer is full is closed and reconnects, re-reading `/status`) and appends to a bounded lock-free ring.
+  `Subscription.close()` is idempotent and returns the slot exactly once.
+* `CallApiGuard` runs in front of every `/api/call` route; `CallApi` holds the routes; `CallSessionToken` is the
+  per-process secret; `LazyCallMediaEngine` creates the real engine (and with it the audio device) on the first call,
+  not at start-up. Only `WebRtcCallMediaEngine.isNativeAvailable()` runs at start.
+* `BrowserServer.stop()` stops the `CallManager` first, then closes the media engine, then the DM manager: closing
+  the engine under live sessions risks the native double free recorded in V0.8.7, and the manager signals over the
+  DM transport.
+
+=== Guard order and token exchange
+
+. the bound port must be known (`503` otherwise);
+. `Host` must be exactly `127.0.0.1:P`, `localhost:P` or `[::1]:P` (`421`, defeats DNS rebinding);
+. `Sec-Fetch-Site`, if present, must be `same-origin` or `none` (`403`);
+. `Origin`, if present, must be one of those three origins (`403`); it is mandatory on POST;
+. POST bodies must be `application/json`, declare a length and stay within 4 KiB (`415`/`411`/`413`);
+. except for `POST /api/call/session`, the path must lie under the secret `/api/call/<scope>/` prefix and the
+  `lapis_call` cookie must match the token (`401`).
+
+The checks run before an SSE slot is handed out, so a foreign page cannot exhaust the subscriber limit. No CORS
+header is ever emitted. Every response is `Cache-Control: no-store`, `Referrer-Policy: no-referrer`; `/call.html` is
+served with `X-Frame-Options: DENY` and `frame-ancestors 'none'` (clickjacking of the Accept button).
+
+The token is 32 bytes from `SecureRandom`, compared in constant time. It reaches the user only in the fragment of
+the start URL (`/call.html#t=<hex>`), which is never sent to a server. `call.js` removes it from the address bar
+immediately and exchanges it for an HttpOnly, `SameSite=Strict` cookie (no `Secure` flag: the connection is plain
+HTTP over loopback). Cookies are not separated by port, so the cookie `Path` is `/api/call/<scope>`, where `<scope>`
+is 16 bytes derived from the token (SHA-256 over a domain label and the token) and returned only in the body of the
+`POST /api/call/session` response; every other call route lives under that prefix and `call.js` keeps the scope in
+`sessionStorage` (per origin, hence per port). A foreign server on another loopback port does not know the scope, so
+the browser never attaches the cookie to a URL it can name. The exchange limits only *failed* attempts (10 per
+minute, then `429`); a correct token is never throttled, so a local process cannot lock the user out. `BrowserMain` prints the URL with `println` only; `logger.info` states that a token
+was issued, never its value, so a log file cannot keep it.
+
+=== Threat model
+
+* *DNS rebinding:* the exact `Host` check.
+* *Cross-site CSRF:* `Origin`/`Sec-Fetch-Site`, JSON-only bodies, no CORS.
+* *Another page on another localhost port:* `SameSite` does **not** help, cookies are scoped by site, not port; the
+  `Origin` and `Sec-Fetch-Site` checks are the actual defence.
+* *Another local user, or a foreign server on another loopback port:* needs the token; the port alone is not enough.
+  The cookie is not sent to other ports' servers because its `Path` is the secret scope prefix. Residual risk: a
+  local user who can read the node's console output or process memory sees the start URL and the token itself.
+* *Clickjacking:* frame-denying headers.
+* *Slow SSE consumer:* bounded buffer, closed when full; the state thread is never blocked.
+* *Body DoS:* 4 KiB cap; `activeCalls()` (blocks up to 5 s) runs on `Dispatchers.IO`, never on an event-loop thread.
+* *Token leak:* fragment only, redacted `toString`, not logged.
+
+=== Scope cuts
+
+* No mute, no persistence of history (it is `CallLog`, in memory).
+* **The acceptance policy is not wired in the browser.** `BrowserServer` passes no `acceptance` to
+  `DmSessionManager.attach` (the V0.8.6b scope cut), so `IncomingCall.quarantined` is always `false` there and the
+  `blocked` event path is exercised by tests with a fake only. Every caller rings like a known one; the page says so
+  in its footer. Wiring a real policy is a separate wave, because it would also change DM behaviour.
+* `blocked` entries never cause a call to the manager: the silently dropped INVITE cannot be answered from the page.
+* HtmlUnit's `EventSource` does not stream, so the page's rendering is tested through `handleCallEvent`, the function
+  the event handlers call; the transport is covered by real-HTTP tests.
 
 == NAT traversal over Circuit Relay v2
 

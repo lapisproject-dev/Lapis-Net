@@ -77,6 +77,15 @@ fun main() {
 
     println("Lapis Net Browser is running.")
     println("Open http://127.0.0.1:${server.boundPort} in your browser.")
+    if (server.callsAvailable) {
+        // Console only, deliberately NOT logger.info: the fragment carries the call session token and
+        // a log appender could persist it to disk for the whole process lifetime.
+        println("Open calls: ${server.callRemoteControlUrl}")
+        println("  (same device only - the link contains a one-time-per-start secret)")
+        logger.info { "call remote-control token issued" }
+    } else {
+        println("Calls are not available on this node (no usable WebRTC native library).")
+    }
     println("Identity fingerprint: ${identity.secp256k1KeyPair.publicKey.fingerprint()}")
     println("Press Ctrl+C to stop.")
 

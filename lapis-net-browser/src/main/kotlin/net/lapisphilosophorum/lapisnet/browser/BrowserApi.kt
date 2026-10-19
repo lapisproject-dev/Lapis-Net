@@ -9,11 +9,15 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCallPipeline
+import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.http.content.staticResources
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.path
 import io.ktor.server.request.receive
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
@@ -211,6 +215,9 @@ class BrowserApiDependencies(
      * before this wave keeps compiling and behaving unchanged without ever constructing the real
      * libp2p/gossip/session-store machinery [DmApiDependencies] needs. */
     val dm: DmApiDependencies? = null,
+    /** V0.8.7b - see `CallApi.kt`'s `installCallRoutes`. `null` (the default) installs no `/api/call`
+     * route at all, leaving every earlier test fixture and caller unchanged. */
+    val call: CallApiDependencies? = null,
 )
 
 /**
@@ -237,6 +244,13 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         exception<Throwable> { call, cause ->
             logger.error(cause) { "unhandled exception in a browser API route" }
             call.respond(HttpStatusCode.InternalServerError, ErrorResponse("internal server error"))
+        }
+    }
+    // V0.8.7b - /call.html carries the Accept button; forbid framing it (clickjacking).
+    intercept(ApplicationCallPipeline.Plugins) {
+        if (call.request.path() == "/call.html") {
+            call.response.header("X-Frame-Options", "DENY")
+            call.response.header("Content-Security-Policy", "frame-ancestors 'none'")
         }
     }
     routing {
@@ -649,6 +663,9 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         // BrowserApiDependencies.dm's own doc comment for why a caller that never wires DM (every
         // test fixture built before this wave) is unaffected.
         deps.dm?.let { dm -> installDmRoutes(dm, deps.storage, deps.identity.secp256k1KeyPair.publicKey) }
+
+        // V0.8.7b call remote-control routes (own guard, see CallApiGuard.kt). Only when wired.
+        deps.call?.let { installCallRoutes(it) }
 
         // Serves src/main/resources/static/ (index.html, style.css, app.js) at the site root -
         // e.g. /index.html, /style.css, /app.js. Mapped LAST relative to the /api/* routes above

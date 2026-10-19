@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lapis Net - Anrufe</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="identity-header">
+  <div class="brand">
+    <h1>Lapis Net Anrufe</h1>
+    <p id="tagline">Fernbedienung f&uuml;r Anrufe dieses Knotens. Das Audio l&auml;uft im Knoten, nicht im Browser.</p>
+  </div>
+  <div id="identity-info">
+    <span id="identity-label">Sie:</span>
+    <span id="identity-fingerprint">loading identity&hellip;</span>
+  </div>
+  <nav id="call-nav">
+    <a href="/index.html">&larr; Timeline</a>
+    <a href="/dm.html">DM</a>
+    <a href="/mail.html">Mail</a>
+  </nav>
+</header>
+
+<main id="call-main">
+  <p id="call-message" class="call-message" role="status" hidden></p>
+  <p id="call-unavailable" class="call-message" hidden>Anrufe auf diesem Knoten nicht verf&uuml;gbar.</p>
+
+  <section id="call-ringing" class="call-panel" aria-live="assertive" hidden>
+    <h2>Eingehender Anruf</h2>
+    <div id="call-ringing-list" class="call-card-list"></div>
+  </section>
+
+  <section id="call-active" class="call-panel" aria-live="polite" hidden>
+    <h2>Aktueller Anruf</h2>
+    <div id="call-active-list" class="call-card-list"></div>
+  </section>
+
+  <section id="call-place" class="call-panel">
+    <h2>Anrufen</h2>
+    <form id="call-place-form">
+      <input type="text" id="call-place-peer" placeholder="Public Key des Gespr&auml;chspartners (Hex, 03ab...ef)" autocomplete="off" />
+      <button type="submit" id="call-place-submit">Anrufen</button>
+    </form>
+  </section>
+
+  <section id="call-history-panel" class="call-panel">
+    <h2>Verlauf</h2>
+    <ol id="call-history" class="call-history"></ol>
+    <p id="call-history-empty" class="call-muted">Noch keine Anrufe.</p>
+  </section>
+
+  <p id="call-notify-optin" class="call-muted">
+    <button type="button" id="call-notify-enable" class="btn-secondary">Desktop-Hinweise aktivieren</button>
+  </p>
+  <p class="call-muted" id="call-footnote">Absender-Policy im Browser noch nicht aktiv: Anrufe unbekannter Absender klingeln wie bekannte.</p>
+</main>
+
+<template id="call-card-template">
+  <div class="call-card">
+    <svg class="call-glyph" viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1z" fill="currentColor"/></svg>
+    <div class="call-card-body">
+      <div class="call-card-peer"></div>
+      <div class="call-card-state"></div>
+      <span class="call-badge call-unaccepted" hidden>nicht akzeptierter Absender</span>
+    </div>
+    <div class="call-card-actions"></div>
+  </div>
+</template>
+
+<template id="call-history-template">
+  <li class="call-history-item">
+    <svg class="call-history-glyph" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path class="call-history-path" d="M12 3 4 6v6c0 4.4 3.4 8.5 8 9 4.6-.5 8-4.6 8-9V6z" fill="currentColor"/></svg>
+    <span class="call-history-peer"></span>
+    <span class="call-history-outcome"></span>
+    <span class="call-history-time"></span>
+  </li>
+</template>
+
+<script src="/call.js"></script>
+</body>
+</html>

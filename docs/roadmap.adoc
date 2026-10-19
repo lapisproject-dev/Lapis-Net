@@ -86,6 +86,11 @@ not by version number. Every row below is an annotated git tag on `master`.
 | Fix release. Fixes a race in the relay's circuit setup that made relay connections hang for 10 s (present in `v0.9.9` and `v0.10.0`), adds diagnostics, makes the relay and slow-reader tests more deterministic, and adds the release pipeline (`release.yml`) that builds and publishes the downloadable files from the tag
 | 2026-10-04
 | the release commit
+
+| unreleased
+| Next release, candidate `v0.11.0` (no tag, no version bump yet): contains the ungated waves V0.9.12-V0.9.14 and V0.8.7b (browser call remote control)
+| -
+| -
 |===
 
 **From `v0.10.0` on, version numbers are chronological** (semantic versioning, `0.MINOR.PATCH`): each
@@ -1174,8 +1179,23 @@ direct-dialable peers only, same reach as V0.8.4/V0.8.5's own text-DM limitation
 `maxConcurrentCalls = 1` by default (no call waiting/hold); a quarantined caller is silently dropped,
 never sent a `REJECT` (metadata minimization, at the cost of a confusing `RING_TIMEOUT` for a
 legitimate stranger); `CallLog` is in-memory-only, mirroring `DmStore`'s own discipline; **no
-`lapis-net-browser` wiring this wave** (V0.8.7b, a named follow-up, not an open question — following
+`lapis-net-browser` wiring this wave** (V0.8.7b — delivered in V0.8.7b, see below; a named follow-up, not an open question — following
 the V0.8.6/V0.8.6b precedent of shipping the engine before its browser UI).
+
+=== V0.8.7b — Browser call remote control
+
+Progress: delivered on a local feature branch, not yet released (see the release card).
+
+* [x] `/call.html` + `call.js` in `lapis-net-browser`: incoming-call card (Decline before Accept), active call with timer, place-call form, history (50 rows, blocked attempts muted), opt-in desktop notifications.
+* [x] `/api/call/{session,status,place,events,{id}/accept|reject|hangup}`; SSE built by hand so `429` and the 4-slot limit apply before any header is sent.
+* [x] Guard: exact `Host`, `Origin`/`Sec-Fetch-Site`, JSON-only bodies of at most 4 KiB, per-process token via URL fragment and HttpOnly cookie, no CORS, frame-denying headers.
+* [x] `CallEventHub`: one manager listener, bounded fan-out, non-blocking on the call state thread.
+* [x] `LazyCallMediaEngine`; stop order `CallManager` then engine then DM.
+* [x] Tests: guard, token, routing, hub, SSE, two-node HTTP integration, XSS rendering in HtmlUnit.
+* [ ] Open: the acceptance policy is not wired in the browser (`BrowserServer` passes no `acceptance`), so `blocked` never occurs in production and every caller rings. A separate wave must decide the policy, since it also affects DMs.
+* [ ] Open: no mute, no history persistence.
+
+Details: docs/architecture.adoc, "Call remote control (V0.8.7b)".
 
 == V0.9 — Asynchronous messages (email replacement)
 

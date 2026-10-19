@@ -105,7 +105,7 @@ Known, deliberate gaps — not oversights, each documented at the point it was c
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
 * *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route, but no relay metric is built yet. Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`): there is no AutoNAT and no automatic relay selection, neither the CLI nor the browser calls it, and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
-* *No browser control surface for calls (V0.8.7b)* — a 1:1 call's audio runs in the JVM node process; a browser page would only remote-control it, not carry browser-native WebRTC.
+* *Browser call remote control has no sender policy (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process; the acceptance policy is not wired in the browser, so unknown callers ring like known ones. No mute, no persisted call history.
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
 * *No DHT-based peer/mailbox discovery in the messaging modules* — `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` publish and discover over GossipSub. They were built that way because cross-node DHT provider discovery was broken from V0.1.4 onwards. V0.9.8 repaired that at the storage layer — `NabuStorage.provide()`/`findProviders()` now work across nodes, and `get()` fetches a block from a peer it learned about through the DHT alone (see `docs/architecture.adoc`) — but migrating those four modules onto it is a separate wave that has not happened yet.
@@ -224,7 +224,7 @@ messages):
 ./gradlew :lapis-net-browser:run
 ----
 
-It prints the local address to open in a browser and the identity fingerprint. The HTTP port is
+It prints the local address to open in a browser and the identity fingerprint. For calls it also prints a link of the form `http://127.0.0.1:7878/call.html#t=<token>` (same device only: the token is regenerated on every start and must not be shared or logged; open the link from the console, a bare `/call.html` is refused). The HTTP port is
 currently fixed at `7878` (there is no environment variable for it yet), so only one browser node can
 run per machine; a second instance on the same machine fails with "address already in use" and would
 also share the same identity and storage directory unless `LAPISNET_HOME` is changed. State lives under

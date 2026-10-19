@@ -7,6 +7,10 @@ import io.ktor.server.netty.Netty
 import io.ktor.server.netty.NettyApplicationEngine
 import io.libp2p.core.multiformats.Multiaddr
 import kotlinx.coroutines.runBlocking
+import net.lapisphilosophorum.lapisnet.call.CallConfig
+import net.lapisphilosophorum.lapisnet.call.CallManager
+import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
+import net.lapisphilosophorum.lapisnet.call.WebRtcCallMediaEngine
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
@@ -32,6 +36,9 @@ import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import net.lapisphilosophorum.lapisnet.virtus.LtrGossip
 import java.nio.file.Path
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
 
@@ -53,6 +60,22 @@ const val DEFAULT_BROWSER_HTTP_PORT = 7878
  * (an explicit, stated scope cut, not an oversight). Generous enough that a browser session left
  * running overnight stays dialable for DM without a restart. */
 private const val DM_SELF_RECORD_TTL_SECONDS = 24L * 3600
+
+/**
+ * V0.8.7b default for [BrowserServer.start]'s `callMediaEngineFactory`: a [LazyCallMediaEngine] over
+ * the real WebRTC engine when the native library loads, else `null` (calls then report "not
+ * available" instead of crashing). Only [WebRtcCallMediaEngine.isNativeAvailable] runs at start-up;
+ * the audio device is not touched until the first call.
+ */
+private fun defaultCallMediaEngine(): CallMediaEngine? =
+    runCatching {
+        if (WebRtcCallMediaEngine.isNativeAvailable()) {
+            LazyCallMediaEngine { WebRtcCallMediaEngine.create() }
+        } else {
+            null
+        }
+    }.onFailure { logger.warn(it) { "call media engine unavailable - calls are disabled on this node" } }
+        .getOrNull()
 
 /**
  * Fallback DM **session**-store passphrase used ONLY when neither `LAPISNET_KEYSTORE_PASSPHRASE`
@@ -77,6 +100,7 @@ private const val DM_SELF_RECORD_TTL_SECONDS = 24L * 3600
  * `val` across more than one call would read back as all-NUL bytes on the second and later calls,
  * silently deriving a different (and non-reproducible across process restarts) encryption key.
  */
+
 private fun insecureDefaultDmPassphrase(): CharArray =
     "lapisnet-browser-dm-insecure-default-passphrase"
         .toCharArray()
@@ -120,11 +144,28 @@ class BrowserServer private constructor(
      * real passphrase was ever configured (headless, no console) - nothing to zero in that case. */
     private val dmPrekeyMasterPassphrase: CharArray?,
     private val dmStore: DmStore,
+    private val callManager: CallManager?,
+    private val callMediaEngine: CallMediaEngine?,
+    private val callEventHub: CallEventHub?,
+    private val callToken: CallSessionToken,
     private val httpEngine: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>,
     /** The HTTP port actually bound, resolved after [httpEngine] started - may differ from the
      * `httpPort` passed to [start] when that was `0` (OS-assigned). */
     val boundPort: Int,
 ) {
+    /** V0.8.7b - the URL that opens the call remote control, token in the fragment (never sent to a
+     * server, never logged by one). Print it to the local console only; do not write it to log files. */
+    val callRemoteControlUrl: String get() = "http://127.0.0.1:$boundPort/call.html#t=${callToken.hex}"
+
+    /** `true` iff calls are wired (a usable media engine was available at start-up). */
+    val callsAvailable: Boolean get() = callEventHub != null
+
+    internal val callManagerForTesting: CallManager? get() = callManager
+
+    internal val callEventHubForTesting: CallEventHub? get() = callEventHub
+
+    internal val callTokenForTesting: CallSessionToken get() = callToken
+
     /** Test seam only - exposes the underlying [LapisNode] so tests can read its [LapisNode.peerId]/
      * [LapisNode.listenAddresses] to build a direct-dial multiaddr (e.g. for
      * `POST /api/peers/connect`) without a real discovery mechanism, and exposes the underlying
@@ -206,6 +247,11 @@ class BrowserServer private constructor(
     fun stop() {
         try {
             runCatching { httpEngine.stop(HTTP_STOP_GRACE_PERIOD_MILLIS, HTTP_STOP_TIMEOUT_MILLIS) }
+            // Calls ride on the DM layer: stop the CallManager first, then close the media engine
+            // (never under live sessions - native double free, V0.8.7), then the DM manager below.
+            // CallManager.stop() already closes the engine; LazyCallMediaEngine.close() is idempotent.
+            runCatching { callManager?.stop() }
+            runCatching { callMediaEngine?.close() }
             // V0.8.6b - reverse of the attach order in start(): dmSessionManager was attached
             // LAST (after mailInbox/mailSender/sentFolder), so it is stopped FIRST here, mirroring
             // every other layer's reverse-of-attach teardown in this method. Wrapped in runCatching
@@ -284,6 +330,14 @@ class BrowserServer private constructor(
              * with it.
              */
             dmKeystorePassphraseSource: () -> CharArray? = ::resolveKeystorePassphrase,
+            /** V0.8.7b - source of the call media engine; may return `null` (calls disabled). Pass
+             * `null` to skip call wiring entirely. */
+            callMediaEngineFactory: (() -> CallMediaEngine?)? = ::defaultCallMediaEngine,
+            callConfig: CallConfig = CallConfig(),
+            callToken: CallSessionToken = CallSessionToken.generate(),
+            callHeartbeatInterval: Duration = 15.seconds,
+            /** Test seam: replaces the [CallManager]-backed remote (e.g. with a fake). */
+            callRemoteOverride: CallRemote? = null,
         ): BrowserServer {
             require(httpHost == "127.0.0.1") {
                 "BrowserServer must bind 127.0.0.1 only - refusing to start on '$httpHost' " +
@@ -471,6 +525,25 @@ class BrowserServer private constructor(
                 )
                 prekeyBundleGossip.announce(prekeyStore.publishBundle(identity, selfRecordNotValidAfter))
 
+                val callMediaEngine = callMediaEngineFactory?.invoke()
+                cleanupOnFailure += { runCatching { callMediaEngine?.close() } }
+                val callManager = callMediaEngine?.let { CallManager.attach(dmSessionManager, it, callConfig) }
+                // callManager.stop() must run BEFORE callMediaEngine.close() (registered above, so
+                // reversed cleanup order gives exactly that).
+                cleanupOnFailure += { runCatching { callManager?.stop() } }
+                val callRemote = callRemoteOverride ?: callManager?.let { CallManagerRemote(it) }
+                val callEventHub = callRemote?.let { CallEventHub(it, callConfig.autoRejectQuarantined) }
+                val portRef = AtomicInteger(0)
+                val callDeps =
+                    CallApiDependencies(
+                        remote = callRemote,
+                        hub = callEventHub,
+                        ownPublicKey = identity.secp256k1KeyPair.publicKey,
+                        sessionToken = callToken,
+                        expectedPort = { portRef.get() },
+                        heartbeatInterval = callHeartbeatInterval,
+                    )
+
                 val deps =
                     BrowserApiDependencies(
                         identity,
@@ -485,6 +558,7 @@ class BrowserServer private constructor(
                         mailSender,
                         sentFolder,
                         dm = DmApiDependencies(peerDirectory, dmSessionManager, dmStore, dmAcceptedContacts),
+                        call = callDeps,
                     )
                 val httpEngine =
                     embeddedServer(Netty, port = httpPort, host = httpHost) {
@@ -505,6 +579,7 @@ class BrowserServer private constructor(
                             .first()
                             .port
                     }
+                portRef.set(boundPort)
 
                 logger.info {
                     "BrowserServer listening on http://$httpHost:$boundPort (peer ${node.peerId.toBase58()})"
@@ -527,6 +602,10 @@ class BrowserServer private constructor(
                     prekeyStore,
                     dmPrekeyMasterPassphrase,
                     dmStore,
+                    callManager,
+                    callMediaEngine,
+                    callEventHub,
+                    callToken,
                     httpEngine,
                     boundPort,
                 )

@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.browser
 
 import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
@@ -29,6 +30,22 @@ private object RestartTestNoAnchorSource : BitcoinTimeAnchorSource {
  */
 class BrowserServerRestartTest :
     FunSpec({
+        test("BrowserServer.stop() stops the CallManager and closes the media engine") {
+            val engine = ClosableFakeEngine()
+            val server =
+                BrowserServer.start(
+                    identity = DualKeyIdentity.generate(),
+                    httpPort = 0,
+                    dataDirectory = Files.createTempDirectory("browser-stop-test"),
+                    karmaAnchorSource = RestartTestNoAnchorSource,
+                    callMediaEngineFactory = { engine },
+                )
+            server.callManagerForTesting shouldNotBe null
+            server.stop()
+            engine.closed.get() shouldBe true
+            server.callManagerForTesting!!.activeCalls().isEmpty() shouldBe true
+        }
+
         test("BrowserServer.start() against a persistent dataDirectory that already has DM state does not throw") {
             val identity = DualKeyIdentity.generate()
             val dataDirectory = Files.createTempDirectory("browser-restart-test")
@@ -168,3 +185,14 @@ class BrowserServerRestartTest :
             }
         }
     })
+
+private class ClosableFakeEngine :
+    net.lapisphilosophorum.lapisnet.call.CallMediaEngine by FakeBrowserCallMediaEngine() {
+    val closed =
+        java.util.concurrent.atomic
+            .AtomicBoolean(false)
+
+    override fun close() {
+        closed.set(true)
+    }
+}
