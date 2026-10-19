@@ -50,12 +50,14 @@ private fun possessionDigest(identity: Secp256k1PublicKey): ByteArray =
  * bundles through a directory built on this record; V0.8.4 (online DM) resolves recipients'
  * current network addresses through it.
  *
- * **Gossip-only, no DHT publication - the same accepted limitation as every V0.9 mail sub-wave.**
- * `org.peergos.protocol.dht.Kademlia.dialPeer` was documented broken from V0.1.4 until V0.9.8 (see
- * `docs/architecture.adoc`'s Storage section; the reason is historical now) - propagation is entirely via
- * [PeerDirectoryGossip]'s GossipSub topic, mirroring
- * `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s identical precedent. A node offline during
- * the gossip window has no catch-up path.
+ * **Gossip first, DHT as the fallback (V0.9.13).** Propagation is [PeerDirectoryGossip]'s GossipSub topic
+ * - the fast path, mirroring `net.lapisphilosophorum.lapisnet.mail.InboxGossip`. Since V0.9.13 a node can
+ * additionally publish its record, together with its prekey bundle, as an IPNS value in the DHT
+ * ([DirectoryDht.publishOwn]), so a node that was offline during the gossip window can catch up
+ * ([DirectoryDht.catchUp], [DirectoryDht.refreshStale]) given the record owner's libp2p peer ID. A
+ * lookup needs that peer ID (the IPNS name is the Ed25519 peer ID): from an older record in the index or
+ * from a contact. With only the secp256k1 identity there is nothing to ask for. Values from the DHT
+ * pass the same three checks below, plus expiry, and are not gossiped on.
  *
  * **THREE independently-verified signatures, deliberately not two - see [verify], [verifyBinding],
  * and [verifyPossession].** [binding] is [identity]'s OWN pre-existing
@@ -99,7 +101,7 @@ private fun possessionDigest(identity: Secp256k1PublicKey): ByteArray =
  * **Explicit, deliberate scope cuts for V0.8.1 (stated here, consistent with this project's
  * practice of disclosing limitations rather than hiding them - see `NabuStorage`'s V0.1.4 gap
  * note):**
- *  - No DHT publication (see above).
+ *  - DHT publication is opt-in and caller-driven (see above); nothing here publishes by itself.
  *  - No `SFU_CAPABLE` capability flag - see [PeerCapability]'s doc comment.
  *  - No bandwidth-class measurement.
  *  - **No reachability verification of advertised [addresses]** - mirrors V0.4's own, still-open
@@ -228,7 +230,7 @@ class PeerRecord private constructor(
          * [notValidAfterEpochSecond] claim validity - see [create]'s doc comment for the round-4
          * audit finding this closes. 24 hours: generous enough that a legitimate node does not need
          * to be online continuously to stay discoverable (mirrors this record type's own "a node
-         * offline during the gossip window has no catch-up path" accepted limitation - a full day
+         * offline during the gossip window has only the DHT catch-up path" limitation - a full day
          * of slack tolerates a node being briefly offline without instantly going stale), yet short
          * enough that [PeerPresenceAnnouncer]'s 300-second default heartbeat renews it roughly 288
          * times within a single window - a live node's own re-announcements always keep it fresh

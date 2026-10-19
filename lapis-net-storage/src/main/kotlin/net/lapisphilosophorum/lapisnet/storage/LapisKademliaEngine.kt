@@ -12,8 +12,8 @@ import org.peergos.Hash
 import org.peergos.PeerAddresses
 import org.peergos.blockstore.Blockstore
 import org.peergos.protocol.dht.KademliaEngine
-import org.peergos.protocol.dht.RecordStore
 import org.peergos.protocol.dht.pb.Dht
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
@@ -33,16 +33,24 @@ private val logger = KotlinLogging.logger {}
  * 3. **Stream left open after `ADD_PROVIDER`** - the request has no reply, so nothing else would
  *    ever close the responder's end.
  *
+ * Since V0.9.13 `PUT_VALUE` and `GET_VALUE` are not delegated to the base class at all: [IpnsValueResponder]
+ * answers them, over [ipnsStore]. The base class gets an [EmptyRecordStore], so it could not store a
+ * record even if a code path reached it.
+ *
  * The provider store is injected as [BoundedProviderStore]; both are shared with [NabuStorage]'s
  * own (non-Nabu) lookup walk through [localProviders].
  */
 internal class LapisKademliaEngine(
     ourPeerId: Multihash,
     private val providerStore: BoundedProviderStore,
-    recordStore: RecordStore,
+    internal val ipnsStore: BoundedIpnsRecordStore,
     blocks: Blockstore,
     private val limits: DhtLimits,
-) : KademliaEngine(ourPeerId, providerStore, recordStore, blocks) {
+    clock: () -> Instant = Instant::now,
+) : KademliaEngine(ourPeerId, providerStore, EmptyRecordStore, blocks) {
+    /** Answers `PUT_VALUE` / `GET_VALUE`; the base class never sees those two (see [receiveRequest]). */
+    internal val ipnsResponder = IpnsValueResponder(ipnsStore, limits, { key, k -> getKClosestPeers(key, k) }, clock)
+
     @Volatile
     private var book: AddressBook? = null
 
@@ -65,7 +73,7 @@ internal class LapisKademliaEngine(
         source: PeerId,
         stream: Stream,
     ) {
-        if (!InboundDhtRequestPolicy.isAcceptable(msg)) {
+        if (!InboundDhtRequestPolicy.isAcceptable(msg, limits)) {
             rejected.incrementAndGet()
             logger.debug { "rejected an inbound DHT request of type ${msg.type}" }
             stream.close()
@@ -75,7 +83,16 @@ internal class LapisKademliaEngine(
         // watching the writes (PUT_VALUE, for one, answers with an echo only when its record is valid
         // and not older than the stored one).
         val replying = ReplyTrackingStream(stream)
-        if (!guarded(msg.type, stream) { super.receiveRequest(msg, source, replying) }) return
+        val handled =
+            guarded(msg.type, stream) {
+                when (msg.type) {
+                    // Never the base class: its record handling cannot serve Ed25519 names (see IpnsValueResponder).
+                    Dht.Message.MessageType.PUT_VALUE -> ipnsResponder.handlePut(msg, source, replying)
+                    Dht.Message.MessageType.GET_VALUE -> ipnsResponder.handleGet(msg, replying)
+                    else -> super.receiveRequest(msg, source, replying)
+                }
+            }
+        if (!handled) return
         // Requests that get no reply must not leave the responder end open until the initiator
         // chooses to close: ADD_PROVIDER and PING never reply, and any other request stays silent when
         // it is invalid (PUT_VALUE: invalid or older than the stored record). Those streams are closed

@@ -2,6 +2,9 @@ package net.lapisphilosophorum.lapisnet.storage
 
 import java.time.Duration
 
+/** Nabu's `IPNS.MAX_RECORD_SIZE`: the largest signed IPNS record any DHT peer accepts. */
+const val IPNS_RECORD_HARD_LIMIT = 10_240
+
 /**
  * Every bound the DHT layer of [NabuStorage] enforces, in one place (V0.9.11). Nabu's own
  * Kademlia code has none of these: its lookups block without a deadline, its responder echoes
@@ -34,6 +37,18 @@ import java.time.Duration
  * provider before that provider is given up on (the fetch slot is held meanwhile).
  * @property streamCloseGrace how long an initiator waits for the responder to close a stream
  * after `closeWrite` before it resets the stream itself.
+ * @property maxIpnsRecordBytes size above which a signed IPNS record is rejected before any
+ * parsing (V0.9.13); at most [IPNS_RECORD_HARD_LIMIT], Nabu's `IPNS.MAX_RECORD_SIZE`.
+ * @property recordStoreCapacity IPNS records the responder keeps before evicting the least
+ * recently used one.
+ * @property maxRecordValidity how far into the future a record's `notValidAfter` may lie (beyond
+ * [maxClockSkew]); also the cap [NabuStorage.publishIpnsValue] callers are expected to respect.
+ * @property maxClockSkew tolerance applied to both ends of a record's validity window.
+ * @property valuePutFanout how many of the closest peers a `PUT_VALUE` is sent to.
+ * @property resolveQuorum valid answers a `GET_VALUE` walk collects before it stops early.
+ * @property maxValuePutsPerSourcePerMinute inbound `PUT_VALUE` requests accepted per source peer
+ * and minute (token bucket).
+ * @property valueRateTrackerCapacity source peers the per-source rate limiter remembers.
  */
 data class DhtLimits(
     val provideFanout: Int = 20,
@@ -50,6 +65,14 @@ data class DhtLimits(
     val maxConcurrentFetches: Int = 4,
     val fetchConnectTimeout: Duration = Duration.ofSeconds(5),
     val streamCloseGrace: Duration = Duration.ofSeconds(1),
+    val maxIpnsRecordBytes: Int = IPNS_RECORD_HARD_LIMIT,
+    val recordStoreCapacity: Int = 1024,
+    val maxRecordValidity: Duration = Duration.ofDays(7),
+    val maxClockSkew: Duration = Duration.ofMinutes(5),
+    val valuePutFanout: Int = 8,
+    val resolveQuorum: Int = 3,
+    val maxValuePutsPerSourcePerMinute: Int = 6,
+    val valueRateTrackerCapacity: Int = 1024,
 ) {
     init {
         require(provideFanout in 1..MAX_PROVIDE_FANOUT) { "provideFanout must be in 1..$MAX_PROVIDE_FANOUT" }
@@ -72,6 +95,16 @@ data class DhtLimits(
             "fetchConnectTimeout must be positive"
         }
         require(!streamCloseGrace.isNegative && !streamCloseGrace.isZero) { "streamCloseGrace must be positive" }
+        require(maxIpnsRecordBytes in MIN_IPNS_RECORD_BYTES..IPNS_RECORD_HARD_LIMIT) {
+            "maxIpnsRecordBytes must be in $MIN_IPNS_RECORD_BYTES..$IPNS_RECORD_HARD_LIMIT"
+        }
+        require(recordStoreCapacity > 0) { "recordStoreCapacity must be positive" }
+        require(!maxRecordValidity.isNegative && !maxRecordValidity.isZero) { "maxRecordValidity must be positive" }
+        require(!maxClockSkew.isNegative) { "maxClockSkew must not be negative" }
+        require(valuePutFanout in 1..MAX_PROVIDE_FANOUT) { "valuePutFanout must be in 1..$MAX_PROVIDE_FANOUT" }
+        require(resolveQuorum in 1..valuePutFanout) { "resolveQuorum must be in 1..valuePutFanout" }
+        require(maxValuePutsPerSourcePerMinute > 0) { "maxValuePutsPerSourcePerMinute must be positive" }
+        require(valueRateTrackerCapacity > 0) { "valueRateTrackerCapacity must be positive" }
     }
 
     private companion object {
@@ -79,5 +112,6 @@ data class DhtLimits(
         const val MAX_WALK_ROUNDS = 32
         const val MAX_ADDRESSES_PER_PEER = 64
         const val MIN_ADDRESS_BYTES = 32
+        const val MIN_IPNS_RECORD_BYTES = 512
     }
 }

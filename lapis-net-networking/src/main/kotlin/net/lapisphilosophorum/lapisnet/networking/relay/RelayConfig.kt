@@ -130,7 +130,7 @@ data class AutoRelayConfig(
  * descriptors on traffic that is not addressed to it and that it cannot read. Every structure an
  * attacker can grow therefore has an explicit, finite cap, exactly as
  * `net.lapisphilosophorum.lapisnet.networking.MAX_CONCURRENT_CONNECTIONS`,
- * `net.lapisphilosophorum.lapisnet.storage.BoundedRecordStore` and `lapis-net-dm`'s
+ * `net.lapisphilosophorum.lapisnet.storage.BoundedIpnsRecordStore` and `lapis-net-dm`'s
  * `MAX_LIVE_SESSIONS` already do for their own attacker-fillable structures.
  *
  * **The library's own defaults are not usable and are deliberately not reused.**

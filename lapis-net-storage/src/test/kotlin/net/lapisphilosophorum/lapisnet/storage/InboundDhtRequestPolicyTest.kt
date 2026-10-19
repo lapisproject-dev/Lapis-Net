@@ -94,33 +94,60 @@ class InboundDhtRequestPolicyTest :
             InboundDhtRequestPolicy.isAcceptable(short.build()) shouldBe false
         }
 
-        test("GET_VALUE with a CIDv0-shaped IPNS suffix is accepted") {
-            val cidV0 = multihashDeclaring(byteArrayOf(32), 32)
-            InboundDhtRequestPolicy.isAcceptable(msg(Dht.Message.MessageType.GET_VALUE, ipns + cidV0).build()) shouldBe
+        // V0.9.13: the only IPNS name is an Ed25519 identity multihash; the old shape (any CID) is refused.
+        val ed25519Key = ipns + byteArrayOf(0x00, 0x24, 0x08, 0x01, 0x12, 0x20) + ByteArray(32) { (it + 1).toByte() }
+
+        test("GET_VALUE with an Ed25519 IPNS name is accepted") {
+            InboundDhtRequestPolicy.isAcceptable(msg(Dht.Message.MessageType.GET_VALUE, ed25519Key).build()) shouldBe
                 true
         }
 
-        test("PUT_VALUE needs a record whose key equals the request key") {
-            val key = ipns + valid
-            val matching = msg(Dht.Message.MessageType.PUT_VALUE, key)
-            matching.setRecord(
-                Dht.Record
-                    .newBuilder()
-                    .setKey(ByteString.copyFrom(key))
-                    .build(),
-            )
-            InboundDhtRequestPolicy.isAcceptable(matching.build()) shouldBe true
+        test("GET_VALUE with a CIDv0-shaped (sha256) IPNS suffix is now rejected: it is no name this node serves") {
+            val cidV0 = multihashDeclaring(byteArrayOf(32), 32)
+            InboundDhtRequestPolicy.isAcceptable(msg(Dht.Message.MessageType.GET_VALUE, ipns + cidV0).build()) shouldBe
+                false
+        }
 
-            val mismatched = msg(Dht.Message.MessageType.PUT_VALUE, key)
-            mismatched.setRecord(
-                Dht.Record
-                    .newBuilder()
-                    .setKey(ByteString.copyFrom(ipns + valid.reversedArray()))
-                    .build(),
-            )
-            InboundDhtRequestPolicy.isAcceptable(mismatched.build()) shouldBe false
+        test("GET_VALUE and PUT_VALUE keys of the wrong size or shape are rejected") {
+            val tooLong = ed25519Key + byteArrayOf(0)
+            val tooShort = ed25519Key.copyOf(ed25519Key.size - 1)
+            val secp = ipns + byteArrayOf(0x00, 0x25, 0x08, 0x02, 0x12, 0x21) + ByteArray(33) { 2 }
+            val zeroKey = ipns + byteArrayOf(0x00, 0x24, 0x08, 0x01, 0x12, 0x20) + ByteArray(32)
+            for (bad in listOf(tooLong, tooShort, secp, zeroKey)) {
+                InboundDhtRequestPolicy.isAcceptable(msg(Dht.Message.MessageType.GET_VALUE, bad).build()) shouldBe false
+                val put =
+                    msg(Dht.Message.MessageType.PUT_VALUE, bad).setRecord(
+                        Dht.Record
+                            .newBuilder()
+                            .setKey(ByteString.copyFrom(bad))
+                            .build(),
+                    )
+                InboundDhtRequestPolicy.isAcceptable(put.build()) shouldBe false
+            }
+        }
 
+        test("PUT_VALUE needs a record whose key equals the request key and whose value fits the limit") {
+            val key = ed25519Key
+
+            fun put(
+                recordKey: ByteArray,
+                value: ByteArray = ByteArray(0),
+            ) = msg(Dht.Message.MessageType.PUT_VALUE, key)
+                .setRecord(
+                    Dht.Record
+                        .newBuilder()
+                        .setKey(ByteString.copyFrom(recordKey))
+                        .setValue(ByteString.copyFrom(value))
+                        .build(),
+                ).build()
+
+            InboundDhtRequestPolicy.isAcceptable(put(key)) shouldBe true
+            InboundDhtRequestPolicy.isAcceptable(put(key.reversedArray())) shouldBe false
             InboundDhtRequestPolicy.isAcceptable(msg(Dht.Message.MessageType.PUT_VALUE, key).build()) shouldBe false
+
+            val limits = DhtLimits(maxIpnsRecordBytes = 1024)
+            InboundDhtRequestPolicy.isAcceptable(put(key, ByteArray(1024)), limits) shouldBe true
+            InboundDhtRequestPolicy.isAcceptable(put(key, ByteArray(1025)), limits) shouldBe false
         }
 
         test("FIND_NODE and PING are accepted whatever the key") {

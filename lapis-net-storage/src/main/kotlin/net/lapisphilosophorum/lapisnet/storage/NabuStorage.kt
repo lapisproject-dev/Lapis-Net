@@ -6,6 +6,7 @@ import io.ipfs.multihash.Multihash
 import io.libp2p.core.Connection
 import io.libp2p.core.Host
 import io.libp2p.core.PeerId
+import io.libp2p.core.crypto.PrivKey
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import org.peergos.BlockRequestAuthoriser
@@ -18,6 +19,7 @@ import org.peergos.protocol.dht.Kademlia
 import org.peergos.protocol.dht.pb.Dht
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 import java.util.Collections
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CompletableFuture
@@ -37,7 +39,6 @@ private val logger = KotlinLogging.logger {}
 
 private val DEFAULT_TIMEOUT: Duration = Duration.ofSeconds(10)
 private val DEFAULT_CONNECT_TIMEOUT: Duration = Duration.ofSeconds(5)
-private const val DEFAULT_RECORD_STORE_CAPACITY = 1024
 private const val DEFAULT_DESIRED_PROVIDER_COUNT = 4
 private const val RPC_POOL_SIZE = 4
 
@@ -45,11 +46,38 @@ private const val RPC_POOL_SIZE = 4
 private val FETCH_REPEAT_WINDOW: Duration = Duration.ofMinutes(5)
 private const val RECENT_FETCH_CAPACITY = 4096
 
+/** A value resolved from the DHT by [NabuStorage.resolveIpnsValue]: signed by [publisher], newest of what was found. */
+class IpnsValue(
+    val publisher: PeerId,
+    value: ByteArray,
+    val sequence: Long,
+    val notValidAfter: Instant,
+    val ttl: Duration,
+) {
+    private val stored: ByteArray = value.copyOf()
+
+    /** The published value (a copy). */
+    val value: ByteArray get() = stored.copyOf()
+}
+
+/**
+ * Outcome of [NabuStorage.publishIpnsValue]: [acknowledged] of the [attempted] peers echoed the
+ * record back (a real acknowledgement - unlike `ADD_PROVIDER`, `PUT_VALUE` has a reply). The record
+ * is always also held locally, so `attempted == 0` means "stored here only".
+ */
+data class IpnsPublishResult(
+    val acknowledged: Int,
+    val attempted: Int,
+)
+
 /** Thrown when a storage or DHT operation fails or times out. */
-class NabuStorageException(
+open class NabuStorageException(
     message: String,
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
+
+/** Thrown when every DHT slot was taken and nothing was asked; callers may retry later. */
+class NabuStorageBusyException : NabuStorageException("DHT busy")
 
 /** Allows every block read - no read-access control in this wave; see docs/architecture.adoc. */
 private val allowAllReads =
@@ -85,11 +113,16 @@ class NabuStorage private constructor(
     private val localDht: Boolean,
     /** Nanosecond clock of the repeat window and the want lifetime; tests age both with it. */
     private val clock: () -> Long = System::nanoTime,
+    /** UTC wall clock of IPNS record validity; tests move it. */
+    private val wallClock: () -> Instant = Instant::now,
 ) {
     private val stopped = AtomicBoolean(false)
 
     /** Completed by [stop]; ends every blocking DHT wait early. */
     private val stopSignal = CompletableFuture<Unit>()
+
+    /** How far ahead a published IPNS record may be valid (see [DhtLimits.maxRecordValidity]). */
+    val maxRecordValidity: Duration get() = limits.maxRecordValidity
 
     private val operationPermits = Semaphore(limits.maxConcurrentDhtOperations)
     private val addressLock = Any()
@@ -524,6 +557,123 @@ class NabuStorage private constructor(
         }
 
     /**
+     * Publishes [value] under the IPNS name of [signingKey]'s peer ID (V0.9.13): signs a record valid
+     * until [notValidAfter] with [sequence], keeps it in this node's own record store and sends it to the
+     * [DhtLimits.valuePutFanout] closest peers with `PUT_VALUE`. [sequence] must increase with every
+     * publication (a record with a lower sequence than the one held is not accepted anywhere);
+     * [notValidAfter] must lie within [DhtLimits.maxRecordValidity] of now, the signed record within
+     * [DhtLimits.maxIpnsRecordBytes]. Only Ed25519 keys have an IPNS name here.
+     *
+     * [timeout] is an absolute deadline: the walk gets the first half, the writes the rest. Returns how
+     * many peers acknowledged (see [IpnsPublishResult]). Throws [IllegalArgumentException] for a record
+     * that cannot be built, [NabuStorageException] if the storage is stopped, the DHT is busy, a newer
+     * record is already held, the thread is interrupted (flag restored) or the walk fails.
+     *
+     * **Information leak.** Every peer that receives the `PUT_VALUE` learns that [signingKey]'s peer ID
+     * is online and publishing now; the peers a walk asks learn the peer ID being looked for. See
+     * docs/architecture.adoc, "DHT fallback", for why this is accepted until traffic anonymisation exists.
+     */
+    fun publishIpnsValue(
+        signingKey: PrivKey,
+        value: ByteArray,
+        sequence: Long,
+        notValidAfter: Instant,
+        ttl: Duration = Duration.ofMinutes(5),
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): IpnsPublishResult {
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        val deadline = start + timeout.toNanos()
+        val walkDeadline = start + timeout.toNanos() / 2
+        failIfStopped()
+        val publisher = PeerId.fromPubKey(signingKey.publicKey())
+        val key =
+            runCatching { ipnsKeyFor(publisher) }.getOrNull()
+                ?: throw IllegalArgumentException("only Ed25519 keys have an IPNS name")
+        val record = IpnsRecordCodec.create(signingKey, value, sequence, notValidAfter, ttl, limits.maxIpnsRecordBytes)
+        val now = wallClock()
+        val validated =
+            IpnsRecordCodec.validate(key, record, now, limits)
+                ?: throw IllegalArgumentException("notValidAfter must lie within the allowed validity window")
+        if (!engine.ipnsStore.putIfNewer(validated, now)) {
+            throw NabuStorageException("a newer record for this IPNS name is already held")
+        }
+        return withOperationPermit(deadline) {
+            val closest =
+                try {
+                    walker.closestPeers(key, limits.valuePutFanout, walkDeadline)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw NabuStorageException("interrupted while finding DHT peers to publish to", e)
+                } catch (e: Exception) {
+                    throw NabuStorageException("failed to find DHT peers to publish to", e)
+                }
+            failIfStopped()
+            if (closest.peers.isEmpty()) {
+                logger.warn { "publishIpnsValue: no DHT peers known - value held locally only" }
+                return@withOperationPermit IpnsPublishResult(0, 0)
+            }
+            val acknowledged =
+                try {
+                    walker.putValue(key, record, closest.peers, deadline)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw NabuStorageException("interrupted while publishing", e)
+                } catch (e: Exception) {
+                    throw NabuStorageException("failed to publish", e)
+                }
+            logger.debug { "publishIpnsValue: $acknowledged of ${closest.peers.size} peers acknowledged" }
+            IpnsPublishResult(acknowledged, closest.peers.size)
+        }
+    }
+
+    /**
+     * Looks up the value [publisher] published with [publishIpnsValue]: this node's own record store
+     * first, then a `GET_VALUE` walk that stops once [DhtLimits.resolveQuorum] valid answers are in.
+     * Every answer is validated completely (signature by [publisher]'s own key, canonical encoding, expiry
+     * in UTC); the one with the highest sequence (then the latest expiry) wins, so a peer that withholds or
+     * replays an older record cannot hide a newer one that another answered. Returns `null` if nothing
+     * valid was found before the [timeout] deadline - a network timeout is "not found", not an error,
+     * as with [get]. Throws [IllegalArgumentException] for a [publisher] without an IPNS name (not Ed25519),
+     * [NabuStorageException] if the storage is stopped, the DHT is busy, the thread is interrupted (flag
+     * restored) or the walk fails.
+     *
+     * **Information leak.** Each peer the walk asks learns which peer ID is being looked up, and the
+     * authenticated peer ID of the asker.
+     */
+    fun resolveIpnsValue(
+        publisher: PeerId,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): IpnsValue? {
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        val deadline = start + timeout.toNanos()
+        failIfStopped()
+        val key =
+            runCatching { ipnsKeyFor(publisher) }.getOrNull()
+                ?: throw IllegalArgumentException("only Ed25519 peer IDs have an IPNS name")
+        val local = engine.ipnsStore.get(publisher, wallClock())
+        val remote =
+            withOperationPermit(deadline) {
+                try {
+                    walker.getValue(key, deadline, limits.resolveQuorum) { raw ->
+                        IpnsRecordCodec.validate(key, raw, wallClock(), limits)?.takeIf { it.publisher == publisher }
+                    }
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw NabuStorageException("interrupted while resolving", e)
+                } catch (e: Exception) {
+                    throw NabuStorageException("failed to resolve", e)
+                }
+            }
+        val best =
+            (remote + listOfNotNull(local)).fold(null as ValidatedIpnsRecord?) { acc, r ->
+                if (acc == null || r.isNewerThan(acc)) r else acc
+            } ?: return null
+        return IpnsValue(best.publisher, best.value, best.sequence, best.notValidAfter, best.ttl)
+    }
+
+    /**
      * Registers [address] (must include a `/p2p/<peerId>` component, e.g. via
      * [Multiaddr.withP2P]) as a peer's dialable address, so a later [get] call can pass that
      * peer explicitly and have Bitswap actually reach it. Bitswap's wire protocol resolves peer
@@ -610,6 +760,16 @@ class NabuStorage private constructor(
     /** How many inbound DHT requests passed validation but made Nabu's responder throw (tests). */
     internal fun inboundFailedCount(): Long = engine.failedInboundRequests
 
+    /** Inbound IPNS `PUT_VALUE` requests accepted / rejected and `GET_VALUE` requests answered (tests). */
+    internal fun ipnsPutsAccepted(): Long = engine.ipnsResponder.ipnsPutsAccepted
+
+    internal fun ipnsPutsRejected(): Long = engine.ipnsResponder.ipnsPutsRejected
+
+    internal fun ipnsGetsAnswered(): Long = engine.ipnsResponder.ipnsGetsAnswered
+
+    /** Number of IPNS records this node's responder currently holds (tests). */
+    internal fun heldIpnsRecords(): Int = engine.ipnsStore.size()
+
     /** The provider records this node itself holds for [cid] (tests). */
     internal fun localProviderRecords(cid: Cid): List<Dht.Message.Peer> = engine.localProviders(cid.bareMultihash())
 
@@ -632,7 +792,7 @@ class NabuStorage private constructor(
                 Thread.currentThread().interrupt()
                 throw NabuStorageException("interrupted while waiting for a DHT slot", e)
             }
-        if (!acquired) throw NabuStorageException("DHT busy")
+        if (!acquired) throw NabuStorageBusyException()
         try {
             failIfStopped()
             return block()
@@ -741,6 +901,7 @@ class NabuStorage private constructor(
             localDht: Boolean,
             limits: DhtLimits,
             clock: () -> Long,
+            wallClock: () -> Instant = Instant::now,
         ): NabuStorage {
             val host = node.host
             val blockstore = FileBlockstore(blockstoreDir)
@@ -767,9 +928,10 @@ class NabuStorage private constructor(
                 LapisKademliaEngine(
                     ourPeerId,
                     BoundedProviderStore(limits),
-                    BoundedRecordStore(DEFAULT_RECORD_STORE_CAPACITY),
+                    BoundedIpnsRecordStore(limits.recordStoreCapacity),
                     blockstore,
                     limits,
+                    wallClock,
                 )
             val kademlia = Kademlia(engine, localDht)
             kademlia.setAddressBook(host.addressBook)
@@ -793,7 +955,18 @@ class NabuStorage private constructor(
             // addAddrs) so that attaching twice or re-registering never duplicates entries.
             host.addressBook.setAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
 
-            return NabuStorage(host, blockstore, bitswap, bitswapEngine, kademlia, engine, limits, localDht, clock)
+            return NabuStorage(
+                host,
+                blockstore,
+                bitswap,
+                bitswapEngine,
+                kademlia,
+                engine,
+                limits,
+                localDht,
+                clock,
+                wallClock,
+            )
         }
     }
 }

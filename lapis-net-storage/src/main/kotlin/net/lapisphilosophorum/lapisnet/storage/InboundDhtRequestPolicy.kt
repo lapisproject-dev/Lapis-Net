@@ -9,27 +9,31 @@ import org.peergos.protocol.dht.pb.Dht
  * sees it. Pure function, allocates nothing proportional to the declared lengths in the message.
  *
  * Why it exists: `receiveRequest` runs on the Netty event loop and feeds the request's key
- * bytes straight into `Multihash.deserialize` (`ADD_PROVIDER`, `GET_PROVIDERS`, `PUT_VALUE` via
- * the IPNS parser) or `Cid.cast` (`GET_VALUE`). Both allocate `new byte[declaredLength]` BEFORE
+ * bytes straight into `Multihash.deserialize` (`ADD_PROVIDER`, `GET_PROVIDERS`). Both that and the parsers
+ * Nabu uses for IPNS keys (`Cid.cast`, V0.9.11 view) allocate `new byte[declaredLength]` BEFORE
  * any bound check (see [CidBytesValidation]), so any connected peer can make this node attempt a
- * multi-gigabyte allocation with a 10-byte key. An unknown message type makes the base class throw
+ * multi-gigabyte allocation with a 10-byte key. Since V0.9.13 `PUT_VALUE` / `GET_VALUE` keys are not
+ * parsed by Nabu at all: they must be exactly `/ipns/` + an Ed25519 identity multihash (one fixed size,
+ * checked first), and a `PUT_VALUE` record may not exceed [DhtLimits.maxIpnsRecordBytes]. An unknown message type makes the base class throw
  * an `IllegalStateException` on the event loop instead of just ignoring the message.
  */
 internal object InboundDhtRequestPolicy {
-    private val IPNS_PREFIX: ByteArray = "/ipns/".toByteArray(Charsets.US_ASCII)
-
-    fun isAcceptable(msg: Dht.Message): Boolean =
+    fun isAcceptable(
+        msg: Dht.Message,
+        limits: DhtLimits = DhtLimits(),
+    ): Boolean =
         when (msg.type) {
             Dht.Message.MessageType.ADD_PROVIDER ->
                 isSafeMultihash(msg.key) &&
                     msg.providerPeersList.all { CidBytesValidation.isSafeToDeserializeMultihash(it.id.toByteArray()) }
             Dht.Message.MessageType.GET_PROVIDERS -> isSafeMultihash(msg.key)
-            Dht.Message.MessageType.GET_VALUE ->
-                ipnsSuffix(msg.key)?.let { CidBytesValidation.isSafeToCast(it) } ?: false
+            // Only Ed25519 names (V0.9.13); the key has one exact size, checked before any copy.
+            Dht.Message.MessageType.GET_VALUE -> isIpnsKey(msg.key)
             Dht.Message.MessageType.PUT_VALUE ->
-                ipnsSuffix(msg.key)?.let { CidBytesValidation.isSafeToDeserializeMultihash(it) } == true &&
+                isIpnsKey(msg.key) &&
                     msg.hasRecord() &&
-                    msg.record.key == msg.key
+                    msg.record.key == msg.key &&
+                    msg.record.value.size() <= limits.maxIpnsRecordBytes
             // The key is only hashed; the source peer is authenticated by Noise.
             Dht.Message.MessageType.FIND_NODE -> true
             Dht.Message.MessageType.PING -> true
@@ -39,11 +43,6 @@ internal object InboundDhtRequestPolicy {
     private fun isSafeMultihash(key: ByteString): Boolean =
         CidBytesValidation.isSafeToDeserializeMultihash(key.toByteArray())
 
-    /** The bytes after the `/ipns/` prefix, or `null` if [key] is not an IPNS key with a non-empty suffix. */
-    private fun ipnsSuffix(key: ByteString): ByteArray? {
-        if (key.size() <= IPNS_PREFIX.size) return null
-        val bytes = key.toByteArray()
-        for (i in IPNS_PREFIX.indices) if (bytes[i] != IPNS_PREFIX[i]) return null
-        return bytes.copyOfRange(IPNS_PREFIX.size, bytes.size)
-    }
+    private fun isIpnsKey(key: ByteString): Boolean =
+        key.size() == IPNS_KEY_SIZE && parseIpnsKey(key.toByteArray()) != null
 }

@@ -171,6 +171,80 @@ internal class DhtWalker(
         return sent
     }
 
+    /**
+     * Sends a `PUT_VALUE` for [key] carrying [record] to each of [targets], at most
+     * [DhtLimits.walkParallelism] at a time, and returns how many ACKNOWLEDGED it. Unlike
+     * `ADD_PROVIDER`, this request has a reply: a responder that accepted the record echoes it, one that
+     * rejected it (or did not understand it) stays silent. Only an echo carrying exactly the sent record
+     * counts. Writes go through [rpc], i.e. off the Netty event loop.
+     */
+    fun putValue(
+        key: ByteArray,
+        record: ByteArray,
+        targets: List<WalkPeer>,
+        deadlineNanos: Long,
+    ): Int {
+        val message =
+            Dht.Message
+                .newBuilder()
+                .setType(Dht.Message.MessageType.PUT_VALUE)
+                .setKey(ByteString.copyFrom(key))
+                .setRecord(
+                    Dht.Record
+                        .newBuilder()
+                        .setKey(ByteString.copyFrom(key))
+                        .setValue(ByteString.copyFrom(record))
+                        .build(),
+                ).build()
+        val sentValue = message.record.value
+        var acknowledged = 0
+        for (chunk in targets.chunked(limits.walkParallelism)) {
+            if (stopSignal.isDone || System.nanoTime() >= deadlineNanos) break
+            val futures =
+                chunk.map {
+                    rpc(it, message, deadlineNanos).handle { reply, t ->
+                        t == null && reply != null && reply.hasRecord() && reply.record.value == sentValue
+                    }
+                }
+            await(futures, deadlineNanos)
+            acknowledged += futures.count { it.isDone && it.getNow(false) }
+        }
+        return acknowledged
+    }
+
+    /**
+     * Walks towards the IPNS [key] with `GET_VALUE` and returns every record that [validate] accepted,
+     * stopping early once [quorum] valid ones are in. A reply's record is looked at only if it is for
+     * exactly [key] and not larger than [DhtLimits.maxIpnsRecordBytes]; everything else about it is
+     * [validate]'s decision. Records are collected on the calling thread only.
+     */
+    fun getValue(
+        key: ByteArray,
+        deadlineNanos: Long,
+        quorum: Int,
+        validate: (ByteArray) -> ValidatedIpnsRecord?,
+    ): List<ValidatedIpnsRecord> {
+        val found = ArrayList<ValidatedIpnsRecord>()
+        walk(
+            key,
+            Dht.Message.MessageType.GET_VALUE,
+            limits.valuePutFanout,
+            deadlineNanos,
+            onReply = { reply ->
+                if (reply.hasRecord() &&
+                    reply.record.key
+                        .toByteArray()
+                        .contentEquals(key) &&
+                    reply.record.value.size() <= limits.maxIpnsRecordBytes
+                ) {
+                    validate(reply.record.value.toByteArray())?.let { found += it }
+                }
+            },
+            satisfied = { found.size >= quorum },
+        )
+        return found
+    }
+
     private fun walk(
         key: ByteArray,
         type: Dht.Message.MessageType,

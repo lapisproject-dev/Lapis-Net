@@ -23,6 +23,14 @@ class DhtLimitsTest :
             limits.maxConcurrentFetches shouldBe 4
             limits.fetchConnectTimeout shouldBe Duration.ofSeconds(5)
             limits.streamCloseGrace shouldBe Duration.ofSeconds(1)
+            limits.maxIpnsRecordBytes shouldBe 10_240
+            limits.recordStoreCapacity shouldBe 1024
+            limits.maxRecordValidity shouldBe Duration.ofDays(7)
+            limits.maxClockSkew shouldBe Duration.ofMinutes(5)
+            limits.valuePutFanout shouldBe 8
+            limits.resolveQuorum shouldBe 3
+            limits.maxValuePutsPerSourcePerMinute shouldBe 6
+            limits.valueRateTrackerCapacity shouldBe 1024
         }
 
         val invalid: Map<String, () -> DhtLimits> =
@@ -49,6 +57,17 @@ class DhtLimitsTest :
                 "maxConcurrentFetches zero" to { DhtLimits(maxConcurrentFetches = 0) },
                 "fetchConnectTimeout zero" to { DhtLimits(fetchConnectTimeout = Duration.ZERO) },
                 "streamCloseGrace zero" to { DhtLimits(streamCloseGrace = Duration.ZERO) },
+                "maxIpnsRecordBytes below the minimum" to { DhtLimits(maxIpnsRecordBytes = 511) },
+                "maxIpnsRecordBytes above Nabu's hard limit" to { DhtLimits(maxIpnsRecordBytes = 10_241) },
+                "recordStoreCapacity zero" to { DhtLimits(recordStoreCapacity = 0) },
+                "maxRecordValidity zero" to { DhtLimits(maxRecordValidity = Duration.ZERO) },
+                "maxClockSkew negative" to { DhtLimits(maxClockSkew = Duration.ofSeconds(-1)) },
+                "valuePutFanout zero" to { DhtLimits(valuePutFanout = 0) },
+                "valuePutFanout above the maximum" to { DhtLimits(valuePutFanout = 65) },
+                "resolveQuorum zero" to { DhtLimits(resolveQuorum = 0) },
+                "resolveQuorum above valuePutFanout" to { DhtLimits(valuePutFanout = 2, resolveQuorum = 3) },
+                "maxValuePutsPerSourcePerMinute zero" to { DhtLimits(maxValuePutsPerSourcePerMinute = 0) },
+                "valueRateTrackerCapacity zero" to { DhtLimits(valueRateTrackerCapacity = 0) },
             )
         for ((name, build) in invalid) {
             test("rejects $name") {

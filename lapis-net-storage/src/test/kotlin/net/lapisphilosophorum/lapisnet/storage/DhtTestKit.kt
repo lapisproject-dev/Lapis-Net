@@ -4,9 +4,11 @@ import com.google.protobuf.ByteString
 import io.ipfs.multihash.Multihash
 import io.libp2p.core.PeerId
 import io.libp2p.core.Stream
+import io.libp2p.core.crypto.PrivKey
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPrivKey
 import org.peergos.blockstore.RamBlockstore
 import org.peergos.protocol.dht.Kademlia
 import org.peergos.protocol.dht.KademliaEngine
@@ -25,6 +27,20 @@ internal fun newNode(): LapisNode =
     LapisNode.create(DualKeyIdentity.generate()).also {
         it.start(bootstrapPeers = emptyList())
     }
+
+/** A started node together with the identity it was created from, so tests can sign IPNS records as the node. */
+internal class TestNode(
+    val node: LapisNode,
+    val identity: DualKeyIdentity,
+) {
+    val signingKey: PrivKey get() = identity.deriveLibp2pPrivKey()
+    val peerId: PeerId get() = node.peerId
+}
+
+internal fun newTestNode(): TestNode {
+    val identity = DualKeyIdentity.generate()
+    return TestNode(LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }, identity)
+}
 
 internal fun storageOn(
     node: LapisNode,
@@ -67,7 +83,7 @@ internal fun peerProto(
  */
 internal class ScriptedKademliaEngine(
     ourPeerId: Multihash,
-) : KademliaEngine(ourPeerId, RamProviderStore(16), BoundedRecordStore(16), RamBlockstore()) {
+) : KademliaEngine(ourPeerId, RamProviderStore(16), EmptyRecordStore, RamBlockstore()) {
     val received = CopyOnWriteArrayList<Dht.Message>()
 
     @Volatile

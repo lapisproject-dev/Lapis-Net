@@ -6,19 +6,22 @@ import io.libp2p.crypto.keys.unmarshalEd25519PrivateKey
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 
 /**
- * Derives this identity's libp2p signing key ([PrivKey]) from its Ed25519 keypair. Internal:
- * only [LapisNode] needs the jvm-libp2p-wrapped signing key - callers that just want to
- * identify, compare, or log a peer should use [deriveLibp2pPeerId] instead. Note this only gates
- * the wrapped [PrivKey] object - `lapis-net-identity`'s own
- * [net.lapisphilosophorum.lapisnet.identity.Ed25519PrivateKey.seed] getter is public and already
- * exposes the same raw signing-key bytes to any module depending on `lapis-net-identity`; this
- * function does not add confidentiality beyond what that module already provides.
+ * Derives this identity's libp2p signing key ([PrivKey]) from its Ed25519 keypair. Public since
+ * V0.9.13: `lapis-net-directory` signs its IPNS-record publications (the DHT fallback for the peer
+ * directory and prekey bundles) with the node's own transport key, and a record can only be accepted
+ * by other nodes if it is signed with exactly the key their Noise handshake authenticated. Callers
+ * that just want to identify, compare, or log a peer should use [deriveLibp2pPeerId] instead. Note this
+ * does not widen what `lapis-net-identity` already exposes - its
+ * [net.lapisphilosophorum.lapisnet.identity.Ed25519PrivateKey.seed] getter is public and already hands
+ * the same raw signing-key bytes to any module depending on `lapis-net-identity`; the returned [PrivKey] is
+ * a wrapper around those bytes and adds no capability beyond signing with that key. Never log it or put it
+ * in an exception message.
  *
  * The raw 32-byte seed [net.lapisphilosophorum.lapisnet.identity.Ed25519PrivateKey.seed] stores
  * is exactly the byte layout jvm-libp2p's `unmarshalEd25519PrivateKey` expects - no adapter or
  * re-encoding needed.
  */
-internal fun DualKeyIdentity.deriveLibp2pPrivKey(): PrivKey = unmarshalEd25519PrivateKey(ed25519KeyPair.privateKey.seed)
+fun DualKeyIdentity.deriveLibp2pPrivKey(): PrivKey = unmarshalEd25519PrivateKey(ed25519KeyPair.privateKey.seed)
 
 /**
  * Deterministically derives this identity's libp2p [PeerId] - the same [DualKeyIdentity] always

@@ -18,8 +18,9 @@ private val logger = KotlinLogging.logger {}
  * [PeerRecord]s over a dedicated topic, persists every accepted record into [NabuStorage], and
  * exposes read access ([lookup]) to the resolved "current record per identity" view. Mirrors
  * `net.lapisphilosophorum.lapisnet.trust.VeritasGossip`'s shape (publishes full record bytes, not
- * a bare CID pointer - same `Kademlia.dialPeer`-broken reasoning, historical since V0.9.8, see this
- * module's `build.gradle.kts` comment) refined with `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s
+ * a bare CID pointer - the gossip path stays self-contained and needs no network round trip per record;
+ * since V0.9.13 [DirectoryDht] adds a DHT fallback beside it, see this module's `build.gradle.kts` comment)
+ * refined with `net.lapisphilosophorum.lapisnet.mail.InboxGossip`'s
  * more recently established `onGossipMessage` step ordering.
  *
  * **Publish-last ordering is load-bearing, mirroring every sibling `Gossip` class exactly**:
@@ -127,6 +128,41 @@ class PeerDirectoryGossip private constructor(
             .toList()
     }
 
+    /**
+     * The libp2p peer ID of the latest record tracked for [identity], EVEN IF that record has expired - an
+     * expired record is still the best hint where to look the identity up in the DHT (V0.9.13,
+     * [DirectoryDht]). `null` if no record was ever tracked. Unverified against anything but the
+     * record's own (already checked) binding; callers must treat it as a lookup hint only.
+     */
+    internal fun knownPeerId(identity: Secp256k1PublicKey): PeerId? = index.current(identity)?.peerId
+
+    /** Identities this node holds a record for, expired or not (V0.9.13: input of [DirectoryDht.refreshStale]). */
+    internal fun knownIdentities(): Set<Secp256k1PublicKey> = index.allIdentities()
+
+    /** Whether the tracked record for [identity] has expired or will within [withinSeconds] of [nowEpochSecond]. */
+    internal fun expiresWithin(
+        identity: Secp256k1PublicKey,
+        nowEpochSecond: Long,
+        withinSeconds: Long,
+    ): Boolean {
+        val record = index.current(identity) ?: return false
+        return record.notValidAfterEpochSecond < nowEpochSecond + withinSeconds
+    }
+
+    /**
+     * Takes a record that [DirectoryDht] fetched from the DHT and fully verified ([PeerRecord.verify],
+     * [verifyBinding], [verifyPossession] and expiry, see [DirectoryDhtValidator]) into persistence and the
+     * index, exactly as a gossip-received one would be. Returns whether it ended up tracked.
+     *
+     * **Never re-published to GossipSub**: a value taken from the DHT is not announced again, which
+     * would turn every successful lookup into network-wide traffic (amplification) and let two nodes
+     * with different views ping-pong the same record. Gossip stays the path for fresh records.
+     */
+    internal fun ingestFromDht(
+        record: PeerRecord,
+        bytes: ByteArray,
+    ): Boolean = ingestVerified(record, bytes, "the DHT", storage, index) == IngestOutcome.ACCEPTED
+
     /** Unsubscribes from the gossip topic. No other sub-resources to release - mirrors
      * `VeritasGossip.stop` exactly. */
     fun stop() {
@@ -198,8 +234,9 @@ class PeerDirectoryGossip private constructor(
          * [PeerRecord.notValidAfterEpochSecond] is attacker-controlled and is NEVER consulted for an
          * accept/reject decision here - TTL is a pure [lookup]-time filter. There is also no
          * `storage.get`/`storage.findProviders` call - the record travels as full bytes, not a CID
-         * pointer, for the same `Kademlia.dialPeer`-broken reasoning (historical since V0.9.8) as every
-         * sibling `Gossip` class.
+         * pointer, so that gossip stays self-contained, as with every sibling `Gossip` class. The DHT fallback
+         * ([DirectoryDht], V0.9.13) is a separate path that calls [ingestVerified] after its own full
+         * verification; this validator knows nothing of it (a test pins that).
          *
          * **[PeerRecordIndex.canAccept] here predicts BOTH exact-content-id duplication AND
          * stale/rollback sequence numbers** - unlike every sibling index's purely-dedup `canAccept`,
@@ -248,12 +285,37 @@ class PeerDirectoryGossip private constructor(
                 return ValidationResult.Invalid
             }
 
+            return when (
+                ingestVerified(record, bytes, "gossip from $from on $PEER_RECORD_GOSSIP_TOPIC", storage, index)
+            ) {
+                IngestOutcome.DECLINED, IngestOutcome.PERSIST_FAILED -> ValidationResult.Invalid
+                // LOST_RACE still propagates: the record was legitimately well-formed and correctly
+                // ordered at the moment it was checked.
+                IngestOutcome.ACCEPTED, IngestOutcome.LOST_RACE -> ValidationResult.Valid
+            }
+        }
+
+        /**
+         * Everything after the cryptographic checks, shared by [onGossipMessage] and the DHT fallback
+         * ([ingestFromDht]): [PeerRecordIndex.canAccept] -> persist (behind
+         * [PeerRecordIndex.tryReservePersistence], reservation released if `storage.put` fails) ->
+         * [PeerRecordIndex.add]. [record] MUST already have passed [PeerRecord.verify],
+         * [verifyBinding] and [verifyPossession]; [bytes] are its exact encoding. [origin] is only for log
+         * lines. No clock and no network call in here, by design - the callers decide what is trusted.
+         */
+        internal fun ingestVerified(
+            record: PeerRecord,
+            bytes: ByteArray,
+            origin: String,
+            storage: NabuStorage,
+            index: PeerRecordIndex,
+        ): IngestOutcome {
             if (!index.canAccept(record)) {
                 logger.debug {
-                    "declining duplicate or stale (sequence-number-superseded) peer record from $from on " +
-                        "$PEER_RECORD_GOSSIP_TOPIC - not persisting or re-propagating"
+                    "declining duplicate or stale (sequence-number-superseded) peer record from $origin - " +
+                        "not persisting or re-propagating"
                 }
-                return ValidationResult.Invalid
+                return IngestOutcome.DECLINED
             }
 
             if (index.tryReservePersistence(record)) {
@@ -267,15 +329,13 @@ class PeerDirectoryGossip private constructor(
                     // that ends up neither persisted nor tracked. See
                     // PeerRecordIndex.releaseReservedPersistence's own doc comment.
                     index.releaseReservedPersistence(record)
-                    logger.warn(e) {
-                        "failed to persist gossip-received peer record from $from - declining to accept it"
-                    }
-                    return ValidationResult.Invalid
+                    logger.warn(e) { "failed to persist peer record from $origin - declining to accept it" }
+                    return IngestOutcome.PERSIST_FAILED
                 }
             } else {
                 logger.debug {
-                    "persistence cap reached - not durably storing peer record from $from on " +
-                        "$PEER_RECORD_GOSSIP_TOPIC (still tracking and propagating it)"
+                    "persistence cap reached - not durably storing peer record from $origin " +
+                        "(still tracking it)"
                 }
             }
 
@@ -283,16 +343,14 @@ class PeerDirectoryGossip private constructor(
                 // Wider than the "narrow race" every sibling index documents: PeerRecordIndex.add
                 // can also decline a record that WAS acceptable at canAccept()-time but has since
                 // been superseded by an even-newer concurrently-processed record for the same
-                // identity, not just an exact duplicate - see PeerRecordIndex.canAccept's doc
-                // comment. Still propagates: the record was legitimately well-formed and
-                // correctly-ordered at the moment it was checked.
+                // identity, not just an exact duplicate - see PeerRecordIndex.canAccept's doc comment.
                 logger.debug {
-                    "peer record from $from on $PEER_RECORD_GOSSIP_TOPIC was persisted but lost a race (duplicate " +
-                        "or since-superseded) before add() ran - propagating anyway"
+                    "peer record from $origin was persisted but lost a race (duplicate or " +
+                        "since-superseded) before add() ran"
                 }
+                return IngestOutcome.LOST_RACE
             }
-
-            return ValidationResult.Valid
+            return IngestOutcome.ACCEPTED
         }
     }
 }

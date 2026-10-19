@@ -29,7 +29,7 @@ class LapisKademliaEngineTest :
                 LapisKademliaEngine(
                     Multihash.deserialize(realPeerId().bytes),
                     BoundedProviderStore(limits),
-                    BoundedRecordStore(8),
+                    BoundedIpnsRecordStore(8),
                     RamBlockstore(),
                     limits,
                 )
@@ -69,7 +69,7 @@ class LapisKademliaEngineTest :
                 LapisKademliaEngine(
                     Multihash.deserialize(realPeerId().bytes),
                     BoundedProviderStore(limits),
-                    BoundedRecordStore(8),
+                    BoundedIpnsRecordStore(8),
                     RamBlockstore(),
                     limits,
                 )

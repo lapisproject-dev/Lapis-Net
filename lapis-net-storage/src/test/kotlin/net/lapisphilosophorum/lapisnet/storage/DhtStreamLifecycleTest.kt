@@ -123,7 +123,7 @@ class DhtStreamLifecycleTest :
                 awaitCondition { streams() <= 4 }
                 val baseline = streams()
 
-                val key = "/ipns/".toByteArray() + byteArrayOf(0x12, 0x20) + ByteArray(32) { 7 }
+                val key = ipnsKeyFor(realPeerId())
                 repeat(20) {
                     attacker.send(
                         victim,
@@ -178,7 +178,7 @@ class DhtStreamLifecycleTest :
                     .build()
 
                 val multihash = byteArrayOf(0x12, 0x20) + ByteArray(32) { 5 }
-                val ipnsKey = "/ipns/".toByteArray() + byteArrayOf(0x12, 0x20) + ByteArray(32) { 7 }
+                val ipnsKey = ipnsKeyFor(realPeerId())
                 val requests =
                     listOf(
                         request(Dht.Message.MessageType.FIND_NODE, multihash),

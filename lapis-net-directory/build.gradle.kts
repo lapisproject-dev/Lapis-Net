@@ -9,9 +9,11 @@
 // bundles through this directory; V0.8.4 (online DM) resolves recipients' current network
 // addresses through it.
 //
-// Kademlia.dialPeer was documented broken from V0.1.4 until V0.9.8 repaired the underlying defects
-// (see docs/architecture.adoc's Storage section; the reason is historical now) - like every V0.9
-// mail sub-wave, this module is gossip-only, no DHT publication.
+// Hybrid since V0.9.13: GossipSub is the fast path; DirectoryDht adds the DHT as a fallback and catch-up
+// path (the peer record and prekey bundle of one node share a single IPNS name, its Ed25519 peer ID). It
+// builds on lapis-net-storage's own IPNS responder (NabuStorage.publishIpnsValue / resolveIpnsValue).
+// Kademlia.dialPeer was documented broken from V0.1.4 until V0.9.8 (see docs/architecture.adoc's Storage
+// section; historical now); the gossip validators stay free of network and clock access either way.
 //
 // Dependency shape mirrors lapis-net-mail's stated house rule, not lapis-net-trust's older
 // transitive-reliance-on-lapis-net-storage's-own-api-edge approach: lapis-net-identity is `api`

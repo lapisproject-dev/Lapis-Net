@@ -64,6 +64,29 @@ class PrekeyBundleGossip private constructor(
         return if (bundle.notValidAfterEpochSecond < nowEpochSecond) null else bundle
     }
 
+    /** Identities this node holds a bundle for, expired or not (V0.9.13: input of [DirectoryDht.refreshStale]). */
+    internal fun knownIdentities(): Set<Secp256k1PublicKey> = index.allIdentities()
+
+    /** Whether the tracked bundle for [identity] has expired or will within [withinSeconds] of [nowEpochSecond]. */
+    internal fun expiresWithin(
+        identity: Secp256k1PublicKey,
+        nowEpochSecond: Long,
+        withinSeconds: Long,
+    ): Boolean {
+        val bundle = index.current(identity) ?: return false
+        return bundle.notValidAfterEpochSecond < nowEpochSecond + withinSeconds
+    }
+
+    /**
+     * Takes a bundle that [DirectoryDht] fetched from the DHT and fully verified into persistence and the
+     * index, exactly as a gossip-received one would be; returns whether it ended up tracked. Never
+     * re-published to GossipSub - see [PeerDirectoryGossip.ingestFromDht].
+     */
+    internal fun ingestFromDht(
+        bundle: PrekeyBundle,
+        bytes: ByteArray,
+    ): Boolean = ingestVerified(bundle, bytes, "the DHT", storage, index) == IngestOutcome.ACCEPTED
+
     /** Unsubscribes from the gossip topic - mirrors [PeerDirectoryGossip.stop] exactly. */
     fun stop() {
         subscription.unsubscribe()
@@ -150,12 +173,32 @@ class PrekeyBundleGossip private constructor(
                 return ValidationResult.Invalid
             }
 
+            return when (
+                ingestVerified(bundle, bytes, "gossip from $from on $PREKEY_BUNDLE_GOSSIP_TOPIC", storage, index)
+            ) {
+                IngestOutcome.DECLINED, IngestOutcome.PERSIST_FAILED -> ValidationResult.Invalid
+                IngestOutcome.ACCEPTED, IngestOutcome.LOST_RACE -> ValidationResult.Valid
+            }
+        }
+
+        /**
+         * Everything after the cryptographic checks, shared by [onGossipMessage] and the DHT fallback
+         * ([ingestFromDht]); see [PeerDirectoryGossip.ingestVerified] for the contract. [bundle] MUST
+         * already have passed [PrekeyBundle.verify], [verifyEncryptionBinding] and [verifySignedPrekey].
+         */
+        internal fun ingestVerified(
+            bundle: PrekeyBundle,
+            bytes: ByteArray,
+            origin: String,
+            storage: NabuStorage,
+            index: PrekeyBundleIndex,
+        ): IngestOutcome {
             if (!index.canAccept(bundle)) {
                 logger.debug {
-                    "declining duplicate or stale (sequence-number-superseded) prekey bundle from $from on " +
-                        "$PREKEY_BUNDLE_GOSSIP_TOPIC - not persisting or re-propagating"
+                    "declining duplicate or stale (sequence-number-superseded) prekey bundle from $origin - " +
+                        "not persisting or re-propagating"
                 }
-                return ValidationResult.Invalid
+                return IngestOutcome.DECLINED
             }
 
             if (index.tryReservePersistence(bundle)) {
@@ -169,26 +212,23 @@ class PrekeyBundleGossip private constructor(
                     // slot for a bundle that ends up neither persisted nor tracked. See
                     // PrekeyBundleIndex.releaseReservedPersistence's own doc comment.
                     index.releaseReservedPersistence(bundle)
-                    logger.warn(e) {
-                        "failed to persist gossip-received prekey bundle from $from - declining to accept it"
-                    }
-                    return ValidationResult.Invalid
+                    logger.warn(e) { "failed to persist prekey bundle from $origin - declining to accept it" }
+                    return IngestOutcome.PERSIST_FAILED
                 }
             } else {
                 logger.debug {
-                    "persistence cap reached - not durably storing prekey bundle from $from on " +
-                        "$PREKEY_BUNDLE_GOSSIP_TOPIC (still tracking and propagating it)"
+                    "persistence cap reached - not durably storing prekey bundle from $origin (still tracking it)"
                 }
             }
 
             if (!index.add(bundle)) {
                 logger.debug {
-                    "prekey bundle from $from on $PREKEY_BUNDLE_GOSSIP_TOPIC was persisted but lost a race " +
-                        "(duplicate or since-superseded) before add() ran - propagating anyway"
+                    "prekey bundle from $origin was persisted but lost a race (duplicate or since-superseded) " +
+                        "before add() ran"
                 }
+                return IngestOutcome.LOST_RACE
             }
-
-            return ValidationResult.Valid
+            return IngestOutcome.ACCEPTED
         }
     }
 }

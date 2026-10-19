@@ -214,7 +214,10 @@ is an uncapped `HashMap`, and its `KademliaEngine` hands any connected peer's si
 record straight into it with no other rate limit - reachable simply by wiring up Kademlia at all,
 regardless of whether this project's own API ever publishes an IPNS record itself.
 `lapis-net-storage`'s own `BoundedRecordStore` (LRU-capped, mirroring Nabu's own
-`RamProviderStore`) is used instead to prevent unbounded remote-triggered heap growth.
+`RamProviderStore`) was used instead to prevent unbounded remote-triggered heap growth. **Superseded in
+V0.9.13:** Nabu's `PUT_VALUE` / `GET_VALUE` handling is no longer reached at all; `IpnsValueResponder` answers
+both over a `BoundedIpnsRecordStore` (keyed by peer ID, LRU, expiry-aware), and Nabu's engine gets an empty
+record store. See "DHT fallback for the peer directory and prekey bundles (V0.9.13)".
 
 === Cross-node DHT provider discovery: broken V0.1.4–V0.9.7, repaired in V0.9.8
 
@@ -307,7 +310,8 @@ disappears.
 blocks this node holds — previously they practically never could. That does not change the trust
 model, but it does make the existing one load-bearing rather than theoretical: the always-allow
 `BlockRequestAuthoriser` documented above still applies (unguessable 256-bit content-hash CIDs are
-the access control), and `BoundedRecordStore`'s LRU cap on the IPNS record store is unchanged.
+the access control), and the LRU cap on the IPNS record store is unchanged (since V0.9.13 that is
+`BoundedIpnsRecordStore`).
 `NabuStorage.provide()`'s own fan-out is bounded (20 peers, matching Nabu's), and the V0.9.8 text
 claimed an overall deadline plus a 2-second per-peer cap and tolerance of unparseable addresses.
 **Corrected in V0.9.11: that was only partly true.** The per-peer cap and the fan-out applied to the
@@ -318,6 +322,9 @@ exception handling inside Nabu's own `dialPeer`. Both claims are true of the cod
 "DHT layer hardening (V0.9.11)" below.
 
 **Follow-up, deliberately NOT done in V0.9.8: downstream modules still route over GossipSub.**
+_Update, V0.9.13: `lapis-net-directory` (peer records and prekey bundles) is now hybrid, GossipSub plus a DHT
+fallback; `lapis-net-mail` and `lapis-net-dm` stay gossip-only until part 2 of that wave. The paragraph below
+describes the situation as of V0.9.8._
 `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` all publish and
 discover over GossipSub, each citing this now-fixed `Kademlia.dialPeer` limitation as the reason.
 V0.9.8 fixes the capability at the `lapis-net-storage` layer only and leaves every one of those
@@ -414,6 +421,10 @@ All bounds live in `DhtLimits` and are validated at construction.
 |`streamCloseGrace`|1 s|wait for the responder to close before the initiator resets
 |===
 
+V0.9.13 added eight more limits for IPNS records (`maxIpnsRecordBytes`, `recordStoreCapacity`,
+`maxRecordValidity`, `maxClockSkew`, `valuePutFanout`, `resolveQuorum`, `maxValuePutsPerSourcePerMinute`,
+`valueRateTrackerCapacity`); they are listed with the DHT fallback below.
+
 ==== Walk and deadline semantics
 
 The DHT key of a block is its **bare multihash** (`cid.bareMultihash().toBytes()`), the same point of
@@ -472,7 +483,9 @@ Worst case with the defaults: 1024 x 8 x 8 x 256 B, roughly 16 MiB.
 
 `InboundDhtRequestPolicy` runs before Nabu's `receiveRequest`: keys of `ADD_PROVIDER` /
 `GET_PROVIDERS` must be a safe multihash, provider IDs likewise, `GET_VALUE` / `PUT_VALUE` need the
-`/ipns/` prefix and a safe suffix (and a record whose key equals the request key), and an unknown
+`/ipns/` prefix and (since V0.9.13) exactly an Ed25519 identity multihash as the suffix - the former
+"any safe multihash" shape is refused - and for `PUT_VALUE` a record whose key equals the request key and whose
+value is within `maxIpnsRecordBytes`; and an unknown
 message type is rejected instead of throwing on the event loop. A rejected or failed request resets
 the stream. The check is `CidBytesValidation` from `lapis-net-core`, the same guard the codecs use.
 
@@ -480,7 +493,7 @@ Whatever the base class does with an accepted request is guarded: an exception -
 `StackOverflowError`, which Peergos' unbounded CBOR parser can throw for a deeply nested but validly
 signed IPNS record - resets the stream and is counted, instead of escaping onto the Netty event loop
 (other `VirtualMachineError`s are rethrown). A request that was ANSWERED (`FIND_NODE`, `GET_PROVIDERS`,
-`GET_VALUE`, `PUT_VALUE`) is half-closed and reset after `streamCloseGrace` unless the initiator closes
+`GET_VALUE`, `PUT_VALUE`; since V0.9.13 the last two by `IpnsValueResponder`, not the base class) is half-closed and reset after `streamCloseGrace` unless the initiator closes
 its end first; one that was not answered (`ADD_PROVIDER`, `PING`, an invalid or stale `PUT_VALUE`) is
 reset at once. An initiator that never closes therefore cannot keep streams open.
 
@@ -1583,7 +1596,7 @@ the network.
 **One GossipSub topic per recipient identity.** `InboxTopics.forRecipient(key)` derives
 `"LapisNet:inbox:<64 lowercase hex chars of sha256(compressed pubkey)>:v1"`. Deliberately NOT a DHT
 inbox record — gossip-only, for the same `Kademlia.dialPeer`-is-broken reason above (historical: repaired in V0.9.8, see the Storage section; the gossip-only design stands). A node offline
-during the gossip window has no catch-up path: best-effort convergence, the same accepted
+during the gossip window has no catch-up path (still true for mail; the peer directory and prekey bundles gained a DHT catch-up in V0.9.13): best-effort convergence, the same accepted
 limitation `VeritasGossip`'s single network-wide topic already carries, now applied to a
 per-identity topic instead.
 
@@ -2310,7 +2323,9 @@ addresses through.
 `org.peergos.protocol.dht.Kademlia.dialPeer` was documented broken from V0.1.4 until V0.9.8 repaired the
 underlying defects (see the Storage section above; the stated reason is historical) — propagation is entirely via `PeerDirectoryGossip`'s dedicated GossipSub
 topic (`LapisNet:peer-record-gossip:v1`), mirroring `InboxGossip`'s identical precedent. A node
-offline during the gossip window has no catch-up path.
+offline during the gossip window has no catch-up path. _Update, V0.9.13: it now has one, the DHT fallback
+(`DirectoryDht`) - opt-in, caller-driven, needing the owner's peer ID as a hint; see "DHT fallback for the
+peer directory and prekey bundles (V0.9.13)"._
 
 **THREE independently-verified signatures per record, not two — this wave's central design
 decision, verified via the mandatory adversarial test rather than merely assumed correct, and
@@ -2614,7 +2629,8 @@ a genuinely generated public key still round-trips through the new validation.
 
 **Known, deliberately accepted gaps:**
 
-* **No DHT publication.** Gossip-only, same accepted limitation as every V0.9 mail sub-wave.
+* **No DHT publication.** _Superseded in V0.9.13:_ publication is available as an opt-in fallback
+  (`DirectoryDht.publishOwn`), the caller decides when; gossip remains the primary path.
 * **No `SFU_CAPABLE` capability flag.** MLS/conferencing/SFU cut from the V0.8 arc entirely on
   2026-08-04 — no consumer exists in this reduced arc; a future wave that reintroduces group calling
   can add a new bit without touching this codec's version or invalidating any V0.8.1 record already
@@ -2871,8 +2887,9 @@ ever runs on untrusted header bytes.
 
 * **No PQXDH / post-quantum hybrid key exchange.** X25519 only.
 * **No formal deniability analysis** beyond X3DH's own published security properties.
-* **No DHT publication.** Gossip-only (`PrekeyBundleGossip`), same `Kademlia.dialPeer`-broken
-  limitation as every prior wave (historical: repaired in V0.9.8, see the Storage section).
+* **No DHT publication.** _Superseded in V0.9.13:_ bundles can be published, together with the peer record,
+  through `DirectoryDht` (size-limited, see "DHT fallback ... (V0.9.13)"); `PrekeyBundleGossip` remains the
+  primary path.
 * **No wire codec for the X3DH initial-message header (`X3dhPreKeyMessageHeader`).** This wave's
   deliverable is the handshake primitive and prekey publication/consumption machinery, callable and
   independently testable — not yet wired into a live message-send path. V0.8.4 (online DM) owns
@@ -4723,6 +4740,167 @@ entries it invents are discarded; entries it omits are appended.
 closing the check-then-act race between a manual `reserve` and the selector.
 * **Messaging modules untouched.** Routing DMs, mail or calls over relays — and the design questions
   each raises — is a separate wave.
+
+== DHT fallback for the peer directory and prekey bundles (V0.9.13)
+
+_Status: part 1 of 2, implemented on a local feature branch; no version bump, no tag. Part 2 (mail pointers
+and the DM session manager as consumers) is not done._
+
+V0.9.8 repaired the DHT at the `lapis-net-storage` layer and V0.9.11 hardened it, but every module above
+it kept routing over GossipSub, so a node that was offline during the gossip window had no way to learn a
+contact's current peer record or prekey bundle. V0.9.13 adds the DHT as a **fallback and catch-up path** for
+exactly two record types, the `PeerRecord` and the `PrekeyBundle`. GossipSub stays the fast path and is
+unchanged. `lapis-net-mail` and `lapis-net-dm` are still gossip-only until part 2.
+
+=== Hybrid model
+
+* A node publishes its peer record and its prekey bundle together, as one IPNS value, with
+  `DirectoryDht.publishOwn`. Nothing publishes by itself: when and how often is the caller's decision, and
+  nothing in this wave wires it into `BrowserServer`.
+* A reader asks with `DirectoryDht.resolve` / `lookupPeerRecord` / `lookupPrekeyBundle` (the gossip index is
+  consulted first and a hit never touches the network), `catchUp` (a bounded list of identities) or
+  `refreshStale` (the identities whose tracked record has expired or is about to).
+* What comes back is verified completely and then enters the same persistence and index as a gossip-received
+  record (`ingestVerified`, the tail shared with the gossip validators). It is **never gossiped on**: a
+  lookup must not turn into network-wide traffic, and two nodes with different views must not be able to
+  ping-pong the same record. The gossip validators themselves are untouched in behaviour - still no clock, no
+  network - and a test pins that their compiled form does not even mention `DirectoryDht`.
+
+=== One IPNS name per node, and why there is an envelope
+
+The IPNS name is the node's Ed25519 libp2p peer ID. A node has one such key and therefore exactly one name, so
+the peer record and the prekey bundle share it, in a `DirectoryDhtValue` envelope: magic `LNDV`, version,
+flags, the secp256k1 identity, the `IdentityBinding`, and the encoded parts as length-prefixed original
+bytes (re-encoding would change the content ID that `NabuStorage.put` derives). The identity and binding are
+repeated because a `PrekeyBundle` carries neither, so a bundle-only value is checked the same way.
+
+*Consequence for lookups.* The name is the Ed25519 peer ID, and a reader who knows only the secp256k1 identity
+cannot compute it. The reader needs the peer ID as a hint: from an older record in the index (also an expired
+one), or from the contact it was given (`lapisnet://connect` carries the `/p2p/` ID). Without either,
+`resolve` answers `NoPeerIdKnown` and makes no network call. A first contact with a bare secp256k1 identity is
+therefore not resolvable through this fallback; that is accepted and documented, not a bug.
+
+=== The chain of mutual proof
+
+A value is accepted only if all of this holds (`DirectoryDhtValidator`):
+
+. the IPNS record was signed by the Ed25519 key behind the name (checked by `resolveIpnsValue`);
+. that name is the peer ID derived from `binding.ed25519PublicKey`: the value says which Ed25519 key it
+  speaks for, and that key signed it;
+. `binding` is a valid `IdentityBinding` by `identity`: the secp256k1 identity vouches for that key;
+. `identity` is the one the caller asked for;
+. a peer record passes `PeerRecord.verify`, `verifyBinding` and `verifyPossession` (the three independent
+  checks of V0.8.1), belongs to this identity and this binding, and has not expired;
+. a prekey bundle passes `PrekeyBundle.verify`, `verifyEncryptionBinding` and `verifySignedPrekey`, belongs to
+  this identity and has not expired.
+
+If any part fails, the whole value is rejected: an envelope with a forged half is not trusted for the other half.
+A wrong peer ID hint cannot make a wrong value pass, because a value must be signed by the hinted key and name
+the asked-for identity with a binding by that identity for that very key.
+
+=== Size budget
+
+An IPNS v2 record carries its value twice (protobuf `value` and the signed CBOR `data`), and no DHT peer
+accepts a record above 10 KiB (`IPNS.MAX_RECORD_SIZE`). `DirectoryDhtValueCodec.MAX_VALUE_BYTES` is 4800; a
+test builds a value of exactly that size and checks that the signed record is 9819 bytes. A peer record with
+16 addresses alone is about 4.4 KB and a bundle with 100 one-time prekeys about 3.9 KB, so **both at their
+maximum do not fit together**: `publishOwn` rejects an oversized value with `IllegalArgumentException`, and the
+caller publishes a reduced bundle (few or no one-time prekeys) for the DHT. One-time prekeys served from the
+DHT may already have been used by somebody else; X3DH then runs without a one-time prekey, which is the
+documented fallback of the handshake.
+
+=== The IPNS layer in `lapis-net-storage`: own responder and own validator
+
+`NabuStorage.publishIpnsValue(signingKey, value, sequence, notValidAfter, ttl, timeout)` and
+`resolveIpnsValue(publisher, timeout)` are bounded like the other DHT operations (absolute deadline, the
+shared operation permits, `stop()` ends waits). Nabu's own `Kademlia.publishValue` / `resolveValue` are not
+used for the reasons in the V0.9.11 section, and Nabu's `PUT_VALUE` / `GET_VALUE` *handlers* are not used
+either, because inspecting the v0.8.0 bytecode showed three problems:
+
+* **They cannot serve Ed25519 names.** `PUT_VALUE` stores under a `Multihash`; `GET_VALUE` looks up with
+  `IPNS.getCidFromKey`, i.e. `Cid.cast` of the key suffix, and a hit in a map keyed by `Multihash` is
+  doubtful. Ed25519 peer IDs are identity multihashes (`0x00 0x24 ...`), and the `isSafeToCast` check that the V0.9.11 request policy applied to `GET_VALUE` keys reads such a key as a CID (version and codec varints first), so it very probably refused them; the existing tests only ever used `0x12 0x20` keys.
+* **`IPNS.parseAndValidateIpnsEntry` parses the signed CBOR with Peergos' parser, which has no depth limit**
+  (a validly signed record of a few KiB with thousands of nested arrays overflows the stack), and
+* **it compares the expiry with `LocalDateTime.now()`**, the machine's local time zone, so the expiry is shifted
+  by the UTC offset (one to two hours in Germany).
+
+Therefore `LapisKademliaEngine` answers `PUT_VALUE` / `GET_VALUE` itself (`IpnsValueResponder`) and hands
+the base class an `EmptyRecordStore`, so it could not store a record even if a code path reached it.
+`IpnsRecordCodec.validate` parses no CBOR at all: it reads the signed fields from the protobuf, re-encodes
+the CBOR a correct signer would have produced (`IPNS.createCborDataForIpnsEntry`, deterministic) and requires
+it to be byte-identical to the signed `data`. It also requires the exact canonical validity string, an optional
+`pubKey` field equal to the key derived from the name, a valid Ed25519 signature, and an expiry in
+`[now - skew, now + maxRecordValidity + skew]`, all computed in UTC on `Instant`. The size is checked before
+anything is parsed. Key shape: `parseIpnsKey` accepts exactly `/ipns/` + the 38-byte Ed25519 identity
+multihash (one fixed size, checked first; all-zero and all-one raw keys are refused); `InboundDhtRequestPolicy`
+uses it, and requires `record.key == key` and `record.value` within `maxIpnsRecordBytes` for `PUT_VALUE`.
+
+*Who may write.* An inbound `PUT_VALUE` is accepted only if the Noise-authenticated source peer **is** the
+publisher (checked first, free), the source is within its token bucket (`maxValuePutsPerSourcePerMinute`,
+tracked in a bounded LRU, a rejected request costs a token too), and the record validates and supersedes what
+is held (higher sequence, or equal sequence and later expiry; a different record with equal sequence and equal
+expiry does not replace the held one). The accepted request is echoed, which is a real acknowledgement:
+`publishIpnsValue` counts the echoes that carry exactly the sent record, unlike `ADD_PROVIDER`. Nobody can
+therefore relay or flood somebody else's record into a node, and a source can only ever occupy a store slot
+under its own name. The store keeps at most `recordStoreCapacity` records (LRU).
+
+*Reading.* `resolveIpnsValue` consults the local store, then walks with `GET_VALUE` until
+`resolveQuorum` valid answers are in, validates **every** answer completely, and returns the one with the
+highest sequence (then the latest expiry). A responder that withholds a record or replays an older one cannot
+hide a newer one that another peer returned. Writes and reads run through `DhtWalker.rpc`
+(`thenComposeAsync` on the RPC executor, never on the Netty event loop), and every stream is closed on every
+path.
+
+*Sequence.* `DirectoryDht.publishOwn` uses `max(previous + 1, epoch milliseconds)`, monotone within the
+process. If the clock jumps back across a restart, nodes holding the old record ignore the new publication
+until the old one expires (at most the record's validity, seven days). A persisted counter would remove that
+window; it was not built.
+
+=== Limits
+
+[cols="2,1,4",options="header"]
+|===
+|Limit |Default |Meaning
+
+|`DhtLimits.maxIpnsRecordBytes`|10240|signed IPNS record size, checked before parsing (hard maximum: Nabu's 10240)
+|`DhtLimits.recordStoreCapacity`|1024|IPNS records kept (LRU)
+|`DhtLimits.maxRecordValidity`|7 days|how far ahead an expiry may lie
+|`DhtLimits.maxClockSkew`|5 min|tolerance at both ends of the validity window
+|`DhtLimits.valuePutFanout`|8|peers a `PUT_VALUE` goes to, and the candidate window of a `GET_VALUE` walk
+|`DhtLimits.resolveQuorum`|3|valid answers after which a resolve stops early
+|`DhtLimits.maxValuePutsPerSourcePerMinute`|6|inbound `PUT_VALUE` per source peer (token bucket)
+|`DhtLimits.valueRateTrackerCapacity`|1024|source peers the rate limiter remembers (LRU)
+|`DirectoryDhtLimits.maxIdentitiesPerCatchUp`|32|identities one `catchUp` looks at
+|`DirectoryDhtLimits.minResolveInterval`|30 s|per identity, between two network lookups
+|`DirectoryDhtLimits.negativeCacheTtl`|60 s|per identity, after a lookup that found nothing valid
+|`DirectoryDhtLimits.resolveTrackerCapacity`|1024|identities the two timers above remember (LRU)
+|`DirectoryDhtLimits.minRepublishInterval`|300 s|between two network publications (monotonic clock)
+|`DirectoryDhtLimits.defaultTimeout`|10 s|deadline of a publish or lookup without an explicit one
+|`DirectoryDhtLimits.maxRecordValidity`|7 days|cap on the IPNS expiry of a publication
+|===
+
+=== Metadata leak (accepted until traffic anonymisation, section 11)
+
+A `GET_VALUE` tells every peer the walk asks, which is up to `walkParallelism x maxWalkRounds` peers plus the
+routing-table seeds, **which peer ID is being looked for** and, through the Noise handshake, the peer ID of the
+asker. A `PUT_VALUE` tells the peers it is sent to that the publisher is online now. This is the same class of
+exposure as the gossip topics, which broadcast presence to every subscriber, and is accepted for the same
+reason. It is mitigated by the negative cache and `minResolveInterval` (no repeated asking), by the fact that
+nothing calls the fallback unless the caller decides to, and by the gossip index being consulted first.
+
+=== Known residual risks
+
+* **Eviction by Sybil identities.** The record store is an LRU. An attacker who connects with many fake
+  identities, one connection each, can push honest records out of a node's store. A publisher that republishes
+  restores them. No per-peer reservation exists.
+* **No repair of stale records at third parties.** A resolver that finds a newer record does not write it back
+  to peers that returned an older one.
+* **No interoperability with IPFS IPNS.** Only Ed25519 names and canonical CBOR are accepted; records from
+  go-libp2p or Kubo are rejected. The Lapis network has no foreign nodes.
+* **Reuse of used one-time prekeys** (see the size budget).
+* **A publisher that goes offline** stays resolvable only until its record expires, at most seven days.
+* The wave has had no independent review or security audit beyond the pipeline's own loops yet.
 
 == Diagrams
 

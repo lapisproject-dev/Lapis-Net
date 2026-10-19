@@ -1966,3 +1966,35 @@ hostile candidates, non-public addresses), reachability heuristic, and real-node
 * A component that later publishes core metrics for a tuple the publisher also wrote must merge the relay block.
 * This wave has had no independent review or security audit yet.
 
+== V0.9.13 — DHT fallback for the directory (part 1 of 2)
+
+_Not yet released: implemented on a local feature branch, no version bump, no tag. This is an internal wave
+identifier, so the release card above gets no line for it._
+
+=== Progress
+
+**What is new** (details: `docs/architecture.adoc`, "DHT fallback for the peer directory and prekey bundles (V0.9.13)"):
+
+* **`lapis-net-storage`:** `NabuStorage.publishIpnsValue` / `resolveIpnsValue`, an own `PUT_VALUE` / `GET_VALUE`
+  responder for Ed25519 IPNS names (Nabu's cannot serve them), an IPNS validator that parses no CBOR and
+  works in UTC, a bounded LRU record store, a per-source rate limit, and `DhtWalker.putValue` / `getValue`
+  with real acknowledgements. Eight new `DhtLimits` fields.
+* **`lapis-net-directory`:** `DirectoryDht` (`publishOwn`, `resolve`, `lookupPeerRecord`, `lookupPrekeyBundle`,
+  `catchUp`, `refreshStale`), the `DirectoryDhtValue` envelope (peer record and prekey bundle under one IPNS
+  name), `DirectoryDhtValidator`, `DirectoryDhtLimits`. GossipSub stays the fast path and its validators are
+  unchanged; values from the DHT enter the same indexes through the shared `ingestVerified` tail and are not
+  gossiped on.
+* `deriveLibp2pPrivKey` in `lapis-net-networking` is now public (the directory signs IPNS records with the
+  node's transport key).
+
+**What remains (part 2 and open points):**
+
+* Part 2: consumers. Mail pointers and `DmSessionManager` do not use the fallback yet, and no application
+  module (`BrowserServer`, CLI) publishes or refreshes. Wiring it earlier would add the metadata exposure
+  without a user.
+* A lookup needs the owner's Ed25519 peer ID as a hint; a bare secp256k1 identity cannot be resolved.
+* Both artefacts at their maximum do not fit one record (4800 byte value budget); DHT readers may get used
+  one-time prekeys.
+* Record store eviction by many fake identities, no repair of stale records at third parties, no IPFS interop,
+  sequence from epoch milliseconds (a clock stepping back across a restart delays new publications).
+* This wave has had no independent review or security audit beyond the pipeline's own loops yet.
