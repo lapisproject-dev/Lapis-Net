@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.directory
 
+import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
 import io.libp2p.core.crypto.PrivKey
 import net.lapisphilosophorum.lapisnet.storage.IpnsPublishResult
@@ -50,4 +51,37 @@ internal class NabuIpnsValueStore(
         publisher: PeerId,
         timeout: Duration,
     ): IpnsValue? = storage.resolveIpnsValue(publisher, timeout)
+}
+
+/**
+ * The seam for rendezvous provider records (V0.9.14): announce "I can provide this key" and look up who does.
+ * The production implementation is [NabuRendezvousStore]; tests of [DirectoryDht] substitute a fake.
+ */
+internal interface RendezvousStore {
+    /** @return the number of peers the provider record was sent to (the protocol has no acknowledgement). */
+    fun provide(
+        cid: Cid,
+        timeout: Duration,
+    ): Int
+
+    fun findProviders(
+        cid: Cid,
+        max: Int,
+        timeout: Duration,
+    ): Set<PeerId>
+}
+
+internal class NabuRendezvousStore(
+    private val storage: NabuStorage,
+) : RendezvousStore {
+    override fun provide(
+        cid: Cid,
+        timeout: Duration,
+    ): Int = storage.provide(cid, timeout)
+
+    override fun findProviders(
+        cid: Cid,
+        max: Int,
+        timeout: Duration,
+    ): Set<PeerId> = storage.findProviders(cid, max, timeout)
 }

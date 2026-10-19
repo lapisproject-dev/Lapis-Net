@@ -3717,7 +3717,7 @@ via `MultiaddrHygiene.isBlockedPrivateOrLocal`; and `pollOnce` enforces a wall-c
 (`MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS`, 4), so one flooding sender identity can no longer consume
 an entire pass and starve every other sender's genuinely fetchable pointers behind it — the flooded
 sender's excess pointers simply carry over to the next pass rather than being lost or blocking others.
-**`MultiaddrHygiene` deliberately does NOT block loopback/RFC1918/link-local addresses**, unlike a
+**`MultiaddrHygiene` (moved to `lapis-net-directory` in V0.9.14, behaviour unchanged) deliberately does NOT block loopback/RFC1918/link-local addresses**, unlike a
 textbook SSRF blocklist — see that object's own doc comment: this project's own documented networking
 model ("no NAT traversal... same-LAN, or otherwise directly reachable," `DmSessionManager`'s own class
 doc comment) makes those ranges the PRIMARY, expected peer address space, not an anomaly, and
@@ -4744,13 +4744,14 @@ closing the check-then-act race between a manual `reserve` and the selector.
 == DHT fallback for the peer directory and prekey bundles (V0.9.13)
 
 _Status: part 1 of 2, implemented on a local feature branch; no version bump, no tag. Part 2 (mail pointers
-and the DM session manager as consumers) is not done._
+and the DM session manager as consumers) is described in "DHT fallback for mail and direct messages (V0.9.14)"
+below._
 
 V0.9.8 repaired the DHT at the `lapis-net-storage` layer and V0.9.11 hardened it, but every module above
 it kept routing over GossipSub, so a node that was offline during the gossip window had no way to learn a
 contact's current peer record or prekey bundle. V0.9.13 adds the DHT as a **fallback and catch-up path** for
 exactly two record types, the `PeerRecord` and the `PrekeyBundle`. GossipSub stays the fast path and is
-unchanged. `lapis-net-mail` and `lapis-net-dm` are still gossip-only until part 2.
+unchanged. `lapis-net-mail` and `lapis-net-dm` become consumers in part 2 (V0.9.14).
 
 === Hybrid model
 
@@ -4901,6 +4902,220 @@ nothing calls the fallback unless the caller decides to, and by the gossip index
 * **Reuse of used one-time prekeys** (see the size budget).
 * **A publisher that goes offline** stays resolvable only until its record expires, at most seven days.
 * The wave has had no independent review or security audit beyond the pipeline's own loops yet.
+
+== DHT fallback for mail and direct messages (V0.9.14)
+
+_Status: part 2 of 2, implemented on a local feature branch; no version bump, no tag, not wired into any
+application (`BrowserServer`, CLI). Nothing calls the new code unless an application decides to._
+
+V0.9.13 let a node catch up on the peer records and prekey bundles it missed. V0.9.14 lets it also catch up on
+**offline direct messages and mail pointers**: a recipient that was not in the gossip window - not subscribed
+yet, or restarted (the in-memory `MailboxPointerIndex` is lost on restart) - can learn from the DHT that a
+sender has something for it. GossipSub stays the fast path and its validators behave exactly as before.
+
+=== Hybrid model, part 2
+
+* A sender does not write anything to the DHT itself. `DmSessionManager` (offline deposit) and `MailSender` (every
+  mail) only `offer` an *outbox entry* into a `DhtOutbox`, a bounded in-memory store: a cheap map operation, no
+  I/O. Both take the outbox as an optional parameter; without one nothing changes.
+* The one and only writer of the IPNS value stays `DirectoryDht.publishOwn`, which takes a selection of the
+  outbox into the value it publishes anyway. Mail and DM must never call `publishIpnsValue` themselves: a node
+  has exactly one IPNS name (section "One IPNS name per node"), and a second writer would overwrite the peer
+  record and the bundle. Derived keys per purpose are not an option either - `IpnsValueResponder.handlePut`
+  accepts a value only from the publisher itself, and loosening that would break a V0.9.13 security property.
+* A recipient fetches with the V0.9.13 calls (`resolve`, `catchUp`, `refreshStale`) and with the new
+  `discoverInbox`. After the peer record and the bundle of the value are ingested, the entries addressed to the
+  local identity are handed to the consumer registered for their kind
+  (`DirectoryDht.registerOutboxConsumer`). Entries for anybody else are ignored - not stored, not forwarded.
+* Nothing that comes out of the DHT is gossiped on, and nothing publishes by itself: when to publish, to catch
+  up and to discover is the caller's decision.
+
+[source]
+----
+Sender A                                      Recipient C
+DmSessionManager.depositOfflineLocked --+
+MailSender.send ------------------------+--> DhtOutbox (local, bounded)
+DirectoryDht.publishOwn(record, bundle) --> IPNS value "LNDV": identity, binding, [peer record],
+                                            [bundle], [outbox: pointers only]
+        + rendezvous provider record per recipient (throttled)
+
+C: DirectoryDht.catchUp / resolve / discoverInbox
+   -> DirectoryDhtValidator (structure, expiry, proof chain of V0.9.13)
+   -> peer record, bundle: ingested as in part 1
+   -> outbox entries addressed to C -> consumer of the kind
+        DM_MAILBOX_POINTER -> MailboxGossip.dhtConsumer -> MailboxPointerIndex -> MailboxPoller (unchanged)
+        MAIL_POINTER       -> InboxDhtFetcher queue -> envelope -> policy -> body -> InboxGossip index
+----
+
+=== Outbox part of the per-identity value
+
+The `LNDV` value (format version 1) gained a third optional part, flag bit `0x04`: `count(1) | count x
+(kind(1) | recipient(33) | notValidAfter(8) | payloadLen(2) | payload)`. The format was extended in place:
+`55f666a` and `ead7a97` (V0.9.12, V0.9.13) are local, unpushed and untagged, so the version-1 layout has never
+been on a network. The reserved bits stay `0x08` and above. The decoder checks the count, the kind, and the
+payload length against the kind maximum **and** the bytes still available before it allocates; the outbox part
+is at most `MAX_OUTBOX_BYTES` (2048), the whole value at most `MAX_VALUE_BYTES` (4800) as before.
+
+The outbox carries **pointers only**, never messages: a signed `MailboxPointer` is 147 to 274 bytes, a mail
+pointer at most 130, and a complete mail frame (up to about 128 KiB) cannot fit a value that the 10 KiB IPNS
+limit caps at 4800 bytes. The blobs are fetched by Bitswap from the sender, with an explicit peer, exactly as
+the `MailboxPoller` always did. The sender therefore has to be reachable for the fetch (a limit already
+documented for the V0.8.5 mailbox). What the DHT adds is that the *recipient* no longer has to be present during
+a gossip window.
+
+`DirectoryDht` (module `lapis-net-directory`) knows no mail or DM types. `OutboxEntryKind` fixes the wire id and
+the maximum payload; the module that owns a kind encodes the payload and verifies it completely. The mirrored
+maxima (`274`, `130`) are pinned by tests in `lapis-net-dm` and `lapis-net-mail`. `lapis-net-mail` now depends
+on `lapis-net-directory` (`api`); `lapis-net-dm` already did. There is no cycle.
+
+*Selection and fairness.* `publishOwn` asks the outbox for a selection within the entry count
+(`maxOutboxEntriesPerValue`) and the byte budget left after the directory parts. The selection is
+round-robin over the recipients, newest first within a recipient, so a burst to one recipient cannot push out
+every other one. Entries that did not fit are reported in `DirectoryDhtPublishResult.outboxEntriesOmitted` and
+stay in the outbox for the next publication. Expired entries are never selected. An outbox-only value expires
+with its latest entry (at most `maxRecordValidity`); a value with directory parts expires with the earlier of
+those, as before. `MailboxPointer` lives up to 30 days, an IPNS record at most 7 days, a peer record about 24
+hours: an entry is resolvable only as long as the value is. This is a property, not a defect.
+
+=== Delivery chain
+
+*Direct messages.* `MailboxGossip.dhtConsumer()` receives the entry, checks it against the value it came in
+(kind, the value's identity equals `pointer.senderIdentity`, header recipient equals pointer recipient equals
+the local identity, header expiry equals the signed one) and then runs the very same chain as the gossip
+validator, extracted into one function: addressed to us, signature, acceptance policy, dedup, persistence
+reservation, put, index. Only the index is filled. The unchanged `MailboxPoller` does the rest: it looks the
+sender up in the directory (the DHT value's peer record was ingested first), registers the addresses, fetches
+the blob and routes it through the normal session code (`DmSessionManager.handleOfflineEnvelope`).
+
+*Mail.* The envelope is the mail's trust anchor (sender, recipients, signature, content CID), and the sender
+can only be reached for it, so the fetch is two-staged and ordered so that the acceptance policy decides before
+the large part is downloaded. `MailPointerQueueConsumer` only queues `(sender, peer ID, envelope CID, expiry)` in
+the bounded `InboxDhtPendingIndex` (no network, no clock - it runs inside `resolve`). `InboxDhtFetcher.pollOnce`
+then, per pointer: looks up the sender's record and refuses one whose peer ID differs from the key that signed
+the DHT value; registers the addresses through `PeerAddressDialing` (the same hygiene as the mailbox poller);
+fetches the **envelope** from that peer; recomputes its CID from the received bytes; runs the *same envelope
+checks as the gossip validator*, including `MailAcceptanceCheck` (`InboxGossip.checkEnvelope`); requires the
+envelope's sender to be the identity of the value; skips it if gossip already delivered it; and only then
+fetches the **body**, again from that peer, within `MAX_BODY_BLOB_SIZE`, verifies its CID against the envelope and
+ingests it (`InboxGossip.ingestChecked`: decode, dedup, persistence cap, index). It never searches providers for
+a CID, because that would announce the CID to the DHT.
+
+=== Same checks as gossip
+
+[cols="2,2,2",options="header"]
+|===
+|Check |Gossip (`onGossipMessage`) |DHT path
+
+|Structure |frame / pointer codec |value codec, then payload codec
+|Addressed to the local identity |before the signature |header + payload recipient, then as gossip
+|Signature |`MailboxPointer.verify` / `MessageEnvelope.verify` |the same functions, same code
+|Sender binding |not needed (the topic is the recipient's) |value identity == pointer sender / envelope sender
+|Content CID |body from the frame |envelope CID and body CID recomputed from the fetched bytes
+|Acceptance policy |`DmAcceptanceCheck` / `MailAcceptanceCheck` |the same instance via `dhtConsumer()` / `dhtCheckEnvelope`
+|Dedup, persistence cap, index |`MailboxPointerIndex` / `InboxIndex` |the same functions and instances
+|Clock, network, publishing in the check |none |none (pinned by bytecode tests on the consumer classes)
+|===
+
+*The acceptance policy cannot be bypassed.* For DMs the consumer holds the `DmAcceptanceCheck` of the
+`MailboxGossip` it belongs to, so there is no second place to wire it. For mail `InboxGossip` exposes
+`dhtCheckEnvelope` with its own `MailAcceptanceCheck`, and the fetcher can only be built from an `InboxGossip`.
+Both run the policy before any blob beyond the envelope is fetched. Tests run the same sender matrix through both
+paths and require identical verdicts, and check that a rejected mail's body is never requested.
+
+One deliberate difference from "a bad part rejects the whole value": an outbox entry is an inner object that the
+consumer verifies completely itself, so a bad entry only drops itself. The validator additionally drops expired
+entries, exact duplicates and entries addressed to the value's own identity.
+
+=== Rendezvous provider records
+
+Without a hint a recipient cannot compute an unknown sender's IPNS name. For first contact (and mail from
+senders not in any contact list), `publishOwn` announces, for a few recipients of the published selection, a
+provider record for `MessagingRendezvous.cidFor(recipient)` - a raw CIDv1 over a domain-separated hash of the
+recipient identity; no block with this CID exists, it is only a DHT key. The recipient calls
+`discoverInbox`, which looks up the providers of its own key (at most `maxRendezvousProviders`, throttled by
+`minDiscoveryInterval`), skips its own value, and resolves each provider by peer ID (`resolveByPeerId`), taking
+the identity from the value under the full proof chain. Provider records are source-authenticated: Nabu v0.8.0
+keeps an `ADD_PROVIDER` provider only if its ID equals the sender (found in the bytecode of
+`lambda$receiveRequest$4`; `ProviderRecordSourceTest` pins it), so nobody can announce somebody else. Without
+`localIdentity` or with `rendezvousEnabled = false` nothing is announced and `discoverInbox` refuses.
+
+[WARNING]
+====
+*Metadata: recipient lookups reveal who talks to whom.* Everything below is accepted until traffic
+anonymisation exists (section 11); read it before wiring this into an application.
+
+. **The sender's value lists recipients in clear.** Anybody who resolves the sender's IPNS name sees every
+  recipient identity with an open entry, the blob and envelope CIDs, and can fetch those blobs from the sender -
+  lengths, and storage for later cryptanalysis included. For that reason `MailSender` offers only
+  `HYBRID_ECIES` mail to the outbox: a pointer to a plaintext (`EncryptionMode.NONE`) mail would let anybody fetch
+  the envelope and then the plaintext body, so plaintext mail travels by gossip only and is never DHT-recoverable.
+. **Rendezvous.** Anybody can ask "who has something for Bob" and gets sender peer IDs, and through their
+  values the identities. DHT nodes near the key see both the `provide` (A to B) and Bob's query.
+. **Catch-up over a contact list.** The peers of a `GET_VALUE` walk see the asker's peer ID (Noise) together
+  with each peer ID looked for; over time the contact list can be reconstructed.
+. **Compared to gossip.** An inbox or mailbox topic reveals the same pair, but only while it is live. The DHT
+  makes it *persistent* (until the record expires, up to seven days) and *queryable after the fact*.
+. **Rendezvous eclipse (residual risk).** `discoverInbox` sees at most `maxRendezvousProviders` providers, and
+  peer IDs cost nothing (Sybil). An attacker can fill the rendezvous key of a victim with throwaway peer IDs so
+  that legitimate first-contact senders no longer appear among the results; the victim then spends its discovery
+  quota (one per `minDiscoveryInterval`) on attacker values. This is the known Kademlia weakness and is not
+  mitigated here; contacts already in the peer directory are unaffected (catch-up and gossip).
+  The queue of fetched pointers is hardened separately: pointers claiming a validity beyond the sender TTL
+  window are dropped, fetches back off exponentially with a hard attempt cap, each sender may hold only a
+  bounded number of pending pointers, and a full queue refuses newcomers instead of evicting legitimate entries.
+. **Why no blinding.** The blob CIDs are fetchable and the mail envelopes name sender and recipient in clear; a
+  blinded recipient field in the value would suggest protection that does not exist.
+. **Mitigations that do exist.** Opt-in on both sides (no outbox given: nothing is offered; no caller: no
+  discovery or catch-up), rate limits and a negative cache, the gossip index consulted first, bounded
+  announcements.
+====
+
+=== Limits
+
+[cols="2,1,4",options="header"]
+|===
+|Limit |Default |Meaning
+
+|`DirectoryDhtValueCodec.MAX_OUTBOX_BYTES`|2048|encoded outbox part, count byte included
+|`DirectoryDhtValueCodec.MAX_OUTBOX_ENTRIES_PER_VALUE`|64|hard maximum entries per value
+|`DirectoryDhtLimits.maxOutboxEntriesPerValue`|24|entries one publication carries
+|`DirectoryDhtLimits.maxOutboxBytes`|2048|byte budget of the outbox part (also bounded by the free space of the value)
+|`DirectoryDhtLimits.maxTrackedOutboxEntries`|256|entries a `DhtOutbox` keeps (LRU)
+|`DirectoryDhtLimits.rendezvousEnabled`|true|announcements and `discoverInbox` allowed
+|`DirectoryDhtLimits.maxRendezvousAnnouncesPerPublish`|8|recipients announced per publication
+|`DirectoryDhtLimits.rendezvousReannounceInterval`|1 h|per recipient, between two announcements
+|`DirectoryDhtLimits.rendezvousTrackerCapacity`|1024|recipients the timer remembers (LRU)
+|`DirectoryDhtLimits.maxRendezvousProviders`|8|providers one discovery asks for and resolves
+|`DirectoryDhtLimits.minDiscoveryInterval`|300 s|between two network discoveries
+|`DirectoryDhtLimits.maxDispatchedEntriesPerResolve`|24|entries one resolve hands to consumers
+|`InboxDhtPendingIndex.MAX_PENDING`|4096|queued mail pointers (resolved first, then oldest)
+|`InboxDhtFetcher.POLL_PASS_WALL_CLOCK_BUDGET`|20 s|per poll pass
+|`InboxDhtFetcher.MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS`|4|network fetches per sender and pass
+|`InboxDhtFetcher.FETCH_TIMEOUT`|10 s|per blob fetch
+|`MailSender.DEFAULT_DHT_ENTRY_TTL_SECONDS`|7 days|lifetime of a mail's outbox entry
+|===
+
+=== Known residual risks
+
+* **Sybil displacement at the rendezvous key.** A key keeps at most eight provider records (LRU); an attacker
+  with many identities can push an honest announcer out. Gossip remains.
+* **Index persistence limit.** `MailboxPointerIndex` never evicts its persistence reservations; the DHT path can
+  exhaust it just as gossip can. It is pull-based and bounded: at most `maxRendezvousProviders` x
+  `maxDispatchedEntriesPerResolve` entries per discovery, which is throttled.
+* **The sender must be online for the fetch.** Only the pointer is in the DHT.
+* **First contact needs the peer record in the value.** A recipient that does not know the sender can only dial
+  it from the peer record that travels in the same value. A sender that publishes an outbox-only value (no
+  peer record) is fetchable only by recipients that already have its record; the pointer waits (bounded) until
+  it expires. Publish the peer record together with the outbox.
+* **Publication is delayed** by up to `minRepublishInterval` (300 s); a deposit made right after a publication
+  waits for the next one.
+* **Burst displacement.** More live entries than fit one value are published over time round-robin; an entry can
+  wait several publications.
+* **No resumption after a sender restart.** `DhtOutbox` is in memory; after a restart nothing is offered until a
+  new deposit or mail.
+* **Bitswap stores fetched blocks** regardless of the persistence cap of the indexes (as the mailbox poller
+  always did).
+* **No application wiring.** `BrowserServer` and the CLI do not publish, catch up, discover or start the fetcher.
 
 == Diagrams
 

@@ -1989,12 +1989,47 @@ identifier, so the release card above gets no line for it._
 
 **What remains (part 2 and open points):**
 
-* Part 2: consumers. Mail pointers and `DmSessionManager` do not use the fallback yet, and no application
-  module (`BrowserServer`, CLI) publishes or refreshes. Wiring it earlier would add the metadata exposure
-  without a user.
+* Part 2: consumers - done in V0.9.14 below. No application module (`BrowserServer`, CLI) publishes or
+  refreshes yet; wiring it earlier would add the metadata exposure without a user.
 * A lookup needs the owner's Ed25519 peer ID as a hint; a bare secp256k1 identity cannot be resolved.
 * Both artefacts at their maximum do not fit one record (4800 byte value budget); DHT readers may get used
   one-time prekeys.
 * Record store eviction by many fake identities, no repair of stale records at third parties, no IPFS interop,
   sequence from epoch milliseconds (a clock stepping back across a restart delays new publications).
+* This wave has had no independent review or security audit beyond the pipeline's own loops yet.
+
+== V0.9.14 — DHT fallback for mail and direct messages (part 2 of 2)
+
+_Not yet released: implemented on a local feature branch, no version bump, no tag. This is an internal wave
+identifier, so the release card above gets no line for it._
+
+=== Progress
+
+**What is new** (details: `docs/architecture.adoc`, "DHT fallback for mail and direct messages (V0.9.14)"):
+
+* **`lapis-net-directory`:** a third, optional part of the per-identity DHT value, the *outbox* (typed, opaque
+  pointers addressed to other identities), with `OutboxEntry`, `OutboxEntryKind`, the bounded `DhtOutbox`, the
+  consumer seam `OutboxEntryConsumer` (`DirectoryDht.registerOutboxConsumer`), rendezvous provider records
+  (`MessagingRendezvous`, announced by `publishOwn`) with `DirectoryDht.discoverInbox` / `resolveByPeerId`, and
+  ten new `DirectoryDhtLimits`. `MultiaddrHygiene` moved here from `lapis-net-dm` (behaviour unchanged) together
+  with the new `PeerAddressDialing`.
+* **`lapis-net-dm`:** `DmSessionManager.attach(dhtOutbox = ...)` leaves the offline pointer in the outbox;
+  `MailboxGossip.dhtConsumer()` runs the gossip validator's chain (now one shared function) on pointers from
+  the DHT, with the same acceptance policy; the `MailboxPoller` is unchanged apart from the shared address
+  helper.
+* **`lapis-net-mail`:** `MailSender(outbox = ...)` leaves a pointer per recipient; `InboxDhtFetcher` fetches the
+  envelope, applies the acceptance policy, and only then fetches the body; `InboxGossip` was split into
+  `checkEnvelope` / `ingestChecked` so both paths share the checks (the gossip validator behaves as before,
+  pinned by an equivalence test). `lapis-net-mail` now depends on `lapis-net-directory`.
+* **`lapis-net-storage`:** no functional change; a test pins that Nabu keeps an `ADD_PROVIDER` only from the
+  provider itself.
+
+**What remains:**
+
+* No application wiring: nothing in `BrowserServer` or the CLI publishes, catches up, discovers, starts the
+  fetcher or hands a `DhtOutbox` to the senders. Without it the feature has no user, which is deliberate.
+* The metadata exposure documented in `docs/architecture.adoc` ("Metadata: recipient lookups reveal who talks to
+  whom") is accepted until traffic anonymisation (section 11).
+* The sender must be reachable for the fetch; the outbox is in memory; publication can lag by up to five
+  minutes; a Sybil attacker can displace provider records at a rendezvous key.
 * This wave has had no independent review or security audit beyond the pipeline's own loops yet.

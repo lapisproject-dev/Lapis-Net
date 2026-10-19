@@ -67,8 +67,16 @@
 // lapis-net-mail dependency (siblings, not an ancestor relationship). `implementation`, not `api`:
 // AcceptanceGate/VeritasPathCache never appear in this module's own public signatures, only inside
 // MailAcceptancePolicy's/MailAcceptanceCheck's private mapping/delegation code.
+//
+// V0.9.14 (DHT fallback for mail, part 2 of 2): `api(project(":lapis-net-directory"))` - DhtOutbox,
+// OutboxEntry/OutboxEntryConsumer, DirectoryDht and PeerDirectoryGossip appear in public signatures of
+// MailSender and InboxDhtFetcher. This revises the earlier stance "no dependency on lapis-net-directory"; it
+// creates no cycle, because lapis-net-directory knows neither mail nor DM types (outbox entries are typed,
+// opaque bytes whose owner verifies them completely). The pointer a mail leaves in the outbox is
+// MailDhtPointerCodec; the fetch is InboxDhtFetcher (envelope first, acceptance policy, then body).
 dependencies {
     implementation(project(":lapis-net-core"))
+    api(project(":lapis-net-directory"))
     api(project(":lapis-net-identity"))
     api(project(":lapis-net-storage"))
     api(project(":lapis-net-networking"))

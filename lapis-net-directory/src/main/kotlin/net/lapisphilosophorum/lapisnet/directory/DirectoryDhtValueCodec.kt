@@ -22,9 +22,11 @@ class MalformedDirectoryDhtValueException(
  * variable parts with every length checked against the bytes actually left BEFORE it allocates, no
  * trailing bytes. All integers big-endian.
  *
- * Layout: `magic "LNDV"(4) | version(1) | flags(1: bit0 peer record, bit1 prekey bundle) |
+ * Layout: `magic "LNDV"(4) | version(1) | flags(1: bit0 peer record, bit1 prekey bundle, bit2 outbox) |
  * identity(33) | edPublicKey(32) | bindingSignature(64) | [peerRecordLen(2) | peerRecord] |
- * [prekeyBundleLen(2) | prekeyBundle]`. The domain tag `LapisNet:dht-directory-value:v1` of the design is
+ * [prekeyBundleLen(2) | prekeyBundle] | [outboxCount(1, 1..MAX_OUTBOX_ENTRIES_PER_VALUE) | outboxCount x
+ * (kind(1) | recipient(33) | notValidAfter(8, signed) | payloadLen(2) | payload)]`. The outbox part (V0.9.14)
+ * was added to version 1 in place: no value of the earlier layout was ever published to a network. The domain tag `LapisNet:dht-directory-value:v1` of the design is
  * the magic plus version: this value is not signed by itself, it travels inside a signed IPNS record, so
  * no separate signing domain is needed.
  *
@@ -41,20 +43,35 @@ object DirectoryDhtValueCodec {
     /** Largest encoded value; see the class comment. */
     const val MAX_VALUE_BYTES: Int = 4_800
 
+    /** Most outbox entries one value carries. */
+    const val MAX_OUTBOX_ENTRIES_PER_VALUE: Int = 64
+
+    /** Largest encoded outbox part (count byte included). */
+    const val MAX_OUTBOX_BYTES: Int = 2_048
+
     private val MAGIC = "LNDV".toByteArray(Charsets.US_ASCII)
     private const val FLAG_PEER_RECORD = 0x01
     private const val FLAG_PREKEY_BUNDLE = 0x02
-    private const val KNOWN_FLAGS = FLAG_PEER_RECORD or FLAG_PREKEY_BUNDLE
+    private const val FLAG_OUTBOX = 0x04
+    private const val KNOWN_FLAGS = FLAG_PEER_RECORD or FLAG_PREKEY_BUNDLE or FLAG_OUTBOX
     private const val PUBLIC_KEY_SIZE = 33
     private const val ED25519_PUBLIC_KEY_SIZE = 32
     private const val SIGNATURE_SIZE = 64
-    private const val FIXED_SIZE = 4 + 1 + 1 + PUBLIC_KEY_SIZE + ED25519_PUBLIC_KEY_SIZE + SIGNATURE_SIZE
+    internal const val FIXED_SIZE = 4 + 1 + 1 + PUBLIC_KEY_SIZE + ED25519_PUBLIC_KEY_SIZE + SIGNATURE_SIZE
 
     /** @throws IllegalArgumentException if the value would exceed [MAX_VALUE_BYTES]. */
     fun encode(value: DirectoryDhtValue): ByteArray {
         val peerRecord = value.peerRecordBytes
         val bundle = value.prekeyBundleBytes
-        val flags = (if (peerRecord != null) FLAG_PEER_RECORD else 0) or (if (bundle != null) FLAG_PREKEY_BUNDLE else 0)
+        val outbox = value.outboxEntries
+        val flags =
+            (if (peerRecord != null) FLAG_PEER_RECORD else 0) or
+                (if (bundle != null) FLAG_PREKEY_BUNDLE else 0) or
+                (if (outbox.isNotEmpty()) FLAG_OUTBOX else 0)
+        require(outbox.size <= MAX_OUTBOX_ENTRIES_PER_VALUE) { "too many outbox entries: ${outbox.size}" }
+        require(outbox.isEmpty() || 1 + outbox.sumOf { it.encodedSize() } <= MAX_OUTBOX_BYTES) {
+            "outbox part exceeds $MAX_OUTBOX_BYTES bytes"
+        }
         val out = ByteArrayOutputStream()
         DataOutputStream(out).apply {
             write(MAGIC)
@@ -73,12 +90,49 @@ object DirectoryDhtValueCodec {
                 writeShort(bundle.size)
                 write(bundle)
             }
+            if (outbox.isNotEmpty()) {
+                writeByte(outbox.size)
+                for (entry in outbox) {
+                    writeByte(entry.kind.wireId)
+                    write(entry.recipient.bytes)
+                    writeLong(entry.notValidAfterEpochSecond)
+                    val payload = entry.payload
+                    writeShort(payload.size)
+                    write(payload)
+                }
+            }
         }
         val bytes = out.toByteArray()
         require(bytes.size <= MAX_VALUE_BYTES) {
             "encoded directory value is ${bytes.size} bytes, the limit is $MAX_VALUE_BYTES"
         }
         return bytes
+    }
+
+    private fun outboxEntries(input: DataInputStream): List<OutboxEntry> {
+        val availableAtStart = input.available()
+        val count = input.readUnsignedByte()
+        if (count !in 1..MAX_OUTBOX_ENTRIES_PER_VALUE) {
+            throw MalformedDirectoryDhtValueException("invalid outbox entry count: $count")
+        }
+        val entries = ArrayList<OutboxEntry>(count)
+        repeat(count) {
+            val kindId = input.readUnsignedByte()
+            val kind =
+                OutboxEntryKind.fromWireId(kindId)
+                    ?: throw MalformedDirectoryDhtValueException("unknown outbox entry kind: $kindId")
+            val recipient = Secp256k1PublicKey(ByteArray(PUBLIC_KEY_SIZE).also { input.readFully(it) })
+            val notValidAfter = input.readLong()
+            val length = input.readUnsignedShort()
+            if (length !in 1..kind.maxPayloadBytes || length > input.available()) {
+                throw MalformedDirectoryDhtValueException("invalid outbox payload length: $length")
+            }
+            entries.add(OutboxEntry(kind, recipient, notValidAfter, ByteArray(length).also { input.readFully(it) }))
+        }
+        if (availableAtStart - input.available() > MAX_OUTBOX_BYTES) {
+            throw MalformedDirectoryDhtValueException("outbox part exceeds $MAX_OUTBOX_BYTES bytes")
+        }
+        return entries
     }
 
     /** Structural decode only - verifies no signature. @throws MalformedDirectoryDhtValueException */
@@ -109,8 +163,9 @@ object DirectoryDhtValueCodec {
             }
             val peerRecord = if (flags and FLAG_PEER_RECORD != 0) part() else null
             val bundle = if (flags and FLAG_PREKEY_BUNDLE != 0) part() else null
+            val outbox = if (flags and FLAG_OUTBOX != 0) outboxEntries(input) else emptyList()
             if (input.available() > 0) throw MalformedDirectoryDhtValueException("trailing bytes")
-            return DirectoryDhtValue(identity, IdentityBinding(edKey, bindingSignature), peerRecord, bundle)
+            return DirectoryDhtValue(identity, IdentityBinding(edKey, bindingSignature), peerRecord, bundle, outbox)
         } catch (e: EOFException) {
             throw MalformedDirectoryDhtValueException("truncated directory value", e)
         } catch (e: IOException) {

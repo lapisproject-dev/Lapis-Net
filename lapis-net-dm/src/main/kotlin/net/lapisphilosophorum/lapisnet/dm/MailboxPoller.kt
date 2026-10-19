@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.dm
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import net.lapisphilosophorum.lapisnet.directory.PeerAddressDialing
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -59,7 +60,7 @@ private val logger = KotlinLogging.logger {}
  * - **Unsolicited outbound dials to unvalidated, gossip-supplied addresses.** [attemptOne] used to
  *   register and dial every address an attacker-chosen sender identity's PeerRecord names, with no
  *   address hygiene anywhere - a wildcard/multicast address would be dialed exactly like any other.
- *   [MultiaddrHygiene.isBlockedPrivateOrLocal] now filters those out before `registerPeerAddress`
+ *   [net.lapisphilosophorum.lapisnet.directory.MultiaddrHygiene.isBlockedPrivateOrLocal] now filters those out before `registerPeerAddress`
  *   ever runs - see that object's own doc comment for the full analysis, INCLUDING why it is
  *   deliberately narrower than a textbook SSRF blocklist (loopback/RFC1918/link-local are this
  *   project's own primary, expected peer address space, not an anomaly to block).
@@ -235,7 +236,7 @@ class MailboxPoller private constructor(
      * uses [PeerDirectoryGossip.lookup]'s freshest data.
      *
      * **Address hygiene (security audit round 1 finding) runs BEFORE anything is registered or
-     * dialed** - see [MultiaddrHygiene.isBlockedPrivateOrLocal]'s own doc comment for the full SSRF-
+     * dialed** - see [net.lapisphilosophorum.lapisnet.directory.MultiaddrHygiene.isBlockedPrivateOrLocal]'s own doc comment for the full SSRF-
      * style analysis (and for why it deliberately does NOT block loopback/RFC1918/link-local, unlike
      * a textbook SSRF blocklist); a sender identity whose ENTIRE published address set is wildcard/
      * multicast is skipped for this attempt exactly like "no directory record at all", without ever
@@ -255,38 +256,17 @@ class MailboxPoller private constructor(
     private fun attemptOne(pointer: MailboxPointer): Boolean {
         val senderRecord = peerDirectory.lookup(pointer.senderIdentity) ?: return false
 
-        val safeAddresses = senderRecord.addresses.filterNot { MultiaddrHygiene.isBlockedPrivateOrLocal(it) }
-        if (safeAddresses.isEmpty()) {
-            logger.debug {
-                "claimed sender ${pointer.senderIdentity.fingerprint()}'s published addresses are all " +
-                    "wildcard/multicast - refusing to dial, skipping this pass"
-            }
-            return false
-        }
-
+        // Address hygiene and per-address registration live in PeerAddressDialing (V0.9.14: shared with the
+        // DHT mail fetcher). A sender whose ENTIRE published address set is wildcard/multicast is skipped for this
+        // attempt exactly like "no directory record at all", without registering or dialing anything.
         val blobBytes =
             try {
-                safeAddresses.forEach { address ->
-                    // Security audit round 2 minor finding: Multiaddr.withP2P throws
-                    // IllegalArgumentException when `address` already carries a /p2p component with
-                    // a DIFFERENT value - reachable by any attacker-published PeerRecord, since
-                    // PeerRecordCodec.decode deserializes addresses with no protocol filtering. That
-                    // IAE is NOT a NabuStorageException, so left unguarded it would escape this
-                    // try/catch entirely, aborting registration of every OTHER, perfectly good
-                    // address in this forEach and skipping storage.get below outright - a single
-                    // malformed address would make an otherwise-fetchable sender wholly unfetchable
-                    // for the rest of this pointer's TTL. Wrapped per-address so only THIS address is
-                    // skipped; every other surviving address still gets registered.
-                    val addressWithP2P = runCatching { address.withP2P(senderRecord.peerId) }.getOrNull()
-                    if (addressWithP2P == null) {
-                        logger.debug {
-                            "claimed sender ${pointer.senderIdentity.fingerprint()}'s published address " +
-                                "$address already carries a conflicting /p2p component - skipping just this " +
-                                "address, not the whole sender"
-                        }
-                    } else {
-                        storage.registerPeerAddress(addressWithP2P)
+                if (!PeerAddressDialing.registerSafeAddresses(storage, senderRecord)) {
+                    logger.debug {
+                        "claimed sender ${pointer.senderIdentity.fingerprint()}'s published addresses are all " +
+                            "wildcard/multicast - refusing to dial, skipping this pass"
                     }
+                    return false
                 }
                 storage.get(pointer.blobCid, peers = setOf(senderRecord.peerId))
             } catch (e: NabuStorageException) {

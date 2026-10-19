@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.dm
 
 import io.libp2p.core.PeerInfo
+import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
@@ -91,6 +92,8 @@ fun buildDmTestNode(
     // instance here and into `acceptance`'s own `isAcceptedContact` lambda - see
     // DmSessionManager.attach's own `acceptedContacts` parameter doc comment.
     acceptedContacts: DmAcceptedContacts? = null,
+    // V0.9.14 - null (the default) preserves every prior test's gossip-only behavior exactly.
+    dhtOutbox: DhtOutbox? = null,
 ): DmTestNode {
     val node = LapisNode.create(identity)
     node.start(bootstrapPeers = emptyList())
@@ -126,6 +129,7 @@ fun buildDmTestNode(
             mailboxPollIntervalSeconds = mailboxPollIntervalSeconds,
             acceptance = acceptance,
             acceptedContacts = acceptedContacts,
+            dhtOutbox = dhtOutbox,
         )
     return DmTestNode(
         identity,

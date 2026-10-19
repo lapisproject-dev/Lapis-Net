@@ -4,6 +4,9 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
 import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
+import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntry
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntryKind
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
@@ -237,6 +240,10 @@ class DmSessionManager private constructor(
      * [DmAcceptanceCheck.isAcceptedContact] lambda of whatever [DmAcceptanceCheck] it configures via
      * [initialAcceptance]/[updateAcceptanceCheck]. */
     private val acceptedContacts: DmAcceptedContacts?,
+    /** V0.9.14 - where an offline deposit also leaves its pointer for the DHT fallback (see
+     * [net.lapisphilosophorum.lapisnet.directory.DhtOutbox]). `null` (the default) keeps every prior wave's
+     * behavior: pointers travel by gossip only. */
+    private val dhtOutbox: DhtOutbox?,
 ) {
     private lateinit var dmProtocol: DmProtocol
 
@@ -997,6 +1004,12 @@ class DmSessionManager private constructor(
             )
         val pointerBytes = MailboxPointerCodec.encode(pointer)
         mailboxRedeliveryScheduler.track(recipient, pointer, pointerBytes)
+        // V0.9.14: the same pointer, also for the DHT fallback. A cheap in-memory offer - nothing is published
+        // here; DirectoryDht.publishOwn picks it up. Before the gossip publish for the reason `track` is: a
+        // throwing publish must not skip registering it.
+        dhtOutbox?.offer(
+            OutboxEntry(OutboxEntryKind.DM_MAILBOX_POINTER, recipient, notValidAfterEpochSecond, pointerBytes),
+        )
         pubsub.publish(MailboxTopics.forRecipient(recipient), pointerBytes)
     }
 
@@ -2056,6 +2069,8 @@ class DmSessionManager private constructor(
              * future UI's explicit accept button to agree passes the SAME instance here and into
              * [acceptance]'s own `isAcceptedContact` lambda. */
             acceptedContacts: DmAcceptedContacts? = null,
+            /** V0.9.14 - see the constructor property of the same name. */
+            dhtOutbox: DhtOutbox? = null,
         ): DmSessionManager {
             Files.createDirectories(sessionStoreDirectory)
             if ("posix" in sessionStoreDirectory.fileSystem.supportedFileAttributeViews()) {
@@ -2115,6 +2130,7 @@ class DmSessionManager private constructor(
                     MailboxRedeliveryScheduler.attach(pubsub, mailboxRedeliverIntervalSeconds),
                     acceptance,
                     acceptedContacts,
+                    dhtOutbox,
                 )
             manager.dmProtocol = DmProtocol.attach(node, manager::handleInboundEnvelope)
             manager.mailboxPoller =

@@ -4,6 +4,10 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.libp2p.core.PeerId
 import io.libp2p.core.pubsub.PubsubSubscription
 import io.libp2p.core.pubsub.ValidationResult
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntry
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntryConsumer
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntryKind
+import net.lapisphilosophorum.lapisnet.directory.OutboxIngestOutcome
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
@@ -25,7 +29,21 @@ private val logger = KotlinLogging.logger {}
 class MailboxGossip private constructor(
     private val index: MailboxPointerIndex,
     private val subscription: PubsubSubscription,
+    private val storage: NabuStorage,
+    private val localIdentity: Secp256k1PublicKey,
+    private val acceptance: DmAcceptanceCheck?,
 ) {
+    /**
+     * The consumer of DHT outbox entries of kind [OutboxEntryKind.DM_MAILBOX_POINTER] (V0.9.14): register it with
+     * `DirectoryDht.registerOutboxConsumer`. It shares this instance's index, storage and **the same
+     * [DmAcceptanceCheck] as the gossip validator**, so the acceptance policy cannot be wired differently for
+     * the DHT path. It only fills the index - the unchanged [MailboxPoller] does the fetching.
+     */
+    fun dhtConsumer(): OutboxEntryConsumer =
+        OutboxEntryConsumer { sender, _, entry ->
+            onDhtEntry(sender, entry, storage, index, localIdentity, acceptance)
+        }
+
     /** Every tracked pointer not yet marked resolved - see [MailboxPointerIndex.pending]. */
     fun pending(): List<MailboxPointer> = index.pending()
 
@@ -62,7 +80,7 @@ class MailboxGossip private constructor(
                 pubsub.subscribe(topic) { bytes, from ->
                     onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
                 }
-            return MailboxGossip(index, subscription)
+            return MailboxGossip(index, subscription, storage, localIdentity, acceptance)
         }
 
         /**
@@ -101,18 +119,83 @@ class MailboxGossip private constructor(
                     logger.debug(e) { "rejected structurally malformed mailbox pointer from $from" }
                     return ValidationResult.Invalid
                 }
+            return when (ingestPointer(pointer, bytes, storage, index, localIdentity, acceptance, "peer $from")) {
+                PointerIngestOutcome.ACCEPTED -> ValidationResult.Valid
+                PointerIngestOutcome.DUPLICATE, PointerIngestOutcome.REJECTED, PointerIngestOutcome.PERSIST_FAILED ->
+                    ValidationResult.Invalid
+            }
+        }
 
+        /**
+         * The DHT entry point (V0.9.14). The header of the outbox entry is only a transport wrapper: the
+         * payload is a full signed [MailboxPointer] and goes through exactly the checks of the gossip path
+         * ([ingestPointer]), after these additional ones that bind the pointer to the value it came in:
+         * the entry has the right kind, [sender] (the identity of the signed directory value) is the pointer's
+         * sender (so nobody can re-publish somebody else's pointer under their own value), the pointer and the
+         * entry agree on recipient and expiry.
+         *
+         * Same invariant as the gossip validator: no clock, no network, nothing published or forwarded.
+         */
+        internal fun onDhtEntry(
+            sender: Secp256k1PublicKey,
+            entry: OutboxEntry,
+            storage: NabuStorage,
+            index: MailboxPointerIndex,
+            localIdentity: Secp256k1PublicKey,
+            acceptance: DmAcceptanceCheck? = null,
+        ): OutboxIngestOutcome {
+            if (entry.kind != OutboxEntryKind.DM_MAILBOX_POINTER) return OutboxIngestOutcome.REJECTED
+            val payload = entry.payload
+            val pointer =
+                try {
+                    MailboxPointerCodec.decode(payload)
+                } catch (e: MalformedMailboxPointerException) {
+                    logger.debug(e) { "rejected structurally malformed DHT mailbox pointer" }
+                    return OutboxIngestOutcome.REJECTED
+                }
+            if (pointer.senderIdentity != sender ||
+                pointer.recipientIdentity != entry.recipient ||
+                entry.recipient != localIdentity ||
+                pointer.notValidAfterEpochSecond != entry.notValidAfterEpochSecond
+            ) {
+                logger.debug { "rejected a DHT mailbox pointer that does not match its outbox entry" }
+                return OutboxIngestOutcome.REJECTED
+            }
+            return when (ingestPointer(pointer, payload, storage, index, localIdentity, acceptance, "the DHT")) {
+                PointerIngestOutcome.ACCEPTED -> OutboxIngestOutcome.ACCEPTED
+                PointerIngestOutcome.DUPLICATE -> OutboxIngestOutcome.DUPLICATE
+                PointerIngestOutcome.REJECTED -> OutboxIngestOutcome.REJECTED
+                PointerIngestOutcome.PERSIST_FAILED -> OutboxIngestOutcome.DEFERRED
+            }
+        }
+
+        private enum class PointerIngestOutcome { ACCEPTED, DUPLICATE, REJECTED, PERSIST_FAILED }
+
+        /**
+         * The checks both paths share, in the order that was established for gossip: addressed to the local
+         * identity -> signature -> acceptance policy -> dedup -> persist -> index (cheapest and most selective
+         * first). [source] is for log messages only.
+         */
+        private fun ingestPointer(
+            pointer: MailboxPointer,
+            bytes: ByteArray,
+            storage: NabuStorage,
+            index: MailboxPointerIndex,
+            localIdentity: Secp256k1PublicKey,
+            acceptance: DmAcceptanceCheck?,
+            source: String,
+        ): PointerIngestOutcome {
             if (pointer.recipientIdentity != localIdentity) {
                 logger.debug {
-                    "dropping mailbox pointer from $from on ${MailboxTopics.forRecipient(localIdentity)} that is " +
+                    "dropping mailbox pointer from $source on ${MailboxTopics.forRecipient(localIdentity)} that is " +
                         "not addressed to this identity - not persisting, not indexing, not re-propagating"
                 }
-                return ValidationResult.Invalid
+                return PointerIngestOutcome.REJECTED
             }
 
             if (!MailboxPointer.verify(pointer)) {
-                logger.debug { "rejected signature-invalid mailbox pointer from $from" }
-                return ValidationResult.Invalid
+                logger.debug { "rejected signature-invalid mailbox pointer from $source" }
+                return PointerIngestOutcome.REJECTED
             }
 
             // V0.8.6 offline pre-check - see DmAcceptancePolicy's own class doc comment for why this
@@ -137,18 +220,18 @@ class MailboxGossip private constructor(
                     )
                 if (decision is DmAcceptanceDecision.Reject) {
                     logger.debug {
-                        "declining to fetch mailbox pointer from $from claiming sender " +
+                        "declining to fetch mailbox pointer from $source claiming sender " +
                             "${pointer.senderIdentity.fingerprint()} - acceptance policy rejected: ${decision.reason}"
                     }
-                    return ValidationResult.Invalid
+                    return PointerIngestOutcome.REJECTED
                 }
             }
 
             if (!index.canAccept(pointer)) {
                 logger.debug {
-                    "declining duplicate (already-tracked) mailbox pointer from $from - not persisting or re-propagating"
+                    "declining duplicate (already-tracked) mailbox pointer from $source - not persisting or re-propagating"
                 }
-                return ValidationResult.Invalid
+                return PointerIngestOutcome.DUPLICATE
             }
 
             if (index.tryReservePersistence(pointer)) {
@@ -163,12 +246,12 @@ class MailboxGossip private constructor(
                     index.releaseReservedPersistence(pointer)
                     logger.warn(
                         e,
-                    ) { "failed to persist gossip-received mailbox pointer from $from - declining to accept it" }
-                    return ValidationResult.Invalid
+                    ) { "failed to persist received mailbox pointer from $source - declining to accept it" }
+                    return PointerIngestOutcome.PERSIST_FAILED
                 }
             } else {
                 logger.debug {
-                    "persistence cap reached - not durably storing mailbox pointer from $from " +
+                    "persistence cap reached - not durably storing mailbox pointer from $source " +
                         "(still tracking and propagating it)"
                 }
             }
@@ -179,11 +262,11 @@ class MailboxGossip private constructor(
                 // the index slot between the two calls above. Still propagates: the pointer was
                 // legitimately well-formed at the moment it was checked.
                 logger.debug {
-                    "mailbox pointer from $from was persisted but lost a narrow index race - propagating anyway"
+                    "mailbox pointer from $source was persisted but lost a narrow index race - propagating anyway"
                 }
             }
 
-            return ValidationResult.Valid
+            return PointerIngestOutcome.ACCEPTED
         }
     }
 }

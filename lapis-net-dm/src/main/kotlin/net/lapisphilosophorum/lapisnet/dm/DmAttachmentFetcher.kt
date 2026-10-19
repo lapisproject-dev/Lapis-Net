@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.dm
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.directory.MultiaddrHygiene
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage

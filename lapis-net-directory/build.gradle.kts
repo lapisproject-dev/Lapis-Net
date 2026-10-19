@@ -15,6 +15,15 @@
 // Kademlia.dialPeer was documented broken from V0.1.4 until V0.9.8 (see docs/architecture.adoc's Storage
 // section; historical now); the gossip validators stay free of network and clock access either way.
 //
+// V0.9.14 (DHT fallback for mail and direct messages, part 2 of 2): DirectoryDhtValue gained a third, optional
+// part, the outbox - typed, OPAQUE pointer entries (OutboxEntry/OutboxEntryKind) addressed to other identities,
+// kept in a bounded DhtOutbox and published by DirectoryDht.publishOwn, the only writer of the IPNS value. This
+// module knows no mail or DM types: lapis-net-mail and lapis-net-dm sit ABOVE it and register an
+// OutboxEntryConsumer per kind (DirectoryDht.registerOutboxConsumer) that verifies its payload completely, so
+// no dependency edge points from here to them. Also new: rendezvous provider records (MessagingRendezvous,
+// announced by publishOwn, found by DirectoryDht.discoverInbox) and, moved here from lapis-net-dm so that both
+// consumers share one source of truth, MultiaddrHygiene plus PeerAddressDialing. No new dependencies.
+//
 // Dependency shape mirrors lapis-net-mail's stated house rule, not lapis-net-trust's older
 // transitive-reliance-on-lapis-net-storage's-own-api-edge approach: lapis-net-identity is `api`
 // because Secp256k1PublicKey/DualKeyIdentity/IdentityBinding appear directly in PeerRecord's

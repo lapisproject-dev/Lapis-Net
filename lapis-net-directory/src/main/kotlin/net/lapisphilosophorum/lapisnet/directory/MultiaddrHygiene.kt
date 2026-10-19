@@ -1,4 +1,4 @@
-package net.lapisphilosophorum.lapisnet.dm
+package net.lapisphilosophorum.lapisnet.directory
 
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
@@ -7,13 +7,13 @@ import java.net.UnknownHostException
 
 /**
  * SSRF-style hygiene guard for automatically-dialed, gossip-supplied [Multiaddr]s - security audit
- * round 1 finding (2026-08-27): [MailboxPoller.attemptOne] resolves and dials a
- * [net.lapisphilosophorum.lapisnet.directory.PeerRecord]'s addresses for whatever sender identity a
- * signed [MailboxPointer] NAMES - an attacker-chosen value, since anyone can mint a throwaway
- * identity, publish a [net.lapisphilosophorum.lapisnet.directory.PeerRecord] for it naming ARBITRARY
+ * round 1 finding (2026-08-27): `MailboxPoller.attemptOne` resolves and dials a
+ * [PeerRecord]'s addresses for whatever sender identity a
+ * signed `MailboxPointer` NAMES - an attacker-chosen value, since anyone can mint a throwaway
+ * identity, publish a [PeerRecord] for it naming ARBITRARY
  * addresses, and sign a mailbox pointer claiming to be that sender - with NO local user involvement
  * at all, on a timer. This is the first place in the codebase that automatically dials gossip-
- * supplied addresses with no local intent behind the dial at all - see [MailboxPoller.attemptOne]'s
+ * supplied addresses with no local intent behind the dial at all - see `MailboxPoller.attemptOne`'s
  * own doc comment for the full "reflection/internal-probe primitive" analysis this closes.
  *
  * **Deliberately narrower than a textbook SSRF blocklist (RFC 1918 / loopback / APIPA / `::1`) -
@@ -36,8 +36,8 @@ import java.net.UnknownHostException
  * ANY of this project's supported models, so filtering it costs nothing while still closing the
  * cheapest, most nonsensical shape of "attacker names an address this node should never touch."
  * The broader DoS/blast-radius concern (an attacker directing large volumes of automated dials
- * anywhere at all) is what [MailboxPoller.POLL_PASS_WALL_CLOCK_BUDGET]/
- * [MailboxPoller.MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS] bound instead - see that class's own doc
+ * anywhere at all) is what `MailboxPoller.POLL_PASS_WALL_CLOCK_BUDGET`/
+ * `MailboxPoller.MAX_FETCH_ATTEMPTS_PER_SENDER_PER_PASS` bound instead - see that class's own doc
  * comment.
  *
  * **Only inspects the numeric `ip4`/`ip6` component of a [Multiaddr], never resolves anything.** A
@@ -49,7 +49,7 @@ import java.net.UnknownHostException
  * fast path (no network call: an `ip4`/`ip6` multiaddr component's string form is always already a
  * literal numeric address, never a hostname).
  */
-internal object MultiaddrHygiene {
+object MultiaddrHygiene {
     /**
      * `true` iff [address] carries an `ip4`/`ip6` component that resolves (purely locally - see
      * this object's own class doc comment) to a wildcard/any-local or multicast address - see this

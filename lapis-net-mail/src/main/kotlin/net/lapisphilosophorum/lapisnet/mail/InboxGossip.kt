@@ -17,10 +17,10 @@ private val logger = KotlinLogging.logger {}
  *
  * **Scope cuts for V0.9.1 (stated here, this module's center of gravity, and referenced from
  * [MessageEnvelope]/[MailSender]):**
- *  - **No DHT inbox record.** Gossip-only, because `Kademlia.dialPeer` was documented broken from
- *    V0.1.4 until V0.9.8 (see `NabuStorage.provide`'s doc comment; the design stands). A node offline
- *    during the gossip window has no catch-up path - a known, accepted limitation carried from
- *    `net.lapisphilosophorum.lapisnet.trust.VeritasGossip`'s best-effort-convergence precedent.
+ *  - **No DHT inbox record - but since V0.9.14 a DHT fallback for the POINTER.** This validator and the
+ *    frame stay gossip-only (the frame carries the body; see below). A node offline during the gossip window
+ *    can learn of a mail through the DHT outbox of the sender (`InboxDhtFetcher`), which fetches envelope and
+ *    body and ingests them through [checkEnvelope]/[ingestChecked] - the two halves of this validator, shared.
  *  - **No relay population.** GossipSub only forwards on topics a peer subscribes to, and an inbox
  *    topic is identity-scoped - so delivery effectively requires a live sender-to-recipient
  *    connection at send time, strictly weaker than `VeritasGossip`'s network-wide topic.
@@ -73,6 +73,7 @@ class InboxGossip private constructor(
     private val localIdentity: Secp256k1PublicKey,
     private val index: InboxIndex,
     private val subscription: PubsubSubscription,
+    private val acceptance: MailAcceptanceCheck?,
 ) {
     /** The GossipSub topic this instance is subscribed to - [InboxTopics.forRecipient] applied to
      * the identity this instance was [attach]ed for. */
@@ -83,6 +84,23 @@ class InboxGossip private constructor(
 
     /** All tracked inbox messages from [sender], oldest first. */
     fun messagesFrom(sender: Secp256k1PublicKey): List<InboxMessage> = index.messagesFrom(sender)
+
+    /**
+     * V0.9.14: the envelope-only checks of this instance, with its own acceptance policy - used by the DHT
+     * fetcher so the policy cannot be wired differently for that path. See [checkEnvelope].
+     */
+    internal fun dhtCheckEnvelope(envelopeBytes: ByteArray): EnvelopeCheck =
+        checkEnvelope(envelopeBytes, localIdentity, acceptance, null, "the DHT")
+
+    /** V0.9.14: [ingestChecked] with this instance's storage and index. */
+    internal fun dhtIngest(
+        envelope: MessageEnvelope,
+        envelopeBytes: ByteArray,
+        bodyBytes: ByteArray,
+    ): InboxIngestOutcome = ingestChecked(envelope, envelopeBytes, bodyBytes, storage, index, "the DHT")
+
+    /** Whether this inbox already tracks [envelope] (e.g. it arrived by gossip). */
+    internal fun alreadyHas(envelope: MessageEnvelope): Boolean = !index.canAccept(envelope)
 
     /** Unsubscribes from the inbox topic. No other sub-resources to release - mirrors
      * `net.lapisphilosophorum.lapisnet.trust.VeritasGossip.stop` exactly. */
@@ -109,7 +127,7 @@ class InboxGossip private constructor(
                 pubsub.subscribe(topic) { bytes, from ->
                     onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
                 }
-            return InboxGossip(pubsub, storage, localIdentity, index, subscription)
+            return InboxGossip(pubsub, storage, localIdentity, index, subscription, acceptance)
         }
 
         /**
@@ -179,42 +197,71 @@ class InboxGossip private constructor(
                     return ValidationResult.Invalid
                 }
 
+            // cidFor is a pure function of raw bytes - the content-CID binding is checked inside checkEnvelope
+            // (given the body) at the same position in the order as ever: after the signature, before the policy.
+            val check =
+                checkEnvelope(frame.envelopeBytes, localIdentity, acceptance, frame.bodyBytes, "peer $from")
+            val envelope =
+                when (check) {
+                    is EnvelopeCheck.Passed -> check.envelope
+                    is EnvelopeCheck.Failed -> return ValidationResult.Invalid
+                }
+            return when (
+                ingestChecked(envelope, frame.envelopeBytes, frame.bodyBytes, storage, index, "peer $from", true)
+            ) {
+                InboxIngestOutcome.ACCEPTED -> ValidationResult.Valid
+                InboxIngestOutcome.DUPLICATE, InboxIngestOutcome.INVALID, InboxIngestOutcome.PERSIST_FAILED ->
+                    ValidationResult.Invalid
+            }
+        }
+
+        /**
+         * Everything that can be decided from the envelope alone (V0.9.14: shared by the gossip validator and
+         * the DHT fetcher): decode -> reserved mode -> addressed to [localIdentity] -> signature -> (only when
+         * [bodyBytes] is given) content-CID binding -> acceptance policy. The DHT path calls it without the
+         * body: the policy then runs BEFORE the body is ever fetched. No clock, no network.
+         */
+        internal fun checkEnvelope(
+            envelopeBytes: ByteArray,
+            localIdentity: Secp256k1PublicKey,
+            acceptance: MailAcceptanceCheck?,
+            bodyBytes: ByteArray? = null,
+            source: String = "unknown",
+        ): EnvelopeCheck {
             val envelope =
                 try {
-                    MessageEnvelopeCodec.decode(frame.envelopeBytes)
+                    MessageEnvelopeCodec.decode(envelopeBytes)
                 } catch (e: MalformedMessageEnvelopeException) {
-                    logger.debug(e) { "rejected structurally malformed envelope from $from" }
-                    return ValidationResult.Invalid
+                    logger.debug(e) { "rejected structurally malformed envelope from $source" }
+                    return EnvelopeCheck.Failed("malformed envelope")
                 }
 
             // Belt-and-braces: unreachable via the decode() path above today (decode() already
             // rejects MLS_ARCHIVE), kept so a future codec change can never silently let a
             // reserved mode through this validator without this function also changing.
             if (envelope.encryption == EncryptionMode.MLS_ARCHIVE) {
-                logger.debug { "rejected envelope from $from with reserved encryption mode ${envelope.encryption}" }
-                return ValidationResult.Invalid
+                logger.debug { "rejected envelope from $source with reserved encryption mode ${envelope.encryption}" }
+                return EnvelopeCheck.Failed("reserved encryption mode")
             }
 
             if (!envelope.isAddressedTo(localIdentity)) {
                 logger.debug {
-                    "dropping envelope from $from on ${InboxTopics.forRecipient(localIdentity)} that is not " +
+                    "dropping envelope from $source on ${InboxTopics.forRecipient(localIdentity)} that is not " +
                         "addressed to this identity - not persisting, not indexing, not re-propagating"
                 }
-                return ValidationResult.Invalid
+                return EnvelopeCheck.Failed("not addressed to this identity")
             }
 
             if (!MessageEnvelope.verify(envelope)) {
-                logger.debug { "rejected signature-invalid envelope from $from" }
-                return ValidationResult.Invalid
+                logger.debug { "rejected signature-invalid envelope from $source" }
+                return EnvelopeCheck.Failed("signature invalid")
             }
 
-            // cidFor is a pure function of raw bytes - this check is unchanged and correct for
-            // BOTH EncryptionMode.NONE (frame.bodyBytes is a plaintext MessageBody blob) and
-            // EncryptionMode.HYBRID_ECIES (frame.bodyBytes is a SealedBody blob). The name reads
-            // slightly misleadingly for the sealed case, but the binding it enforces is identical.
-            if (MessageBodyCodec.cidFor(frame.bodyBytes) != envelope.contentCid) {
-                logger.debug { "rejected envelope from $from whose contentCid does not match the frame's body" }
-                return ValidationResult.Invalid
+            // Valid for BOTH EncryptionMode.NONE (a plaintext MessageBody blob) and
+            // EncryptionMode.HYBRID_ECIES (a SealedBody blob): the binding it enforces is identical.
+            if (bodyBytes != null && MessageBodyCodec.cidFor(bodyBytes) != envelope.contentCid) {
+                logger.debug { "rejected envelope from $source whose contentCid does not match the frame's body" }
+                return EnvelopeCheck.Failed("content cid mismatch")
             }
 
             // acceptance.gates.isEmpty() is checked HERE, before calling shouldAccept, not just
@@ -239,39 +286,60 @@ class InboxGossip private constructor(
                         deposit = acceptance.depositLookup(envelope),
                     )
                 if (decision is MailAcceptanceDecision.Reject) {
-                    logger.debug { "rejected envelope from $from by mail acceptance policy: ${decision.reason}" }
-                    return ValidationResult.Invalid
+                    logger.debug { "rejected envelope from $source by mail acceptance policy: ${decision.reason}" }
+                    return EnvelopeCheck.Failed("acceptance policy: ${decision.reason}")
                 }
+            }
+            return EnvelopeCheck.Passed(envelope)
+        }
+
+        /**
+         * The second half (V0.9.14: shared by gossip and the DHT fetcher), for an envelope that passed
+         * [checkEnvelope]: content-CID binding (skipped when [cidChecked]) -> payload decode -> dedup -> persist
+         * (body first, then envelope) -> index.
+         */
+        internal fun ingestChecked(
+            envelope: MessageEnvelope,
+            envelopeBytes: ByteArray,
+            bodyBytes: ByteArray,
+            storage: NabuStorage,
+            index: InboxIndex,
+            source: String,
+            cidChecked: Boolean = false,
+        ): InboxIngestOutcome {
+            if (!cidChecked && MessageBodyCodec.cidFor(bodyBytes) != envelope.contentCid) {
+                logger.debug { "rejected envelope from $source whose contentCid does not match the body" }
+                return InboxIngestOutcome.INVALID
             }
 
             val payload =
                 try {
                     when (envelope.encryption) {
-                        EncryptionMode.NONE -> InboxPayload.Plaintext(MessageBodyCodec.decode(frame.bodyBytes))
-                        EncryptionMode.HYBRID_ECIES -> InboxPayload.Sealed(SealedBodyCodec.decode(frame.bodyBytes))
-                        EncryptionMode.MLS_ARCHIVE -> return ValidationResult.Invalid // unreachable, checked above
+                        EncryptionMode.NONE -> InboxPayload.Plaintext(MessageBodyCodec.decode(bodyBytes))
+                        EncryptionMode.HYBRID_ECIES -> InboxPayload.Sealed(SealedBodyCodec.decode(bodyBytes))
+                        EncryptionMode.MLS_ARCHIVE -> return InboxIngestOutcome.INVALID // unreachable
                     }
                 } catch (e: MalformedMessageBodyException) {
-                    logger.debug(e) { "rejected structurally malformed body from $from" }
-                    return ValidationResult.Invalid
+                    logger.debug(e) { "rejected structurally malformed body from $source" }
+                    return InboxIngestOutcome.INVALID
                 } catch (e: MalformedSealedBodyException) {
-                    logger.debug(e) { "rejected structurally malformed sealed body from $from" }
-                    return ValidationResult.Invalid
+                    logger.debug(e) { "rejected structurally malformed sealed body from $source" }
+                    return InboxIngestOutcome.INVALID
                 }
 
             if (!index.canAccept(envelope)) {
                 logger.debug {
-                    "declining duplicate (already-tracked) envelope from $from - not persisting or re-propagating"
+                    "declining duplicate (already-tracked) envelope from $source - not persisting or re-propagating"
                 }
-                return ValidationResult.Invalid
+                return InboxIngestOutcome.DUPLICATE
             }
 
             if (index.tryReservePersistence(envelope)) {
                 try {
                     // Body first, then envelope: a crash between the two never leaves a persisted
                     // envelope pointing at a body this node does not have.
-                    storage.put(frame.bodyBytes)
-                    storage.put(frame.envelopeBytes)
+                    storage.put(bodyBytes)
+                    storage.put(envelopeBytes)
                 } catch (e: NabuStorageException) {
                     // Backported from MailboxGossip's identical fix (V0.8.5 security audit
                     // finding): release the reservation on failure - tryReservePersistence already
@@ -292,25 +360,39 @@ class InboxGossip private constructor(
                     // by releasing the reservation below regardless of which of the two put() calls
                     // failed.
                     index.releaseReservedPersistence(envelope)
-                    logger.warn(e) { "failed to persist gossip-received mail from $from - declining to accept it" }
-                    return ValidationResult.Invalid
+                    logger.warn(e) { "failed to persist received mail from $source - declining to accept it" }
+                    return InboxIngestOutcome.PERSIST_FAILED
                 }
             } else {
                 // Persistence cap reached - NOT a reason to decline the message, mirroring
                 // VeritasGossip/KarmaGossip/LtrGossip/MadliGossip's identical reasoning.
                 logger.debug {
-                    "persistence cap reached - not durably storing mail from $from (still tracking and propagating it)"
+                    "persistence cap reached - not durably storing mail from $source (still tracking and propagating it)"
                 }
             }
 
             if (!index.add(InboxMessage(envelope, payload))) {
                 // Narrow race: canAccept() and add() are two separate @Synchronized lock
-                // acquisitions - a concurrent gossip delivery of the identical content id could win
+                // acquisitions - a concurrent delivery of the identical content id could win
                 // the index slot between the two calls above. Still propagates.
-                logger.debug { "envelope from $from was persisted but lost a narrow index race - propagating anyway" }
+                logger.debug { "envelope from $source was persisted but lost a narrow index race - propagating anyway" }
             }
 
-            return ValidationResult.Valid
+            return InboxIngestOutcome.ACCEPTED
         }
     }
 }
+
+/** Result of [InboxGossip.checkEnvelope]. */
+internal sealed interface EnvelopeCheck {
+    data class Passed(
+        val envelope: MessageEnvelope,
+    ) : EnvelopeCheck
+
+    data class Failed(
+        val reason: String,
+    ) : EnvelopeCheck
+}
+
+/** Result of [InboxGossip.ingestChecked]. */
+internal enum class InboxIngestOutcome { ACCEPTED, DUPLICATE, INVALID, PERSIST_FAILED }

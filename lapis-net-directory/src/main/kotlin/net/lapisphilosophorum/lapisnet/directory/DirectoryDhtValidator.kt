@@ -21,6 +21,8 @@ internal class ValidatedDirectoryEntry(
     val peerRecordBytes: ByteArray?,
     val prekeyBundle: PrekeyBundle?,
     val prekeyBundleBytes: ByteArray?,
+    val publisher: PeerId,
+    val outboxEntries: List<OutboxEntry>,
 )
 
 /**
@@ -38,14 +40,17 @@ internal class ValidatedDirectoryEntry(
  * names that key. Then each part is checked with the same checks its gossip validator makes, plus that it
  * belongs to this identity (and for a peer record, to this binding) and has not expired.
  *
- * One part failing verification rejects the whole value: an envelope with a forged half is not trusted for
- * the other half. A part that is merely expired is dropped instead (the IPNS record outlives the earlier
+ * One directory part (peer record, bundle) failing verification rejects the whole value: an envelope with a
+ * forged half is not trusted for the other half. **Outbox entries (V0.9.14) are the deliberate exception**:
+ * they are opaque to this module and each consumer verifies its payload completely itself (signature, sender
+ * binding), so a bad entry only drops itself. Entries that are expired, exact duplicates or addressed to the
+ * value's own identity are dropped here. A part that is merely expired is dropped instead (the IPNS record outlives the earlier
  * part by up to the storage layer's clock-skew tolerance); only a value with no valid part left is rejected.
  */
 internal object DirectoryDhtValidator {
     fun validate(
         resolved: IpnsValue,
-        expectedIdentity: Secp256k1PublicKey,
+        expectedIdentity: Secp256k1PublicKey?,
         nowEpochSecond: Long,
     ): ValidatedDirectoryEntry? =
         try {
@@ -66,7 +71,7 @@ internal object DirectoryDhtValidator {
 
     private fun validateOrThrow(
         resolved: IpnsValue,
-        expectedIdentity: Secp256k1PublicKey,
+        expectedIdentity: Secp256k1PublicKey?,
         nowEpochSecond: Long,
     ): ValidatedDirectoryEntry? {
         val value = DirectoryDhtValueCodec.decode(resolved.value)
@@ -75,7 +80,7 @@ internal object DirectoryDhtValidator {
 
         val bindingPeerId = PeerId.fromPubKey(unmarshalEd25519PublicKey(binding.ed25519PublicKey.bytes))
         if (resolved.publisher != bindingPeerId) return reject("publisher is not the binding's transport key")
-        if (identity != expectedIdentity) return reject("value is for another identity")
+        if (expectedIdentity != null && identity != expectedIdentity) return reject("value is for another identity")
         if (!IdentityBinding.verify(identity, binding)) return reject("identity binding does not verify")
 
         var peerRecord: PeerRecord? = null
@@ -104,13 +109,22 @@ internal object DirectoryDhtValidator {
             if (decoded.identity != identity) return reject("prekey bundle is for another identity")
             if (decoded.notValidAfterEpochSecond >= nowEpochSecond) bundle = decoded
         }
-        if (peerRecord == null && bundle == null) return reject("every part has expired")
+        val seen = HashSet<List<Byte>>()
+        val outbox =
+            value.outboxEntries.filter {
+                it.notValidAfterEpochSecond >= nowEpochSecond &&
+                    it.recipient != identity &&
+                    seen.add(it.contentId().toList())
+            }
+        if (peerRecord == null && bundle == null && outbox.isEmpty()) return reject("no valid part left")
         return ValidatedDirectoryEntry(
             identity,
             peerRecord,
             peerRecordBytes.takeIf { peerRecord != null },
             bundle,
             bundleBytes.takeIf { bundle != null },
+            resolved.publisher,
+            outbox,
         )
     }
 

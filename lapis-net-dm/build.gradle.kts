@@ -69,6 +69,11 @@ plugins {
     id("java-test-fixtures")
 }
 
+// V0.9.14 (DHT fallback for direct messages): MailboxGossip.dhtConsumer() is the OutboxEntryConsumer for
+// DM_MAILBOX_POINTER entries that DirectoryDht (lapis-net-directory, already an `api` edge here) hands over; it
+// shares the gossip validator's checks and the same DmAcceptanceCheck. DmSessionManager takes an optional
+// DhtOutbox and leaves the offline pointer in it. MultiaddrHygiene moved to lapis-net-directory (behaviour
+// unchanged) so the mail module shares it; the MailboxPoller registers addresses through PeerAddressDialing.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))

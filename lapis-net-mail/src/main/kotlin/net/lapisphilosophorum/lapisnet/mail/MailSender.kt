@@ -1,6 +1,9 @@
 package net.lapisphilosophorum.lapisnet.mail
 
 import io.ipfs.cid.Cid
+import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntry
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntryKind
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
@@ -19,6 +22,8 @@ class SentMessage(
     val bodyCid: Cid,
     val sealedBody: SealedBody?,
     frameBytes: ByteArray,
+    /** CID of the stored envelope blob (V0.9.14: what the DHT outbox pointer refers to). */
+    val envelopeCid: Cid? = null,
 ) {
     private val storedFrameBytes: ByteArray = frameBytes.copyOf()
 
@@ -34,7 +39,32 @@ class SentMessage(
 class MailSender(
     private val pubsub: GossipPubSub,
     private val storage: NabuStorage,
+    /** V0.9.14 - where every sent [EncryptionMode.HYBRID_ECIES] mail also leaves a pointer for the DHT fallback
+     * ([DhtOutbox]); `null` (the default) keeps gossip-only behavior. [EncryptionMode.NONE] mail never leaves a
+     * pointer (the DHT value is world-readable and the plaintext body would be fetchable by anybody). Nothing is
+     * published to the DHT by this class. */
+    private val outbox: DhtOutbox? = null,
+    private val dhtEntryTtlSeconds: Long = DEFAULT_DHT_ENTRY_TTL_SECONDS,
 ) {
+    init {
+        require(dhtEntryTtlSeconds > 0) { "dhtEntryTtlSeconds must be positive" }
+    }
+
+    private fun offerToOutbox(
+        localIdentity: Secp256k1KeyPair,
+        recipients: List<Secp256k1PublicKey>,
+        envelopeCid: Cid,
+        sentAtEpochSecond: Long,
+    ) {
+        val outbox = outbox ?: return
+        val payload = MailDhtPointerCodec.encode(MailDhtPointer(envelopeCid))
+        recipients.filter { it != localIdentity.publicKey }.distinct().forEach { recipient ->
+            outbox.offer(
+                OutboxEntry(OutboxEntryKind.MAIL_POINTER, recipient, sentAtEpochSecond + dhtEntryTtlSeconds, payload),
+            )
+        }
+    }
+
     /**
      * Builds a [MessageBody] from [subject]/[body]/[attachments]/[headers]. For
      * [EncryptionMode.NONE] (the default), stores the plaintext body blob in [storage], signs a
@@ -116,12 +146,21 @@ class MailSender(
                 threadRoot = threadRoot,
             )
         val envelopeBytes = MessageEnvelopeCodec.encode(envelope)
-        storage.put(envelopeBytes)
+        val envelopeCid = storage.put(envelopeBytes)
 
         val frame = MailFrameCodec.encode(envelopeBytes, bodyBytes)
+        // Deliberately NO offerToOutbox here: the DHT value is world-readable, and a pointer to a plaintext
+        // envelope would let anybody fetch the envelope and then the plaintext body from this node.
         recipients.forEach { recipient -> pubsub.publish(InboxTopics.forRecipient(recipient), frame) }
 
-        return SentMessage(envelope, messageBody, bodyCid, sealedBody = null, frameBytes = frame)
+        return SentMessage(
+            envelope,
+            messageBody,
+            bodyCid,
+            sealedBody = null,
+            frameBytes = frame,
+            envelopeCid = envelopeCid,
+        )
     }
 
     private fun sendHybridEcies(
@@ -164,12 +203,21 @@ class MailSender(
                 wraps = sealed.wraps,
             )
         val envelopeBytes = MessageEnvelopeCodec.encode(envelope)
-        storage.put(envelopeBytes)
+        val envelopeCid = storage.put(envelopeBytes)
 
         val frame = MailFrameCodec.encode(envelopeBytes, sealed.sealedBodyBytes)
+        // before the gossip publish, as a throwing publish must not skip registering the DHT pointer
+        offerToOutbox(localIdentity, recipients, envelopeCid, sentAtEpochSecond)
         recipients.forEach { recipient -> pubsub.publish(InboxTopics.forRecipient(recipient), frame) }
 
-        return SentMessage(envelope, messageBody, sealed.contentCid, sealedBody = sealed.sealedBody, frameBytes = frame)
+        return SentMessage(
+            envelope,
+            messageBody,
+            sealed.contentCid,
+            sealedBody = sealed.sealedBody,
+            frameBytes = frame,
+            envelopeCid = envelopeCid,
+        )
     }
 
     /**
@@ -185,5 +233,10 @@ class MailSender(
         sent.envelope.recipients.forEach { recipient ->
             pubsub.publish(InboxTopics.forRecipient(recipient), sent.frameBytes)
         }
+    }
+
+    companion object {
+        /** How long a mail's pointer stays valid in the DHT outbox (an IPNS record lives at most 7 days anyway). */
+        const val DEFAULT_DHT_ENTRY_TTL_SECONDS: Long = 7 * 86_400L
     }
 }
