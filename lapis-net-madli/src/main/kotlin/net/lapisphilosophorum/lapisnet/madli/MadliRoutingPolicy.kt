@@ -87,7 +87,7 @@ object MadliRoutingPolicy {
 
 /** Unsigned lexicographic byte-order comparator over `PeerId.bytes` - [MadliRoutingPolicy.orderPeers]'s
  * deterministic tie-break, mirroring `lapis-net-trust`'s `Secp256k1PublicKeyBytesComparator`. */
-private object PeerIdBytesComparator : Comparator<PeerId> {
+internal object PeerIdBytesComparator : Comparator<PeerId> {
     override fun compare(
         a: PeerId,
         b: PeerId,

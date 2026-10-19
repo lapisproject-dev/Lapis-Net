@@ -20,10 +20,19 @@ import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopProtocol
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopBinding
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitStopProtocol
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisRelayTransport
+import net.lapisphilosophorum.lapisnet.networking.relay.NodeReachability
+import net.lapisphilosophorum.lapisnet.networking.relay.ReachabilityHeuristic
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayCandidateRanker
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayControlDiagnostics
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayReliabilityCounts
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayReliabilityTracker
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationRegistry
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayUsageLedger
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
@@ -167,7 +176,17 @@ class LapisNode private constructor(
     /** The hop protocol of this node's relay server role. Only for tests (they widen the window in
      * which a circuit is being wired up) - not a public API. */
     internal val relayHopProtocol: LapisCircuitHopProtocol,
+    private val relayConfig: RelayConfig,
+    private val relayLedger: RelayUsageLedger,
+    private val relayReliability: RelayReliabilityTracker,
 ) {
+    @Volatile
+    private var autoRelay: RelayAutoSelector? = null
+
+    /** Serialises [startAutoRelay] against itself and against [stop], so a selector can neither
+     * be started after the node stopped nor leave two selectors running. */
+    private val autoRelayLock = Any()
+
     private val discovered = BoundedPeerCache(MAX_DISCOVERED_PEERS)
     private val stopped = AtomicBoolean(false)
 
@@ -194,6 +213,60 @@ class LapisNode private constructor(
     internal val connectsBeforeGossipAttach = AtomicInteger(0)
 
     val peerId: PeerId get() = host.peerId
+
+    /**
+     * This node's local relay-usage balance for [peer] (`received - served`, in relayed bytes,
+     * decayed): negative means this node forwarded more for [peer] than [peer] did for it. Local
+     * and read-only; never gossiped. `0` for an unknown peer.
+     */
+    fun relayUsageBalance(peer: PeerId): Long = relayLedger.balanceOf(peer)
+
+    /** A copy of every non-zero local relay-usage balance. See [relayUsageBalance]. */
+    fun relayUsageSnapshot(): Map<PeerId, Long> = relayLedger.snapshot()
+
+    /**
+     * Relay reliability this node observed on the given UTC day ([epochDay] = days since the Unix
+     * epoch): per relay, how many reservation / renewal / outgoing-circuit-dial attempts there were
+     * and how many succeeded. Only the current and previous day are retained. Input for the Madli
+     * relay-reliability publisher.
+     */
+    fun relayReliabilityCounts(epochDay: Long): Map<PeerId, RelayReliabilityCounts> =
+        relayReliability.countsForDay(epochDay)
+
+    /**
+     * Starts the automatic relay selection ([RelayAutoSelector]) with candidates from [candidates]
+     * (typically the peer directory's relay candidates), optionally ordered by [ranker] (e.g. the
+     * Madli reliability ranker). **Only acts when the node declared
+     * [NodeReachability.PRIVATE]**; otherwise it logs and returns a selector that is not running.
+     * Calling it again replaces (and stops) the previous selector. The selector is stopped by
+     * [stop] before the reservation client is.
+     */
+    fun startAutoRelay(
+        candidates: () -> List<PeerInfo>,
+        ranker: RelayCandidateRanker = RelayCandidateRanker.UNRANKED,
+    ): RelayAutoSelector {
+        val selector =
+            RelayAutoSelector(
+                client = relayClient,
+                config = relayConfig.autoRelay,
+                candidates = candidates,
+                ranker = ranker,
+                selfPeerId = host.peerId,
+            )
+        synchronized(autoRelayLock) {
+            check(!stopped.get()) { "node is stopped" }
+            autoRelay?.stop()
+            autoRelay = selector
+            if (relayConfig.reachability != NodeReachability.PRIVATE) {
+                logger.info {
+                    "automatic relay selection not started: reachability is ${relayConfig.reachability}, not PRIVATE"
+                }
+                return selector
+            }
+            selector.start()
+        }
+        return selector
+    }
 
     /** Circuits this node currently relays for others (server role). Only for tests and logging. */
     internal fun relayCircuitCount(): Int = relayRegistry.circuitCount()
@@ -271,6 +344,7 @@ class LapisNode private constructor(
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
         awaitOrWrap("start host", timeout) { host.start() }
+        warnOnReachabilityMismatch()
         awaitOrWrap("start mDNS discovery", timeout) { mdns.start() }
         bootstrapPeers.forEach { address ->
             host.network
@@ -287,6 +361,35 @@ class LapisNode private constructor(
     }
 
     /**
+     * Logs ONE warning when the declared [RelayConfig.reachability] and the node's own addresses
+     * obviously disagree. Purely informative - never changes behaviour (no AutoNAT in this build).
+     * Wildcard listen addresses are expanded to the machine's interface addresses.
+     */
+    private fun warnOnReachabilityMismatch() {
+        runCatching {
+            val addresses = ArrayList<InetAddress>()
+            for (listen in host.listenAddresses().filterNot { it.has(Protocol.P2PCIRCUIT) }) {
+                val literals = ReachabilityHeuristic.literalAddressesOf(listen)
+                if (literals.any { it.isAnyLocalAddress }) {
+                    addresses += interfaceAddresses()
+                } else {
+                    addresses += literals
+                }
+            }
+            val hint = ReachabilityHeuristic.assess(addresses)
+            ReachabilityHeuristic.warningFor(relayConfig.reachability, hint)?.let { logger.warn { it } }
+        }.onFailure { logger.debug(it) { "reachability heuristic could not run" } }
+    }
+
+    private fun interfaceAddresses(): List<InetAddress> =
+        NetworkInterface
+            .getNetworkInterfaces()
+            ?.toList()
+            .orEmpty()
+            .filter { runCatching { it.isUp }.getOrDefault(false) }
+            .flatMap { it.inetAddresses.toList() }
+
+    /**
      * Stops mDNS discovery and the host independently - a failure stopping one (e.g. mDNS was
      * never successfully started) must never prevent the other's shutdown from being attempted,
      * or the Netty-backed host (bound socket, event-loop threads) could leak. Idempotent: a
@@ -301,6 +404,9 @@ class LapisNode private constructor(
         // Stop renewing relay reservations before anything else: the renewal task dials, and a
         // dial racing a host shutdown is pure noise. Never fatal - a failure here must not stop the
         // host's own shutdown, same reasoning as the mDNS/host split below.
+        // The selector first: it reserves through the client, so it must not outlive it.
+        runCatching { synchronized(autoRelayLock) { autoRelay?.stop() } }
+            .onFailure { logger.warn(it) { "failed to stop automatic relay selection cleanly" } }
         runCatching { relayClient.stop() }
             .onFailure { logger.warn(it) { "failed to stop relay reservation renewal cleanly" } }
         val mdnsFailure = runCatching { awaitOrWrap("stop mDNS discovery", timeout) { mdns.stop() } }.exceptionOrNull()
@@ -353,7 +459,9 @@ class LapisNode private constructor(
             // is counted exactly once either way.
             val relayInboundHandlers = ConnectionHandler.createBroadcast(listOf(connectionCap))
 
-            val registry = RelayReservationRegistry(relayConfig.serverLimits)
+            val ledger = RelayUsageLedger()
+            val reliability = RelayReliabilityTracker()
+            val registry = RelayReservationRegistry(relayConfig.serverLimits, ledger)
             val controlDiagnostics = RelayControlDiagnostics()
             val stopProtocol = LapisCircuitStopProtocol(relayConfig.clientLimits, controlDiagnostics)
             val stopBinding = LapisCircuitStopBinding(stopProtocol)
@@ -370,7 +478,7 @@ class LapisNode private constructor(
                     transports {
                         add(::TcpTransport)
                         add { upgrader ->
-                            LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits)
+                            LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits, ledger, reliability)
                                 .also { relayTransport = it }
                         }
                     }
@@ -393,7 +501,13 @@ class LapisNode private constructor(
             stopProtocol.onCircuitAccepted = { stream, initiator ->
                 relayTransport.acceptCircuit(stream, initiator, relayInboundHandlers)
             }
-            val relayClient = RelayReservationClient(builtHost, hopBinding, relayConfig.clientLimits)
+            val relayClient =
+                RelayReservationClient(
+                    builtHost,
+                    hopBinding,
+                    relayConfig.clientLimits,
+                    reliability = reliability,
+                )
             relayTransport.circuitAddresses = relayClient::circuitAddresses
             stopProtocol.holdsReservationWith = relayClient::holdsReservationWith
             // Registered BEFORE start() - see MAX_CONCURRENT_CONNECTIONS's own doc comment for why
@@ -411,6 +525,9 @@ class LapisNode private constructor(
                     registry,
                     relayTransport,
                     hopProtocol,
+                    relayConfig,
+                    ledger,
+                    reliability,
                 )
             mdns.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {

@@ -91,6 +91,7 @@ object MadliAggregator {
     ): AggregatedMadli? {
         val weighted =
             vectors
+                .filter { it.metrics != null }
                 .map { vector -> WeightedVector(vector, observerWeight(vector.observer)) }
                 .filter { it.observerWeight > 0.0 }
         if (weighted.isEmpty()) return null
@@ -112,25 +113,59 @@ object MadliAggregator {
         return AggregatedMadli(
             reachabilityMicros =
                 weightedMedianLong(
-                    decayedPairsLong(halfLives.reachabilityDays) { it.metrics.reachabilityMicros.toLong() },
+                    decayedPairsLong(halfLives.reachabilityDays) { it.coreMetrics().reachabilityMicros.toLong() },
                 ).toInt(),
             medianBandwidthBytesPerSec =
                 weightedMedianLong(
-                    decayedPairsLong(halfLives.bandwidthDays) { it.metrics.medianBandwidthBytesPerSec },
+                    decayedPairsLong(halfLives.bandwidthDays) { it.coreMetrics().medianBandwidthBytesPerSec },
                 ),
             medianLatencyMillis =
                 weightedMedianLong(
-                    decayedPairsLong(halfLives.latencyDays) { it.metrics.medianLatencyMillis.toLong() },
+                    decayedPairsLong(halfLives.latencyDays) { it.coreMetrics().medianLatencyMillis.toLong() },
                 ).toInt(),
             deliveryIntegrityMicros =
                 weightedMedianLong(
-                    decayedPairsLong(halfLives.deliveryIntegrityDays) { it.metrics.deliveryIntegrityMicros.toLong() },
+                    decayedPairsLong(
+                        halfLives.deliveryIntegrityDays,
+                    ) { it.coreMetrics().deliveryIntegrityMicros.toLong() },
                 ).toInt(),
             routingHelpfulnessMicros =
                 weightedMedianLong(
-                    decayedPairsLong(halfLives.routingHelpfulnessDays) { it.metrics.routingHelpfulnessMicros.toLong() },
+                    decayedPairsLong(
+                        halfLives.routingHelpfulnessDays,
+                    ) { it.coreMetrics().routingHelpfulnessMicros.toLong() },
                 ).toInt(),
         )
+    }
+
+    /**
+     * Veritas-weighted, decay-weighted, weighted-MEDIAN relay reliability (micros, `0..1_000_000`)
+     * of one observed peer, over the vectors in [vectors] that carry a relay block; `null` if no
+     * such vector has positive observer weight. Same manipulation defenses as [aggregate]: vectors
+     * with `observerWeight <= 0` are dropped, at most ONE representative sample per observer (the
+     * freshest under [MadliHalfLives.relayReliabilityDays]), weighted median instead of mean.
+     * Vectors without a relay block are filtered out BEFORE grouping, so they can neither
+     * contribute nor displace an observer's relay-carrying vector.
+     */
+    fun aggregateRelayReliability(
+        vectors: Collection<MadliDailyVector>,
+        observerWeight: (Secp256k1PublicKey) -> Double,
+        atEpochDay: Long,
+        halfLives: MadliHalfLives = MadliHalfLives(),
+    ): Int? {
+        val weighted =
+            vectors
+                .filter { it.relayMetrics != null }
+                .map { vector -> WeightedVector(vector, observerWeight(vector.observer)) }
+                .filter { it.observerWeight > 0.0 }
+        if (weighted.isEmpty()) return null
+        val pairs =
+            weighted.groupBy { it.vector.observer }.values.map { group ->
+                representativeFor(group, halfLives.relayReliabilityDays, atEpochDay) {
+                    requireNotNull(it.relayMetrics).relayReliabilityMicros.toLong()
+                }
+            }
+        return weightedMedianLong(pairs).toInt()
     }
 
     /**
@@ -150,6 +185,9 @@ object MadliAggregator {
             TrustPathFinder.trustMicros(graph, localIdentity, observer).toDouble() /
                 MAX_TRUST_MICROS.toDouble()
         }
+
+    private fun MadliDailyVector.coreMetrics(): MadliMetrics =
+        requireNotNull(metrics) { "core aggregation requires core metrics (filtered earlier)" }
 
     private data class WeightedVector(
         val vector: MadliDailyVector,

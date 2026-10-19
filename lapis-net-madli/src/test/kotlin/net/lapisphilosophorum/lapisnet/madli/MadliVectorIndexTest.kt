@@ -375,4 +375,44 @@ class MadliVectorIndexTest :
             index.vectorsForObservedPeer(peer) shouldBe listOf(v1)
             index.vectorsForObservedPeer(otherPeer) shouldBe listOf(v2)
         }
+
+        test("a replayed core-only vector never displaces the merged vector carrying a relay block") {
+            val observer = Secp256k1KeyPair.generate()
+            val peer = testPeerId(1)
+            val core = vector(observer, peer)
+            val merged =
+                MadliDailyVector.create(
+                    observer,
+                    peer,
+                    100L,
+                    testMetrics(),
+                    MadliRelayMetrics(relayReliabilityMicros = 100_000, relayAttemptCount = 9),
+                )
+            val index = MadliVectorIndex()
+
+            index.add(core) shouldBe true
+            index.add(merged) shouldBe true // merge replaces the core-only vector
+            index.canAccept(core) shouldBe false // replay is refused up front
+            index.add(core) shouldBe false // and by add itself
+            index.vectorFor(observer.publicKey, peer, 100L) shouldBe merged
+            index.vectorsForObservedPeer(peer) shouldBe listOf(merged)
+            // repeated replay cannot make it flip back
+            repeat(3) { index.add(core) shouldBe false }
+            index.vectorFor(observer.publicKey, peer, 100L) shouldBe merged
+        }
+
+        test("a relay-bearing vector replaces a core-only one and another relay vector") {
+            val observer = Secp256k1KeyPair.generate()
+            val peer = testPeerId(2)
+            val relay1 = MadliRelayMetrics(relayReliabilityMicros = 100_000, relayAttemptCount = 5)
+            val relay2 = MadliRelayMetrics(relayReliabilityMicros = 900_000, relayAttemptCount = 7)
+            val v1 = MadliDailyVector.create(observer, peer, 100L, testMetrics(), relay1)
+            val v2 = MadliDailyVector.create(observer, peer, 100L, testMetrics(), relay2)
+            val index = MadliVectorIndex()
+
+            index.add(vector(observer, peer)) shouldBe true
+            index.add(v1) shouldBe true
+            index.add(v2) shouldBe true
+            index.vectorFor(observer.publicKey, peer, 100L) shouldBe v2
+        }
     })

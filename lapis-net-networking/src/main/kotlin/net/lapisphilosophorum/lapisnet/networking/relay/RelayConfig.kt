@@ -22,12 +22,14 @@ import java.time.Duration
  *    module: a relay forwards attacker-chosen bytes to attacker-chosen third parties on the
  *    operator's bandwidth and IP address, so it must never be the accidental default.
  *
- * **No Virtus/Libertaler compensation scheme for relay operators in this wave** - a deliberate
- * scope cut, consistent with the answer already settled for storage replication: at the protocol
- * layer, running infrastructure for others earns *reputation* (Madli, `lapis-net-madli`), not
- * payment. Adding a dedicated Madli "relay service quality" metric is a possible follow-up; this
- * wave deliberately ships the raw network capability first and leaves the incentive question
- * exactly where `docs/architecture.adoc` already had it.
+ * **No Virtus/Libertaler compensation scheme for relay operators** - a deliberate scope cut,
+ * consistent with the answer already settled for storage replication: at the protocol layer,
+ * running infrastructure for others earns *reputation* (Madli, `lapis-net-madli`), not payment.
+ * Since V0.9.12 two reputation mechanisms exist: (1) a Madli relay-reliability metric (observed by
+ * relay *clients*, signed, gossiped, Veritas-weighted) that feeds the optional
+ * [RelayCandidateRanker] of the automatic relay selection ([autoRelay]), and (2) a purely
+ * node-local usage ledger ([RelayUsageLedger]) that gives net contributors priority when the relay
+ * is busy ([RelayServerLimits.priorityHeadroomFraction]).
  */
 data class RelayConfig(
     /** Whether this node is willing to act as a relay **for other peers**. Off by default - see
@@ -37,7 +39,27 @@ data class RelayConfig(
     val serverLimits: RelayServerLimits = RelayServerLimits(),
     /** Ceilings applied to circuits this node uses as a *client* - see [RelayClientLimits]. */
     val clientLimits: RelayClientLimits = RelayClientLimits(),
+    /** What the operator declares about this node's inbound reachability. Only
+     * [NodeReachability.PRIVATE] enables the automatic relay selection
+     * ([net.lapisphilosophorum.lapisnet.networking.LapisNode.startAutoRelay]). There is no AutoNAT
+     * in this build, so the node cannot detect its reachability itself; a heuristic only *warns*
+     * on an obvious mismatch ([ReachabilityHeuristic]) and never changes behaviour. */
+    val reachability: NodeReachability = NodeReachability.UNSPECIFIED,
+    /** Parameters of the automatic relay selection - used only when [reachability] is
+     * [NodeReachability.PRIVATE]. */
+    val autoRelay: AutoRelayConfig = AutoRelayConfig(),
 ) {
+    init {
+        // Only enforced when the selector can actually run, so a plain client config with a small
+        // maxReservations is not rejected over a setting it never uses.
+        require(
+            reachability != NodeReachability.PRIVATE || autoRelay.targetRelayCount <= clientLimits.maxReservations,
+        ) {
+            "autoRelay.targetRelayCount (${autoRelay.targetRelayCount}) must not exceed " +
+                "clientLimits.maxReservations (${clientLimits.maxReservations}) when reachability is PRIVATE"
+        }
+    }
+
     companion object {
         /** Client-capable, never a relay for others. The default for [
          * net.lapisphilosophorum.lapisnet.networking.LapisNode.create]. */
@@ -46,6 +68,57 @@ data class RelayConfig(
         /** Convenience for an intentionally-operated public relay node. */
         fun relayServer(limits: RelayServerLimits = RelayServerLimits()): RelayConfig =
             RelayConfig(serverEnabled = true, serverLimits = limits)
+    }
+}
+
+/** The operator's declaration of whether other peers can dial this node directly. */
+enum class NodeReachability {
+    /** Not declared. No automatic relay selection; the reachability heuristic may still warn. */
+    UNSPECIFIED,
+
+    /** Directly dialable from the internet (public IP / port forwarding in place). */
+    PUBLIC,
+
+    /** Behind NAT / firewall: needs a relay to be reachable. Enables automatic relay selection. */
+    PRIVATE,
+}
+
+/**
+ * Parameters of the automatic relay selection ([RelayAutoSelector]).
+ *
+ * Every number is a bound: the candidate list is filtered (self, held, backoff, unsafe addresses,
+ * duplicates) and then truncated to [candidateLimit] before anything is ranked or dialled, a pass
+ * makes at most [maxAttemptsPerPass] reservation attempts however many candidates a hostile
+ * directory offers, and the failure memory is capped at [maxBackoffEntries].
+ */
+data class AutoRelayConfig(
+    /** How many relay reservations the selector tries to hold at once. */
+    val targetRelayCount: Int = 2,
+    /** How often a selection pass runs (fills gaps, replaces lost relays). */
+    val reselectInterval: Duration = Duration.ofMinutes(5),
+    /** How many directory candidates are considered per pass. */
+    val candidateLimit: Int = 16,
+    /** Maximum reservation attempts per pass (each may block up to the client control timeout). */
+    val maxAttemptsPerPass: Int = 4,
+    /** How long a relay that failed a reservation attempt is skipped. */
+    val failureBackoff: Duration = Duration.ofMinutes(10),
+    /** Cap on the failure-memory table. */
+    val maxBackoffEntries: Int = 256,
+    /** Whether candidates with loopback / private / link-local / CGNAT / reserved IP addresses are
+     * acceptable. `false` (default) drops them: candidate addresses come from a gossiped directory
+     * written by strangers, and dialling an address inside the operator's own network on a
+     * stranger's say-so is an SSRF primitive. Enable for LAN deployments and loopback tests. DNS-form
+     * addresses (`/dns*`, `/dnsaddr`) are dropped too unless this is set: they would be resolved
+     * later by the dialler without any check (rebinding / `*.nip.io` into the local network). */
+    val allowNonPublicCandidateAddresses: Boolean = false,
+) {
+    init {
+        require(targetRelayCount > 0) { "targetRelayCount must be > 0" }
+        require(!reselectInterval.isNegative && !reselectInterval.isZero) { "reselectInterval must be positive" }
+        require(candidateLimit > 0) { "candidateLimit must be > 0" }
+        require(maxAttemptsPerPass > 0) { "maxAttemptsPerPass must be > 0" }
+        require(!failureBackoff.isNegative) { "failureBackoff must not be negative" }
+        require(maxBackoffEntries > 0) { "maxBackoffEntries must be > 0" }
     }
 }
 
@@ -194,8 +267,20 @@ data class RelayServerLimits(
      * [maxConnectAttemptsPerWindow] and by the refusal of a `CONNECT` from an initiator that is not
      * draining its own connection. */
     val connectionStallGrace: Duration = Duration.ofSeconds(1),
+    /** Fraction of [maxConcurrentReservations] / [maxConcurrentCircuits] that is reserved for peers
+     * with a non-negative [RelayUsageLedger] balance ("priority headroom"). While the relay is
+     * below the remaining soft limit everybody is served; inside the top band only peers that have
+     * not consumed more than they contributed are admitted, a debtor is deferred (refused now,
+     * served again once load drops). **Never a hard gate:** a debtor is never refused for its
+     * balance alone while capacity below the soft limit is free, and renewals of an existing
+     * reservation are always served. `0.0` switches priority off. Must be in `0.0..0.9`. Appended
+     * last with a default so positional constructor calls keep compiling. */
+    val priorityHeadroomFraction: Double = 0.25,
 ) {
     init {
+        require(priorityHeadroomFraction in 0.0..0.9) {
+            "priorityHeadroomFraction must be in 0.0..0.9: $priorityHeadroomFraction"
+        }
         require(!connectionStallBudget.isNegative && !connectionStallBudget.isZero) {
             "connectionStallBudget must be positive"
         }

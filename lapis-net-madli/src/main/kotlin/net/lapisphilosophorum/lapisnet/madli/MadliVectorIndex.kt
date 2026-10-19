@@ -43,7 +43,8 @@ internal data class MadliContentId(
  * content-id duplicate is caught earlier), the old vector is removed from every index before the
  * new one is added. Only the observer can sign vectors attributed to itself, so replace only ever
  * lets an observer correct **its own** report for a day - harmless. This stops "one observer
- * publishes many vectors about one peer for the same day".
+ * publishes many vectors about one peer for the same day". Exception (replay guard): a vector
+ * without a relay-reliability block never replaces one that has it (see [isDowngrade]).
  *
  * **Invariant B - at most [MAX_TRACKED_DAYS_PER_OBSERVER_PEER] distinct-day vectors per
  * `(observer, observedPeer)` pair - evict the smallest `epochDay` when exceeded. The
@@ -141,6 +142,7 @@ class MadliVectorIndex internal constructor(
 
             val dayKey = ObserverPeerDayKey(vector.observer, vector.observedPeer, vector.epochDay)
             currentByObserverPeerDay[dayKey]?.let { previous ->
+                if (isDowngrade(previous, vector)) return@runCatching false
                 vectorsByContentId.remove(MadliContentId(previous.contentId()))
                 removeFromSecondaryIndices(previous)
             }
@@ -174,8 +176,28 @@ class MadliVectorIndex internal constructor(
      * by content id. Mirrors `KarmaVoteIndex.canAccept`'s contract exactly.
      */
     @Synchronized
-    fun canAccept(vector: MadliDailyVector): Boolean =
-        !vectorsByContentId.containsKey(MadliContentId(vector.contentId()))
+    fun canAccept(vector: MadliDailyVector): Boolean {
+        if (vectorsByContentId.containsKey(MadliContentId(vector.contentId()))) return false
+        val current =
+            currentByObserverPeerDay[ObserverPeerDayKey(vector.observer, vector.observedPeer, vector.epochDay)]
+        return current == null || !isDowngrade(current, vector)
+    }
+
+    /**
+     * Replay guard for invariant A: `true` iff [candidate] would replace [current] although it
+     * carries LESS information - [current] has a relay-reliability block and [candidate] does not.
+     * The relay-reliability publisher merges the observer's older core-only vector into a v2
+     * vector, so a core-only vector for the same tuple always exists and is replayable by any peer
+     * once it left the GossipSub seen-cache; with pure most-recent-arrival-wins that replay would
+     * erase the observer's relay block network-wide (a hostile relay could use it to remove
+     * negative reports about itself). A vector with a relay block therefore always beats one
+     * without, independent of arrival order. The observer can still correct its own report by
+     * publishing another vector that carries a relay block.
+     */
+    private fun isDowngrade(
+        current: MadliDailyVector,
+        candidate: MadliDailyVector,
+    ): Boolean = current.relayMetrics != null && candidate.relayMetrics == null
 
     /**
      * Admission gate purely for **durable persistence** - a bounded, non-evicting,
@@ -197,6 +219,14 @@ class MadliVectorIndex internal constructor(
     @Synchronized
     internal fun vectorsForObservedPeer(peer: PeerId): List<MadliDailyVector> =
         vectorsByObservedPeer[peer]?.toList() ?: emptyList()
+
+    /** The currently tracked vector for the exact `(observer, peer, epochDay)` tuple, if any. */
+    @Synchronized
+    internal fun vectorFor(
+        observer: Secp256k1PublicKey,
+        peer: PeerId,
+        epochDay: Long,
+    ): MadliDailyVector? = currentByObserverPeerDay[ObserverPeerDayKey(observer, peer, epochDay)]
 
     /** Every distinct observed [PeerId] with at least one tracked vector. */
     @Synchronized

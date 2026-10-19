@@ -46,7 +46,10 @@ class MadliDailyVector private constructor(
     val observer: Secp256k1PublicKey,
     val observedPeer: PeerId,
     val epochDay: Long,
-    val metrics: MadliMetrics,
+    /** The five core infrastructure metrics, or `null` for a relay-only (v2) vector. */
+    val metrics: MadliMetrics?,
+    /** The relay-reliability observation, or `null` for a core-only (v1-encoded) vector. */
+    val relayMetrics: MadliRelayMetrics?,
     signature: ByteArray,
 ) {
     private val storedSignature: ByteArray = signature.copyOf()
@@ -56,6 +59,9 @@ class MadliDailyVector private constructor(
     val signature: ByteArray get() = storedSignature.copyOf()
 
     init {
+        require(metrics != null || relayMetrics != null) {
+            "a vector must carry core metrics, relay metrics, or both"
+        }
         require(storedSignature.size == SIGNATURE_SIZE) {
             "vector signature must be a compact $SIGNATURE_SIZE-byte ECDSA signature"
         }
@@ -74,6 +80,7 @@ class MadliDailyVector private constructor(
             observedPeer == other.observedPeer &&
             epochDay == other.epochDay &&
             metrics == other.metrics &&
+            relayMetrics == other.relayMetrics &&
             storedSignature.contentEquals(other.storedSignature)
     }
 
@@ -81,7 +88,8 @@ class MadliDailyVector private constructor(
         var result = observer.hashCode()
         result = 31 * result + observedPeer.hashCode()
         result = 31 * result + epochDay.hashCode()
-        result = 31 * result + metrics.hashCode()
+        result = 31 * result + (metrics?.hashCode() ?: 0)
+        result = 31 * result + (relayMetrics?.hashCode() ?: 0)
         result = 31 * result + storedSignature.contentHashCode()
         return result
     }
@@ -89,7 +97,7 @@ class MadliDailyVector private constructor(
     /** Deliberately excludes [signature] - see this class's doc comment on never logging it. */
     override fun toString(): String =
         "MadliDailyVector(observer=${observer.fingerprint()}, observedPeer=$observedPeer, " +
-            "epochDay=$epochDay, metrics=$metrics)"
+            "epochDay=$epochDay, metrics=$metrics, relayMetrics=$relayMetrics)"
 
     companion object {
         private fun signingDigest(body: ByteArray): ByteArray =
@@ -104,10 +112,32 @@ class MadliDailyVector private constructor(
             observedPeer: PeerId,
             epochDay: Long,
             metrics: MadliMetrics,
+        ): MadliDailyVector = create(observer, observedPeer, epochDay, metrics, null)
+
+        /** As the core-only overload, but may additionally (or exclusively) carry a
+         * [relayMetrics] block. At least one of [metrics]/[relayMetrics] must be non-null. A
+         * vector with [relayMetrics] != null is encoded as wire-format v2; a core-only vector is
+         * always encoded as v1 (the canonical encoding - see [MadliDailyVectorCodec]). */
+        fun create(
+            observer: Secp256k1KeyPair,
+            observedPeer: PeerId,
+            epochDay: Long,
+            metrics: MadliMetrics?,
+            relayMetrics: MadliRelayMetrics?,
         ): MadliDailyVector {
-            val body = MadliDailyVectorCodec.encodeSignedBody(observer.publicKey, observedPeer, epochDay, metrics)
+            require(metrics != null || relayMetrics != null) {
+                "a vector must carry core metrics, relay metrics, or both"
+            }
+            val body =
+                MadliDailyVectorCodec.encodeSignedBody(
+                    observer.publicKey,
+                    observedPeer,
+                    epochDay,
+                    metrics,
+                    relayMetrics,
+                )
             val signature = observer.sign(signingDigest(body))
-            return MadliDailyVector(observer.publicKey, observedPeer, epochDay, metrics, signature)
+            return MadliDailyVector(observer.publicKey, observedPeer, epochDay, metrics, relayMetrics, signature)
         }
 
         /** Self-contained cryptographic verification: checks [vector]'s signature against the
@@ -131,9 +161,10 @@ class MadliDailyVector private constructor(
             observer: Secp256k1PublicKey,
             observedPeer: PeerId,
             epochDay: Long,
-            metrics: MadliMetrics,
+            metrics: MadliMetrics?,
+            relayMetrics: MadliRelayMetrics?,
             signature: ByteArray,
-        ): MadliDailyVector = MadliDailyVector(observer, observedPeer, epochDay, metrics, signature)
+        ): MadliDailyVector = MadliDailyVector(observer, observedPeer, epochDay, metrics, relayMetrics, signature)
     }
 }
 

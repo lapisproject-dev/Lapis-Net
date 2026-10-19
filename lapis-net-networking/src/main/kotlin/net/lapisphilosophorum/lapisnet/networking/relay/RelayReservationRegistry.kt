@@ -7,6 +7,7 @@ import java.time.Duration
 import java.time.Instant
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ceil
 
 /** One granted reservation, as the relay itself tracks it. */
 internal class GrantedReservation(
@@ -105,6 +106,20 @@ internal class ConnectRateLimiter(
     }
 }
 
+/** Outcome of [RelayReservationRegistry.tryReserve]. */
+internal sealed interface ReservationOutcome {
+    data class Granted(
+        val reservation: GrantedReservation,
+    ) : ReservationOutcome
+
+    /** A hard limit (total slots or per-source-address) refused the request. */
+    data object CapacityFull : ReservationOutcome
+
+    /** The relay is inside its priority headroom band and the requestor's [RelayUsageLedger]
+     * balance is negative: refused now, admissible again once load drops. */
+    data object DeferredLowPriority : ReservationOutcome
+}
+
 /** Outcome of [RelayReservationRegistry.claimCircuitFor]. */
 internal sealed interface CircuitClaim {
     /** A slot was claimed against [reservation]; the caller now owes exactly one release. */
@@ -117,6 +132,10 @@ internal sealed interface CircuitClaim {
 
     /** A reservation exists, but its own or the relay-wide circuit budget is exhausted. */
     data object LimitExceeded : CircuitClaim
+
+    /** Capacity is only left inside the priority headroom band and the initiator's ledger
+     * balance is negative: refused now, admissible again once load drops. */
+    data object DeferredLowPriority : CircuitClaim
 }
 
 /**
@@ -145,7 +164,15 @@ internal sealed interface CircuitClaim {
  */
 internal class RelayReservationRegistry(
     private val limits: RelayServerLimits,
+    /** The node-local usage ledger driving priority inside the headroom band. */
+    val ledger: RelayUsageLedger = RelayUsageLedger(),
 ) {
+    /** Reservation count from which only non-debtors are admitted as NEW reservations. */
+    private val softReservationLimit = softLimit(limits.maxConcurrentReservations, limits.priorityHeadroomFraction)
+
+    /** Live-circuit count above which only non-debtor initiators are admitted. */
+    private val softCircuitLimit = softLimit(limits.maxConcurrentCircuits, limits.priorityHeadroomFraction)
+
     private val reservations = HashMap<PeerId, GrantedReservation>()
 
     /**
@@ -161,21 +188,40 @@ internal class RelayReservationRegistry(
     private val connectRateLimiter =
         ConnectRateLimiter(limits.maxConnectAttemptsPerWindow, limits.connectRateLimitWindow)
 
-    /** Grants (or renews) a reservation for [requestor], or `null` if this relay is full. Expired
-     * entries are pruned on every call, so a burst of abandoned reservations frees itself up
-     * without needing any background timer. */
+    /** Grants (or renews) a reservation for [requestor], or `null` if it was not granted. See
+     * [tryReserve] for the distinguishable outcomes. */
     @Synchronized
     fun reserve(
         requestor: PeerId,
         observedAddress: Multiaddr,
         now: Instant,
-    ): GrantedReservation? {
+    ): GrantedReservation? = (tryReserve(requestor, observedAddress, now) as? ReservationOutcome.Granted)?.reservation
+
+    /** Grants (or renews) a reservation for [requestor]. Expired entries are pruned on every call,
+     * so a burst of abandoned reservations frees itself up without needing any background timer.
+     *
+     * A renewal by a peer that already holds a slot is always served. A NEW reservation is admitted
+     * while the table is below the soft limit; inside the top
+     * [RelayServerLimits.priorityHeadroomFraction] band only requestors whose
+     * [RelayUsageLedger] balance is non-negative are admitted - a debtor is
+     * [ReservationOutcome.DeferredLowPriority], never refused for good. */
+    @Synchronized
+    fun tryReserve(
+        requestor: PeerId,
+        observedAddress: Multiaddr,
+        now: Instant,
+    ): ReservationOutcome {
         pruneExpired(now)
         // A renewal by a peer that already holds a slot must never be counted as a new slot, or a
         // well-behaved client renewing on schedule would be refused once the relay filled up.
         val existing = reservations[requestor]
-        if (existing == null && reservations.size >= limits.maxConcurrentReservations) return null
-        if (existing == null && !sourceAddressHasRoom(observedAddress)) return null
+        if (existing == null && reservations.size >= limits.maxConcurrentReservations) {
+            return ReservationOutcome.CapacityFull
+        }
+        if (existing == null && !sourceAddressHasRoom(observedAddress)) return ReservationOutcome.CapacityFull
+        if (existing == null && reservations.size >= softReservationLimit && ledger.balanceOf(requestor) < 0) {
+            return ReservationOutcome.DeferredLowPriority
+        }
         val granted =
             GrantedReservation(
                 requestor = requestor,
@@ -186,7 +232,7 @@ internal class RelayReservationRegistry(
                 liveCircuits = circuitCounters.getOrPut(requestor) { AtomicInteger(0) },
             )
         reservations[requestor] = granted
-        return granted
+        return ReservationOutcome.Granted(granted)
     }
 
     /** Whether another *distinct* peer may reserve from [observedAddress]'s host, per
@@ -222,9 +268,14 @@ internal class RelayReservationRegistry(
     fun claimCircuitFor(
         target: PeerId,
         now: Instant,
+        initiator: PeerId? = null,
     ): CircuitClaim {
         val reservation = find(target, now) ?: return CircuitClaim.NoReservation
-        return if (tryClaimCircuit(reservation)) CircuitClaim.Granted(reservation) else CircuitClaim.LimitExceeded
+        return when (claimCircuit(reservation, initiator)) {
+            ClaimResult.CLAIMED -> CircuitClaim.Granted(reservation)
+            ClaimResult.LIMIT -> CircuitClaim.LimitExceeded
+            ClaimResult.DEFERRED -> CircuitClaim.DeferredLowPriority
+        }
     }
 
     /**
@@ -232,17 +283,33 @@ internal class RelayReservationRegistry(
      * if either is exhausted. Prefer [findAndClaim]; this stays separate only so the claim rule
      * itself is directly testable.
      */
-    fun tryClaimCircuit(reservation: GrantedReservation): Boolean {
-        if (liveCircuits.incrementAndGet() > limits.maxConcurrentCircuits) {
+    fun tryClaimCircuit(reservation: GrantedReservation): Boolean =
+        claimCircuit(reservation, null) == ClaimResult.CLAIMED
+
+    private enum class ClaimResult { CLAIMED, LIMIT, DEFERRED }
+
+    /** The claim rule. With a non-null [initiator], a claim that would push the relay-wide circuit
+     * count into the priority headroom band is deferred when the initiator's ledger balance is
+     * negative. */
+    private fun claimCircuit(
+        reservation: GrantedReservation,
+        initiator: PeerId?,
+    ): ClaimResult {
+        val live = liveCircuits.incrementAndGet()
+        if (live > limits.maxConcurrentCircuits) {
             liveCircuits.decrementAndGet()
-            return false
+            return ClaimResult.LIMIT
+        }
+        if (initiator != null && live > softCircuitLimit && ledger.balanceOf(initiator) < 0) {
+            liveCircuits.decrementAndGet()
+            return ClaimResult.DEFERRED
         }
         if (reservation.liveCircuits.incrementAndGet() > limits.maxCircuitsPerReservation) {
             reservation.liveCircuits.decrementAndGet()
             liveCircuits.decrementAndGet()
-            return false
+            return ClaimResult.LIMIT
         }
-        return true
+        return ClaimResult.CLAIMED
     }
 
     fun releaseCircuit(reservation: GrantedReservation) {
@@ -274,4 +341,18 @@ internal class RelayReservationRegistry(
         // bounded by reservations plus peers with live circuits, never by attempts.
         circuitCounters.entries.removeIf { !reservations.containsKey(it.key) && it.value.get() <= 0 }
     }
+}
+
+/**
+ * The soft limit below which everybody is served: `max` minus the priority band. The band is
+ * clamped to `max - 1` so that at least one slot always stays outside it - otherwise a small limit
+ * (e.g. 1) would yield a soft limit of 0 and priority would turn into a hard gate for every debtor
+ * even on an idle relay.
+ */
+internal fun softLimit(
+    max: Int,
+    headroomFraction: Double,
+): Int {
+    val band = minOf(ceil(max * headroomFraction).toInt(), maxOf(max - 1, 0))
+    return max - band
 }

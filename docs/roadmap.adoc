@@ -1919,3 +1919,50 @@ for measurement, see "What is not proven"):
   macOS checksum command was run with the Perl `shasum` 6.04 on Linux, not on macOS.
 * A hop stream that raises a decode exception is still left open (see `docs/architecture.adoc`).
 
+== V0.9.12 — Madli relay reliability metric and automatic relay selection
+
+_Not yet released: implemented on a local feature branch, no version bump, no tag. The release card above gets its line when the release is cut._
+
+=== Progress
+
+**What is new** (details: `docs/architecture.adoc`, Madli section "Relay reliability and wire format v2" and relay section "Relay usage ledger and priority" / "Automatic relay selection"):
+
+* **Madli daily vector wire format v2** with an optional relay-reliability block. v1 stays byte-identical
+  (pinned by a golden test generated on `v0.10.1`); a core-only vector is always v1, so each statement has
+  one encoding. `MadliDailyVector.metrics` is now nullable.
+* **Reading side:** `MadliAggregator.aggregateRelayReliability` (same three manipulation defenses as the
+  core aggregate), `MadliHalfLives.relayReliabilityDays`, and `MadliRelayRanker`, an advisory
+  `RelayCandidateRanker`. The networking module has no dependency on Madli; the ranker is injected.
+* **Writing side, off by default:** `MadliRelayReliabilityPublisher` (`enabled = false`). Old nodes reject v2
+  vectors as invalid, so the writer should be switched on only after the decoder has shipped for a while.
+  It merges into an existing own core vector instead of displacing it.
+* **Observation:** `RelayReliabilityTracker` counts reservation, renewal and outgoing circuit-dial outcomes
+  per relay and UTC day; exposed as `LapisNode.relayReliabilityCounts(epochDay)`.
+* **Relay usage ledger** (`RelayUsageLedger`, local, never gossiped): bytes forwarded per circuit are charged
+  to the receiving side and credited to the relay on the endpoints. `RelayServerLimits.priorityHeadroomFraction`
+  (default 0.25) defers peers with a negative balance in the top capacity band; never a hard gate.
+* **Automatic relay selection** (`RelayAutoSelector`, `LapisNode.startAutoRelay`), active only for
+  `RelayConfig.reachability = PRIVATE`: bounded candidate list, source-host diversity, failure back-off,
+  non-public candidate addresses refused by default. `ReachabilityHeuristic` only warns on a mismatch.
+* `RelayReservationClient.reserve` no longer has a check-then-act race on `maxReservations`.
+
+**Test evidence:** `./gradlew clean check --no-build-cache --rerun-tasks` green (1858 tests across all modules,
+about 30 minutes), and the networking and Madli test tasks green again with the JVM pinned to two CPUs
+(`taskset -c 0,1`, because the previous wave's relay races showed only on two CPUs). New tests: golden v1 and
+v2 codec tests including tamper and canonicality cases, relay aggregation and a 50-Sybil scenario, the
+ranker, the publisher (disabled, minimum attempts, merge, signature, two-node propagation), the ledger
+(saturation, decay, eviction under a 5000-identity flood, 8-thread concurrency), registry priority and
+circuit-claim priority, reliability tracker, selector (ranking, diversity, back-off, hostile ranker, 1000
+hostile candidates, non-public addresses), reachability heuristic, and real-node tests of ledger accounting
+(including an abruptly stopped endpoint, booked exactly once), reliability counts and auto relay.
+
+**What remains:**
+
+* No application module (CLI, browser) wires the publisher, the ranker or `startAutoRelay`; nothing writes v2
+  vectors in production. The CLI switches (`--reachability`, `--auto-relay`) are a separate small wave.
+* The ledger is memory-only and a new `PeerId` starts at 0, so debt can be shed by changing identity.
+* The reliability metric counts dials that failed for reasons that are not the relay's fault.
+* Candidate DNS names are not resolved before dialling, so a name that resolves to a private address is not caught.
+* A component that later publishes core metrics for a tuple the publisher also wrote must merge the relay block.
+* This wave has had no independent review or security audit yet.
+

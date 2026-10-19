@@ -13,6 +13,7 @@ data class MadliHalfLives(
     val latencyDays: Double = 7.0,
     val deliveryIntegrityDays: Double = 90.0,
     val routingHelpfulnessDays: Double = 30.0,
+    val relayReliabilityDays: Double = 14.0,
 ) {
     init {
         require(
@@ -20,7 +21,8 @@ data class MadliHalfLives(
                 bandwidthDays > 0 &&
                 latencyDays > 0 &&
                 deliveryIntegrityDays > 0 &&
-                routingHelpfulnessDays > 0,
+                routingHelpfulnessDays > 0 &&
+                relayReliabilityDays > 0,
         ) { "half-lives must be positive" }
     }
 }

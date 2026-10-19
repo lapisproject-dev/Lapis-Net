@@ -41,7 +41,8 @@ class RelayReservationClient internal constructor(
     private val hopBinding: LapisCircuitHopBinding,
     private val limits: RelayClientLimits,
     private val clock: () -> Instant = Instant::now,
-) {
+    private val reliability: RelayReliabilityTracker = RelayReliabilityTracker(),
+) : RelaySlots {
     private class Held(
         val relay: PeerInfo,
         @Volatile var reservation: RelayReservation,
@@ -86,7 +87,7 @@ class RelayReservationClient internal constructor(
      * @throws RelayException if the relay refuses, misbehaves, or cannot be reached, or if this
      * node already holds [RelayClientLimits.maxReservations] reservations.
      */
-    fun reserve(relay: PeerInfo): RelayReservation {
+    override fun reserve(relay: PeerInfo): RelayReservation {
         check(!stopped.get()) { "relay reservation client is stopped" }
         require(relay.peerId != host.peerId) { "cannot reserve a relay slot on ourselves" }
         require(relay.addresses.isNotEmpty()) { "relay ${relay.peerId} has no addresses to dial" }
@@ -94,7 +95,16 @@ class RelayReservationClient internal constructor(
             throw RelayException("already holding ${limits.maxReservations} relay reservations")
         }
         val reservation = requestReservation(relay)
-        held[relay.peerId] = Held(relay, reservation)
+        // Re-checked under a lock together with the insert: the check above and this put are
+        // otherwise a race between concurrent reserve() calls (e.g. a manual call racing the
+        // automatic selector) that could overshoot maxReservations. The network exchange itself
+        // stays outside the lock.
+        synchronized(held) {
+            if (!held.containsKey(relay.peerId) && held.size >= limits.maxReservations) {
+                throw RelayException("already holding ${limits.maxReservations} relay reservations")
+            }
+            held[relay.peerId] = Held(relay, reservation)
+        }
         ensureRenewalScheduled()
         logger.info { "reserved a relay slot on ${relay.peerId} until ${reservation.expiresAt}" }
         return reservation
@@ -112,6 +122,13 @@ class RelayReservationClient internal constructor(
      * discipline `LapisRelayTransport.dial` already applies to its own hop stream.
      */
     private fun requestReservation(relay: PeerInfo): RelayReservation {
+        val outcome = runCatching { requestReservationUnrecorded(relay) }
+        // Reserve and renew both count as one attempt against this relay's reliability.
+        reliability.recordReservationAttempt(relay.peerId, outcome.isSuccess)
+        return outcome.getOrThrow()
+    }
+
+    private fun requestReservationUnrecorded(relay: PeerInfo): RelayReservation {
         val addresses = relay.addresses.map { it.withP2P(relay.peerId) }
         val timeoutMillis = limits.controlTimeout.toMillis()
         val hopStream = CompletableFuture<Stream>()
@@ -145,13 +162,13 @@ class RelayReservationClient internal constructor(
      * uses to decide whether an offered inbound circuit is one this node could plausibly have asked
      * for. An expired reservation counts as absent, exactly as it does for [circuitAddresses].
      */
-    fun holdsReservationWith(relay: PeerId): Boolean {
+    override fun holdsReservationWith(relay: PeerId): Boolean {
         val entry = held[relay] ?: return false
         return entry.reservation.expiresAt.isAfter(clock())
     }
 
     /** Reservations currently held, newest state per relay. */
-    fun reservations(): List<RelayReservation> = held.values.map { it.reservation }
+    override fun reservations(): List<RelayReservation> = held.values.map { it.reservation }
 
     /**
      * The `/p2p-circuit` addresses this node is currently reachable at, one per address of each
@@ -171,7 +188,7 @@ class RelayReservationClient internal constructor(
 
     /** Drops the reservation held on [relay], if any. The relay forgets it on its own once the TTL
      * runs out; this only stops this node from advertising or renewing it. */
-    fun release(relay: PeerId) {
+    override fun release(relay: PeerId) {
         held.remove(relay)
     }
 

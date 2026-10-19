@@ -23,5 +23,8 @@ dependencies {
     api(project(":lapis-net-identity"))
     api(project(":lapis-net-storage"))
     api(project(":lapis-net-trust"))
+    // RelayCandidateRanker / RelayReliabilityCounts / PeerInfo appear in the public API of
+    // MadliRelayRanker and MadliRelayReliabilityPublisher.
+    api(project(":lapis-net-networking"))
     api(rootProject.libs.java.cid)
 }

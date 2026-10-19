@@ -1366,6 +1366,60 @@ engine only; it does not implement any protocol-level reward or penalty tied to 
 With V0.5 landed, all four of the fach-spec's scoring dimensions — Veritas, Virtus, Karma, and
 Madli — are now implemented.
 
+=== Relay reliability and wire format v2 (V0.9.12)
+
+Madli gained a sixth observation: how reliably a peer served as a **circuit relay**. It is carried
+in an optional *relay block* of the daily vector, which required a second wire-format version.
+
+[cols="1,3", options="header"]
+|===
+|Version |Layout of the signed body (the 64-byte signature follows, as before)
+
+|v1 (unchanged, byte-identical to `v0.10.1`)
+|`magic("LNMV") \| version=1 \| observer(33) \| peerIdLen(2) \| peerId \| epochDay(8) \| core block`
+
+|v2 (new)
+|`magic("LNMV") \| version=2 \| observer(33) \| peerIdLen(2) \| peerId \| epochDay(8) \| flags(1) \| [core block, iff bit0] \| [relay block, iff bit1]`
+|===
+
+The core block is the six v1 metric fields (`reachabilityMicros`, bandwidth, latency,
+`deliveryIntegrityMicros`, `routingHelpfulnessMicros`, `observationCount`). The relay block is
+`relayReliabilityMicros(4) \| relayAttemptCount(4)`. The domain-separation tag
+(`LapisNet:madli-daily-vector:v1`) is unchanged; the version byte sits inside the signed body.
+
+**Canonical encoding — exactly one byte string per statement.** A vector that carries only core
+metrics is *always* v1; a v2 vector must contain the relay block. The decoder rejects, as
+`MalformedMadliDailyVectorException`: unknown flag bits, `flags == 0`, a v2 vector with only the
+core flag (non-canonical), versions other than 1 and 2, out-of-range fields, truncation and trailing
+bytes. Without this rule the same statement would have two content ids and escape deduplication.
+`MadliDailyVector.metrics` therefore became nullable (a relay-only vector has no core block), and
+`MadliGoldenV1Test` pins the v1 bytes and content id generated on `v0.10.1`.
+
+**Aggregation.** `MadliAggregator.aggregate` ignores vectors without a core block;
+`MadliAggregator.aggregateRelayReliability` applies the same three defenses (Veritas weight, weighted
+median, one representative vector per observer, decayed with `MadliHalfLives.relayReliabilityDays`,
+default 14) to the relay block. Vectors without a relay block are filtered out *before* grouping.
+
+**Ranking.** `lapis-net-networking` cannot depend on this module, so automatic relay selection takes
+an injected `RelayCandidateRanker`; `MadliRelayRanker` is the Madli implementation (reliability plus
+a small core-reachability tie-weight). A ranker is **advisory, never a gate**: candidates without
+any signal are ranked last but kept, so a new relay can still earn observations.
+
+**Rollout — readers before writers.** A node on `v0.10.1` or older answers a v2 vector with
+`ValidationResult.Invalid`, which lowers the GossipSub score of whoever forwarded it.
+`MadliRelayReliabilityPublisher` (the only writer) is therefore constructed with `enabled = false` by
+default and no application module wires it. It should be switched on no earlier than two releases
+after the decoder shipped. When it does publish it *merges*: if the node already announced a core
+vector for the same `(observer, peer, epochDay)`, the new v2 vector carries both blocks, because the
+index's replace-on-conflict rule would otherwise let a relay-only vector displace the core one.
+
+**What is observed.** `RelayReliabilityTracker` (client side, UTC-day buckets, current and previous
+day, 256 relays) counts reservations, renewals and outgoing circuit dials through a relay, with their
+outcome. Incoming circuits are not counted (a failure to deliver one is invisible to the receiver). A
+dial can fail for reasons that are not the relay's fault (target without reservation); the metric is a
+noisy lower bound that the median over many observers averages out. At least three attempts per day
+are required before a relay is published.
+
 == Lightning proof (V0.6)
 
 V0.6 closes V0.2.1's "Zwei Zahlungswege" gap on the Lightning side: `LightningProof`, the second
@@ -4596,17 +4650,77 @@ capability bit is added.
   dialability, so wiring it would produce a confidently wrong reachability verdict. Relay use is
   therefore explicit configuration, not an automatic reaction to a self-diagnosis this library
   cannot make.
-* **No Madli metric for relay service quality, and no payment.** Relay operators are not
-  compensated; reputation via Madli is the intended route — the same answer already settled for storage
-  replication — but no relay metric exists yet. A dedicated Madli
-  metric for relay reliability is a plausible follow-up; the raw network capability ships first.
-  Reputation-weighted *admission* is the same follow-up seen from the other side:
-  `maxReservationsPerSourceAddress` stops a one-machine Sybil flood and nothing more — an attacker
-  holding a /64 of IPv6 or a botnet still gets one reservation slot per address, and a genuine NAT
-  gateway with many clients behind it is refused along with them. Neither shortcoming is a reason to
-  leave the trivial case unguarded, and neither is fixed by this cap.
-* **No automatic relay selection.** `relayCandidates` lists, the caller chooses. A Madli-informed
-  preference order over candidates is exactly the shape the follow-up above would take.
+* **No payment.** Relay operators are not compensated; reputation is the route — the same answer
+  already settled for storage replication. V0.9.12 added the reputation mechanisms (see "Relay usage
+  ledger and priority", "Automatic relay selection" below and "Relay reliability and wire format v2"
+  in the Madli section). `maxReservationsPerSourceAddress` still stops a one-machine Sybil flood and
+  nothing more — an attacker holding a /64 of IPv6 or a botnet still gets one reservation slot per
+  address, and a genuine NAT gateway with many clients behind it is refused along with them.
+* **Automatic relay selection is opt-in and explicit** (since V0.9.12, see below). Without
+  `LapisNode.startAutoRelay` nothing is reserved on its own.
+
+=== Relay usage ledger and priority (V0.9.12)
+
+Two different things are measured, and they must not be confused:
+
+* **Relay reliability** is a reputation of the relay *as infrastructure*, observed by its *clients*,
+  signed, gossiped and Veritas-weighted (Madli, see above).
+* **Usage** is a local, bilateral bookkeeping of the node that *serves*, in the style of the Bitswap
+  ledger. It is never gossiped, never self-reported, and exists only to decide who is served first
+  when the relay is busy.
+
+`RelayUsageLedger` keeps, per counterparty `PeerId`, a balance `received - served` in relayed bytes.
+On the relay, `CircuitByteMeter` counts the bytes each circuit leg delivers; when the circuit ends
+(once, however it ends) the bytes read from the initiator are charged to the *target* and vice versa
+("the receiver pays"). On an endpoint, the bytes a relay delivers are credited to that relay when the
+stream closes. Balances decay with a seven-day half-life, are kept in memory only and capped at 4096
+entries; when full, the entry with the smallest absolute balance is evicted, so flooding the ledger
+with fresh identities cannot push out a heavy debtor.
+
+*Priority, not admission.* `RelayServerLimits.priorityHeadroomFraction` (default 0.25; `0.0` switches
+it off) reserves the top band of reservation and circuit capacity for peers whose balance is not
+negative. Below the soft limit everybody is served; renewals of an existing reservation are always
+served; inside the band a debtor is *deferred* (refused now, served once load drops) with the existing
+status codes — no new wire status. For circuits the initiator's balance decides. It is **never a hard
+gate**: a debtor is not refused for its balance alone while capacity below the soft limit is free.
+
+*Known property.* A new `PeerId` starts at balance 0, so a debtor can shed its debt by changing
+identity. That is the accepted consequence of "everybody starts at zero"; the per-source-address cap
+bounds how many such identities one host can hold at once.
+
+*Known property: "the receiver pays" is steerable by third parties.* Because the circuit target is
+charged for the bytes the initiator sends, a third party using throw-away identities (whose own
+balance starts at 0 again) can push a target that holds a reservation into a negative balance simply
+by sending it traffic through the relay. That target is then deferred inside the headroom band, for its
+own outgoing connects and for a new reservation after its old one lapsed. Since a relay usually
+receives nothing from its clients, returning legitimate clients can end up behind fresh identities
+inside the band, which partly reverses the intended incentive. The effect is bounded: it only acts inside
+the headroom band (never below the soft limit), renewals are always served, balances decay, and the
+band is clamped so that at least one slot always stays outside it. Charging only the initiator is the
+alternative if this proves a problem in practice.
+
+=== Automatic relay selection (V0.9.12)
+
+`RelayConfig.reachability` (`UNSPECIFIED`, `PUBLIC`, `PRIVATE`) is the operator's declaration, because
+there is no AutoNAT (see above). Only `PRIVATE` lets `LapisNode.startAutoRelay(candidates, ranker)`
+start a `RelayAutoSelector`; for the other values the call logs and returns a selector that is not
+running. `ReachabilityHeuristic` inspects the node's own addresses (RFC 1918, CGNAT, link-local, ULA;
+wildcard listen addresses are expanded through the network interfaces) and *only logs a warning* if
+the declaration and the addresses disagree.
+
+A selection pass releases lapsed reservations (and backs those relays off), takes the candidate list
+truncated to `AutoRelayConfig.candidateLimit` (16) *before* anything else, drops candidates on
+loopback/private/link-local/CGNAT/reserved addresses unless
+`allowNonPublicCandidateAddresses` (the directory is written by strangers; dialling an address inside
+the operator's network on a stranger's say-so would be an SSRF primitive; DNS names are accepted except
+`localhost`, their resolution is the dialler's job), asks the ranker, puts candidates on source hosts
+not yet in use first, and makes at most `maxAttemptsPerPass` (4) attempts. Failed relays are
+remembered for ten minutes in a capped table. A working relay is never swapped for a better-ranked
+one; the selector only fills gaps. The ranker is advisory: if it throws, the directory order is used;
+entries it invents are discarded; entries it omits are appended.
+
+`RelayReservationClient.reserve` re-checks `maxReservations` under a lock together with the insert,
+closing the check-then-act race between a manual `reserve` and the selector.
 * **Messaging modules untouched.** Routing DMs, mail or calls over relays — and the design questions
   each raises — is a separate wave.
 

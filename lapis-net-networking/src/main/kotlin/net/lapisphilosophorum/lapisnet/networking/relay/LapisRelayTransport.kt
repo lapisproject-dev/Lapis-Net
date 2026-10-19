@@ -43,6 +43,8 @@ class LapisRelayTransport internal constructor(
     private val upgrader: ConnectionUpgrader,
     private val hopBinding: LapisCircuitHopBinding,
     private val clientLimits: RelayClientLimits,
+    private val ledger: RelayUsageLedger = RelayUsageLedger(),
+    private val reliability: RelayReliabilityTracker = RelayReliabilityTracker(),
 ) : Transport {
     @Volatile
     private var host: Host? = null
@@ -120,6 +122,8 @@ class LapisRelayTransport internal constructor(
             splitCircuitAddress(addr)
                 ?: return CompletableFuture.failedFuture(RelayException("not a dialable circuit address: $addr"))
         val (relayAddress, target) = split
+        val relay =
+            relayAddress.getPeerId() ?: return CompletableFuture.failedFuture(RelayException("no relay in $addr"))
         if (target == us.peerId) {
             return CompletableFuture.failedFuture(RelayException("refusing to relay-dial ourselves"))
         }
@@ -151,8 +155,18 @@ class LapisRelayTransport internal constructor(
                     io.libp2p.etc.util.netty
                         .InboundTrafficLimitHandler(clientLimits.maxInboundBytesPerCircuit),
                 )
+                meterRelayedBytes(stream, relay)
                 RelayTransport.upgradeStream(stream, true, upgrader, this, target, connHandler)
             }.whenComplete { connection, error ->
+                // One outgoing circuit dial through this relay = one reliability attempt.
+                // A NO_RESERVATION refusal is the TARGET's doing and is not counted: otherwise gossiped
+                // circuit addresses naming an honest relay and an unreserved target would poison the
+                // relay's reliability. CONNECTION_FAILED IS counted (the relay picks that status, so
+                // excluding it would let a hostile relay hide failures).
+                val cause = generateSequence(error) { it.cause }.firstOrNull { it is RelayException } as? RelayException
+                if (cause?.isTargetSideFailure != true) {
+                    reliability.recordDial(relay, target, error == null && connection != null)
+                }
                 if (error != null) {
                     hopStream.thenAccept { runCatching { it.close() } }
                 } else if (connection != null) {
@@ -184,6 +198,8 @@ class LapisRelayTransport internal constructor(
         connHandler: ConnectionHandler,
     ) {
         requireHost()
+        // Credit the relay for the bytes it carried to us, settled when the circuit closes.
+        meterRelayedBytes(stream, stream.remotePeerId())
         guardInboundCircuit(
             counter = pendingInboundCircuits,
             timeout = clientLimits.circuitAcceptTimeout,
@@ -205,6 +221,22 @@ class LapisRelayTransport internal constructor(
                 }
             },
         )
+    }
+
+    /**
+     * Counts the bytes [relay] delivers on [stream] and credits them to [relay] in the usage
+     * ledger once the stream closes (the relay spent resources on this node). Settled exactly once.
+     */
+    private fun meterRelayedBytes(
+        stream: Stream,
+        relay: PeerId,
+    ) {
+        val meter = CircuitByteMeter()
+        stream.pushHandler(meter)
+        val settled = AtomicBoolean(false)
+        stream.closeFuture().whenComplete { _, _ ->
+            if (settled.compareAndSet(false, true)) ledger.recordReceivedFrom(relay, meter.bytes())
+        }
     }
 
     /**

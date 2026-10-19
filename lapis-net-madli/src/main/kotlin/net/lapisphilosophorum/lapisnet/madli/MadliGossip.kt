@@ -5,6 +5,7 @@ import io.libp2p.core.PeerId
 import io.libp2p.core.pubsub.PubsubSubscription
 import io.libp2p.core.pubsub.ValidationResult
 import net.lapisphilosophorum.lapisnet.core.crypto.fingerprintHex
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.storage.NabuStorageException
@@ -78,6 +79,16 @@ class MadliGossip private constructor(
     /** Every tracked [MadliDailyVector] about [peer], in insertion order - the raw input
      * [MadliAggregator.aggregate] folds over. */
     fun currentVectorsForObservedPeer(peer: PeerId): List<MadliDailyVector> = index.vectorsForObservedPeer(peer)
+
+    /** This node's own currently tracked vector for the exact `(observer, peer, epochDay)` tuple,
+     * if any - used by [MadliRelayReliabilityPublisher] to merge a relay block into an existing
+     * core vector, since the index's replace-on-conflict rule would otherwise let a relay-only
+     * vector displace the core one. */
+    internal fun ownVectorFor(
+        observer: Secp256k1PublicKey,
+        peer: PeerId,
+        epochDay: Long,
+    ): MadliDailyVector? = index.vectorFor(observer, peer, epochDay)
 
     /** Unsubscribes from the gossip topic. No other sub-resources to release - mirrors
      * `KarmaGossip.stop`/`LtrGossip.stop` exactly. */

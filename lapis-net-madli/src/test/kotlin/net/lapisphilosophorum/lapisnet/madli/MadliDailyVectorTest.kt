@@ -104,7 +104,7 @@ class MadliDailyVectorTest :
 
             text shouldBe
                 "MadliDailyVector(observer=${observer.publicKey.fingerprint()}, " +
-                "observedPeer=${vector.observedPeer}, epochDay=100, metrics=${vector.metrics})"
+                "observedPeer=${vector.observedPeer}, epochDay=100, metrics=${vector.metrics}, relayMetrics=null)"
         }
 
         test("equals/hashCode are consistent, including the signature") {

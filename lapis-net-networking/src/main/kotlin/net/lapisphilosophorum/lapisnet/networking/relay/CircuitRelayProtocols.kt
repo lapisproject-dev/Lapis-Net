@@ -396,7 +396,10 @@ internal class HopSender(
                 .build(),
         ).thenApply { msg ->
             if (msg.type != Circuit.HopMessage.Type.STATUS || msg.status != Circuit.Status.OK) {
-                throw RelayException("relay refused to connect to $target: ${msg.status.name}")
+                throw RelayException(
+                    "relay refused to connect to $target: ${msg.status.name}",
+                    relayStatus = msg.status,
+                )
             }
             stream.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
             stream
@@ -521,11 +524,22 @@ internal class HopReceiver(
             return
         }
         val now = clock()
-        val reservation = registry.reserve(stream.remotePeerId(), remoteAddress, now)
-        if (reservation == null) {
-            refuse(stream, Circuit.Status.RESERVATION_REFUSED)
-            return
-        }
+        val reservation =
+            when (val outcome = registry.tryReserve(stream.remotePeerId(), remoteAddress, now)) {
+                is ReservationOutcome.Granted -> outcome.reservation
+                ReservationOutcome.CapacityFull -> {
+                    refuse(stream, Circuit.Status.RESERVATION_REFUSED)
+                    return
+                }
+                ReservationOutcome.DeferredLowPriority -> {
+                    logger.debug {
+                        "deferring relay reservation for ${stream.remotePeerId()}: busy and its usage balance is " +
+                            "${registry.ledger.balanceOf(stream.remotePeerId())}"
+                    }
+                    refuse(stream, Circuit.Status.RESERVATION_REFUSED)
+                    return
+                }
+            }
         val limits = config.serverLimits
         val reservationBuilder =
             Circuit.Reservation
@@ -603,9 +617,16 @@ internal class HopReceiver(
         // Look up and claim under one lock: between a separate find() and tryClaimCircuit() the
         // reservation could expire and be pruned, leaving a slot claimed against an object nothing
         // consults any more.
-        when (val claim = registry.claimCircuitFor(target, now)) {
+        when (val claim = registry.claimCircuitFor(target, now, initiator)) {
             is CircuitClaim.NoReservation -> refuse(stream, Circuit.Status.NO_RESERVATION)
             is CircuitClaim.LimitExceeded -> refuse(stream, Circuit.Status.RESOURCE_LIMIT_EXCEEDED)
+            is CircuitClaim.DeferredLowPriority -> {
+                logger.debug {
+                    "deferring relay CONNECT from $initiator: busy and its usage balance is " +
+                        "${registry.ledger.balanceOf(initiator)}"
+                }
+                refuse(stream, Circuit.Status.RESOURCE_LIMIT_EXCEEDED)
+            }
             is CircuitClaim.Granted -> openCircuit(stream, initiator, target, claim.reservation)
         }
     }
@@ -743,6 +764,26 @@ internal class HopReceiver(
         // arrived (see StopSender.beginRawPipe) - only a is cleared here, on its own loop.
         // Everything b received in the meantime is held until the forwarders below exist.
         if (!sender.rawPipeStarted) b.pushHandler(CONTROL_CLEARER_NAME, ControlStreamClearer())
+        // Usage metering ("receiver pays"): bytes read from the initiator leg are forwarded TO the
+        // target and charged to the target, and vice versa. Installed before the forwarders so it
+        // sees every byte, and accounted exactly once when the circuit ends (accountingRelease).
+        val meterFromInitiator = CircuitByteMeter()
+        val meterFromTarget = CircuitByteMeter()
+        a.pushHandler(meterFromInitiator)
+        b.pushHandler(meterFromTarget)
+        val accounted =
+            java.util.concurrent.atomic
+                .AtomicBoolean(false)
+        val accountingRelease = {
+            if (accounted.compareAndSet(false, true)) {
+                // "Receiver pays". Known property: a third party with throw-away identities can
+                // push the target into debt by sending it traffic - see docs/architecture.adoc,
+                // "Relay usage ledger and priority".
+                registry.ledger.recordServed(target, meterFromInitiator.bytes())
+                registry.ledger.recordServed(initiator, meterFromTarget.bytes())
+            }
+            release()
+        }
         listOf(a, b).forEach { stream ->
             stream.pushHandler(InboundTrafficLimitHandler(limits.circuitMaxBytes))
             stream.pushHandler(TotalTimeoutHandler(limits.circuitMaxDuration))
@@ -753,7 +794,7 @@ internal class HopReceiver(
             // Should be unreachable in this build; forwarding without flow control is still better
             // than refusing an otherwise-valid circuit, but it must be visible if it ever happens.
             logger.warn { "circuit legs are not Netty-backed - forwarding without flow control" }
-            spliceWithoutFlowControl(a, b, release)
+            spliceWithoutFlowControl(a, b, accountingRelease)
             sender.endRawPipeHold()
             return
         }
@@ -814,12 +855,12 @@ internal class HopReceiver(
         // circuit slot and a stream forever. A stall closure (CircuitState.closeForStall) ends up
         // here too, through the streams it closes, so the slot is released exactly once.
         a.closeFuture().whenComplete { _, _ ->
-            release()
+            accountingRelease()
             unwireResumers()
             runCatching { b.close() }
         }
         b.closeFuture().whenComplete { _, _ ->
-            release()
+            accountingRelease()
             unwireResumers()
             runCatching { a.close() }
         }
@@ -1143,7 +1184,20 @@ internal class LapisCircuitStopBinding(
 class RelayException(
     message: String,
     cause: Throwable? = null,
-) : RuntimeException(message, cause)
+    /** The relay's typed refusal status, when the failure was a relay `STATUS` answer; `null` for
+     * local, transport or protocol failures. Typed so callers never parse [message]. */
+    val relayStatus: Circuit.Status? = null,
+) : RuntimeException(message, cause) {
+    /** Whether this failure says nothing about the relay's own reliability: the relay answered
+     * correctly and the *target* simply has no reservation there. Only `NO_RESERVATION` qualifies.
+     * `CONNECTION_FAILED` deliberately does not: the relay itself chooses that status for every
+     * failure on its side of the stop leg (timeouts, its own stream setup), so a hostile relay
+     * could otherwise launder failures out of the metric by answering it for circuits it wants to
+     * censor. (A target's own non-OK stop reply is forwarded unchanged and is therefore
+     * indistinguishable from the relay's own status; that residual noise is accepted.) */
+    val isTargetSideFailure: Boolean
+        get() = relayStatus == Circuit.Status.NO_RESERVATION
+}
 
 /** Splits `<relay addr>/p2p/<relay>/p2p-circuit/p2p/<target>` into its relay and target halves.
  * Returns `null` if [address] is not a well-formed circuit address. */

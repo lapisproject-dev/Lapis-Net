@@ -34,6 +34,15 @@ class MalformedMadliDailyVectorException(
  * routingHelpfulnessMicros(4) | observationCount(4)`. [encode] appends the 64-byte signature
  * after that.
  *
+ * **Wire format v2 (relay reliability, V0.9.12).** `magic | version=2 | observer(33) |
+ * peerIdLen(2) | peerId | epochDay(8) | flags(1) | [core block, iff bit0] | [relay block, iff
+ * bit1] | signature(64)`. The core block is exactly v1's six metric fields; the relay block is
+ * `relayReliabilityMicros(4) | relayAttemptCount(4)`. **Canonical encoding = exactly one encoding
+ * per statement:** a vector with core metrics only is ALWAYS v1 (so v1 stays byte-identical to
+ * what v0.10.1 wrote and validates), and a v2 vector must carry the relay block. The decoder
+ * rejects unknown flag bits, `flags == 0`, and v2 with `flags == bit0` (non-canonical), so no two
+ * different byte strings (and hence content ids) express the same statement.
+ *
  * **`epochDay` is NOT range-checked against wall-clock time here - deliberate.** This codec is
  * used by [MadliGossip]'s validator, which must be clock-independent and deterministic (see that
  * class's doc comment). A negative or absurd `epochDay` is structurally accepted at decode time; it
@@ -43,7 +52,11 @@ class MalformedMadliDailyVectorException(
  */
 object MadliDailyVectorCodec {
     private val MAGIC = "LNMV".toByteArray(Charsets.US_ASCII)
-    private const val VERSION: Byte = 1
+    const val VERSION_V1: Byte = 1
+    const val VERSION_V2: Byte = 2
+    private const val FLAG_CORE = 0x01
+    private const val FLAG_RELAY = 0x02
+    private const val KNOWN_FLAGS = FLAG_CORE or FLAG_RELAY
     private const val PUBLIC_KEY_SIZE = 33
     private const val SIGNATURE_SIZE = 64
 
@@ -62,32 +75,45 @@ object MadliDailyVectorCodec {
     const val MAX_BODY_SIZE = 0xFFFF
 
     /** Builds the exact bytes that get domain-separated-digested and signed - see
-     * [MadliDailyVector.Companion.create]. */
+     * [MadliDailyVector.Companion.create]. Core-only input yields the byte-identical v1 layout;
+     * any input with [relayMetrics] yields v2. */
     fun encodeSignedBody(
         observer: Secp256k1PublicKey,
         observedPeer: PeerId,
         epochDay: Long,
-        metrics: MadliMetrics,
+        metrics: MadliMetrics?,
+        relayMetrics: MadliRelayMetrics?,
     ): ByteArray {
+        require(metrics != null || relayMetrics != null) { "vector must carry core metrics, relay metrics, or both" }
         val peerIdBytes = observedPeer.bytes
         require(peerIdBytes.size in 1..MAX_PEER_ID_BYTES) {
             "peer id must be 1..$MAX_PEER_ID_BYTES bytes, was ${peerIdBytes.size}"
         }
+        val isV1 = relayMetrics == null
 
         val out = ByteArrayOutputStream()
         DataOutputStream(out).apply {
             write(MAGIC)
-            writeByte(VERSION.toInt())
+            writeByte((if (isV1) VERSION_V1 else VERSION_V2).toInt())
             write(observer.bytes)
             writeShort(peerIdBytes.size)
             write(peerIdBytes)
             writeLong(epochDay)
-            writeInt(metrics.reachabilityMicros)
-            writeLong(metrics.medianBandwidthBytesPerSec)
-            writeInt(metrics.medianLatencyMillis)
-            writeInt(metrics.deliveryIntegrityMicros)
-            writeInt(metrics.routingHelpfulnessMicros)
-            writeInt(metrics.observationCount)
+            if (!isV1) {
+                writeByte((if (metrics != null) FLAG_CORE or FLAG_RELAY else FLAG_RELAY))
+            }
+            if (metrics != null) {
+                writeInt(metrics.reachabilityMicros)
+                writeLong(metrics.medianBandwidthBytesPerSec)
+                writeInt(metrics.medianLatencyMillis)
+                writeInt(metrics.deliveryIntegrityMicros)
+                writeInt(metrics.routingHelpfulnessMicros)
+                writeInt(metrics.observationCount)
+            }
+            if (relayMetrics != null) {
+                writeInt(relayMetrics.relayReliabilityMicros)
+                writeInt(relayMetrics.relayAttemptCount)
+            }
         }
         val body = out.toByteArray()
         require(body.size <= MAX_BODY_SIZE) { "encoded vector body exceeds $MAX_BODY_SIZE bytes: ${body.size}" }
@@ -101,6 +127,7 @@ object MadliDailyVectorCodec {
             observedPeer = vector.observedPeer,
             epochDay = vector.epochDay,
             metrics = vector.metrics,
+            relayMetrics = vector.relayMetrics,
         )
 
     /** The full canonical artifact: signed body followed by the 64-byte signature. This is what
@@ -130,7 +157,9 @@ object MadliDailyVectorCodec {
             if (!magic.contentEquals(MAGIC)) throw MalformedMadliDailyVectorException("bad magic")
 
             val version = input.readByte()
-            if (version != VERSION) throw MalformedMadliDailyVectorException("unsupported version $version")
+            if (version != VERSION_V1 && version != VERSION_V2) {
+                throw MalformedMadliDailyVectorException("unsupported version $version")
+            }
 
             val observerBytes = ByteArray(PUBLIC_KEY_SIZE).also { input.readFully(it) }
 
@@ -141,12 +170,47 @@ object MadliDailyVectorCodec {
             val peerIdBytes = ByteArray(peerIdLen).also { input.readFully(it) }
 
             val epochDay = input.readLong()
-            val reachabilityMicros = input.readInt()
-            val medianBandwidthBytesPerSec = input.readLong()
-            val medianLatencyMillis = input.readInt()
-            val deliveryIntegrityMicros = input.readInt()
-            val routingHelpfulnessMicros = input.readInt()
-            val observationCount = input.readInt()
+
+            val hasCore: Boolean
+            val hasRelay: Boolean
+            if (version == VERSION_V1) {
+                hasCore = true
+                hasRelay = false
+            } else {
+                val flags = input.readUnsignedByte()
+                if (flags and KNOWN_FLAGS.inv() != 0) {
+                    throw MalformedMadliDailyVectorException("unknown flag bits: $flags")
+                }
+                if (flags == 0) throw MalformedMadliDailyVectorException("v2 vector with no blocks")
+                hasCore = flags and FLAG_CORE != 0
+                hasRelay = flags and FLAG_RELAY != 0
+                if (!hasRelay) {
+                    throw MalformedMadliDailyVectorException("non-canonical v2 vector without relay block")
+                }
+            }
+
+            val metrics =
+                if (hasCore) {
+                    MadliMetrics(
+                        reachabilityMicros = input.readInt(),
+                        medianBandwidthBytesPerSec = input.readLong(),
+                        medianLatencyMillis = input.readInt(),
+                        deliveryIntegrityMicros = input.readInt(),
+                        routingHelpfulnessMicros = input.readInt(),
+                        observationCount = input.readInt(),
+                    )
+                } else {
+                    null
+                }
+            val relayMetrics =
+                if (hasRelay) {
+                    MadliRelayMetrics(
+                        relayReliabilityMicros = input.readInt(),
+                        relayAttemptCount = input.readInt(),
+                    )
+                } else {
+                    null
+                }
 
             val signature = ByteArray(SIGNATURE_SIZE).also { input.readFully(it) }
             if (input.available() > 0) throw MalformedMadliDailyVectorException("trailing bytes after signature")
@@ -155,15 +219,8 @@ object MadliDailyVectorCodec {
                 observer = Secp256k1PublicKey(observerBytes),
                 observedPeer = PeerId(peerIdBytes),
                 epochDay = epochDay,
-                metrics =
-                    MadliMetrics(
-                        reachabilityMicros = reachabilityMicros,
-                        medianBandwidthBytesPerSec = medianBandwidthBytesPerSec,
-                        medianLatencyMillis = medianLatencyMillis,
-                        deliveryIntegrityMicros = deliveryIntegrityMicros,
-                        routingHelpfulnessMicros = routingHelpfulnessMicros,
-                        observationCount = observationCount,
-                    ),
+                metrics = metrics,
+                relayMetrics = relayMetrics,
                 signature = signature,
             )
         } catch (e: EOFException) {

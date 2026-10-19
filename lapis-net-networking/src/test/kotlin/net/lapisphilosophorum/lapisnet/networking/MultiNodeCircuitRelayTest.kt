@@ -236,6 +236,13 @@ class MultiNodeCircuitRelayTest :
                         nodeA.connect(PeerInfo(nodeB.peerId, listOf(circuitAddress)), Duration.ofSeconds(45))
                     }
                 causeChain(error) shouldContain "NO_RESERVATION"
+                // The relay answered correctly; the target merely holds no slot there. That must
+                // not be booked as a failure of the relay (gossip-steerable otherwise).
+                val today =
+                    java.time.LocalDate
+                        .now(java.time.ZoneOffset.UTC)
+                        .toEpochDay()
+                (nodeA.relayReliabilityCounts(today)[relay.peerId]?.attempts ?: 0) shouldBe 0
             } finally {
                 runCatching { nodeA.stop() }
                 runCatching { nodeB.stop() }
