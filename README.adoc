@@ -101,11 +101,11 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 | ✅
 
 | v0.11.0 (V0.9.12)
-| Madli relay-reliability metric (daily vector wire format v2, v1 stays readable; the publisher is off by default), usage-based relay priority (reputation is never a hard gate), automatic relay selection (two relays per node, only for a node declared `PRIVATE`), a reachability heuristic that only warns, a hardened IP classifier. Library-level: the browser and the CLI do not call it
+| Madli relay-reliability metric (daily vector wire format v2, v1 stays readable; the publisher is off by default), usage-based relay priority (reputation is never a hard gate), automatic relay selection (two relays per node, only for a node declared `PRIVATE`), a reachability heuristic that only warns, a hardened IP classifier. Wired into the browser node and `lapisnet node` in V0.9.15: automatic selection only with `reachability=private`, the publisher only with `publish-relay-reliability=true`
 | ✅
 
 | v0.11.0 (V0.9.13, V0.9.14)
-| DHT fallback next to GossipSub for peer records, prekey bundles, mail and direct-message pointers (IPNS value per identity, own IPNS responder and validator, bounded record store, outbox, rendezvous provider records, consumers). Plaintext mail leaves no DHT pointer. Library-level: the browser and the CLI do not publish or fetch over it
+| DHT fallback next to GossipSub for peer records, prekey bundles, mail and direct-message pointers (IPNS value per identity, own IPNS responder and validator, bounded record store, outbox, rendezvous provider records, consumers). Plaintext mail leaves no DHT pointer. Wired into the browser node and `lapisnet node` in V0.9.15 (on by default, off with `--dht-fallback=false`; `lapisnet node` has no direct messages and no mail)
 | ✅
 
 | v0.11.0 (V0.8.7b)
