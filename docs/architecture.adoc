@@ -4847,7 +4847,7 @@ closing the check-then-act race between a manual `reserve` and the selector.
 
 == DHT fallback for the peer directory and prekey bundles (V0.9.13)
 
-_Status: part 1 of 2, implemented on a local feature branch; no version bump, no tag. Part 2 (mail pointers
+_Status: part 1 of 2, released in `v0.11.0`. Part 2 (mail pointers
 and the DM session manager as consumers) is described in "DHT fallback for mail and direct messages (V0.9.14)"
 below._
 
@@ -5009,7 +5009,7 @@ nothing calls the fallback unless the caller decides to, and by the gossip index
 
 == DHT fallback for mail and direct messages (V0.9.14)
 
-_Status: part 2 of 2, implemented on a local feature branch; no version bump, no tag, not wired into any
+_Status: part 2 of 2, released in `v0.11.0`, not wired into any
 application (`BrowserServer`, CLI). Nothing calls the new code unless an application decides to._
 
 V0.9.13 let a node catch up on the peer records and prekey bundles it missed. V0.9.14 lets it also catch up on

@@ -87,10 +87,11 @@ not by version number. Every row below is an annotated git tag on `master`.
 | 2026-10-04
 | the release commit
 
-| unreleased
-| Next release, candidate `v0.11.0` (no tag, no version bump yet): contains the ungated waves V0.9.12-V0.9.14 and V0.8.7b (browser call remote control)
-| -
-| -
+| `v0.11.0`
+| Feature release. Contains the waves V0.9.12 (Madli relay reliability metric, usage-based relay priority, automatic relay selection), V0.9.13 and V0.9.14 (DHT fallback for the peer directory, prekey bundles, mail and direct messages) and V0.8.7b (browser call remote control). The protocol code of V0.9.12-V0.9.14 is library-level: `BrowserServer` and the CLI do not call it yet
+| 2026-10-20
+| the release commit
+
 |===
 
 **From `v0.10.0` on, version numbers are chronological** (semantic versioning, `0.MINOR.PATCH`): each
@@ -1184,7 +1185,7 @@ the V0.8.6/V0.8.6b precedent of shipping the engine before its browser UI).
 
 === V0.8.7b — Browser call remote control
 
-Progress: delivered on a local feature branch, not yet released (see the release card).
+Progress: delivered and released in `v0.11.0`.
 
 * [x] `/call.html` + `call.js` in `lapis-net-browser`: incoming-call card (Decline before Accept), active call with timer, place-call form, history (50 rows, blocked attempts muted), opt-in desktop notifications.
 * [x] `/api/call/{session,status,place,events,{id}/accept|reject|hangup}`; SSE built by hand so `429` and the 4-slot limit apply before any header is sent.
@@ -1857,7 +1858,7 @@ Every fix was also checked by mutation: with the fix removed, the test named for
   republish of provider records, protobuf decoding of up to 1 MiB before the entry caps apply.
 * Bitswap has no way to cancel a want: a timed-out fetch leaves its want and re-send thread behind
   (five minutes against a single peer).
-* The gossip-only modules are not migrated onto the DHT; that remains a separately planned wave.
+* The gossip-only modules are not migrated onto the DHT; that remains a separately planned wave. _Update, `v0.11.0`: V0.9.13 and V0.9.14 added a DHT fallback to the directory, mail and DM modules; GossipSub stays the primary path._
 
 == Relay test stability and release-pipeline hardening (post-`v0.10.0` maintenance, released in `v0.10.1`)
 
@@ -1941,7 +1942,7 @@ for measurement, see "What is not proven"):
 
 == V0.9.12 — Madli relay reliability metric and automatic relay selection
 
-_Not yet released: implemented on a local feature branch, no version bump, no tag. The release card above gets its line when the release is cut._
+_Released in `v0.11.0`. Library-level: no application module wires it (see "What remains")._
 
 === Progress
 
@@ -1988,8 +1989,7 @@ hostile candidates, non-public addresses), reachability heuristic, and real-node
 
 == V0.9.13 — DHT fallback for the directory (part 1 of 2)
 
-_Not yet released: implemented on a local feature branch, no version bump, no tag. This is an internal wave
-identifier, so the release card above gets no line for it._
+_Released in `v0.11.0`. This is an internal wave identifier, so the release card above has no line of its own for it._
 
 === Progress
 
@@ -2020,8 +2020,7 @@ identifier, so the release card above gets no line for it._
 
 == V0.9.14 — DHT fallback for mail and direct messages (part 2 of 2)
 
-_Not yet released: implemented on a local feature branch, no version bump, no tag. This is an internal wave
-identifier, so the release card above gets no line for it._
+_Released in `v0.11.0`. This is an internal wave identifier, so the release card above has no line of its own for it._
 
 === Progress
 

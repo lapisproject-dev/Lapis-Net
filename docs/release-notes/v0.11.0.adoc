@@ -1,0 +1,29 @@
+Feature release: a relay reliability metric with automatic relay selection, a DHT fallback for the peer directory, prekey bundles, mail and direct messages, and a browser page that remote-controls voice calls. **Most of the new protocol code is library-level only:** the browser node and the CLI do not call it yet (details per item below), so a node started from the downloads behaves as in `v0.10.1` except for the call page.
+
+**Relay reliability and automatic relay selection (V0.9.12).**
+
+* Madli daily vector wire format v2 with an optional "relay reliability" block. v1 vectors stay byte-identical (pinned by a golden test generated on `v0.10.1`); a vector without the block is always v1. Old nodes reject v2 vectors as invalid, so the publisher `MadliRelayReliabilityPublisher` is **off by default** (`enabled = false`) and nothing in the browser node or the CLI switches it on.
+* Relay usage ledger (local, never gossiped): bytes forwarded per circuit are charged to the receiving side and credited to the relay. A peer with a negative balance is deferred in the top capacity band (`priorityHeadroomFraction`, default 0.25); reputation is never a hard gate.
+* Automatic relay selection (`LapisNode.startAutoRelay`, two relays per node) is active only when the operator declares `RelayConfig.reachability = PRIVATE`. The reachability heuristic only warns on a mismatch; it never changes behaviour. The IP classifier is hardened and non-public candidate addresses are refused by default.
+* Not wired: no application module calls `startAutoRelay`, the publisher or the relay ranker, and the CLI has no switch for them. Nothing writes v2 vectors in production.
+
+**DHT fallback for the directory (V0.9.13) and for mail and direct messages (V0.9.14).**
+
+* Hybrid: GossipSub stays the fast path and its validators are unchanged. Peer records and prekey bundles are additionally published as one IPNS value per identity, served by an own IPNS `PUT_VALUE`/`GET_VALUE` responder and validator (Nabu's cannot serve Ed25519 names) with a bounded record store.
+* Mail and direct-message pointers are left in an outbox inside that value. A rendezvous provider record lets a recipient find senders that have something for it, and a fetcher applies the same acceptance checks as the gossip path before it fetches the body. Plaintext mail deliberately leaves no outbox pointer, only encrypted mail does, so plaintext mail is never recoverable from the DHT.
+* Not wired: `BrowserServer` and the CLI do not publish, catch up, discover or hand an outbox to the senders. The feature is available to code that uses the libraries and has no user in the shipped applications yet.
+
+**Call remote control in the browser (V0.8.7b).**
+
+* `/call.html` remote-controls a call whose audio runs inside the node's JVM: incoming-call card (Decline before Accept), active call with timer, place-call form, call history. State arrives over Server-Sent Events.
+* Guarded as a local-only page: exact `Host` check, `Origin` and `Sec-Fetch-Site` checks, JSON-only bodies of at most 4 KiB, a per-process session token exchanged for an HttpOnly cookie, no CORS, at most 4 event subscribers. The call history is kept in memory only.
+* The acceptance policy is not wired in the browser, so unknown callers ring like known ones and the "blocked" display never occurs in production. There is no mute.
+
+**Known limits.**
+
+* DHT lookups reveal to the peers that are asked who is looking for whom, until traffic anonymisation (section 11 of docs/architecture.adoc) exists. Pointers in the DHT make this exposure persistent for up to seven days instead of only while a gossip topic is live.
+* The rendezvous key of a victim can be eclipsed by throwaway peer identities (a known Kademlia weakness, not mitigated); contacts already in the directory are not affected.
+* The outbox and the relay usage ledger are held in memory only, and a new identity starts with a balance of 0.
+* Still no hole punching (`dcutr`): relayed connections stay relayed, and voice calls need a direct connection.
+* **Test note:** `MultiNodeIpnsValueTest` ("acknowledged counts the echoes that carry the record, not the requests that were sent") failed in about 1 of 18 runs under heavy CPU load (8 to 16 busy loops on two cores): a peer was missing from the routing table and `attempted` was 2 instead of 3. The cause is not understood, so a red run of that test alone is not necessarily a regression.
+* The downloads are not signed. The new waves had only the pipeline's own review and security loops, no independent audit.

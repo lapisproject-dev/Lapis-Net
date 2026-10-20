@@ -29,8 +29,8 @@ requirements.
 == Status
 
 Every wave through *V0.9* is implemented and merged to `master`, followed by four
-post-arc maintenance waves (V0.9.8 to V0.9.11, below) and a fix release. The current release is
-*v0.10.1* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
+post-arc maintenance waves (V0.9.8 to V0.9.14, below), a fix release and a feature release. The current release is
+*v0.11.0* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
 are wave identifiers (V0.7 was never a standalone wave — its scope was folded into the
 incremental browser growth of V0.2–V0.5), from `v0.10.0` on they count releases in the
 order they ship). See link:docs/roadmap.adoc[docs/roadmap.adoc] for the
@@ -99,16 +99,28 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 | v0.10.1
 | Fix release: a race in the relay's circuit setup (present in `v0.9.9` and `v0.10.0`) made relay connections hang for 10 s and fail with no warning or error in the log (the decoding exception was visible only in DEBUG output); fixed on both legs; a deterministic regression test covers the hop leg, and the destination's leg is covered only by an assertion that the relay's control-failure counter stays at zero. Adds the release pipeline: a tag push builds, smoke-tests and publishes the downloadable ZIPs with `SHA256SUMS`
 | ✅
+
+| v0.11.0 (V0.9.12)
+| Madli relay-reliability metric (daily vector wire format v2, v1 stays readable; the publisher is off by default), usage-based relay priority (reputation is never a hard gate), automatic relay selection (two relays per node, only for a node declared `PRIVATE`), a reachability heuristic that only warns, a hardened IP classifier. Library-level: the browser and the CLI do not call it
+| ✅
+
+| v0.11.0 (V0.9.13, V0.9.14)
+| DHT fallback next to GossipSub for peer records, prekey bundles, mail and direct-message pointers (IPNS value per identity, own IPNS responder and validator, bounded record store, outbox, rendezvous provider records, consumers). Plaintext mail leaves no DHT pointer. Library-level: the browser and the CLI do not publish or fetch over it
+| ✅
+
+| v0.11.0 (V0.8.7b)
+| `/call.html`: the browser page as a remote control for voice calls (Server-Sent Events, session-token cookie, `Host` and `Origin` checks, in-memory history)
+| ✅
 |===
 
 Known, deliberate gaps — not oversights, each documented at the point it was cut:
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
-* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route, but no relay metric is built yet. Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`): there is no AutoNAT and no automatic relay selection, neither the CLI nor the browser calls it, and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
-* *Browser call remote control has no sender policy (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process; the acceptance policy is not wired in the browser, so unknown callers ring like known ones. No mute, no persisted call history.
+* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and no application switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and neither the CLI nor the browser calls any of it, and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
+* *Browser call remote control has no sender policy (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process; the acceptance policy is not wired in the browser, so unknown callers ring like known ones. No mute, no persisted call history (the history is held in memory).
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
-* *No DHT-based peer/mailbox discovery in the messaging modules* — `lapis-net-directory`, `lapis-net-mail`, `lapis-net-dm` and `lapis-net-ratchet` publish and discover over GossipSub. They were built that way because cross-node DHT provider discovery was broken from V0.1.4 onwards. V0.9.8 repaired that at the storage layer — `NabuStorage.provide()`/`findProviders()` now work across nodes, and `get()` fetches a block from a peer it learned about through the DHT alone (see `docs/architecture.adoc`) — but migrating those four modules onto it is a separate wave that has not happened yet.
+* *The DHT fallback is library-level only (V0.9.13, V0.9.14).* `lapis-net-directory`, `lapis-net-mail` and `lapis-net-dm` can additionally publish and look up peer records, prekey bundles and mail/DM pointers over the DHT (GossipSub stays the primary path), but `BrowserServer` and the CLI do not wire it: nothing in the shipped applications publishes, catches up or fetches over the DHT yet. DHT lookups tell the peers that are asked who is looking for whom, until traffic anonymisation exists (docs/architecture.adoc, section 11); the rendezvous key of a victim can be eclipsed by throwaway identities; plaintext mail is deliberately never recoverable from the DHT; a lookup needs the owner's Ed25519 peer ID.
 
 == Comparison
 
@@ -179,7 +191,7 @@ the table above, not a detail to gloss over. One clarification on the first row:
 | Karma (free likes): Bitcoin time-anchored, Veritas-weighted Sybil-resistant "like" scoring.
 
 | `lapis-net-madli`
-| Madli (machine-to-machine node reputation): five-metric observation vector with Veritas-weighted, manipulation-resistant weighted-median aggregation.
+| Madli (machine-to-machine node reputation): five-metric observation vector (plus, since V0.9.12, an optional relay-reliability block in wire format v2, written only if the off-by-default publisher is enabled) with Veritas-weighted, manipulation-resistant weighted-median aggregation.
 
 | `lapis-net-mail`
 | Asynchronous messages (the e-mail replacement), fully implemented (V0.9.1–V0.9.4): a signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1); hybrid-ecies encryption (HKDF + AES-256-GCM over a secp256k1 ECDH exchange, V0.9.2); cycle-safe, receive-order-independent threading, encrypted attachments, a local sent-folder view, and a browser inbox UI with verified XSS protection (V0.9.3); and a Veritas/Karma scoring filter plus a Lightning first-contact deposit for spam resistance (V0.9.4). A follow-up security-hardening pass closed a critical unauthenticated remote memory-exhaustion bug found in this module and, on audit, in three other already-shipped modules (`lapis-net-trust`, `lapis-net-virtus`, `lapis-net-karma`) plus a fourth instance in `lapis-net-browser`.
@@ -200,7 +212,7 @@ the table above, not a detail to gloss over. One clarification on the first row:
 | 1:1 audio calls over WebRTC (V0.8.7): `CallManager` (the call-control state machine — INVITE/ACCEPT/REJECT/HANGUP, a three-executor concurrency model, invite-flood rate limiting), `CallSignal`/`CallSignalCodec` (the wire frame carried as a `DmMessageType.CALL_SIGNAL` envelope's ratchet plaintext), `CallSdpPolicy` (SSRF-class defenses against a peer-supplied SDP), and `WebRtcCallMediaEngine` (the sole `dev.onvoid.webrtc:webrtc-java` consumer — host-ICE-candidates only, no STUN/TURN). Depends on `lapis-net-dm` for signaling transport and DTLS-fingerprint identity binding; `lapis-net-dm` itself stays entirely WebRTC-free.
 
 | `lapis-net-browser`
-| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b).
+| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b), and the call remote control `/call.html` (V0.8.7b).
 
 | `lapis-net-cli`
 | Entry point / multi-node demo harness proving trust propagation end to end.
@@ -251,7 +263,7 @@ cached, never dialled automatically and not shown in the UI. If you only have on
 == Download
 
 Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. `v0.10.1` is the first release built by the release pipeline, whose publish step was tested only against local stand-ins before that run, not against GitHub itself. Starting with
-`v0.10.1`, a release is published together with `lapis-net-browser-<version>.zip`,
+`v0.10.1` (the current release is `v0.11.0`), a release is published together with `lapis-net-browser-<version>.zip`,
 `lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases before that, including `v0.10.0`, have no
 downloadable files: check the release's asset list, and build from source (see <<Building>>) if none
 are attached.
