@@ -21,18 +21,13 @@ Feature release: a relay reliability metric with automatic relay selection, a DH
 
 **Operator options (V0.9.15).** The same keys everywhere; an **invalid value in any source aborts the start** (browser: exit code 2 and one line on stderr), it never falls back to a default. Priority in the browser: command-line arguments, `LAPISNET_*` environment variables, `$LAPISNET_HOME/browser.properties` (at most 64 KiB), defaults. The CLI takes arguments only.
 
-[cols="2,2,2,2,3",options="header"]
-|===
-|Command line |`browser.properties` key |Environment variable |Default |Validation
-
-|`--reachability=`|`reachability`|`LAPISNET_REACHABILITY`|`undeclared`|`public`, `private` or `undeclared`; never guessed
-|`--auto-relay=`|`autoRelay`|`LAPISNET_AUTO_RELAY`|`true` iff reachability is `private`|`true`/`false`; `true` requires `--reachability=private` ("--auto-relay requires --reachability=private")
-|`--dht-fallback=`|`dhtFallback`|`LAPISNET_DHT_FALLBACK`|`true`|`true`/`false`
-|`--publish-relay-reliability=`|`publishRelayReliability`|`LAPISNET_PUBLISH_RELAY_RELIABILITY`|`false`|`true`/`false`; older nodes reject v2 vectors as invalid
-|`--dm-veritas-gate=`|`dmAcceptance.veritasGate`|`LAPISNET_DM_VERITAS_GATE`|`false`|`true`/`false`
-|`--dm-karma-min-score=`|`dmAcceptance.karmaMinScore`|`LAPISNET_DM_KARMA_MIN_SCORE`|off|finite number >= 0
-|`--dm-min-deposit-msat=`|`dmAcceptance.minDepositMsat`|`LAPISNET_DM_MIN_DEPOSIT_MSAT`|`1000000`|integer >= 1
-|===
+* `--reachability=` (`reachability`, `LAPISNET_REACHABILITY`): `public`, `private` or `undeclared`; default `undeclared`; never guessed.
+* `--auto-relay=` (`autoRelay`, `LAPISNET_AUTO_RELAY`): `true` or `false`; default `true` if and only if reachability is `private`; `true` requires `--reachability=private`.
+* `--dht-fallback=` (`dhtFallback`, `LAPISNET_DHT_FALLBACK`): `true` or `false`; default `true`.
+* `--publish-relay-reliability=` (`publishRelayReliability`, `LAPISNET_PUBLISH_RELAY_RELIABILITY`): `true` or `false`; default `false`; older nodes reject v2 vectors as invalid.
+* `--dm-veritas-gate=` (`dmAcceptance.veritasGate`, `LAPISNET_DM_VERITAS_GATE`): `true` or `false`; default `false`.
+* `--dm-karma-min-score=` (`dmAcceptance.karmaMinScore`, `LAPISNET_DM_KARMA_MIN_SCORE`): a finite number >= 0; default off.
+* `--dm-min-deposit-msat=` (`dmAcceptance.minDepositMsat`, `LAPISNET_DM_MIN_DEPOSIT_MSAT`): an integer >= 1; default `1000000`.
 
 Unknown keys, repeated keys and bare words are errors too. `lapisnet node --help` and `lapisnet-browser --help` print the options. `reachability=private` with `auto-relay=false` declares the node private but runs no selector (and the library's reachability warning, which sees `UNSPECIFIED`, is then replaced by one INFO line). The node's status, including the active gates, is shown read-only on the start page (`GET /api/node/status`); a gate cannot be edited there.
 
