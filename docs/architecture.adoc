@@ -345,7 +345,8 @@ latent: `NabuStorage.attach()` registers the Kademlia responder on every browser
 connected peer could trigger the multihash overflow and fill the provider store, and
 `BrowserApi`/`MailApi` call `storage.get(cid)` without a peer hint, which turns stored provider
 records into dial targets. V0.9.11 replaces the lookup, announce and responder paths with this
-project's own bounded code. Nabu still supplies the wire protocol, the routing table and Bitswap.
+project's own bounded code. Nabu still supplies the wire protocol and Bitswap; since V0.9.16 the routing table is
+this project's own as well (finding H).
 
 No Nabu lookup method is called any more: `Kademlia.findClosestPeers`, `findProviders`,
 `getCloserPeers`, `provideBlock`, `bootstrapRoutingTable`, `publishValue` and `resolveValue` are all
@@ -391,6 +392,21 @@ IDs in responses.
 |F
 |`getKClosestPeers` threw an NPE for a routing-table peer without an address-book entry.
 |`LapisKademliaEngine` skips such entries and caps address lists.
+
+|H (V0.9.16)
+|Nabu builds its routing table as `Router(id, 2, 2, 2)`: two peers per bucket (its own `BUCKET_SIZE = 20`
+is never used). A third peer of a bucket was admitted but only reached the replacement cache, which
+`find(.., includeStale = false)` never returns - in roughly one of seven random three-peer networks (and
+in most five-peer ones) a peer was missing from every walk, which made `MultiNodeIpnsValueTest` flaky
+independently of load. Two further defects in the same code: the node's own ID is not hashed the way every
+peer ID is (the bucket tree is split around a wrong position), and `Router.touch` throws when the wall clock
+steps backwards, which fails every dial.
+|`LapisKademliaEngine` keeps its own `Router`: k = `DhtLimits.routingBucketSize` (20), replacement cache
+`routingReplacementCacheSize` (8), own ID hashed with SHA-256, touch times clamped to be monotonic, no
+exception towards the Netty event loop. Nabu's router stays empty (no `super` call). Access is serialised on
+the engine's monitor. Only peers this node dialled and authenticated are admitted, as in Nabu, and the table is
+bounded by roughly 256 buckets x (k + cache). `NabuStorage.connectToDhtPeer` now returns `true` only if the
+peer is routable afterwards.
 
 |G
 |Nothing configurable.
@@ -4058,6 +4074,19 @@ INCOMING call (which must behave like a REJECT for `DmAcceptedContacts` purposes
 `CallManagerDmWiringIntegrationTest` covers the `CallManager.attach` DM-listener wiring itself, and
 also pins `DmCallSignalTransport.send`'s `marksAcceptance` forwarding end to end in both directions
 (the accept-flow test asserts `true`, the reject-flow test asserts `false`).
+
+==== A call signal can be lost silently while the recipient's directory record is unknown (V0.9.16)
+
+`DmSessionManager.sendCallSignal` needs a directory record for the recipient and throws
+`DmUnknownRecipientException` otherwise. A callee that has not yet received the caller's record therefore cannot
+send ACCEPT, REJECT or HANGUP: the caller keeps ringing until `CallConfig.ringTimeout` (45 s) and ends with
+`RING_TIMEOUT` instead of `DECLINED`. This was the root cause of the flaky "a rejected call ends on both sides
+with DECLINED" browser test (confirmed by instrumentation under CPU load: callee did not know the caller, the
+REJECT send failed). Fixed in V0.9.16 only as far as it is visible: a failed outbound call signal is logged at
+`warn` level (type and fingerprints only) and counted, and the integration test now waits for directory
+convergence in both directions. **Known gap:** the signal itself is still lost; answering over the connection
+the INVITE arrived on would close it but touches the identity rule of `DmProtocol` (the stream's `PeerId` is
+only a resource key), so it needs an explicit decision and a security review.
 
 === `DmStore`: in-memory conversation history, a future caller's job to populate
 

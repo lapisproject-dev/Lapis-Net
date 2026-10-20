@@ -17,6 +17,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 private val logger = KotlinLogging.logger {}
 
@@ -762,12 +763,24 @@ class CallManager private constructor(
             try {
                 transport.send(peer, CallSignalCodec.encode(signal), marksAcceptance)
             } catch (e: RuntimeException) {
-                logger.debug(e) {
-                    "failed to send ${signal.type} for call ${signal.callId.fingerprint()} to ${peer.fingerprint()}"
+                failedSignalSends.incrementAndGet()
+                // Warn, not debug (V0.9.16): a lost ACCEPT / REJECT / HANGUP leaves the peer ringing until
+                // its own timeout, e.g. when the recipient's directory record is not known yet
+                // (DmUnknownRecipientException). Only the type and fingerprints are logged.
+                logger.warn {
+                    "failed to send ${signal.type} for call ${signal.callId.fingerprint()} to " +
+                        "${peer.fingerprint()}: ${e.javaClass.simpleName}"
                 }
+                logger.debug(e) { "details of the failed ${signal.type} send" }
             }
         }
     }
+
+    /** How many outbound call signals the transport failed to send (never reset); see [sendSignalAsync]. */
+    private val failedSignalSends = AtomicLong()
+
+    /** Number of outbound call signals whose [CallSignalTransport.send] threw (tests / diagnostics). */
+    internal fun failedSignalSendsForTesting(): Long = failedSignalSends.get()
 
     private fun endCallOnStateThread(
         call: ActiveCall,

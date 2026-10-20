@@ -93,6 +93,24 @@ class CallManagerStateMachineTest :
         // Review-fix regression (2026-09-02, MINOR finding): CallLog used to read Instant.now()
         // independently of CallManager's own injectable clock, so a fixed/fake clock (as every
         // skew/expiry test in this file sets) never reached callHistory()'s own timestamps.
+        test("a REJECT that the transport cannot send is counted and does not break the callee's own state") {
+            val (a, b) = buildPair()
+            val callId = a.manager.placeCall(b.identity)
+            awaitCondition { b.events.any { it is CallEvent.IncomingCall } }
+            // The callee does not know the caller's directory record yet: its transport throws on send.
+            b.transport.failSends = true
+
+            b.manager.rejectCall(callId, CallEndReason.DECLINED)
+
+            awaitCondition { b.events.any { it is CallEvent.Ended } }
+            awaitCondition { b.manager.failedSignalSendsForTesting() == 1L }
+            a.events.none { it is CallEvent.Ended } shouldBe true
+            a.manager.failedSignalSendsForTesting() shouldBe 0L
+
+            a.manager.stop()
+            b.manager.stop()
+        }
+
         test("callHistory() timestamps come from the injected clock, not the real wall clock") {
             val fixedInstant = Instant.ofEpochSecond(1_700_000_000L)
             val (a, b) = buildPair(clock = { fixedInstant })

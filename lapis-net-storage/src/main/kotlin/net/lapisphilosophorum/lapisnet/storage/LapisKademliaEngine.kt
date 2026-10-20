@@ -1,6 +1,8 @@
 package net.lapisphilosophorum.lapisnet.storage
 
 import com.offbynull.kademlia.Id
+import com.offbynull.kademlia.Node
+import com.offbynull.kademlia.Router
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.multihash.Multihash
 import io.libp2p.core.AddressBook
@@ -20,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
 private val logger = KotlinLogging.logger {}
 
 /**
- * Nabu's [KademliaEngine] with the three defects of its RESPONDER side closed (V0.9.11):
+ * Nabu's [KademliaEngine] with the defects of its RESPONDER side and its routing table closed (V0.9.11, V0.9.16):
  *
  * 1. **Unvalidated key bytes** - `receiveRequest` deserializes request keys with allocate-before-
  *    check parsers; [InboundDhtRequestPolicy] rejects those requests first. Rejected and failed
@@ -32,6 +34,13 @@ private val logger = KotlinLogging.logger {}
  *    This override skips such entries and caps each peer's address list.
  * 3. **Stream left open after `ADD_PROVIDER`** - the request has no reply, so nothing else would
  *    ever close the responder's end.
+ *
+ * 4. **Routing table** (V0.9.16) - Nabu builds `Router(id, 2, 2, 2)`: two peers per bucket (its own
+ *    `BUCKET_SIZE = 20` is never used), so a third peer of a bucket was admitted but not routable
+ *    (`find(.., includeStale = false)` skips the replacement cache). Its own ID is also not hashed the
+ *    way every peer ID is, which skews the bucket tree, and `Router.touch` throws when the wall clock
+ *    steps backwards, which would break every dial. This engine keeps its own [routingTable]
+ *    (k = [DhtLimits.routingBucketSize], hashed own ID, monotonic touch time) and leaves Nabu's empty.
  *
  * Since V0.9.13 `PUT_VALUE` and `GET_VALUE` are not delegated to the base class at all: [IpnsValueResponder]
  * answers them, over [ipnsStore]. The base class gets an [EmptyRecordStore], so it could not store a
@@ -46,13 +55,25 @@ internal class LapisKademliaEngine(
     internal val ipnsStore: BoundedIpnsRecordStore,
     blocks: Blockstore,
     private val limits: DhtLimits,
-    clock: () -> Instant = Instant::now,
+    private val clock: () -> Instant = Instant::now,
 ) : KademliaEngine(ourPeerId, providerStore, EmptyRecordStore, blocks) {
     /** Answers `PUT_VALUE` / `GET_VALUE`; the base class never sees those two (see [receiveRequest]). */
     internal val ipnsResponder = IpnsValueResponder(ipnsStore, limits, { key, k -> getKClosestPeers(key, k) }, clock)
 
     @Volatile
     private var book: AddressBook? = null
+
+    /** Guarded by this engine's monitor: [Router] is not thread-safe. */
+    private val routingTable =
+        Router(
+            Id.create(Hash.sha256(ourPeerId.bareMultihash().toBytes()), 256),
+            2,
+            limits.routingBucketSize,
+            limits.routingReplacementCacheSize,
+        )
+
+    /** The newest time handed to [Router.touch]; it throws on time going backwards. Guarded by this engine's monitor. */
+    private var lastTouch: Instant = Instant.EPOCH
 
     private val rejected = AtomicLong()
     private val failed = AtomicLong()
@@ -67,6 +88,38 @@ internal class LapisKademliaEngine(
         super.setAddressBook(addrs)
         book = addrs
     }
+
+    /**
+     * Admits an authenticated peer into [routingTable] (the base class would use its own k=2 table).
+     * Deliberately no `super` call. Never throws: a clock that stepped backwards is clamped.
+     */
+    @Synchronized
+    override fun addOutgoingConnection(peerId: PeerId) {
+        val now = clock().let { if (it.isBefore(lastTouch)) lastTouch else it }
+        lastTouch = now
+        try {
+            routingTable.touch(now, Node(Id.create(Hash.sha256(peerId.bytes), 256), peerId.toString()))
+        } catch (e: RuntimeException) {
+            logger.debug { "routing table refused a peer: ${e.javaClass.simpleName}" }
+        }
+    }
+
+    /** No-op, as in Nabu: only peers this node dialled and authenticated itself enter the routing table. */
+    override fun addIncomingConnection(peerId: PeerId) {
+    }
+
+    /** Whether [peerId] is routable, that is in a bucket proper and not only in the replacement cache. */
+    @Synchronized
+    internal fun isRoutable(peerId: PeerId): Boolean =
+        routingTable
+            .find(Id.create(Hash.sha256(peerId.bytes), 256), 1, false)
+            .firstOrNull()
+            ?.link == peerId.toString()
+
+    /** How many peers [getKClosestPeers] could return at most (tests). */
+    @Synchronized
+    internal fun routingTableSizeForTesting(): Int =
+        routingTable.find(Id.create(ByteArray(32), 256), Int.MAX_VALUE, false).size
 
     override fun receiveRequest(
         msg: Dht.Message,
@@ -152,7 +205,7 @@ internal class LapisKademliaEngine(
         val addressBook = book ?: return emptyList()
         val nodes =
             synchronized(this) {
-                router.find(Id.create(Hash.sha256(key), 256), k, false)
+                routingTable.find(Id.create(Hash.sha256(key), 256), k, false)
             }
         return nodes.mapNotNull { node ->
             val peerId = runCatching { PeerId.fromBase58(node.link) }.getOrNull() ?: return@mapNotNull null

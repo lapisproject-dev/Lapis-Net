@@ -49,6 +49,10 @@ const val IPNS_RECORD_HARD_LIMIT = 10_240
  * @property maxValuePutsPerSourcePerMinute inbound `PUT_VALUE` requests accepted per source peer
  * and minute (token bucket).
  * @property valueRateTrackerCapacity source peers the per-source rate limiter remembers.
+ * @property routingBucketSize Kademlia's k: peers kept routable per routing-table bucket (V0.9.16).
+ * Nabu's own table keeps only 2, which silently dropped a third peer of a bucket from every walk.
+ * @property routingReplacementCacheSize peers per bucket held in reserve for when a routable one goes stale.
+ * Together with the bucket size this bounds the table at roughly 256 buckets x (k + cache) entries.
  */
 data class DhtLimits(
     val provideFanout: Int = 20,
@@ -73,6 +77,8 @@ data class DhtLimits(
     val resolveQuorum: Int = 3,
     val maxValuePutsPerSourcePerMinute: Int = 6,
     val valueRateTrackerCapacity: Int = 1024,
+    val routingBucketSize: Int = 20,
+    val routingReplacementCacheSize: Int = 8,
 ) {
     init {
         require(provideFanout in 1..MAX_PROVIDE_FANOUT) { "provideFanout must be in 1..$MAX_PROVIDE_FANOUT" }
@@ -105,10 +111,17 @@ data class DhtLimits(
         require(resolveQuorum in 1..valuePutFanout) { "resolveQuorum must be in 1..valuePutFanout" }
         require(maxValuePutsPerSourcePerMinute > 0) { "maxValuePutsPerSourcePerMinute must be positive" }
         require(valueRateTrackerCapacity > 0) { "valueRateTrackerCapacity must be positive" }
+        require(routingBucketSize in 1..MAX_ROUTING_BUCKET_SIZE) {
+            "routingBucketSize must be in 1..$MAX_ROUTING_BUCKET_SIZE"
+        }
+        require(routingReplacementCacheSize in 1..MAX_ROUTING_BUCKET_SIZE) {
+            "routingReplacementCacheSize must be in 1..$MAX_ROUTING_BUCKET_SIZE"
+        }
     }
 
     private companion object {
         const val MAX_PROVIDE_FANOUT = 64
+        const val MAX_ROUTING_BUCKET_SIZE = 64
         const val MAX_WALK_ROUNDS = 32
         const val MAX_ADDRESSES_PER_PEER = 64
         const val MIN_ADDRESS_BYTES = 32

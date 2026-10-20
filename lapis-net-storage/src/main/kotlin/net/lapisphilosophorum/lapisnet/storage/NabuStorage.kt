@@ -704,7 +704,8 @@ class NabuStorage private constructor(
      * (must include a `/p2p/<peerId>` component, e.g. via [Multiaddr.withP2P]). A deterministic,
      * loopback-friendly alternative to a real-network bootstrap - mirrors [LapisNode.connect]'s
      * "explicit local peer" pattern. Returns `true` if the peer was reachable within [timeout] and
-     * added, `false` otherwise.
+     * routable afterwards, `false` otherwise - including when it answered but its bucket was already
+     * full, so it only reached the replacement cache and no walk will use it.
      *
      * Deliberately not Nabu's `bootstrapRoutingTable`: that one resolves DNS, runs on the
      * non-daemon `ioExec` pool and leaves the stream it opens unclosed.
@@ -729,9 +730,14 @@ class NabuStorage private constructor(
         // resetting it that early would fail the negotiation itself.
         promise.controller.whenComplete { _, _ -> promise.stream.thenAccept { it.close() } }
         return try {
-            // Completing the controller is what adds the peer to the routing table (onStartInitiator).
+            // Completing the controller is what adds the peer to the routing table (onStartInitiator),
+            // synchronously, but admission depends on the bucket's capacity.
             promise.controller.get(timeout.toNanos(), TimeUnit.NANOSECONDS)
-            true
+            engine.isRoutable(peerId).also {
+                if (!it) {
+                    logger.debug { "connectToDhtPeer: peer reachable, but its bucket is full (replacement cache only)" }
+                }
+            }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             false

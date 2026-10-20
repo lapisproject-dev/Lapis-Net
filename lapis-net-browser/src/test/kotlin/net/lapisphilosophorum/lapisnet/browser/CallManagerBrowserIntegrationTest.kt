@@ -5,6 +5,7 @@ import io.kotest.matchers.shouldBe
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.GossipPubSubException
 import java.time.Instant
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -92,11 +93,23 @@ class CallManagerBrowserIntegrationTest :
             val bKey = b.key
             var converged = false
             while (!converged && Instant.now().isBefore(deadline)) {
-                a.server.republishSelfForDmTesting()
-                b.server.republishSelfForDmTesting()
+                // Best-effort and retried by this loop: right after connecting, GossipSub may not have an
+                // outbound stream to the peer yet (SemiDuplexNoOutboundStreamException), which fails the
+                // publish. That must not abort the test setup (seen under CPU load, V0.9.16).
+                for (node in listOf(a, b)) {
+                    try {
+                        node.server.republishSelfForDmTesting()
+                    } catch (_: GossipPubSubException) {
+                        // retried on the next iteration
+                    }
+                }
+                // Both directions: the callee answers (ACCEPT / REJECT / HANGUP) only if ITS directory knows the
+                // caller. Waiting for A -> B alone left the REJECT of the second test lost whenever the
+                // gossip A -> B arrived late (V0.9.16, found under CPU load).
                 converged =
                     a.server.peerDirectoryForDmTesting.lookup(bKey) != null &&
-                    a.server.prekeyBundleGossipForDmTesting.lookup(bKey) != null
+                    a.server.prekeyBundleGossipForDmTesting.lookup(bKey) != null &&
+                    b.server.peerDirectoryForDmTesting.lookup(a.key) != null
                 if (!converged) Thread.sleep(300)
             }
             check(converged) { "directory convergence did not complete" }

@@ -31,6 +31,8 @@ class DhtLimitsTest :
             limits.resolveQuorum shouldBe 3
             limits.maxValuePutsPerSourcePerMinute shouldBe 6
             limits.valueRateTrackerCapacity shouldBe 1024
+            limits.routingBucketSize shouldBe 20
+            limits.routingReplacementCacheSize shouldBe 8
         }
 
         val invalid: Map<String, () -> DhtLimits> =
@@ -68,6 +70,10 @@ class DhtLimitsTest :
                 "resolveQuorum above valuePutFanout" to { DhtLimits(valuePutFanout = 2, resolveQuorum = 3) },
                 "maxValuePutsPerSourcePerMinute zero" to { DhtLimits(maxValuePutsPerSourcePerMinute = 0) },
                 "valueRateTrackerCapacity zero" to { DhtLimits(valueRateTrackerCapacity = 0) },
+                "routingBucketSize zero" to { DhtLimits(routingBucketSize = 0) },
+                "routingBucketSize above the maximum" to { DhtLimits(routingBucketSize = 65) },
+                "routingReplacementCacheSize zero" to { DhtLimits(routingReplacementCacheSize = 0) },
+                "routingReplacementCacheSize above the maximum" to { DhtLimits(routingReplacementCacheSize = 65) },
             )
         for ((name, build) in invalid) {
             test("rejects $name") {

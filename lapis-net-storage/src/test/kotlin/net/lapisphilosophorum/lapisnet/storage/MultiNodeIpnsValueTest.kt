@@ -163,6 +163,42 @@ class MultiNodeIpnsValueTest :
             }
         }
 
+        test("three DHT peers that share one bucket are all attempted").config(timeout = 60.seconds) {
+            val a = newTestNode()
+            val peers = mutableListOf<ScriptedDhtPeer>()
+            val discarded = mutableListOf<ScriptedDhtPeer>()
+            try {
+                // Nabu's k=2 routing table kept only two peers of a bucket routable, so a third was
+                // silently missing from every walk. Pick three peers that land in a single bucket of A.
+                while (peers.size < 3) {
+                    val candidate = ScriptedDhtPeer.start()
+                    if (topBit(candidate.peerId) != topBit(a.peerId)) peers += candidate else discarded += candidate
+                }
+                discarded.forEach { it.stop() }
+                discarded.clear()
+                val storageA = storageOn(a.node)
+                peers.forEach {
+                    it.answer(Dht.Message.MessageType.FIND_NODE) { msg -> msg }
+                    storageA.connectToDhtPeer(it.address) shouldBe true
+                }
+
+                val result =
+                    storageA.publishIpnsValue(
+                        a.signingKey,
+                        "x".toByteArray(),
+                        1,
+                        expiry(),
+                        timeout = Duration.ofSeconds(8),
+                    )
+
+                result.attempted shouldBe 3
+            } finally {
+                peers.forEach { it.stop() }
+                discarded.forEach { it.stop() }
+                runCatching { a.node.stop() }
+            }
+        }
+
         test("acknowledged counts the echoes that carry the record, not the requests that were sent").config(
             timeout = 60.seconds,
         ) {

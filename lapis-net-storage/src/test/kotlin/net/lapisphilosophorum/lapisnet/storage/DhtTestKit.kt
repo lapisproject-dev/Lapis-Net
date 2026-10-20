@@ -9,6 +9,7 @@ import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPrivKey
+import org.peergos.Hash
 import org.peergos.blockstore.RamBlockstore
 import org.peergos.protocol.dht.Kademlia
 import org.peergos.protocol.dht.KademliaEngine
@@ -177,3 +178,12 @@ internal class CountingListener(
         sockets.forEach { runCatching { it.close() } }
     }
 }
+
+/** The most significant bit of `sha256(peerId)`: the Kademlia key space of a peer, split into two top-level halves. */
+internal fun topBit(peerId: PeerId): Int = (Hash.sha256(peerId.bytes)[0].toInt() ushr 7) and 1
+
+/** Whether [a] and [b] fall into the same top-level half of the Kademlia key space (so into the same bucket of any node in the other half). */
+internal fun sameTopBucket(
+    a: PeerId,
+    b: PeerId,
+): Boolean = topBit(a) == topBit(b)
