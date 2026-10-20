@@ -1421,7 +1421,8 @@ any signal are ranked last but kept, so a new relay can still earn observations.
 **Rollout — readers before writers.** A node on `v0.10.1` or older answers a v2 vector with
 `ValidationResult.Invalid`, which lowers the GossipSub score of whoever forwarded it.
 `MadliRelayReliabilityPublisher` (the only writer) is therefore constructed with `enabled = false` by
-default and no application module wires it. It should be switched on no earlier than two releases
+default; the browser node and `lapisnet node` start it only with the explicit option
+`publish-relay-reliability=true`. It should be switched on no earlier than two releases
 after the decoder shipped. When it does publish it *merges*: if the node already announced a core
 vector for the same `(observer, peer, epochDay)`, the new v2 vector carries both blocks, because the
 index's replace-on-conflict rule would otherwise let a relay-only vector displace the core one.

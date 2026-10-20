@@ -1193,7 +1193,7 @@ Progress: delivered and released in `v0.11.0`.
 * [x] `CallEventHub`: one manager listener, bounded fan-out, non-blocking on the call state thread.
 * [x] `LazyCallMediaEngine`; stop order `CallManager` then engine then DM.
 * [x] Tests: guard, token, routing, hub, SSE, two-node HTTP integration, XSS rendering in HtmlUnit.
-* [ ] Open: the acceptance policy is not wired in the browser (`BrowserServer` passes no `acceptance`), so `blocked` never occurs in production and every caller rings. A separate wave must decide the policy, since it also affects DMs.
+* [x] The acceptance policy is wired in the browser since V0.9.15 (`BrowserServer` takes a `BrowserAcceptance`), so `blocked` now occurs in production (shown locally, nothing is sent to the caller).
 * [ ] Open: no mute, no history persistence.
 
 Details: docs/architecture.adoc, "Call remote control (V0.8.7b)".
@@ -1942,7 +1942,7 @@ for measurement, see "What is not proven"):
 
 == V0.9.12 — Madli relay reliability metric and automatic relay selection
 
-_Released in `v0.11.0`. Library-level: no application module wires it (see "What remains")._
+_Released in `v0.11.0`. Wired into the browser node and `lapisnet node` by V0.9.15 behind operator options (see the V0.9.15 section)._
 
 === Progress
 
@@ -1979,8 +1979,9 @@ hostile candidates, non-public addresses), reachability heuristic, and real-node
 
 **What remains:**
 
-* No application module (CLI, browser) wires the publisher, the ranker or `startAutoRelay`; nothing writes v2
-  vectors in production. The CLI switches (`--reachability`, `--auto-relay`) are a separate small wave.
+* Wiring (done in V0.9.15): the browser node and `lapisnet node` start `startAutoRelay` and the ranker when
+  `reachability=private`; the publisher runs only with `publish-relay-reliability=true`, so nothing writes v2
+  vectors unless an operator asks for it.
 * The ledger is memory-only and a new `PeerId` starts at 0, so debt can be shed by changing identity.
 * The reliability metric counts dials that failed for reasons that are not the relay's fault.
 * Candidate DNS names are not resolved before dialling, so a name that resolves to a private address is not caught.
@@ -2009,8 +2010,8 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 
 **What remains (part 2 and open points):**
 
-* Part 2: consumers - done in V0.9.14 below. No application module (`BrowserServer`, CLI) publishes or
-  refreshes yet; wiring it earlier would add the metadata exposure without a user.
+* Part 2: consumers - done in V0.9.14 below. Wired into `BrowserServer` and `lapisnet node` by V0.9.15
+  (on by default, switch off with `--dht-fallback=false`; the metadata exposure is documented there).
 * A lookup needs the owner's Ed25519 peer ID as a hint; a bare secp256k1 identity cannot be resolved.
 * Both artefacts at their maximum do not fit one record (4800 byte value budget); DHT readers may get used
   one-time prekeys.
