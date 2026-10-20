@@ -16,6 +16,9 @@ dependencies {
     implementation(project(":lapis-net-storage"))
     implementation(project(":lapis-net-trust"))
     implementation(project(":lapis-net-networking"))
+    // V0.9.15 - `node` subcommand: DHT directory + Madli (relay ranking/publishing).
+    implementation(project(":lapis-net-directory"))
+    implementation(project(":lapis-net-madli"))
 
     runtimeOnly(rootProject.libs.logback.classic)
 }

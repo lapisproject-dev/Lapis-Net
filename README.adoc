@@ -116,11 +116,11 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 Known, deliberate gaps — not oversights, each documented at the point it was cut:
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
-* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and no application switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and neither the CLI nor the browser calls any of it, and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
+* *NAT traversal is relay-only — no hole punching.* A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. What is still missing is `dcutr` hole punching, which would let two NAT'd peers upgrade a relayed connection to a direct one: it is absent from `jvm-libp2p` entirely and would have to be implemented from scratch. Every relayed connection therefore stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and no application switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and the browser and `lapisnet node --reachability=private` start it (the publisher stays off unless `--publish-relay-reliability=true`), and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
 * *Browser call remote control has no sender policy (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process; the acceptance policy is not wired in the browser, so unknown callers ring like known ones. No mute, no persisted call history (the history is held in memory).
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
-* *The DHT fallback is library-level only (V0.9.13, V0.9.14).* `lapis-net-directory`, `lapis-net-mail` and `lapis-net-dm` can additionally publish and look up peer records, prekey bundles and mail/DM pointers over the DHT (GossipSub stays the primary path), but `BrowserServer` and the CLI do not wire it: nothing in the shipped applications publishes, catches up or fetches over the DHT yet. DHT lookups tell the peers that are asked who is looking for whom, until traffic anonymisation exists (docs/architecture.adoc, section 11); the rendezvous key of a victim can be eclipsed by throwaway identities; plaintext mail is deliberately never recoverable from the DHT; a lookup needs the owner's Ed25519 peer ID.
+* *The DHT fallback is wired since V0.9.15 (V0.9.13, V0.9.14).* The browser publishes and looks up peer records, prekey bundles and mail/DM pointers over the DHT (GossipSub stays the primary path); it is on by default and `--dht-fallback=false` turns it off. The CLI's `node` subcommand uses it for the peer directory only. DHT lookups tell the peers that are asked who is looking for whom, until traffic anonymisation exists (docs/architecture.adoc, section 11); the rendezvous key of a victim can be eclipsed by throwaway identities; plaintext mail is deliberately never recoverable from the DHT; a lookup needs the owner's Ed25519 peer ID.
 
 == Comparison
 
@@ -217,6 +217,18 @@ the table above, not a detail to gloss over. One clarification on the first row:
 | `lapis-net-cli`
 | Entry point / multi-node demo harness proving trust propagation end to end.
 |===
+
+== Running a node with the V0.9.x features
+
+[source,bash]
+----
+# headless node behind a NAT: reserves relays, uses the DHT directory (no DM, no mail)
+lapisnet node --reachability=private
+# browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
+lapisnet-browser --reachability=private --dm-veritas-gate=true
+----
+
+An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
 
 == Building
 

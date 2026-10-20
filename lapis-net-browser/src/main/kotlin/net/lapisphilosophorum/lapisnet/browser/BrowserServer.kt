@@ -11,6 +11,10 @@ import net.lapisphilosophorum.lapisnet.call.CallConfig
 import net.lapisphilosophorum.lapisnet.call.CallManager
 import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
 import net.lapisphilosophorum.lapisnet.call.WebRtcCallMediaEngine
+import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
+import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
+import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
+import net.lapisphilosophorum.lapisnet.directory.OutboxEntryKind
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
@@ -19,17 +23,30 @@ import net.lapisphilosophorum.lapisnet.dm.DmAcceptedContacts
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.dm.DmStore
 import net.lapisphilosophorum.lapisnet.dm.MailboxGossip
+import net.lapisphilosophorum.lapisnet.dm.MailboxPoller
+import net.lapisphilosophorum.lapisnet.dm.MailboxRedeliveryScheduler
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
 import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
 import net.lapisphilosophorum.lapisnet.karma.BitcoinTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.ElectrumTimeAnchorSource
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
+import net.lapisphilosophorum.lapisnet.madli.CachedVeritasObserverWeight
+import net.lapisphilosophorum.lapisnet.madli.DailyRelayReliabilityPublication
+import net.lapisphilosophorum.lapisnet.madli.MadliGossip
+import net.lapisphilosophorum.lapisnet.madli.MadliRelayRanker
+import net.lapisphilosophorum.lapisnet.madli.MadliRelayReliabilityPublisher
+import net.lapisphilosophorum.lapisnet.mail.InboxDhtFetcher
 import net.lapisphilosophorum.lapisnet.mail.InboxGossip
 import net.lapisphilosophorum.lapisnet.mail.MailSender
 import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
+import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
+import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
@@ -38,7 +55,11 @@ import java.nio.file.Path
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinDuration
 
 private val logger = KotlinLogging.logger {}
 
@@ -55,11 +76,10 @@ private const val HTTP_STOP_TIMEOUT_MILLIS = 5_000L
  * collisions between concurrently running test servers. */
 const val DEFAULT_BROWSER_HTTP_PORT = 7878
 
-/** How long [start]'s one-shot self [PeerRecord]/prekey-bundle publish stays valid for - see the
- * `publishSelfForDm` call site's own comment for why this wave does not periodically re-publish
- * (an explicit, stated scope cut, not an oversight). Generous enough that a browser session left
- * running overnight stays dialable for DM without a restart. */
-private const val DM_SELF_RECORD_TTL_SECONDS = 24L * 3600
+/** How long a self [PeerRecord]/prekey-bundle publish stays valid for. Since V0.9.15 [SelfRecordRepublisher]
+ * re-publishes it (on address changes and well before this expires), so this is no longer the dialability limit of a
+ * long-running session. */
+internal const val DM_SELF_RECORD_TTL_SECONDS = 24L * 3600
 
 /**
  * V0.8.7b default for [BrowserServer.start]'s `callMediaEngineFactory`: a [LazyCallMediaEngine] over
@@ -148,6 +168,19 @@ class BrowserServer private constructor(
     private val callMediaEngine: CallMediaEngine?,
     private val callEventHub: CallEventHub?,
     private val callToken: CallSessionToken,
+    /** V0.9.15 - owns every background job and the stop actions of the optional components (DHT fetcher, Madli,
+     * auto-relay); stopped FIRST in [stop] because those jobs use storage and the DM manager. */
+    private val supervisor: NodeServiceSupervisor,
+    private val config: BrowserConfig,
+    private val directoryDht: DirectoryDht?,
+    private val dhtOutbox: DhtOutbox?,
+    private val acceptance: BrowserAcceptance,
+    private val autoRelaySelector: RelayAutoSelector?,
+    private val madliGossip: MadliGossip?,
+    private val relayReliabilityJob: NodeServiceSupervisor.PeriodicJob?,
+    private val inboxDhtFetcher: InboxDhtFetcher?,
+    private val selfRecordRepublisher: SelfRecordRepublisher,
+    private val acceptedContacts: DmAcceptedContacts,
     private val httpEngine: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>,
     /** The HTTP port actually bound, resolved after [httpEngine] started - may differ from the
      * `httpPort` passed to [start] when that was `0` (OS-assigned). */
@@ -165,6 +198,39 @@ class BrowserServer private constructor(
     internal val callEventHubForTesting: CallEventHub? get() = callEventHub
 
     internal val callTokenForTesting: CallSessionToken get() = callToken
+
+    internal val supervisorForTesting: NodeServiceSupervisor get() = supervisor
+
+    /** `null` iff `dhtFallback` is off. */
+    internal val directoryDhtForTesting: DirectoryDht? get() = directoryDht
+
+    /** `null` iff `dhtFallback` is off - the outbox both [MailSender] and [DmSessionManager] were given. */
+    internal val dhtOutboxForTesting: DhtOutbox? get() = dhtOutbox
+
+    internal val acceptanceForTesting: BrowserAcceptance get() = acceptance
+
+    internal val autoRelaySelectorForTesting: RelayAutoSelector? get() = autoRelaySelector
+
+    internal val madliGossipForTesting: MadliGossip? get() = madliGossip
+
+    /** `null` unless `publishRelayReliability` is on. */
+    internal val relayReliabilityJobForTesting: NodeServiceSupervisor.PeriodicJob? get() = relayReliabilityJob
+
+    internal val inboxDhtFetcherForTesting: InboxDhtFetcher? get() = inboxDhtFetcher
+
+    internal val mailboxGossipForTesting: MailboxGossip get() = mailboxGossip
+
+    internal val dmSessionManagerForTesting: DmSessionManager get() = dmSessionManager
+
+    internal val selfRecordRepublisherForTesting: SelfRecordRepublisher get() = selfRecordRepublisher
+
+    internal val configForTesting: BrowserConfig get() = config
+
+    internal fun acceptedContactsForTesting() = acceptedContacts
+
+    internal fun identityForTesting() = identity
+
+    internal fun veritasForTesting() = veritas
 
     /** Test seam only - exposes the underlying [LapisNode] so tests can read its [LapisNode.peerId]/
      * [LapisNode.listenAddresses] to build a direct-dial multiaddr (e.g. for
@@ -246,6 +312,10 @@ class BrowserServer private constructor(
      */
     fun stop() {
         try {
+            // V0.9.15 - FIRST: the periodic jobs and the optional components (publisher, auto-relay, DHT fetcher,
+            // Madli) use storage and the DM manager, which are torn down below. Bounded by per-component and
+            // overall timeouts, never throws.
+            runCatching { supervisor.stopAll() }
             runCatching { httpEngine.stop(HTTP_STOP_GRACE_PERIOD_MILLIS, HTTP_STOP_TIMEOUT_MILLIS) }
             // Calls ride on the DM layer: stop the CallManager first, then close the media engine
             // (never under live sessions - native double free, V0.8.7), then the DM manager below.
@@ -338,6 +408,29 @@ class BrowserServer private constructor(
             callHeartbeatInterval: Duration = 15.seconds,
             /** Test seam: replaces the [CallManager]-backed remote (e.g. with a fake). */
             callRemoteOverride: CallRemote? = null,
+            /** V0.9.15 - the operator's wiring and acceptance configuration, see [BrowserConfig.load]. The default
+             * is the pre-0.9.15 behavior plus the library defaults (DHT fallback on, everything else off). */
+            config: BrowserConfig = BrowserConfig.DEFAULT,
+            /** Test seam: the library throttles (publish/discovery/resolve intervals) are never overridden in production. */
+            directoryDhtLimits: DirectoryDhtLimits = DirectoryDhtLimits(),
+            /** Test seam: interval of the DHT maintenance job (`discoverInbox`/`refreshStale`/`catchUp`). */
+            dhtMaintenanceInterval: Duration = 60.seconds,
+            /** Test seam: first DHT maintenance run, never earlier than the mesh needs to form (attach before connect). */
+            dhtMaintenanceInitialDelay: Duration = 5.seconds,
+            /** Test seam: runs before each DHT maintenance pass (e.g. to block it and prove a prompt stop). */
+            dhtMaintenanceHook: (() -> Unit)? = null,
+            /** Test seam: how often [SelfRecordRepublisher] looks for changed addresses. */
+            selfRecordCheckInterval: Duration = 30.seconds,
+            /** Test seam: a high value keeps gossip redelivery from masking the DHT path in tests. */
+            mailboxRedeliverIntervalSeconds: Long = MailboxRedeliveryScheduler.DEFAULT_REDELIVER_INTERVAL_SECONDS,
+            /** Test seam: how often the mailbox poller fetches the blobs of pending pointers. */
+            mailboxPollIntervalSeconds: Long = MailboxPoller.DEFAULT_POLL_INTERVAL_SECONDS,
+            /** Test seam: how often the acceptance check is rebuilt after a trust graph change. */
+            acceptanceRefreshInterval: Duration = 60.seconds,
+            /** Test seam: tests need `allowNonPublicCandidateAddresses = true` (loopback relays); production never sets it. */
+            autoRelayConfig: AutoRelayConfig = AutoRelayConfig(),
+            /** Test seam: replaces the Karma-per-identity adapter. */
+            karmaLookupOverride: KarmaScoreLookup? = null,
         ): BrowserServer {
             require(httpHost == "127.0.0.1") {
                 "BrowserServer must bind 127.0.0.1 only - refusing to start on '$httpHost' " +
@@ -359,9 +452,27 @@ class BrowserServer private constructor(
             // ordinary (non-failure) shutdown path.
             val cleanupOnFailure = mutableListOf<() -> Unit>()
             try {
-                val node = LapisNode.create(identity, listenAddress)
+                val wiring = config.wiring
+                val node =
+                    LapisNode.create(
+                        identity,
+                        listenAddress,
+                        relayConfig = wiring.relayConfig(RelayConfig.CLIENT_ONLY.copy(autoRelay = autoRelayConfig)),
+                    )
                 node.start(bootstrapPeers = bootstrapPeers)
                 cleanupOnFailure += { runCatching { node.stop() } }
+                if (wiring.dhtFallback) {
+                    logger.info {
+                        "DHT fallback active: DHT lookups for inbox, prekeys and directory reveal query timing and " +
+                            "key interest to DHT peers - disable with --dht-fallback=false"
+                    }
+                }
+                if (wiring.declaredPrivateWithoutAutoRelay) {
+                    logger.info {
+                        "reachability=private declared but auto-relay is off: no relay reservations will be made " +
+                            "(set --auto-relay=true to enable them)"
+                    }
+                }
 
                 val storage = NabuStorage.attach(node, dataDirectory)
                 cleanupOnFailure += { runCatching { storage.stop() } }
@@ -387,7 +498,9 @@ class BrowserServer private constructor(
                 // multi-node test.
                 val mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
                 cleanupOnFailure += { runCatching { mailInbox.stop() } }
-                val mailSender = MailSender(pubsub, storage)
+                // V0.9.15 - the outbox through which mail and DM pointers reach the DHT (no outbox = gossip only).
+                val dhtOutbox = if (wiring.dhtFallback) DhtOutbox() else null
+                val mailSender = MailSender(pubsub, storage, outbox = dhtOutbox)
                 val sentFolder = SentFolder()
 
                 // V0.8.6b - DM browser wiring. Mirrors DmTestNode/buildDmTestNode's established
@@ -398,7 +511,24 @@ class BrowserServer private constructor(
                 cleanupOnFailure += { runCatching { peerDirectory.stop() } }
                 val prekeyBundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
                 cleanupOnFailure += { runCatching { prekeyBundleGossip.stop() } }
-                val mailboxGossip = MailboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+                val ownPublicKey = identity.secp256k1KeyPair.publicKey
+                // Created BEFORE mailboxGossip: the acceptance check's isAcceptedContact needs it (and the
+                // accept button and outbound sends mark contacts in the same instance).
+                val dmAcceptedContacts = DmAcceptedContacts()
+                // The ONE acceptance instance: handed to MailboxGossip (offline pre-check, gossip AND DHT path)
+                // and to DmSessionManager (post-decrypt classification, also what makes calls "blocked").
+                val acceptance =
+                    BrowserAcceptance(
+                        settings = config.acceptance,
+                        localIdentity = ownPublicKey,
+                        veritas = veritas,
+                        karmaLookupFactory = { graph ->
+                            karmaLookupOverride ?: PostKarmaScoreLookup(posts, karma, graph, ownPublicKey)
+                        },
+                        acceptedContacts = dmAcceptedContacts,
+                    )
+                val acceptanceCheck = acceptance.buildCheck()
+                val mailboxGossip = MailboxGossip.attach(pubsub, storage, ownPublicKey, acceptanceCheck)
                 cleanupOnFailure += { runCatching { mailboxGossip.stop() } }
                 // Resolved EXACTLY ONCE per start() call - not once per PrekeyStore file access. A
                 // prior revision of this code re-resolved via dmKeystorePassphraseSource() on every
@@ -475,7 +605,6 @@ class BrowserServer private constructor(
                 // which would zero the master here too if passed directly.
                 val dmPassphrase = dmPrekeyMasterPassphrase?.copyOf() ?: insecureDefaultDmPassphrase()
                 val dmStore = DmStore()
-                val dmAcceptedContacts = DmAcceptedContacts()
                 val dmSessionManager =
                     DmSessionManager.attach(
                         identity,
@@ -491,39 +620,141 @@ class BrowserServer private constructor(
                         // acceptedContacts wired so an outbound send (DmApi.kt's `POST /api/dm/{peerHex}`)
                         // marks the recipient accepted - see DmAcceptedContacts's own doc comment for
                         // "this node itself sent that peer a message" being one of the two ways a peer
-                        // becomes accepted. `acceptance` (a DmAcceptanceCheck with real gates) is
-                        // DELIBERATELY left null/unwired this wave - see DmApi.kt's class doc comment for
-                        // the full, explicit scope-cut statement (mirrors lapis-net-mail's own identical
-                        // "MailAcceptanceCheck has zero production callers" state).
+                        // becomes accepted.
+                        mailboxRedeliverIntervalSeconds = mailboxRedeliverIntervalSeconds,
+                        mailboxPollIntervalSeconds = mailboxPollIntervalSeconds,
+                        // V0.9.15: the SAME DmAcceptanceCheck instance as MailboxGossip above (null while no gate is on).
+                        acceptance = acceptanceCheck,
                         acceptedContacts = dmAcceptedContacts,
+                        dhtOutbox = dhtOutbox,
                     )
                 cleanupOnFailure += { runCatching { dmSessionManager.stop() } }
                 dmSessionManager.addInboundListener { message -> dmStore.recordInbound(message) }
-                // One-shot publish so this node is dialable/handshakeable for DM as soon as it starts -
-                // see DM_SELF_RECORD_TTL_SECONDS's own doc comment for why this wave does not also
-                // periodically re-publish (a stated scope cut: a browser session running longer than
-                // the TTL needs a restart to remain DM-reachable by a peer that has not cached an
-                // earlier record/bundle).
-                val selfRecordNotValidAfter = Instant.now().epochSecond + DM_SELF_RECORD_TTL_SECONDS
-                peerDirectory.announce(
-                    PeerRecord.create(
+                // V0.9.15 - everything with a lifetime of its own hangs off ONE supervisor, so a stop (or a failed
+                // start) leaves no thread behind. Registered first, so the rollback stops it LAST of the
+                // supervised parts but BEFORE the earlier-attached layers they depend on (reverse attach order).
+                val supervisor = NodeServiceSupervisor("lapis-browser")
+                cleanupOnFailure += { supervisor.stopAll() }
+
+                // DHT fallback (default on). Order matters: the DHT is attached over the already attached
+                // directory gossips; both outbox consumers are registered BEFORE the first resolve can dispatch.
+                var directoryDht: DirectoryDht? = null
+                var inboxDhtFetcher: InboxDhtFetcher? = null
+                if (wiring.dhtFallback) {
+                    val dht =
+                        DirectoryDht.attach(
+                            storage,
+                            peerDirectory,
+                            prekeyBundleGossip,
+                            directoryDhtLimits,
+                            localIdentity = ownPublicKey,
+                            outbox = dhtOutbox,
+                        )
+                    directoryDht = dht
+                    // DirectoryDht has no stop of its own: this entry only documents the position in the
+                    // (reverse-start) stop order. The ONE DM-pointer entrance of the DHT path is
+                    // mailboxGossip.dhtConsumer(), i.e. the very same acceptance as the gossip validator;
+                    // registerOutboxConsumer rejects a second registration, so there is no other way in.
+                    supervisor.register("directory-dht") { logger.debug { "directory DHT detached" } }
+                    dht.registerOutboxConsumer(OutboxEntryKind.DM_MAILBOX_POINTER, mailboxGossip.dhtConsumer())
+                    val fetcher = InboxDhtFetcher.attach(mailInbox, storage, peerDirectory, dht, ownPublicKey)
+                    inboxDhtFetcher = fetcher
+                    supervisor.register("inbox-dht-fetcher") { fetcher.stop() }
+                    supervisor.launchPeriodic(
+                        "dht-maintenance",
+                        interval = dhtMaintenanceInterval,
+                        jitter = (dhtMaintenanceInterval.inWholeMilliseconds / 6).milliseconds,
+                        initialDelay = dhtMaintenanceInitialDelay,
+                    ) {
+                        dhtMaintenanceHook?.invoke()
+                        // The library throttles (300 s for discovery) apply; calling more often is harmless.
+                        runCatching { dht.discoverInbox() }
+                            .onFailure { if (it is InterruptedException) throw it }
+                        runCatching { dht.refreshStale() }
+                            .onFailure { if (it is InterruptedException) throw it }
+                        val contacts = dmAcceptedContacts.snapshot()
+                        if (contacts.isNotEmpty()) {
+                            runCatching { dht.catchUp(contacts, directoryDhtLimits.defaultTimeout) }
+                                .onFailure { if (it is InterruptedException) throw it }
+                        }
+                    }
+                }
+
+                // Own record + prekey bundle: published at once, then kept current (a private node learns its
+                // /p2p-circuit addresses only after the reservations exist).
+                val selfRecordRepublisher =
+                    SelfRecordRepublisher(
                         identity = identity,
-                        addresses = node.listenAddresses(),
-                        capabilities = setOf(PeerCapability.DM),
-                        // Wall-clock epoch millis, NOT System.nanoTime() - nanoTime's absolute value is
-                        // boot-relative and meaningless across JVM/machine restarts (see
-                        // PeerPresenceAnnouncer's own doc comment on this exact restriction), but
-                        // PeerRecordIndex.add rejects any sequenceNumber lower than the highest one it has
-                        // already seen for this identity as an anti-rollback measure. A restarted node
-                        // publishing a smaller nanoTime-derived sequence number than its own pre-restart
-                        // value would be permanently unresolvable/undialable by every peer that stayed up
-                        // across the restart. Epoch millis only goes backwards if the system clock itself
-                        // is set backwards, which is a far narrower and more honest failure mode.
-                        sequenceNumber = Instant.now().toEpochMilli(),
-                        notValidAfterEpochSecond = selfRecordNotValidAfter,
-                    ),
-                )
-                prekeyBundleGossip.announce(prekeyStore.publishBundle(identity, selfRecordNotValidAfter))
+                        addresses = node::listenAddresses,
+                        peerDirectory = peerDirectory,
+                        prekeyBundleGossip = prekeyBundleGossip,
+                        prekeyStore = prekeyStore,
+                        directoryDht = directoryDht,
+                        outbox = dhtOutbox,
+                        minDhtAttemptInterval = directoryDhtLimits.minRepublishInterval.toKotlinDuration(),
+                    )
+                // Gossip only at start: a DHT publication may block for seconds and must not delay the start.
+                selfRecordRepublisher.tick(includeDht = false)
+                supervisor.launchPeriodic(
+                    "self-record-republisher",
+                    interval = selfRecordCheckInterval,
+                    jitter = (selfRecordCheckInterval.inWholeMilliseconds / 10).milliseconds,
+                    initialDelay = selfRecordCheckInterval,
+                ) { selfRecordRepublisher.tick() }
+
+                // Madli: needed to rank relay candidates (read) and/or to publish relay reliability (write).
+                var madliGossip: MadliGossip? = null
+                var autoRelaySelector: RelayAutoSelector? = null
+                var relayReliabilityJob: NodeServiceSupervisor.PeriodicJob? = null
+                if (wiring.autoRelay || wiring.publishRelayReliability) {
+                    val madli = MadliGossip.attach(pubsub, storage)
+                    madliGossip = madli
+                    supervisor.register("madli-gossip") { madli.stop() }
+                    if (wiring.autoRelay) {
+                        val weights = CachedVeritasObserverWeight(veritas, ownPublicKey)
+                        val ranker =
+                            MadliRelayRanker(
+                                vectorsFor = madli::currentVectorsForObservedPeer,
+                                observerWeight = weights::weightOf,
+                            )
+                        val selector = node.startAutoRelay({ peerDirectory.relayCandidates() }, ranker)
+                        autoRelaySelector = selector
+                        supervisor.register("auto-relay") { selector.stop() }
+                    }
+                    if (wiring.publishRelayReliability) {
+                        val publisher =
+                            MadliRelayReliabilityPublisher(
+                                madli,
+                                identity.secp256k1KeyPair,
+                                node::relayReliabilityCounts,
+                                enabled = true,
+                            )
+                        val daily = DailyRelayReliabilityPublication(publisher)
+                        // Last to be started = first to be stopped.
+                        relayReliabilityJob =
+                            supervisor.launchPeriodic(
+                                "madli-relay-publisher",
+                                interval = 6.hours,
+                                jitter = 10.minutes,
+                                initialDelay = 1.minutes,
+                            ) { daily.runOnce() }
+                    }
+                }
+
+                if (config.acceptance.enabled) {
+                    supervisor.launchPeriodic(
+                        "acceptance-refresh",
+                        interval = acceptanceRefreshInterval,
+                        jitter = (acceptanceRefreshInterval.inWholeMilliseconds / 6).milliseconds,
+                        initialDelay = acceptanceRefreshInterval,
+                    ) {
+                        // One new instance, handed to BOTH consumers: the single acceptance point stays single.
+                        acceptance.refresh { check ->
+                            mailboxGossip.updateAcceptanceCheck(check)
+                            dmSessionManager.updateAcceptanceCheck(check)
+                        }
+                    }
+                }
 
                 val callMediaEngine = callMediaEngineFactory?.invoke()
                 cleanupOnFailure += { runCatching { callMediaEngine?.close() } }
@@ -532,7 +763,10 @@ class BrowserServer private constructor(
                 // reversed cleanup order gives exactly that).
                 cleanupOnFailure += { runCatching { callManager?.stop() } }
                 val callRemote = callRemoteOverride ?: callManager?.let { CallManagerRemote(it) }
-                val callEventHub = callRemote?.let { CallEventHub(it, callConfig.autoRejectQuarantined) }
+                val callEventHub =
+                    callRemote?.let {
+                        CallEventHub(it, callConfig.autoRejectQuarantined, blockReasonOf = acceptance::blockReasonOf)
+                    }
                 val portRef = AtomicInteger(0)
                 val callDeps =
                     CallApiDependencies(
@@ -544,6 +778,18 @@ class BrowserServer private constructor(
                         heartbeatInterval = callHeartbeatInterval,
                     )
 
+                val nodeStatus: () -> NodeStatusResponse = {
+                    NodeStatusResponse(
+                        reachability = wiring.reachability.name.lowercase(),
+                        autoRelay = wiring.autoRelay,
+                        autoRelayRunning = autoRelaySelector?.isRunning() == true,
+                        relayReservations = node.relayClient.reservations().size,
+                        dhtFallback = wiring.dhtFallback,
+                        publishRelayReliability = wiring.publishRelayReliability,
+                        acceptanceGates = acceptance.gateNames(),
+                        configFile = BrowserConfig.FILE_NAME,
+                    )
+                }
                 val deps =
                     BrowserApiDependencies(
                         identity,
@@ -559,6 +805,7 @@ class BrowserServer private constructor(
                         sentFolder,
                         dm = DmApiDependencies(peerDirectory, dmSessionManager, dmStore, dmAcceptedContacts),
                         call = callDeps,
+                        nodeStatus = nodeStatus,
                     )
                 val httpEngine =
                     embeddedServer(Netty, port = httpPort, host = httpHost) {
@@ -606,6 +853,17 @@ class BrowserServer private constructor(
                     callMediaEngine,
                     callEventHub,
                     callToken,
+                    supervisor,
+                    config,
+                    directoryDht,
+                    dhtOutbox,
+                    acceptance,
+                    autoRelaySelector,
+                    madliGossip,
+                    relayReliabilityJob,
+                    inboxDhtFetcher,
+                    selfRecordRepublisher,
+                    dmAcceptedContacts,
                     httpEngine,
                     boundPort,
                 )

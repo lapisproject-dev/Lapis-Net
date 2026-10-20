@@ -9,8 +9,11 @@ import net.lapisphilosophorum.lapisnet.identity.FileIdentityRepository
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
 import net.lapisphilosophorum.lapisnet.identity.defaultIdentityDirectory
 import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
+import net.lapisphilosophorum.lapisnet.networking.BootstrapConfig
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
+import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.TrustGraph
@@ -18,10 +21,14 @@ import net.lapisphilosophorum.lapisnet.trust.TrustPath
 import net.lapisphilosophorum.lapisnet.trust.TrustPathFinder
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import net.lapisphilosophorum.lapisnet.trust.VeritasGrant
+import java.io.PrintStream
 import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import kotlin.system.exitProcess
 
 private val logger = KotlinLogging.logger {}
 
@@ -30,13 +37,131 @@ private val logger = KotlinLogging.logger {}
  * [net.lapisphilosophorum.lapisnet.trust.ThreeNodeVeritasGossipRelayTest]'s own warm-up topic. */
 private const val WARMUP_TOPIC = "lapisnet-cli-demo:warmup:v1"
 
-fun main() {
+/**
+ * Entry point. **Without arguments** it runs the multi-node demo exactly as before V0.9.15; with arguments it is the
+ * `node` subcommand or `--help` (see [runCli]).
+ */
+fun main(args: Array<String>) {
+    if (args.isEmpty()) {
+        runDemo()
+        return
+    }
+    exitProcess(runCli(args.toList(), System.out, System.err))
+}
+
+private fun runDemo() {
     logger.info { "Starting Lapis Net CLI (V0.1.8 multi-node trust-propagation demo)" }
 
     runIdentityAndStorageDemo()
     println()
     val result = runMultiNodeTrustPropagationDemo()
     println("Final resolved trust score A -> C on node C: ${result.resolvedPathOnC?.scoreFraction}")
+}
+
+/** Exit code for an unknown subcommand/flag or an invalid option value. */
+internal const val EXIT_USAGE = 2
+
+private val CLI_USAGE =
+    """
+    |Usage:
+    |  lapisnet                      run the multi-node demo (no network egress beyond localhost)
+    |  lapisnet node [options]       run a headless node (relay selection, DHT directory, Madli); no DM, no mail
+    |  lapisnet --help
+    |
+    """.trimMargin()
+
+/**
+ * The testable body of [main] for the non-demo cases. Returns the process exit code: `0` after a clean run or `--help`,
+ * [EXIT_USAGE] for an unknown subcommand/flag or an invalid option (one line on [err], no stack trace).
+ *
+ * @param awaitShutdown blocks until the process should end; it is handed the stop action so a shutdown hook can run it.
+ * @param startNode seam for tests; the default starts a real [HeadlessNode] with the operator's identity
+ * @param demo seam for the no-argument case
+ */
+internal fun runCli(
+    args: List<String>,
+    out: PrintStream,
+    err: PrintStream,
+    awaitShutdown: (stop: () -> Unit) -> Unit = ::blockUntilShutdown,
+    startNode: (NodeWiringOptions) -> HeadlessNode = ::startDefaultHeadlessNode,
+    demo: () -> Unit = ::runDemo,
+): Int {
+    if (args.isEmpty()) {
+        demo()
+        return 0
+    }
+    if (args[0] == "--help" || args[0] == "-h" || args[0] == "help") {
+        out.println(CLI_USAGE)
+        out.println(NodeWiringOptions.HELP_TEXT)
+        return 0
+    }
+    if (args[0] != "node") {
+        err.println("lapisnet: unknown command '${args[0]}'")
+        err.println(CLI_USAGE)
+        return EXIT_USAGE
+    }
+    val rest = args.drop(1)
+    if ("--help" in rest || "-h" in rest) {
+        out.println(NodeWiringOptions.HELP_TEXT)
+        return 0
+    }
+    val options =
+        try {
+            NodeWiringOptions.resolve(NodeWiringOptions.parseCliArgs(rest))
+        } catch (e: InvalidWiringOptionException) {
+            err.println("lapisnet node: ${e.message}")
+            return EXIT_USAGE
+        }
+    val headless = startNode(options)
+    try {
+        out.println("Lapis Net node running. PeerId: ${headless.node.peerId.toBase58().take(12)}...")
+        out.println(
+            "  reachability=${options.reachability.name.lowercase()} auto-relay=${options.autoRelay} " +
+                "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability}",
+        )
+        if (options.dhtFallback) {
+            out.println(
+                "  note: DHT lookups reveal query timing and key interest to DHT peers - disable with --dht-fallback=false",
+            )
+        }
+        out.println("Press Ctrl+C to stop.")
+        awaitShutdown(headless::stop)
+    } finally {
+        headless.stop()
+    }
+    return 0
+}
+
+private fun lapisnetHome(): Path =
+    Path.of(
+        System.getenv("LAPISNET_HOME") ?: (System.getProperty("user.home") + "/.lapisnet"),
+    )
+
+private fun startDefaultHeadlessNode(options: NodeWiringOptions): HeadlessNode {
+    val repository = FileIdentityRepository(defaultIdentityDirectory(), warningPassphraseProvider())
+    val identity = repository.loadDefault() ?: repository.generateAndSave()
+    val bootstrap = BootstrapConfig.resolve()
+    val listen = BootstrapConfig.resolveListenAddress()
+    return HeadlessNode.start(
+        options = options,
+        identity = identity,
+        bootstrapPeers = bootstrap,
+        listenAddress = listen,
+        dataDirectory = lapisnetHome().resolve("cli-node-storage"),
+    )
+}
+
+/** Blocks the calling thread until the JVM receives SIGINT/SIGTERM; [stop] runs inside the shutdown hook. */
+private fun blockUntilShutdown(stop: () -> Unit) {
+    val latch = CountDownLatch(1)
+    Runtime.getRuntime().addShutdownHook(
+        Thread {
+            logger.info { "shutting down Lapis Net node" }
+            runCatching { stop() }
+            latch.countDown()
+        },
+    )
+    latch.await()
 }
 
 /**

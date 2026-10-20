@@ -6,7 +6,9 @@ import io.ipfs.multibase.Base58
 import io.ipfs.multibase.Multibase
 import io.ipfs.multihash.Multihash
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.decodeURLPart
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCallPipeline
@@ -218,6 +220,24 @@ class BrowserApiDependencies(
     /** V0.8.7b - see `CallApi.kt`'s `installCallRoutes`. `null` (the default) installs no `/api/call`
      * route at all, leaving every earlier test fixture and caller unchanged. */
     val call: CallApiDependencies? = null,
+    /** V0.9.15 - source of `GET /api/node/status`; `null` installs no such route (older fixtures stay unchanged). */
+    val nodeStatus: (() -> NodeStatusResponse)? = null,
+)
+
+/**
+ * V0.9.15 - what the status panel shows. Read-only, loopback-only, deliberately free of absolute paths: [configFile] is
+ * a file NAME relative to `LAPISNET_HOME`.
+ */
+@Serializable
+data class NodeStatusResponse(
+    val reachability: String,
+    val autoRelay: Boolean,
+    val autoRelayRunning: Boolean,
+    val relayReservations: Int,
+    val dhtFallback: Boolean,
+    val publishRelayReliability: Boolean,
+    val acceptanceGates: List<String>,
+    val configFile: String,
 )
 
 /**
@@ -248,10 +268,16 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
     }
     // V0.8.7b - /call.html carries the Accept button; forbid framing it (clickjacking).
     intercept(ApplicationCallPipeline.Plugins) {
-        if (call.request.path() == "/call.html") {
+        if (call.request.path().decodeURLPart() == "/call.html") {
             call.response.header("X-Frame-Options", "DENY")
             call.response.header("Content-Security-Policy", "frame-ancestors 'none'")
         }
+    }
+    // DNS-rebinding defence for EVERY request (reads of decrypted DMs/mail included): refuse any non-loopback Host.
+    // Deliberately path-independent: request.path() is still percent-encoded while routing decodes segments,
+    // so a path-prefix check is bypassable (/%61pi/dm). The static UI has no legitimate non-loopback Host either.
+    intercept(ApplicationCallPipeline.Plugins) {
+        if (!call.requireLoopbackHost()) finish()
     }
     routing {
         get("/api/identity") {
@@ -263,6 +289,14 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
                     peerId = deps.node.peerId.toBase58(),
                 ),
             )
+        }
+
+        deps.nodeStatus?.let { status ->
+            get("/api/node/status") {
+                if (!call.requireLoopbackRequest()) return@get
+                call.response.header(HttpHeaders.CacheControl, "no-store")
+                call.respond(status())
+            }
         }
 
         get("/api/timeline") {

@@ -5219,7 +5219,90 @@ anonymisation exists (section 11); read it before wiring this into an applicatio
   new deposit or mail.
 * **Bitswap stores fetched blocks** regardless of the persistence cap of the indexes (as the mailbox poller
   always did).
-* **No application wiring.** `BrowserServer` and the CLI do not publish, catch up, discover or start the fetcher.
+* **Application wiring (V0.9.15).** `BrowserServer` publishes, catches up, discovers and starts the fetcher; see "Wiring of the V0.9.x features".
+
+== Wiring of the V0.9.x features into the browser and the CLI (V0.9.15)
+
+Until V0.9.14 the relay selection, the Madli publisher, the DHT fallback and the acceptance gates were library
+code that no application started. V0.9.15 wires them into `lapis-net-browser` (`BrowserServer`) and, as a lean
+headless node without DM and mail, into `lapis-net-cli` (`lapisnet node`). Every switch is an operator option
+(`NodeWiringOptions`, `BrowserConfig`; see `docs/release-notes/v0.11.0.adoc` for the table). An invalid value
+aborts the start; nothing falls back silently.
+
+=== Single acceptance point
+
+One `DmAcceptanceCheck` instance, built by `BrowserAcceptance` from the current Veritas grants, is handed to
+**both** `MailboxGossip.attach` and `DmSessionManager.attach`. Every way a DM pointer or a call reaches the node
+ends in the same two checks:
+
+[kuml, single-acceptance-point, svg]
+----
+import dev.kuml.c4.dsl.c4Model
+
+c4Model(name = "SingleAcceptancePoint") {
+    val node = softwareSystem(name = "Lapis Net Node") {
+        container(name = "GossipSub validator") {
+            technology = "MailboxGossip"
+        }
+        container(name = "DHT consumer") {
+            technology = "MailboxGossip.dhtConsumer"
+        }
+        container(name = "ingestPointer") {
+            technology = "pre-check, one DmAcceptanceCheck"
+        }
+        container(name = "classifyQuarantined") {
+            technology = "DmSessionManager, after decryption"
+        }
+        container(name = "CallManager and CallEventHub") {
+            technology = "silent drop, blocked display"
+        }
+    }
+    containerDiagram(name = "Single acceptance point") {
+        system = node
+    }
+}
+----
+
+* The GossipSub validator and `dhtConsumer()` call the same `ingestPointer`; both read the current check on every
+  call (`MailboxGossip.updateAcceptanceCheck`), so a refresh cannot leave one path on an old trust graph.
+  `registerOutboxConsumer` refuses a second consumer per kind, so the DHT has no other entrance for DM pointers.
+* `DmSessionManager.classifyQuarantined` marks messages and call signals; `CallManager` drops a quarantined
+  `INVITE` silently (no RINGING, no REJECT) and `CallEventHub` shows it as "blocked" with a locally computed reason.
+  The reason (`AcceptanceGateEvaluator.failedGates`) is display only and takes no decision.
+* A 60 s job rebuilds the check when the number of known Veritas grants changed and gives the one new instance to both
+  consumers. Gates are off by default. The mail acceptance (`MailAcceptanceCheck`) is not wired.
+* Karma per identity is defined by `PostKarmaScoreLookup` (sum over the sender's 20 newest posts, memoised 60 s).
+
+=== Metadata exposure
+
+With `dht-fallback=true` (default) DHT queries for inbox rendezvous keys, prekey bundles and directory values tell the
+DHT peers that are asked *when* this node asks and *whose keys* it is interested in (contact list over time), and
+publications tell them the node is online. This adds to the exposure described in "Metadata leak" (V0.9.13) and
+"Metadata: recipient lookups reveal who talks to whom" (V0.9.14). The browser logs a notice at start, the status panel
+shows the state permanently, and `--dht-fallback=false` removes it.
+
+=== Self record republication
+
+A node behind a NAT learns its `/p2p-circuit` addresses only after the reservations succeeded, which is after the
+one-shot publication at start. `SelfRecordRepublisher` therefore re-announces the peer record and prekey bundle over
+gossip when `node.listenAddresses()` changed and at least every six hours, and publishes to the DHT on the same
+triggers and whenever the outbox holds entries (at most one attempt per `minRepublishInterval`, with a reduced bundle
+that fits the value). The capability set stays `{DM}`.
+
+=== Lifecycle
+
+`NodeServiceSupervisor` (`lapis-net-networking`) owns one bounded, named, daemon pool and the stop actions. Periodic
+jobs run at `interval +/- jitter`, back off exponentially up to 300 s after a failure and are interrupted on stop.
+`stopAll` cancels the jobs, then runs the stop actions in reverse start order (publisher, auto-relay, Madli, DHT
+fetcher, DHT), each with a 5 s limit and a 15 s overall budget; a component that hangs is logged by name and skipped.
+`BrowserServer.stop()` calls it first, before the HTTP engine and the layers the jobs use; a failed start rolls it
+back. It uses plain threads because the networking module has no coroutine dependency and the scheduled library
+calls block.
+
+=== Not done
+
+Editable settings page, mail acceptance wiring, a reported "deposit missing" reason, and a default change of the
+relay-reliability publisher.
 
 == Diagrams
 

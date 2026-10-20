@@ -88,7 +88,7 @@ not by version number. Every row below is an annotated git tag on `master`.
 | the release commit
 
 | `v0.11.0`
-| Feature release. Contains the waves V0.9.12 (Madli relay reliability metric, usage-based relay priority, automatic relay selection), V0.9.13 and V0.9.14 (DHT fallback for the peer directory, prekey bundles, mail and direct messages) and V0.8.7b (browser call remote control). The protocol code of V0.9.12-V0.9.14 is library-level: `BrowserServer` and the CLI do not call it yet
+| Feature release. Contains the waves V0.9.12 (Madli relay reliability metric, usage-based relay priority, automatic relay selection), V0.9.13 and V0.9.14 (DHT fallback for the peer directory, prekey bundles, mail and direct messages) and V0.8.7b (browser call remote control). Since V0.9.15 `BrowserServer` and the new `lapisnet node` wire it behind operator options
 | 2026-10-20
 | the release commit
 
@@ -2052,3 +2052,10 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 * The sender must be reachable for the fetch; the outbox is in memory; publication can lag by up to five
   minutes; a Sybil attacker can displace provider records at a rendezvous key.
 * This wave has had no independent review or security audit beyond the pipeline's own loops yet.
+
+== V0.9.15 — Wiring of relay selection, DHT fallback and acceptance gates
+
+_Done, part of `v0.11.0`. Internal wave identifier._
+
+* **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapisnet node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
+* **Open:** wire the mail acceptance; editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.

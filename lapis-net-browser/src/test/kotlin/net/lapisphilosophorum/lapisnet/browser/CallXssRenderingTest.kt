@@ -178,6 +178,76 @@ class CallXssRenderingTest :
             }
         }
 
+        test("a blocked call names the gate that stopped it, links to the acceptance rules and is not red").config(
+            timeout = 60.seconds,
+        ) {
+            withPage { page, _, _, _ ->
+                val labels =
+                    mapOf(
+                        "VERITAS_BELOW_THRESHOLD" to "Blockiert \u2013 Veritas unter Schwelle",
+                        "KARMA_BELOW_THRESHOLD" to "Blockiert \u2013 Karma unter Schwelle",
+                        "DEPOSIT_MISSING" to "Blockiert \u2013 Lightning-Deposit fehlt",
+                        "POLICY" to "Blockiert \u2013 Annahmeregel",
+                    )
+                labels.keys.forEachIndexed { index, reason ->
+                    page.executeJavaScript(
+                        """handleCallEvent({type: "blocked", callId: "c$index", peer: "p", peerFingerprint: "badbad0$index", blockReason: "$reason"})""",
+                    )
+                }
+                // newest first: the last injected event is the first row
+                val rows = page.querySelectorAll("#call-history .call-history-item")
+                rows.size shouldBe labels.size
+                labels.values.reversed().forEachIndexed { index, text ->
+                    rows[index].querySelector<DomNode>(".call-history-outcome")!!.textContent shouldBe text
+                }
+                val link = rows[0].querySelector<org.htmlunit.html.HtmlAnchor>(".call-history-settings")!!
+                link.hrefAttribute shouldBe "/index.html#node-status-acceptance"
+                link.isDisplayed shouldBe true
+                // the glyph is a neutral stroke in the current (muted) text colour, never a fixed red
+                val path = rows[0].querySelector<DomNode>(".call-history-path")!!
+                path.getAttributes().getNamedItem("stroke").nodeValue shouldBe "currentColor"
+                path.getAttributes().getNamedItem("fill").nodeValue shouldBe "none"
+            }
+        }
+
+        test("an unknown or hostile block reason falls back to the generic text and stays inert").config(
+            timeout = 60.seconds,
+        ) {
+            withPage { page, _, _, _ ->
+                page.executeJavaScript(
+                    """handleCallEvent({type: "blocked", callId: "ee", peer: "p", peerFingerprint: "aa",
+                        blockReason: ${jsString(PAYLOAD)}})""",
+                )
+                ScriptResult.isUndefined(page.executeJavaScript("window.__callXssFired")) shouldBe true
+                page.getElementsByTagName("img").size shouldBe 0
+                page.querySelector<DomNode>("#call-history .call-history-outcome")!!.textContent shouldBe
+                    "Blockiert \u2013 Annahmeregel"
+                // a blocked row from the status endpoint (no reason known) reads the same
+                page.executeJavaScript(
+                    """applyStatus({available: true, active: [], history: [{callId: "ff", peer: "p",
+                        peerFingerprint: "bb", outcome: "BLOCKED", atEpochSecond: 1, blocked: true}]}); render()""",
+                )
+                page.querySelector<DomNode>("#call-history .call-history-outcome")!!.textContent shouldBe
+                    "Blockiert \u2013 Annahmeregel"
+            }
+        }
+
+        test("the stylesheet gives no call-history rule a red colour").config(timeout = 60.seconds) {
+            val css =
+                CallXssRenderingTest::class.java
+                    .getResourceAsStream("/static/style.css")!!
+                    .readBytes()
+                    .toString(Charsets.UTF_8)
+            val rules = css.lines().filter { it.contains("call-history") }
+            (rules.isNotEmpty()) shouldBe true
+            rules.forEach { line ->
+                listOf("#c00", "#cc0000", "#b02a2a", "red").forEach { red ->
+                    line.lowercase().contains(red) shouldBe
+                        false
+                }
+            }
+        }
+
         test("call.html forbids framing").config(timeout = 60.seconds) {
             withPage { page, _, _, _ ->
                 page.webResponse.getResponseHeaderValue("X-Frame-Options") shouldBe "DENY"

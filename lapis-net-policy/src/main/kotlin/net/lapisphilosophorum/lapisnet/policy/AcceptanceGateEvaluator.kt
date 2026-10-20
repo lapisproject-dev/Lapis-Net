@@ -49,7 +49,27 @@ object AcceptanceGateEvaluator {
         hasVeritasPath: (Secp256k1PublicKey) -> Boolean,
         karmaScoreOf: KarmaScoreLookup,
     ): String? {
-        val failedGates = mutableListOf<String>()
+        val failed = failedGates(sender, gates, hasVeritasPath, karmaScoreOf) ?: return null
+        return failed.joinToString("; ") { gate ->
+            when (gate) {
+                is AcceptanceGate.VeritasPath -> "no Veritas path from local identity to sender"
+                is AcceptanceGate.KarmaThreshold -> "karma below threshold ${gate.minScore}"
+            }
+        }
+    }
+
+    /**
+     * The structured form of [firstPassOrFailureReason] (V0.9.15): `null` if [sender] was accepted (passed at least
+     * one gate, or [gates] is empty), otherwise the gates that did NOT pass, in configuration order. Used only to
+     * explain a decision to the local user (which gate blocked a call) - never to take one.
+     */
+    fun failedGates(
+        sender: Secp256k1PublicKey,
+        gates: List<AcceptanceGate>,
+        hasVeritasPath: (Secp256k1PublicKey) -> Boolean,
+        karmaScoreOf: KarmaScoreLookup,
+    ): List<AcceptanceGate>? {
+        val failed = mutableListOf<AcceptanceGate>()
         for (gate in gates) {
             val passed =
                 when (gate) {
@@ -57,13 +77,8 @@ object AcceptanceGateEvaluator {
                     is AcceptanceGate.KarmaThreshold -> karmaScoreOf.karmaScoreOf(sender) >= gate.minScore
                 }
             if (passed) return null
-            failedGates +=
-                when (gate) {
-                    is AcceptanceGate.VeritasPath -> "no Veritas path from local identity to sender"
-                    is AcceptanceGate.KarmaThreshold -> "karma below threshold ${gate.minScore}"
-                }
+            failed += gate
         }
-        if (failedGates.isEmpty()) return null
-        return failedGates.joinToString("; ")
+        return failed.ifEmpty { null }
     }
 }

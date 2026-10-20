@@ -57,9 +57,21 @@ class PostAnnouncementIndex internal constructor(
      * that field's doc comment for why this is FIFO-equivalent in practice, not true LRU. */
     private val postsByContentId =
         object : LinkedHashMap<PostContentId, IndexedPost>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<PostContentId, IndexedPost>): Boolean =
-                size > maxTracked
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<PostContentId, IndexedPost>): Boolean {
+                if (size <= maxTracked) return false
+                val author = eldest.value.announcement.author
+                postsByAuthor[author]?.let { bucket ->
+                    bucket.remove(eldest.key)
+                    if (bucket.isEmpty()) postsByAuthor.remove(author)
+                }
+                return true
+            }
         }
+
+    /** Secondary index author -> that author's tracked posts, kept in lock-step with [postsByContentId] (including
+     * eviction), so per-author lookups never scan the whole index. */
+    private val postsByAuthor =
+        HashMap<net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey, MutableMap<PostContentId, IndexedPost>>()
 
     /** Backing set for [tryReservePersistence] - a plain, never-evicting [HashSet], mirroring
      * [net.lapisphilosophorum.lapisnet.virtus.LtrRecordIndex.persistedContentIds] exactly. */
@@ -88,7 +100,9 @@ class PostAnnouncementIndex internal constructor(
             if (!PostAnnouncement.verify(announcement)) return@runCatching false
             val id = PostContentId(announcement.contentId())
             if (postsByContentId.containsKey(id)) return@runCatching false
-            postsByContentId[id] = IndexedPost(cid, announcement)
+            val indexed = IndexedPost(cid, announcement)
+            postsByContentId[id] = indexed
+            postsByAuthor.getOrPut(announcement.author) { HashMap() }[id] = indexed
             true
         }.getOrDefault(false)
 
@@ -150,6 +164,11 @@ class PostAnnouncementIndex internal constructor(
         persistedBodyCids.add(cid)
         return true
     }
+
+    /** The tracked posts of one [author]; O(posts of that author), empty (and O(1)) for an unknown author. */
+    @Synchronized
+    fun postsBy(author: net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey): List<IndexedPost> =
+        postsByAuthor[author]?.values?.toList() ?: emptyList()
 
     /** Every tracked [IndexedPost], in insertion order. */
     @Synchronized

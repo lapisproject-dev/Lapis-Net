@@ -6,9 +6,13 @@ import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
 import net.lapisphilosophorum.lapisnet.identity.defaultIdentityDirectory
 import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
 import net.lapisphilosophorum.lapisnet.networking.BootstrapConfig
+import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
+import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
+import java.io.PrintStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
+import kotlin.system.exitProcess
 
 private val logger = KotlinLogging.logger {}
 
@@ -41,8 +45,45 @@ private fun warningPassphraseProvider(): PassphraseProvider =
         passphrase
     }
 
-fun main() {
-    logger.info { "Starting Lapis Net Browser (V0.4 Genesis-Bootstrap + Identity Hardening)" }
+/** Exit code for an invalid command line, environment or `browser.properties` (nothing is started). */
+internal const val EXIT_INVALID_CONFIGURATION = 2
+
+fun main(args: Array<String>) {
+    val code = runBrowserMain(args.toList(), System.getenv(), System.out, System.err)
+    if (code != 0) exitProcess(code)
+}
+
+/**
+ * The testable body of [main]: returns instead of exiting. `--help` prints the options and returns `0`; an invalid
+ * configuration prints ONE line (no stack trace) to [err] and returns [EXIT_INVALID_CONFIGURATION] without starting
+ * anything. Otherwise it starts the server and blocks until the JVM shuts down.
+ */
+internal fun runBrowserMain(
+    args: List<String>,
+    env: Map<String, String>,
+    out: PrintStream,
+    err: PrintStream,
+    startServer: (BrowserConfig) -> Unit = ::runBrowserServer,
+): Int {
+    if ("--help" in args || "-h" in args) {
+        out.println("Usage: lapisnet-browser [--key=value ...]")
+        out.println(NodeWiringOptions.HELP_TEXT)
+        out.println(BrowserConfig.HELP_TEXT)
+        return 0
+    }
+    val config =
+        try {
+            BrowserConfig.load(args, env)
+        } catch (e: InvalidWiringOptionException) {
+            err.println("lapisnet-browser: ${e.message}")
+            return EXIT_INVALID_CONFIGURATION
+        }
+    startServer(config)
+    return 0
+}
+
+private fun runBrowserServer(config: BrowserConfig) {
+    logger.info { "Starting Lapis Net Browser (V0.9.15 wiring)" }
 
     // Load-or-generate the identity exactly like LapisNetCli.runIdentityAndStorageDemo() does -
     // this process holds the same kind of real signing key, so identity handling must be
@@ -73,6 +114,7 @@ fun main() {
             bootstrapPeers = bootstrapPeers,
             listenAddress = listenAddress,
             dataDirectory = dataDirectory,
+            config = config,
         )
 
     println("Lapis Net Browser is running.")

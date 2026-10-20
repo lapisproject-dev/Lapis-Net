@@ -54,7 +54,7 @@
   <p id="call-notify-optin" class="call-muted">
     <button type="button" id="call-notify-enable" class="btn-secondary">Desktop-Hinweise aktivieren</button>
   </p>
-  <p class="call-muted" id="call-footnote">Absender-Policy im Browser noch nicht aktiv: Anrufe unbekannter Absender klingeln wie bekannte.</p>
+  <p class="call-muted" id="call-footnote">Annahmeregeln sind standardm&auml;&szlig;ig aus: Dann klingeln Anrufe unbekannter Absender wie bekannte. Sind Regeln aktiv, wird ein Anruf von einem Absender, der keine Regel erf&uuml;llt, stillschweigend blockiert &ndash; der Anrufer erf&auml;hrt davon nichts.</p>
 </main>
 
 <template id="call-card-template">
@@ -75,6 +75,7 @@
     <span class="call-history-peer"></span>
     <span class="call-history-outcome"></span>
     <span class="call-history-time"></span>
+    <a class="call-history-settings" href="/index.html#node-status-acceptance" hidden>Annahmeregeln</a>
   </li>
 </template>
 

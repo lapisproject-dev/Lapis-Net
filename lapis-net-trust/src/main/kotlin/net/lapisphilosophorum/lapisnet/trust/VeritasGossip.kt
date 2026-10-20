@@ -96,6 +96,33 @@ class VeritasGossip private constructor(
             VeritasGrantResolver.resolveLatest(index.grantsFor(truster, target))
         }
 
+    /** O(1) change counter of the underlying grant index; see [VeritasGrantIndex.version]. */
+    fun grantsVersion(): Long = index.version()
+
+    /**
+     * A content fingerprint of [currentGrants]: changes whenever any pair's latest grant changes, including a
+     * revocation or score change that REPLACES an edge without changing the grant count. Order-independent.
+     */
+    fun currentGrantsFingerprint(grants: Collection<VeritasGrant> = currentGrants()): List<Byte> {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        grants
+            .map { it.contentId().toList() }
+            .sortedWith { a, b -> compareLists(a, b) }
+            .forEach { digest.update(it.toByteArray()) }
+        return digest.digest().toList()
+    }
+
+    private fun compareLists(
+        a: List<Byte>,
+        b: List<Byte>,
+    ): Int {
+        for (i in 0 until minOf(a.size, b.size)) {
+            val c = a[i].compareTo(b[i])
+            if (c != 0) return c
+        }
+        return a.size.compareTo(b.size)
+    }
+
     /** Unsubscribes from the gossip topic. No other sub-resources to release - [GossipPubSub]/
      * [NabuStorage] are owned and stopped by their own callers, not by this class. */
     fun stop() {

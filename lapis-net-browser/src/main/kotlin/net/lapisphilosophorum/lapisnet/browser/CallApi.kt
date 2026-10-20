@@ -76,6 +76,8 @@ data class CallHistoryDto(
     val outcome: String,
     val atEpochSecond: Long,
     val blocked: Boolean,
+    /** [CallBlockReason] name for a blocked entry, else `null`. Local display only, never sent to the peer. */
+    val blockReason: String? = null,
 )
 
 @Serializable
@@ -95,6 +97,8 @@ data class CallUiEvent(
     val peerFingerprint: String,
     val reason: String? = null,
     val unaccepted: Boolean = false,
+    /** [CallBlockReason] name, set only for `blocked`. Local display only, never sent to the peer. */
+    val blockReason: String? = null,
 )
 
 /**
@@ -216,6 +220,7 @@ internal fun Route.installCallRoutes(deps: CallApiDependencies) {
                             "BLOCKED",
                             it.atEpochSecond,
                             blocked = true,
+                            blockReason = it.reason.name,
                         )
                     }
                 val history =

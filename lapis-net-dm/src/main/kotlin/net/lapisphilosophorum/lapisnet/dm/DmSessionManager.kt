@@ -273,6 +273,10 @@ class DmSessionManager private constructor(
         acceptance = check
     }
 
+    /** The check currently in effect (diagnostics and wiring tests: the same instance must be in effect here and in
+     * [MailboxGossip.currentAcceptanceCheck]). */
+    fun currentAcceptanceCheck(): DmAcceptanceCheck? = acceptance
+
     /** Guards [cachedKey] against the race between [stop]'s `cachedKey.fill(0)` and an IN-FLIGHT
      * [persistSession]/[loadPersisted] call reading it - follow-up hardening item 2 (2026-08-11).
      * Traced, not assumed: [withPeerLock]'s per-peer stripe lock (held by every [persistSession]/

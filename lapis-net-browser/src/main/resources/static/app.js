@@ -129,6 +129,30 @@ async function loadIdentity() {
   }
 }
 
+// V0.9.15 status panel. Every value is written through textContent; the node only ever sends enum-like strings,
+// booleans and numbers here, never absolute paths.
+async function loadNodeStatus() {
+  try {
+    const status = await fetchJson("/api/node/status");
+    document.getElementById("node-status-dht").textContent = status.dhtFallback ? "active" : "off";
+    document.getElementById("node-status-dht-note").textContent = status.dhtFallback
+      ? "(DHT lookups reveal query timing and key interest to DHT peers; disable with --dht-fallback=false)"
+      : "";
+    document.getElementById("node-status-reachability").textContent = status.reachability;
+    document.getElementById("node-status-relay").textContent = status.autoRelay
+      ? (status.autoRelayRunning ? "running" : "enabled, not running") + " - " + status.relayReservations + " reservation(s)"
+      : "off";
+    document.getElementById("node-status-publish").textContent = status.publishRelayReliability ? "on" : "off";
+    document.getElementById("node-status-acceptance-text").textContent =
+      status.acceptanceGates.length === 0
+        ? "No rule active: everybody is accepted."
+        : "Active: " + status.acceptanceGates.join(", ");
+    document.getElementById("node-status-config-file").textContent = status.configFile;
+  } catch (error) {
+    document.getElementById("node-status-dht").textContent = "unavailable";
+  }
+}
+
 async function loadPeers() {
   try {
     const peers = await fetchJson("/api/peers");
@@ -416,6 +440,7 @@ connectUriSelfLinkButton.addEventListener("click", async () => {
 });
 
 loadIdentity();
+loadNodeStatus();
 loadPeers();
 loadTimeline();
 loadConnectInfo();

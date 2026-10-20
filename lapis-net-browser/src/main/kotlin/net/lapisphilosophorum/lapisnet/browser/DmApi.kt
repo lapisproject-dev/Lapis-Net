@@ -56,31 +56,15 @@ private val logger = KotlinLogging.logger {}
  * mail's `MessageEnvelope.replyTo`/`threadRoot`) - a flat, one-conversation-per-peer view is the
  * whole of the DM data model this wave, so there is nothing to build a thread view over.
  *
- * **Second explicit, deliberate scope cut: no [net.lapisphilosophorum.lapisnet.dm.DmAcceptanceCheck]
- * (gate-based) policy is configured anywhere `BrowserServer` wires this up.** `BrowserServer.start`
- * passes `acceptance = null` to both `DmSessionManager.attach` and (transitively, via
- * `mailboxGossip`) `MailboxGossip.attach` - the SAME state `lapis-net-mail`'s own
- * `MailAcceptanceCheck` is in (zero production callers anywhere in this codebase, only exercised by
- * its own unit tests). Consequences, so they are discovered by reading this comment rather than by
- * surprise:
- *   - [DmMessageResponse.quarantined] is unconditionally `false` in [toResponse] below - there is no
- *     `DmAcceptanceCheck` for [net.lapisphilosophorum.lapisnet.dm.DmSessionManager] to ever classify
- *     an inbound message as [net.lapisphilosophorum.lapisnet.dm.DmAcceptanceDecision.Quarantine], so
- *     `dm.js`'s quarantine badge can never render in this wave's real wiring.
- *   - `POST /api/dm/{peerHex}/accept` still functions - it flips [DmAcceptedContacts.isAccepted] for
- *     display purposes ([DmConversationSummary.accepted]) and would take effect immediately the day
- *     an `acceptance` gate policy IS wired (since `DmAcceptancePolicy.decide` checks
- *     `isAcceptedContact` unconditionally, independent of which gates are configured) - but until
- *     then it accepts a contact that was never actually gated in the first place.
- *   - [DmAcceptedContacts] itself IS wired into `DmSessionManager.attach`'s `acceptedContacts`
- *     parameter (unlike `acceptance`) - so an outbound send still correctly marks its recipient
- *     accepted (see [DmAcceptedContacts]'s own "this node itself sent that peer a message" doc
- *     comment half). Only the gate-evaluation half of V0.8.6's acceptance feature is unwired here.
- *
- * Wiring a real `acceptance` gate policy needs a live `TrustGraph` snapshot and a
- * `KarmaScoreLookup` sourced from this node's own veritas/karma gossip state - a genuine product
- * decision (which gates, which thresholds) intentionally left to a dedicated future wave rather
- * than invented as a side effect of a review pass.
+ * **Acceptance gates (wired since V0.9.15).** `BrowserServer.start` hands ONE `DmAcceptanceCheck` instance to
+ * both `MailboxGossip.attach` (offline pre-check, gossip and DHT path) and `DmSessionManager.attach` (post-decrypt
+ * classification), built from the operator's `BrowserConfig`. With no gate configured (the default) everybody is
+ * accepted as before; with a gate on, a sender who passes none of the gates is quarantined:
+ *   - [DmMessageResponse.quarantined] carries the real classification of an inbound message.
+ *   - `POST /api/dm/{peerHex}/accept` marks the peer as an accepted contact, which makes the policy accept that peer
+ *     regardless of the gates from then on. It is therefore guarded like a state-changing call route (loopback host and
+ *     origin, see [requireLoopbackRequest]).
+ *   - An outbound send still marks its recipient accepted (see [DmAcceptedContacts]).
  */
 
 @Serializable
@@ -244,6 +228,9 @@ internal fun Route.installDmRoutes(
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("peerHex must be a valid secp256k1 public key hex"))
             return@post
         }
+        // Sending also marks the recipient as an accepted contact (lifting the gates for them), so this route needs the
+        // same DNS-rebinding / foreign-origin defence as /accept.
+        if (!call.requireLoopbackRequest()) return@post
         val request = call.receive<NewDmRequest>()
 
         val bodyBytes = request.body.toByteArray(Charsets.UTF_8)
@@ -397,6 +384,9 @@ internal fun Route.installDmRoutes(
         // solely to force a Content-Type: application/json request (and thus a CORS preflight this
         // loopback server never satisfies) before this state-changing action can run.
         call.receive<DmAcceptRequest>()
+        // V0.9.15: accepting a contact now REALLY lifts the acceptance gates for that peer (the gates are wired),
+        // so the request must come from this page and no other.
+        if (!call.requireLoopbackRequest()) return@post
         deps.dmAcceptedContacts.accept(peer)
         call.respond(DmAcceptResponse(peerPublicKeyHex = peer.bytes.toHexString(), accepted = true))
     }

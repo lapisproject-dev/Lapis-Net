@@ -23,6 +23,8 @@ data class BlockedCallAttempt(
     val callId: CallId,
     val peer: Secp256k1PublicKey,
     val atEpochSecond: Long,
+    /** Local display only (V0.9.15): which gate blocked it. Never serialized onto the wire - the caller gets nothing. */
+    val reason: CallBlockReason = CallBlockReason.POLICY,
 )
 
 /**
@@ -39,7 +41,10 @@ data class BlockedCallAttempt(
  *
  * **Quarantine:** an `IncomingCall(quarantined = true)` with [autoRejectQuarantined] is mapped to a
  * `blocked` UI event and recorded - and, deliberately, this class never calls the remote for it: the
- * acceptance policy is not bypassed by a browser click on a call that was silently dropped.
+ * acceptance policy is not bypassed by a browser click on a call that was silently dropped. Since V0.9.15 the
+ * acceptance gates are wired, so this is a real block; the caller still receives neither RINGING nor REJECT
+ * (a rejection would tell a spammer that the node is online and would reward probing). The reason shown to the
+ * local user ([CallBlockReason]) is computed locally and is never serialized.
  */
 class CallEventHub(
     remote: CallRemote,
@@ -48,6 +53,9 @@ class CallEventHub(
     private val maxSubscribers: Int = 4,
     private val subscriberBuffer: Int = 64,
     private val maxBlockedEntries: Int = 64,
+    /** V0.9.15 - explains a block for display only; must be cheap and non-blocking (it runs on the call state
+     * thread). It never influences the decision, which was already taken inside `lapis-net-call`. */
+    private val blockReasonOf: (Secp256k1PublicKey) -> CallBlockReason = { CallBlockReason.POLICY },
 ) {
     /** A live SSE subscription; [close] is idempotent and returns the slot exactly once. */
     sealed interface Subscription : AutoCloseable {
@@ -119,8 +127,14 @@ class CallEventHub(
         return when (event) {
             is CallEvent.IncomingCall ->
                 if (event.quarantined && autoRejectQuarantined) {
-                    recordBlocked(BlockedCallAttempt(event.callId, event.peer, clockSeconds()))
-                    CallUiEvent("blocked", id, peer, fp)
+                    val reason =
+                        try {
+                            blockReasonOf(event.peer)
+                        } catch (e: Exception) {
+                            CallBlockReason.POLICY
+                        }
+                    recordBlocked(BlockedCallAttempt(event.callId, event.peer, clockSeconds(), reason))
+                    CallUiEvent("blocked", id, peer, fp, blockReason = reason.name)
                 } else {
                     CallUiEvent("incoming", id, peer, fp, unaccepted = event.quarantined)
                 }

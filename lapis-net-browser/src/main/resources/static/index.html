@@ -32,6 +32,22 @@
 </header>
 
 <main>
+  <section id="node-status" aria-labelledby="node-status-title">
+    <h2 id="node-status-title">Node status</h2>
+    <p class="connect-notice">Read-only. These switches are set when the node starts (command line, environment or the settings file) and cannot be changed here.</p>
+    <ul id="node-status-list">
+      <li>DHT fallback: <strong id="node-status-dht">loading&hellip;</strong> <span id="node-status-dht-note" class="node-status-note"></span></li>
+      <li>Reachability: <strong id="node-status-reachability">&hellip;</strong></li>
+      <li>Auto-relay: <strong id="node-status-relay">&hellip;</strong></li>
+      <li>Relay reliability publishing: <strong id="node-status-publish">&hellip;</strong></li>
+    </ul>
+    <div id="node-status-acceptance">
+      <h3>Acceptance rules</h3>
+      <p id="node-status-acceptance-text" class="node-status-note">&hellip;</p>
+      <p class="connect-notice">Change them in <code id="node-status-config-file">browser.properties</code> inside your Lapis Net home directory (keys <code>dmAcceptance.veritasGate</code>, <code>dmAcceptance.karmaMinScore</code>, <code>dmAcceptance.minDepositMsat</code>), or on the command line, then restart the node. A sender who passes none of the active rules is quarantined (messages) or silently blocked (calls); you can always accept a contact on the DM page.</p>
+    </div>
+  </section>
+
   <section id="connect-panel">
     <h2>Connect a device or person</h2>
     <p class="connect-notice">Show this code to another device or person to let them connect to you. It contains only your public address and key — never a secret.</p>

@@ -39,6 +39,10 @@ dependencies {
     // V0.8.7b - browser call remote control. The webrtc-java natives arrive transitively through
     // lapis-net-call's runtimeOnly declaration.
     implementation(project(":lapis-net-call"))
+    // V0.9.15 - wiring of the V0.9.x library features: Madli (relay ranking/publishing) and the shared
+    // acceptance-gate vocabulary (also reachable transitively through lapis-net-dm, declared explicitly).
+    implementation(project(":lapis-net-madli"))
+    implementation(project(":lapis-net-policy"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)

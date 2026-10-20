@@ -46,6 +46,11 @@ class DmAcceptedContacts(
     @Synchronized
     fun isAccepted(peer: Secp256k1PublicKey): Boolean = accepted[peer] != null
 
+    /** The accepted peers, least recently used first (V0.9.15: the contact list the DHT catch-up walks). Does not
+     * refresh anybody's recency. */
+    @Synchronized
+    fun snapshot(): List<Secp256k1PublicKey> = accepted.keys.toList()
+
     companion object {
         /** Generous headroom, provisional magnitude - same "not derived from pilot data" framing as
          * every sibling numeric cap in this codebase. */

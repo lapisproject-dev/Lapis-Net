@@ -7,6 +7,6 @@ import kotlin.time.Duration.Companion.seconds
 class LapisNetCliTest :
     FunSpec({
         test("main runs the full identity/storage/multi-node demo without throwing").config(timeout = 120.seconds) {
-            shouldNotThrowAny { main() }
+            shouldNotThrowAny { main(emptyArray()) }
         }
     })

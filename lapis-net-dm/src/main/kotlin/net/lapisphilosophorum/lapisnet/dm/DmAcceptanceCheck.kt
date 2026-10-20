@@ -40,9 +40,9 @@ class DmAcceptanceCheck(
     private val veritasPathCache = VeritasPathCache(trustGraph)
 
     /** A cached equivalent of `AcceptanceGateEvaluator.veritasPathCheck(trustGraph, localIdentity)` -
-     * see [VeritasPathCache]'s own doc comment for the memoization this saves. `internal`, not
-     * `private`: [MailboxGossip.onGossipMessage] and [DmSessionManager] (same module) are the only
-     * intended callers. */
-    internal fun cachedVeritasPathCheck(localIdentity: Secp256k1PublicKey): (Secp256k1PublicKey) -> Boolean =
+     * see [VeritasPathCache]'s own doc comment for the memoization this saves. Public since V0.9.15 so
+     * the browser can explain a decision (which gate blocked a call) from the SAME cache instead of paying
+     * a second BFS; it must never be used to take one. */
+    fun cachedVeritasPathCheck(localIdentity: Secp256k1PublicKey): (Secp256k1PublicKey) -> Boolean =
         veritasPathCache.checkFor(localIdentity)
 }

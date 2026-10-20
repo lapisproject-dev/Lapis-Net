@@ -117,6 +117,14 @@ class VeritasGrantIndex internal constructor(
      * [grantsByContentId]'s eviction policy. */
     private val persistedContentIds = HashSet<GrantContentId>()
 
+    /** Monotonic change counter, incremented on every successful [add] (which also covers evictions, since an
+     * eviction only ever happens inside an add). Lets callers decide cheaply whether any derived snapshot is stale. */
+    private var version: Long = 0
+
+    /** Current change counter; O(1). Equal values on two reads mean the tracked grant set did not change between them. */
+    @Synchronized
+    fun version(): Long = version
+
     /**
      * Adds [grant] to the index. Returns `true` iff it was newly added; `false` for a duplicate
      * (by content id) or a signature-invalid grant - **never throws**, since this is the last line
@@ -138,6 +146,7 @@ class VeritasGrantIndex internal constructor(
             if (grantsByContentId.containsKey(id)) return@runCatching false
             grantsByContentId[id] = grant
             grantsByPair.getOrPut(grant.truster to grant.target) { mutableListOf() }.add(grant)
+            version++
             true
         }.getOrDefault(false)
 

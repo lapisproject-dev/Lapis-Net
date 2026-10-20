@@ -4,10 +4,12 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
@@ -162,6 +164,37 @@ private fun hexOf(publicKey: net.lapisphilosophorum.lapisnet.identity.Secp256k1P
 
 class DmApiRoutingTest :
     FunSpec({
+        test("percent-encoded and static paths cannot bypass the Host guard") {
+            val harness = DmTestHarness()
+            try {
+                testApplication {
+                    application { installBrowserApi(harness.deps) }
+                    for (path in listOf("/%61pi/dm", "/%61pi/identity", "/%61pi/mail", "/")) {
+                        val response = client.get(path) { header(HttpHeaders.Host, "evil.example:7878") }
+                        response.status.value shouldBe 421
+                    }
+                }
+            } finally {
+                harness.stop()
+            }
+        }
+
+        test("read routes refuse a foreign Host header (DNS rebinding)") {
+            val harness = DmTestHarness()
+            val peer = DualKeyIdentity.generate().secp256k1KeyPair.publicKey
+            try {
+                testApplication {
+                    application { installBrowserApi(harness.deps) }
+                    for (path in listOf("/api/dm", "/api/dm/${hexOf(peer)}", "/api/dm/attachment/${hexOf(peer)}/x")) {
+                        val response = client.get(path) { header(HttpHeaders.Host, "evil.example:7878") }
+                        response.status.value shouldBe 421
+                    }
+                }
+            } finally {
+                harness.stop()
+            }
+        }
+
         test("GET /api/dm lists conversations with last-message preview and accepted flag") {
             val harness = DmTestHarness()
             val peer = DualKeyIdentity.generate().secp256k1KeyPair.publicKey

@@ -31,8 +31,21 @@ class MailboxGossip private constructor(
     private val subscription: PubsubSubscription,
     private val storage: NabuStorage,
     private val localIdentity: Secp256k1PublicKey,
-    private val acceptance: DmAcceptanceCheck?,
+    private val acceptanceRef: AcceptanceRef,
 ) {
+    /**
+     * V0.9.15 - replaces the acceptance policy of **both** entry paths (the GossipSub validator and
+     * [dhtConsumer]) at once, because both read this one reference on every call instead of capturing a value at
+     * [attach] time. Pairs with [DmSessionManager.updateAcceptanceCheck]: a caller that rebuilds its policy
+     * (e.g. after the trust graph changed) hands the same new instance to both.
+     */
+    fun updateAcceptanceCheck(check: DmAcceptanceCheck?) {
+        acceptanceRef.value = check
+    }
+
+    /** The check currently in effect for both entry paths (diagnostics and wiring tests). */
+    fun currentAcceptanceCheck(): DmAcceptanceCheck? = acceptanceRef.value
+
     /**
      * The consumer of DHT outbox entries of kind [OutboxEntryKind.DM_MAILBOX_POINTER] (V0.9.14): register it with
      * `DirectoryDht.registerOutboxConsumer`. It shares this instance's index, storage and **the same
@@ -41,7 +54,7 @@ class MailboxGossip private constructor(
      */
     fun dhtConsumer(): OutboxEntryConsumer =
         OutboxEntryConsumer { sender, _, entry ->
-            onDhtEntry(sender, entry, storage, index, localIdentity, acceptance)
+            onDhtEntry(sender, entry, storage, index, localIdentity, acceptanceRef.value)
         }
 
     /** Every tracked pointer not yet marked resolved - see [MailboxPointerIndex.pending]. */
@@ -76,11 +89,13 @@ class MailboxGossip private constructor(
         ): MailboxGossip {
             val index = MailboxPointerIndex()
             val topic = MailboxTopics.forRecipient(localIdentity)
+            // Read on every message (never captured as a value): see updateAcceptanceCheck.
+            val acceptanceRef = AcceptanceRef(acceptance)
             val subscription =
                 pubsub.subscribe(topic) { bytes, from ->
-                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
+                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptanceRef.value)
                 }
-            return MailboxGossip(index, subscription, storage, localIdentity, acceptance)
+            return MailboxGossip(index, subscription, storage, localIdentity, acceptanceRef)
         }
 
         /**
@@ -168,6 +183,11 @@ class MailboxGossip private constructor(
                 PointerIngestOutcome.PERSIST_FAILED -> OutboxIngestOutcome.DEFERRED
             }
         }
+
+        /** The mutable holder both entry paths read the current [DmAcceptanceCheck] from. */
+        internal class AcceptanceRef(
+            @Volatile var value: DmAcceptanceCheck?,
+        )
 
         private enum class PointerIngestOutcome { ACCEPTED, DUPLICATE, REJECTED, PERSIST_FAILED }
 

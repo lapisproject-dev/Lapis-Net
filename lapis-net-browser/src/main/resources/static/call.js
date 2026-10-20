@@ -15,6 +15,18 @@
 
 const MAX_HISTORY_ROWS = 50;
 const EVENT_TYPES = ["incoming", "ringing", "connecting", "active", "ended", "blocked"];
+// Why a call was silently blocked (V0.9.15). The reason is computed on THIS node only and never sent to the caller:
+// they get neither RINGING nor REJECT. Enum names come from the node; unknown ones fall back to the generic text.
+const BLOCK_REASON_LABELS = {
+  VERITAS_BELOW_THRESHOLD: "Blockiert – Veritas unter Schwelle",
+  KARMA_BELOW_THRESHOLD: "Blockiert – Karma unter Schwelle",
+  DEPOSIT_MISSING: "Blockiert – Lightning-Deposit fehlt",
+  POLICY: "Blockiert – Annahmeregel",
+};
+const BLOCK_FALLBACK_LABEL = "Blockiert – Annahmeregel";
+// A neutral (not red) crossed-out handset, drawn in the muted text colour.
+const BLOCKED_GLYPH_PATH =
+  "M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25 11.4 11.4 0 0 0 3.6.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1zM3 3l18 18";
 const STATE_LABELS = {
   incoming: "Eingehender Anruf",
   ringing: "Klingelt ...",
@@ -154,6 +166,7 @@ function applyStatus(status) {
     outcome: row.outcome,
     at: row.atEpochSecond,
     blocked: !!row.blocked,
+    blockReason: row.blockReason || null,
   }));
   state.pending = {};
 }
@@ -168,6 +181,7 @@ function applyEvent(evt) {
       outcome: "BLOCKED",
       at: Math.floor(Date.now() / 1000),
       blocked: true,
+      blockReason: evt.blockReason || null,
     });
     return;
   }
@@ -267,9 +281,21 @@ function render() {
     historyEl,
     state.history.map((row) => {
       const item = el("call-history-template").content.firstElementChild.cloneNode(true);
-      if (row.blocked) item.classList.add("call-history--blocked");
       setText(item.querySelector(".call-history-peer"), shortFingerprint(row.fp));
-      setText(item.querySelector(".call-history-outcome"), OUTCOME_LABELS[row.outcome] || row.outcome);
+      if (row.blocked) {
+        item.classList.add("call-history--blocked");
+        item.querySelector(".call-history-path").setAttribute("d", BLOCKED_GLYPH_PATH);
+        item.querySelector(".call-history-path").setAttribute("fill", "none");
+        item.querySelector(".call-history-path").setAttribute("stroke", "currentColor");
+        item.querySelector(".call-history-path").setAttribute("stroke-width", "1.6");
+        setText(
+          item.querySelector(".call-history-outcome"),
+          (row.blockReason && BLOCK_REASON_LABELS[row.blockReason]) || BLOCK_FALLBACK_LABEL,
+        );
+        item.querySelector(".call-history-settings").hidden = false;
+      } else {
+        setText(item.querySelector(".call-history-outcome"), OUTCOME_LABELS[row.outcome] || row.outcome);
+      }
       setText(item.querySelector(".call-history-time"), formatClock(row.at));
       return item;
     }),

@@ -89,6 +89,7 @@ main {
 
 #compose-panel,
 #timeline-controls,
+#node-status,
 #connect-panel {
   background: var(--panel-bg);
   border: 1px solid var(--border);
@@ -493,4 +494,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 .call-history-peer { font-weight: 600; }
 .call-history-outcome, .call-history-time { color: var(--muted); }
 .call-history-time { margin-left: auto; }
-.call-history--blocked { opacity: 0.55; }
+.call-history--blocked { opacity: 0.75; }
+.call-history--blocked .call-history-glyph { color: var(--muted); }
+.call-history-settings { color: var(--muted); font-size: 0.8rem; text-decoration: underline; }
+
+#node-status h2 { margin: 0 0 0.35rem; font-size: 1rem; }
+#node-status h3 { margin: 0.6rem 0 0.2rem; font-size: 0.9rem; }
+#node-status-list { margin: 0 0 0.5rem; padding-left: 1.1rem; font-size: 0.9rem; }
+.node-status-note { color: var(--muted); font-size: 0.78rem; margin: 0; }

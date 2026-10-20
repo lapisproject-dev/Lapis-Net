@@ -6,6 +6,20 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 
 class VeritasGrantIndexTest :
     FunSpec({
+        test("version advances only on a successful add") {
+            val truster = Secp256k1KeyPair.generate()
+            val target = Secp256k1KeyPair.generate().publicKey
+            val grant = VeritasGrant.create(truster, target, trustMicros = 500_000)
+            val index = VeritasGrantIndex()
+            val v0 = index.version()
+
+            index.add(grant) shouldBe true
+            val v1 = index.version()
+            (v1 > v0) shouldBe true
+            index.add(grant) shouldBe false
+            index.version() shouldBe v1
+        }
+
         test("add returns true for a new grant, false for the same grant added again") {
             val truster = Secp256k1KeyPair.generate()
             val target = Secp256k1KeyPair.generate().publicKey

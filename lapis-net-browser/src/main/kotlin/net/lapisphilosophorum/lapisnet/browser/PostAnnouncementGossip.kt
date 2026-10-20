@@ -135,6 +135,10 @@ class PostAnnouncementGossip private constructor(
     /** Every tracked [IndexedPost], in insertion order - see [PostAnnouncementIndex.all]. */
     fun currentPosts(): List<IndexedPost> = index.all()
 
+    /** Tracked posts of one author without scanning the whole index - see [PostAnnouncementIndex.postsBy]. */
+    fun postsBy(author: net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey): List<IndexedPost> =
+        index.postsBy(author)
+
     /** Unsubscribes from the gossip topic. No other sub-resources to release - mirrors
      * [net.lapisphilosophorum.lapisnet.virtus.LtrGossip.stop] exactly. */
     fun stop() {
