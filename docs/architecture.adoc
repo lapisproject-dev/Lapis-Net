@@ -4075,18 +4075,62 @@ INCOMING call (which must behave like a REJECT for `DmAcceptedContacts` purposes
 also pins `DmCallSignalTransport.send`'s `marksAcceptance` forwarding end to end in both directions
 (the accept-flow test asserts `true`, the reject-flow test asserts `false`).
 
-==== A call signal can be lost silently while the recipient's directory record is unknown (V0.9.16)
+==== A call signal can be lost silently while the recipient's directory record is unknown (V0.9.16, closed in V0.9.19)
 
-`DmSessionManager.sendCallSignal` needs a directory record for the recipient and throws
-`DmUnknownRecipientException` otherwise. A callee that has not yet received the caller's record therefore cannot
-send ACCEPT, REJECT or HANGUP: the caller keeps ringing until `CallConfig.ringTimeout` (45 s) and ends with
+`DmSessionManager.sendCallSignal` needs a directory record for the recipient and used to throw
+`DmUnknownRecipientException` otherwise. A callee that had not yet received the caller's record therefore could not
+send ACCEPT, REJECT or HANGUP: the caller kept ringing until `CallConfig.ringTimeout` (45 s) and ended with
 `RING_TIMEOUT` instead of `DECLINED`. This was the root cause of the flaky "a rejected call ends on both sides
-with DECLINED" browser test (confirmed by instrumentation under CPU load: callee did not know the caller, the
-REJECT send failed). Fixed in V0.9.16 only as far as it is visible: a failed outbound call signal is logged at
-`warn` level (type and fingerprints only) and counted, and the integration test now waits for directory
-convergence in both directions. **Known gap:** the signal itself is still lost; answering over the connection
-the INVITE arrived on would close it but touches the identity rule of `DmProtocol` (the stream's `PeerId` is
-only a resource key), so it needs an explicit decision and a security review.
+with DECLINED" browser test. V0.9.16 only made the loss visible (a failed outbound call signal is logged at `warn`
+level and counted). **Closed in V0.9.19 (unreleased)** by the reply route described below.
+
+==== Call reply route over the existing connection (V0.9.19, unreleased)
+
+*Mechanism.* After a call signal arrived over the online path and its AEAD decryption succeeded, `DmSessionManager`
+remembers which libp2p connection (`PeerId`) carried it and hands the `CallManager` an opaque, unguessable
+`DmCallReplyRoute` token (16 random bytes, `DmInboundCallSignal.replyRoute`). The `CallManager` attaches the token
+to the call (`ActiveCall.replyRoute`) and passes it back with every answer (ACCEPT, REJECT, HANGUP, timeouts,
+automatic rejects) through `CallSignalTransport.send`. `sendCallSignal` uses it only when the peer directory has
+no record for the recipient: it resolves the token in an in-memory registry, checks that it was issued for exactly
+this recipient and is not older than 4 hours, looks up an already established, still open connection to the
+registered `PeerId` (`LapisNode.liveConnectionTo`, never dialling) and opens a new stream on it
+(`DmProtocol.openStreamOn`, `Connection.muxerSession().createStream`). The target is resolved before the ratchet
+advances, so an unsendable signal does not consume a ratchet step. Nothing is persisted and no wire format
+changes (`DmEnvelope`, `CallSignalCodec` and the session file format are untouched).
+
+*The identity rule is preserved.* The `PeerId` is only a routing target, never evidence of identity: a token is
+issued only after the AEAD check succeeded (and after the dedup check, so a replay never creates one), it does not
+feed any acceptance, decryption or sender-attribution decision, and the payload of the answer is still bound to the
+caller by the ratchet, so a mis-routed answer cannot be read by anyone else. An attacker who relays a genuine,
+not yet delivered envelope can at most redirect the answer to its own connection (denial of service, no
+disclosure); a replay after delivery creates no route.
+
+*Parity principle.* Over the new path nothing may be sent that the old path would not have sent with a known
+directory record. The path replaces only the address resolution; whether a signal is sent at all stays entirely in
+the unchanged `CallManager` (silent drop of quarantined INVITEs, no `ActiveCall` for automatic rejects, the
+`marksAcceptance` semantics and `DmAcceptedContacts` are untouched). Senders in quarantine therefore receive over
+this path exactly what they would receive with a known record.
+
+*Alternatives considered.*
+
+* *B - put `PeerId` and addresses into the INVITE:* changes the `CallSignal` wire format and dials addresses chosen
+  by the caller (reflection to arbitrary hosts, only mitigable with a blocklist); no gain behind NAT. Rejected.
+* *C - put a signed `PeerRecord` into the INVITE and insert it into the directory:* a second write path into the
+  directory index outside gossip, usable by quarantined senders, needs a codec change and a dependency from `call`
+  on `directory`, and again dials self-chosen addresses. Rejected.
+* *D - active `DirectoryDht.lookupPeerRecord` when sending:* blocks the media thread on top of `DIAL_TIMEOUT`, is
+  throttled by `minResolveInterval` and helps only if the caller has already published to the DHT; the root cause
+  (propagation time of gossip) remains. Possible later addition, not part of this wave.
+
+*Bounds.* At most 256 routes (`MAX_CALL_REPLY_ROUTES`, four times `CallManager.MAX_TRACKED_CALLS`) and at most 4 per
+sender identity (`MAX_CALL_REPLY_ROUTES_PER_IDENTITY`, so one sender cannot evict others' routes by arriving over
+many connections), oldest evicted first; a route unused for 4 hours (`CALL_REPLY_ROUTE_MAX_AGE`, monotonic clock) is
+dropped. A token is never logged and never part of an exception message.
+
+*Limits.* The connection must still exist: if it dropped, the signal is lost as before (warn log and counter, and
+no new connection is opened). After eviction or expiry a late HANGUP is lost and the peer notices the end through
+the media failure. There is no DHT or directory fallback. The `CallManager` does not release a token explicitly at
+the end of a call; eviction and maximum age suffice (open point).
 
 === `DmStore`: in-memory conversation history, a future caller's job to populate
 

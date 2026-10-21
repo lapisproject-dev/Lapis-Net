@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.dm
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.libp2p.core.Connection
 import io.libp2p.core.Host
 import io.libp2p.core.PeerId
 import io.libp2p.core.Stream
@@ -411,6 +412,10 @@ class DmProtocol private constructor(
         peer: PeerId,
         vararg addresses: Multiaddr,
     ): StreamPromise<out DmStreamRole> = binding.dial(node.host, peer, *addresses)
+
+    /** Opens a DM stream on an ALREADY-ESTABLISHED [connection] - never dials (V0.9.19). */
+    fun openStreamOn(connection: Connection): StreamPromise<out DmStreamRole> =
+        connection.muxerSession().createStream(binding)
 
     /** Test-visibility passthrough to [DmProtocolHandler.streamCountForTest] - see that function's
      * own doc comment. */

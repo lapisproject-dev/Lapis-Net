@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.dm
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
+import io.libp2p.core.Connection
 import io.libp2p.core.PeerId
 import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
 import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
@@ -128,7 +129,14 @@ data class DmInboundCallSignal(
     val payload: ByteArray,
     val quarantined: Boolean,
     val receivedAtEpochSecond: Long,
-)
+    /** V0.9.19 - handle for answering over the connection this signal arrived on, when the sender
+     * is not (yet) in the peer directory. Routing hint only, never authority; `null` if none. */
+    val replyRoute: DmCallReplyRoute? = null,
+) {
+    override fun toString(): String =
+        "DmInboundCallSignal(sender=${sender.fingerprint()}, payloadBytes=${payload.size}, " +
+            "quarantined=$quarantined, receivedAtEpochSecond=$receivedAtEpochSecond)"
+}
 
 /** [DmSessionManager.sendAuto]'s result - which transport actually carried the message. */
 enum class DmSendOutcome {
@@ -309,6 +317,35 @@ class DmSessionManager private constructor(
     private val cachedKeyLock = ReentrantReadWriteLock()
 
     private val dialSemaphore = Semaphore(MAX_CONCURRENT_OUTBOUND_DIALS)
+
+    private class ReplyRouteEntry(
+        val identity: Secp256k1PublicKey,
+        val peerId: PeerId,
+        var touchedNanos: Long,
+    )
+
+    /** V0.9.19 - token (hex) -> entry, insertion-ordered (oldest first); guarded by
+     * [replyRoutesLock], the INNERMOST lock of this class: nothing under it takes [withPeerLock] or
+     * touches the network. */
+    private val replyRoutes = LinkedHashMap<String, ReplyRouteEntry>()
+    private val replyRouteByPair = HashMap<Pair<Secp256k1PublicKey, PeerId>, String>()
+    private val replyRoutesLock = Any()
+
+    /** Monotonic clock for reply-route aging; injectable for tests. */
+    internal var nanoClock: () -> Long = System::nanoTime
+
+    private val callSignalsSentViaReplyRoute =
+        java.util.concurrent.atomic
+            .AtomicLong()
+
+    /** Diagnostic: call signals sent via a reply route (not the directory) so far. */
+    fun callSignalsSentViaReplyRouteCount(): Long = callSignalsSentViaReplyRoute.get()
+
+    /** Test seam: overrides the registry caps (global, per identity). */
+    internal var replyRouteCapacity: Int = MAX_CALL_REPLY_ROUTES
+    internal var replyRouteCapacityPerIdentity: Int = MAX_CALL_REPLY_ROUTES_PER_IDENTITY
+
+    internal fun replyRouteCountForTesting(): Int = synchronized(replyRoutesLock) { replyRoutes.size }
 
     /** Bounds concurrent [PrekeyStore.consumeOneTimePrekey] calls triggered by inbound `X3DH_INITIAL`
      * envelopes - closes a DoS gap found in this wave's own review round 3.
@@ -824,6 +861,7 @@ class DmSessionManager private constructor(
         recipient: Secp256k1PublicKey,
         payload: ByteArray,
         marksAcceptance: Boolean,
+        replyRoute: DmCallReplyRoute? = null,
     ) {
         if (payload.size > MAX_CALL_SIGNAL_PAYLOAD_BYTES) {
             throw DmSessionException(
@@ -831,12 +869,106 @@ class DmSessionManager private constructor(
             )
         }
         withPeerLock(recipient) {
-            val record =
-                peerDirectory.lookup(recipient)
-                    ?: throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
+            // V0.9.19: resolve the target BEFORE advancing the ratchet - an unsendable signal must
+            // not consume a ratchet step. The directory always wins; the reply route is only an
+            // address fallback and never changes WHETHER a signal is sent.
+            val record = peerDirectory.lookup(recipient)
+            val connection = if (record == null) resolveReplyRouteLocked(recipient, replyRoute) else null
             val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
-            dispatchOnlineLocked(recipient, record, DmEnvelopeCodec.encode(envelope))
+            val bytes = DmEnvelopeCodec.encode(envelope)
+            if (record != null) {
+                dispatchOnlineLocked(recipient, record, bytes)
+            } else {
+                dispatchOnConnectionLocked(recipient, connection!!, bytes)
+                callSignalsSentViaReplyRoute.incrementAndGet()
+                logger.debug { "call signal to ${recipient.fingerprint()} sent via reply route" }
+            }
         }
+    }
+
+    /** Issues (or refreshes and reuses) the reply-route token for ([sender], [viaPeerId]). Called
+     * only after a successful AEAD decrypt of an ONLINE call signal. */
+    private fun issueCallReplyRoute(
+        sender: Secp256k1PublicKey,
+        viaPeerId: PeerId,
+    ): DmCallReplyRoute =
+        synchronized(replyRoutesLock) {
+            val now = nanoClock()
+            val pair = sender to viaPeerId
+            val existing = replyRouteByPair[pair]?.let { key -> replyRoutes[key]?.let { key to it } }
+            if (existing != null) {
+                existing.second.touchedNanos = now
+                // move to the newest position
+                replyRoutes.remove(existing.first)
+                replyRoutes[existing.first] = existing.second
+                return@synchronized DmCallReplyRoute(hexToBytes(existing.first))
+            }
+            val tokenBytes = ByteArray(DmCallReplyRoute.TOKEN_SIZE).also { random.nextBytes(it) }
+            val key = tokenBytes.joinToString("") { "%02x".format(it) }
+            replyRoutes[key] = ReplyRouteEntry(sender, viaPeerId, now)
+            replyRouteByPair[pair] = key
+            // Per-identity cap first: one authenticated sender must not be able to evict other
+            // senders' routes by arriving over many connections.
+            while (replyRoutes.values.count { it.identity == sender } > replyRouteCapacityPerIdentity) {
+                val eldestOfSender = replyRoutes.entries.first { it.value.identity == sender }
+                replyRoutes.remove(eldestOfSender.key)
+                replyRouteByPair.remove(eldestOfSender.value.identity to eldestOfSender.value.peerId)
+            }
+            while (replyRoutes.size > replyRouteCapacity) {
+                val eldest = replyRoutes.entries.iterator().next()
+                replyRoutes.remove(eldest.key)
+                replyRouteByPair.remove(eldest.value.identity to eldest.value.peerId)
+            }
+            DmCallReplyRoute(tokenBytes)
+        }
+
+    private fun hexToBytes(hex: String): ByteArray =
+        ByteArray(hex.length / 2) {
+            hex.substring(it * 2, it * 2 + 2).toInt(16).toByte()
+        }
+
+    /** MUST run inside [withPeerLock] for [recipient]. Never dials; messages carry no token/PeerId. */
+    private fun resolveReplyRouteLocked(
+        recipient: Secp256k1PublicKey,
+        replyRoute: DmCallReplyRoute?,
+    ): Connection {
+        if (replyRoute == null) {
+            throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
+        }
+        val key = replyRoute.token.joinToString("") { "%02x".format(it) }
+        val peerId: PeerId =
+            synchronized(replyRoutesLock) {
+                val entry =
+                    replyRoutes[key]
+                        ?: throw DmUnknownRecipientException(
+                            "no directory record and no valid reply route for ${recipient.fingerprint()}",
+                        )
+                if (nanoClock() - entry.touchedNanos > CALL_REPLY_ROUTE_MAX_AGE.toNanos()) {
+                    replyRoutes.remove(key)
+                    replyRouteByPair.remove(entry.identity to entry.peerId)
+                    throw DmUnknownRecipientException(
+                        "no directory record and reply route expired for ${recipient.fingerprint()}",
+                    )
+                }
+                if (entry.identity != recipient) {
+                    throw DmSessionException("reply route was not issued for this recipient")
+                }
+                entry.peerId
+            }
+        return node.liveConnectionTo(peerId)
+            ?: throw DmUnknownRecipientException(
+                "no directory record and no live connection for ${recipient.fingerprint()}",
+            )
+    }
+
+    /** MUST run inside [withPeerLock]. Like [dispatchOnlineLocked] but opens the stream on an
+     * already-established [connection] - never dials. */
+    private fun dispatchOnConnectionLocked(
+        recipient: Secp256k1PublicKey,
+        connection: Connection,
+        envelopeBytes: ByteArray,
+    ) = dispatchViaLocked(recipient, envelopeBytes, "open stream to ${recipient.fingerprint()} for call signal") {
+        dmProtocol.openStreamOn(connection)
     }
 
     /**
@@ -935,6 +1067,15 @@ class DmSessionManager private constructor(
         recipient: Secp256k1PublicKey,
         record: PeerRecord,
         envelopeBytes: ByteArray,
+    ) = dispatchViaLocked(recipient, envelopeBytes, "dial ${recipient.fingerprint()} for DM send") {
+        dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
+    }
+
+    private fun dispatchViaLocked(
+        recipient: Secp256k1PublicKey,
+        envelopeBytes: ByteArray,
+        awaitDescription: String,
+        openStream: () -> io.libp2p.core.StreamPromise<out DmStreamRole>,
     ) {
         if (!dialSemaphore.tryAcquire(DIAL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
             throw DmSessionException(
@@ -945,7 +1086,7 @@ class DmSessionManager private constructor(
         try {
             val promise =
                 try {
-                    dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
+                    openStream()
                 } catch (e: DmSessionException) {
                     throw e
                 } catch (e: RuntimeException) {
@@ -962,7 +1103,7 @@ class DmSessionManager private constructor(
                     // first-message trap sendAuto's own doc comment says it eliminates.
                     throw DmSessionException("failed to dial ${recipient.fingerprint()} for DM send", e)
                 }
-            val controller = await(promise.controller, "dial ${recipient.fingerprint()} for DM send")
+            val controller = await(promise.controller, awaitDescription)
             val sendHandle =
                 controller as? DmSendHandle
                     ?: throw DmSessionException(
@@ -1050,7 +1191,7 @@ class DmSessionManager private constructor(
                 logger.warn(e) { "unexpected exception decoding DM envelope from $fromPeerId - rejecting" }
                 return
             }
-        processInboundDmEnvelope(envelope, "peer $fromPeerId")
+        processInboundDmEnvelope(envelope, "peer $fromPeerId", fromPeerId)
     }
 
     /**
@@ -1095,7 +1236,7 @@ class DmSessionManager private constructor(
             }
             return true
         }
-        return processInboundDmEnvelope(envelope, "offline mailbox")
+        return processInboundDmEnvelope(envelope, "offline mailbox", null)
     }
 
     /**
@@ -1141,6 +1282,9 @@ class DmSessionManager private constructor(
     private fun processInboundDmEnvelope(
         envelope: DmEnvelope,
         sourceDescription: String,
+        // V0.9.19: routing target only - issued a reply route AFTER AEAD success, never an
+        // input to any acceptance, decryption or sender-attribution decision.
+        onlinePeerId: PeerId?,
     ): Boolean {
         val claimedSender = envelope.senderIdentity
         return try {
@@ -1467,8 +1611,9 @@ class DmSessionManager private constructor(
                 if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
                     val quarantined = classifyQuarantinedSender(claimedSender)
                     markRecentlyDelivered(dedupKey)
+                    val route = onlinePeerId?.let { issueCallReplyRoute(claimedSender, it) }
                     val signal =
-                        DmInboundCallSignal(claimedSender, plaintext, quarantined, Instant.now().epochSecond)
+                        DmInboundCallSignal(claimedSender, plaintext, quarantined, Instant.now().epochSecond, route)
                     callSignalListeners.forEach { listener ->
                         try {
                             listener(signal)
@@ -2016,6 +2161,15 @@ class DmSessionManager private constructor(
          * this module's OWN independent ceiling, not a duplicate of `lapis-net-call`'s, so
          * `lapis-net-dm` never needs to know that module's exact constant to stay safe. */
         const val MAX_CALL_SIGNAL_PAYLOAD_BYTES = 32_768
+
+        /** V0.9.19 - cap on the reply-route registry; 4 x `CallManager.MAX_TRACKED_CALLS` (64). */
+        const val MAX_CALL_REPLY_ROUTES = 256
+
+        /** V0.9.19 - at most this many live routes per sender identity (distinct connections). */
+        const val MAX_CALL_REPLY_ROUTES_PER_IDENTITY = 4
+
+        /** V0.9.19 - a reply route unused (no fresh inbound signal) this long is dropped. */
+        val CALL_REPLY_ROUTE_MAX_AGE: Duration = Duration.ofHours(4)
 
         /**
          * Bootstraps a [DmSessionManager]: loads or generates a persisted `.salt` file (0600 where

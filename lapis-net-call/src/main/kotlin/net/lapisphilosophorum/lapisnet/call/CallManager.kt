@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.call
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
+import net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute
 import net.lapisphilosophorum.lapisnet.dm.DmInboundCallSignal
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
@@ -39,6 +40,9 @@ private class ActiveCall(
     /** Only ever set for an INCOMING call, between [CallManager.handleInboundInvite] admitting it
      * and a local [CallManager.acceptCall] consuming it. */
     var remoteOfferSdp: String? = null
+
+    /** V0.9.19 - address-fallback handle from the latest inbound signal; state thread only. */
+    var replyRoute: DmCallReplyRoute? = null
 }
 
 private fun CallMediaSession.closeQuietly() {
@@ -753,6 +757,7 @@ class CallManager private constructor(
         peer: Secp256k1PublicKey,
         signal: CallSignal,
         marksAcceptance: Boolean,
+        replyRoute: DmCallReplyRoute?,
     ) {
         // Guarded like every other state-thread-to-mediaExecutor hand-off - MINOR review-round
         // finding (2026-09-02, see executeOnMediaThreadIfRunning's own doc comment). A rejected
@@ -761,11 +766,11 @@ class CallManager private constructor(
         // function's own class doc comment already describes for a transport.send that throws).
         executeOnMediaThreadIfRunning("sending ${signal.type} for call ${signal.callId.fingerprint()}") {
             try {
-                transport.send(peer, CallSignalCodec.encode(signal), marksAcceptance)
+                transport.send(peer, CallSignalCodec.encode(signal), marksAcceptance, replyRoute)
             } catch (e: RuntimeException) {
                 failedSignalSends.incrementAndGet()
                 // Warn, not debug (V0.9.16): a lost ACCEPT / REJECT / HANGUP leaves the peer ringing until
-                // its own timeout, e.g. when the recipient's directory record is not known yet
+                // its own timeout, e.g. when there is neither a directory record nor a live connection for the recipient
                 // (DmUnknownRecipientException). Only the type and fingerprints are logged.
                 logger.warn {
                     "failed to send ${signal.type} for call ${signal.callId.fingerprint()} to " +
@@ -870,6 +875,7 @@ class CallManager private constructor(
         val call = calls[callId] ?: return
         if (call.direction != CallDirection.INCOMING || call.state != CallState.INCOMING_RINGING) return
         val remoteSdp = call.remoteOfferSdp
+        val replyRoute = call.replyRoute // captured on the state thread, handed to the media thread by value
         if (remoteSdp == null) {
             endCallOnStateThread(call, CallEndReason.LOCAL_ERROR)
             return
@@ -883,7 +889,7 @@ class CallManager private constructor(
         // needed on rejection, for the identical reason placeCallOnStateThread's own call site
         // needs none.
         executeOnMediaThreadIfRunning("starting incoming media setup for ${callId.fingerprint()}") {
-            runIncomingMediaSetup(callId, call.peer, remoteSdp)
+            runIncomingMediaSetup(callId, call.peer, remoteSdp, replyRoute)
         }
     }
 
@@ -901,7 +907,12 @@ class CallManager private constructor(
         // Sending `true` here let anyone with an existing (even quarantined) ratchet session with
         // this node force their own promotion to accepted contact merely by inviting and having the
         // user press "reject" - permanently bypassing every configured DmAcceptancePolicy gate.
-        sendSignalAsync(call.peer, CallSignal.reject(callId, reason, now, now + config.signalTtl.toMillis()), false)
+        sendSignalAsync(
+            call.peer,
+            CallSignal.reject(callId, reason, now, now + config.signalTtl.toMillis()),
+            false,
+            call.replyRoute,
+        )
         endCallOnStateThread(call, reason)
     }
 
@@ -927,6 +938,7 @@ class CallManager private constructor(
             call.peer,
             CallSignal.hangUp(callId, reason, now, now + config.signalTtl.toMillis()),
             marksAcceptance,
+            call.replyRoute,
         )
         endCallOnStateThread(call, reason)
     }
@@ -942,7 +954,7 @@ class CallManager private constructor(
             }
         // marksAcceptance=false: an automatic timeout reaction, never a local user decision about
         // this peer (see sendSignalAsync's own doc comment).
-        sendSignalAsync(call.peer, signal, false)
+        sendSignalAsync(call.peer, signal, false, call.replyRoute)
         endCallOnStateThread(call, CallEndReason.RING_TIMEOUT)
     }
 
@@ -955,6 +967,7 @@ class CallManager private constructor(
             call.peer,
             CallSignal.hangUp(callId, CallEndReason.CONNECT_TIMEOUT, now, now + config.signalTtl.toMillis()),
             false,
+            call.replyRoute,
         )
         endCallOnStateThread(call, CallEndReason.CONNECT_TIMEOUT)
     }
@@ -979,8 +992,14 @@ class CallManager private constructor(
             return
         }
         when (signal.type) {
-            CallSignalType.INVITE -> handleInboundInvite(inbound.sender, inbound.quarantined, signal)
-            CallSignalType.ACCEPT -> handleInboundAccept(inbound.sender, signal)
+            CallSignalType.INVITE ->
+                handleInboundInvite(
+                    inbound.sender,
+                    inbound.quarantined,
+                    signal,
+                    inbound.replyRoute,
+                )
+            CallSignalType.ACCEPT -> handleInboundAccept(inbound.sender, signal, inbound.replyRoute)
             CallSignalType.REJECT -> handleInboundReject(inbound.sender, signal)
             CallSignalType.HANGUP -> handleInboundHangup(inbound.sender, signal)
             CallSignalType.ICE_CANDIDATE, CallSignalType.RINGING, CallSignalType.RENEGOTIATE ->
@@ -992,6 +1011,7 @@ class CallManager private constructor(
         sender: Secp256k1PublicKey,
         quarantined: Boolean,
         signal: CallSignal,
+        replyRoute: DmCallReplyRoute?,
     ) {
         if (calls.containsKey(signal.callId)) {
             // A duplicate INVITE for an already-known callId (e.g. a retransmit) rings only once -
@@ -1050,6 +1070,7 @@ class CallManager private constructor(
                     now + config.signalTtl.toMillis(),
                 ),
                 false,
+                replyRoute,
             )
             return
         }
@@ -1072,11 +1093,13 @@ class CallManager private constructor(
                 sender,
                 CallSignal.reject(signal.callId, e.reason, now, now + config.signalTtl.toMillis()),
                 false,
+                replyRoute,
             )
             return
         }
         val call = ActiveCall(signal.callId, sender, CallDirection.INCOMING)
         call.remoteOfferSdp = sdp
+        call.replyRoute = replyRoute
         calls[signal.callId] = call
         scheduleTimeout(call, config.ringTimeout) { onRingTimeout(signal.callId) }
         // MAJOR review-round finding (2026-09-02): this used to hard-code `quarantined = false`
@@ -1096,6 +1119,7 @@ class CallManager private constructor(
     private fun handleInboundAccept(
         sender: Secp256k1PublicKey,
         signal: CallSignal,
+        replyRoute: DmCallReplyRoute?,
     ) {
         val call = calls[signal.callId] ?: return
         if (call.peer != sender ||
@@ -1104,6 +1128,9 @@ class CallManager private constructor(
         ) {
             return
         }
+        // V0.9.19: the peer's latest connection is the best route for our later signals (e.g. HANGUP);
+        // refreshed only after the sender/direction/state guards above passed.
+        if (replyRoute != null) call.replyRoute = replyRoute
         val sdp = signal.sdp ?: return
         try {
             CallSdpPolicy.validateRemote(sdp, signal.mediaKind)
@@ -1232,6 +1259,7 @@ class CallManager private constructor(
                 now + config.signalTtl.toMillis(),
             ),
             false,
+            call.replyRoute,
         )
         endCallOnStateThread(call, CallEndReason.LOCAL_ERROR)
     }
@@ -1315,7 +1343,7 @@ class CallManager private constructor(
             // marksAcceptance=true: this INVITE only exists because the local user called placeCall()
             // - a real, deliberate decision to communicate with peer (see
             // CallSignalTransport.send's own doc comment, SECURITY round-11 review finding).
-            transport.send(peer, CallSignalCodec.encode(signal), true)
+            transport.send(peer, CallSignalCodec.encode(signal), true, null)
         } catch (e: RuntimeException) {
             logger.debug(e) { "failed to send INVITE for outgoing call ${callId.fingerprint()}" }
             closeAndUntrack(session)
@@ -1331,6 +1359,7 @@ class CallManager private constructor(
         callId: CallId,
         peer: Secp256k1PublicKey,
         remoteOfferSdp: String,
+        replyRoute: DmCallReplyRoute?,
     ) {
         // MINOR review-round finding (2026-09-02), part (b) - identical rationale and mechanism as
         // runOutgoingMediaSetup's own identical check, mirrored here for the incoming-call path.
@@ -1386,7 +1415,7 @@ class CallManager private constructor(
             // marksAcceptance=true: this ACCEPT only exists because the local user called
             // acceptCall() - a real, deliberate decision to communicate with peer (see
             // CallSignalTransport.send's own doc comment, SECURITY round-11 review finding).
-            transport.send(peer, CallSignalCodec.encode(signal), true)
+            transport.send(peer, CallSignalCodec.encode(signal), true, replyRoute)
         } catch (e: RuntimeException) {
             logger.debug(e) { "failed to send ACCEPT for incoming call ${callId.fingerprint()}" }
             closeAndUntrack(session)

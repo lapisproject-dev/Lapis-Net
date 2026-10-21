@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.call
 
+import net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 
@@ -20,6 +21,9 @@ fun interface CallSignalTransport {
      * the full SECURITY reasoning - every caller here must pass it through unchanged, never hardcode
      * either value.
      *
+     * [replyRoute] is only an address fallback (V0.9.19); it never changes whether a signal is
+     * sent. `null` for an INVITE and whenever no inbound signal from [peer] supplied one.
+     *
      * @throws RuntimeException on any send failure - `CallManager` catches this generically (it
      * never needs to distinguish transport failure modes, only that a send did or did not succeed)
      * and reports [CallEndReason.LOCAL_ERROR] to any local listener.
@@ -28,6 +32,7 @@ fun interface CallSignalTransport {
         peer: Secp256k1PublicKey,
         payload: ByteArray,
         marksAcceptance: Boolean,
+        replyRoute: DmCallReplyRoute?,
     )
 }
 
@@ -43,7 +48,8 @@ class DmCallSignalTransport(
         peer: Secp256k1PublicKey,
         payload: ByteArray,
         marksAcceptance: Boolean,
+        replyRoute: DmCallReplyRoute?,
     ) {
-        dm.sendCallSignal(peer, payload, marksAcceptance)
+        dm.sendCallSignal(peer, payload, marksAcceptance, replyRoute)
     }
 }

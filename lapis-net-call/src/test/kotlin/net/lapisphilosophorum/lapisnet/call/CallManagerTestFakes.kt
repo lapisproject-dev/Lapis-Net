@@ -117,9 +117,12 @@ internal class FakeCallNetwork {
         peer: Secp256k1PublicKey,
         payload: ByteArray,
         quarantined: Boolean,
+        replyRoute: net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute? = null,
     ) {
         val target = managers[peer] ?: return
-        target.onInboundCallSignal(DmInboundCallSignal(sender, payload, quarantined, System.currentTimeMillis() / 1000))
+        target.onInboundCallSignal(
+            DmInboundCallSignal(sender, payload, quarantined, System.currentTimeMillis() / 1000, replyRoute),
+        )
     }
 }
 
@@ -140,6 +143,15 @@ internal class FakeCallSignalTransport(
      * [CallSignalTransport.send]'s own doc comment, SECURITY round-11 review finding (2026-09-03). */
     val sentMarksAcceptance = CopyOnWriteArrayList<Boolean>()
 
+    /** Parallel to [sentSignals] - the `replyRoute` (V0.9.19) passed for that signal (nullable). */
+    val sentReplyRoutes =
+        java.util.Collections.synchronizedList(
+            ArrayList<net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute?>(),
+        )
+
+    /** Token this fake attaches to every signal it delivers - simulates the DM layer issuing a route. */
+    var routeToAttachOnDeliver: net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute? = null
+
     /** When set, [send] blocks on this latch before doing anything else - simulates a real
      * `DmCallSignalTransport.send` still mid-dial (up to `DmSessionManager.DIAL_TIMEOUT`) on
      * `CallManager`'s own single-threaded media executor, exactly the race
@@ -150,12 +162,14 @@ internal class FakeCallSignalTransport(
         peer: Secp256k1PublicKey,
         payload: ByteArray,
         marksAcceptance: Boolean,
+        replyRoute: net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute?,
     ) {
         blockSendUntil?.await(5, java.util.concurrent.TimeUnit.SECONDS)
         if (failSends) throw RuntimeException("simulated transport failure")
         sentSignals.add(CallSignalCodec.decode(payload))
         sentMarksAcceptance.add(marksAcceptance)
-        network.deliver(selfIdentity, peer, payload, quarantinedFromSelf)
+        sentReplyRoutes.add(replyRoute)
+        network.deliver(selfIdentity, peer, payload, quarantinedFromSelf, routeToAttachOnDeliver)
     }
 }
 

@@ -298,6 +298,19 @@ class LapisNode private constructor(
     fun discoveredPeers(): List<PeerInfo> = discovered.values()
 
     /**
+     * Returns an already-established, still-open connection to [peerId] (direct preferred over
+     * relayed, including an accepted relayed one), or `null`. **Never dials** - V0.9.19: used to
+     * answer on a connection a peer opened to us without opening any new channel.
+     */
+    fun liveConnectionTo(peerId: PeerId): Connection? {
+        val known =
+            host.network.connections
+                .filter { it.secureSession().remoteId == peerId && !it.closeFuture().isDone }
+        return (known.firstOrNull { !it.remoteAddress().has(Protocol.P2PCIRCUIT) } ?: known.firstOrNull())
+            ?: relayTransport.liveConnectionTo(peerId)
+    }
+
+    /**
      * Explicitly dial a peer (bootstrap or mDNS-discovered), or return the connection to it that
      * already exists.
      *
