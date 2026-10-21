@@ -159,6 +159,32 @@ class NodeServiceSupervisor(
         return job
     }
 
+    /**
+     * Runs [block] once on this supervisor's bounded pool. Returns `false` (and runs nothing) if the supervisor is
+     * stopped or the pool rejects. A throwing block is logged (task name and exception type only), never rethrown.
+     * Interrupted by [stopAll] like every other job.
+     */
+    fun launchOneShot(
+        taskName: String,
+        block: () -> Unit,
+    ): Boolean {
+        if (stopped.get()) return false
+        return try {
+            executor.execute {
+                try {
+                    block()
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (e: Throwable) {
+                    logger.warn { "one-shot task '$taskName' failed (${e.javaClass.simpleName})" }
+                }
+            }
+            true
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            false
+        }
+    }
+
     private fun jittered(
         interval: Duration,
         jitter: Duration,

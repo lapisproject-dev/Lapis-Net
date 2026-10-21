@@ -2059,6 +2059,7 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 _Done, part of `v0.11.0`. Internal wave identifier._
 
 * **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapisnet node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
+* **Security-audit remainder:** recomputing the observer weight on every grant change was named as a remaining gap; _resolved in V0.9.18 (unreleased)_. The remaining bound: the weight lags the grants by at most two windows plus tick jitter and one run (one window plus a run while readers keep asking).
 * **Open:** wire the mail acceptance (_done in V0.9.17, unreleased_); editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
 
 == V0.9.16 — Root-cause fixes for two flaky tests (post-v0.11.0 maintenance)
@@ -2077,3 +2078,10 @@ _Done on a local branch, not yet released. Internal wave identifier._
 
 * **Done:** `MailAcceptanceCheck` is installed in `InboxGossip` for the gossip validator and the DHT fetcher alike; `InboxGossip.updateAcceptanceCheck` / `currentAcceptanceCheck`; accepted-contact bypass in `MailAcceptancePolicy` (empty gates, contact, deposit, gates); `MailRejectListener` and `MailAcceptanceDecision.Reject.failedGates`; `MailAcceptanceSettings` with `--mail-veritas-gate`, `--mail-karma-min-score`, `--mail-min-deposit-msat` (environment `LAPISNET_MAIL_*`, file keys `mailAcceptance.*`); one trust-graph build for DM and mail in `BrowserAcceptance`; refresh job for mail-only setups; local blocked-delivery counters in the status panel; outgoing mail marks its recipients as accepted contacts.
 * **Open:** blocked mail is discarded (no quarantine, no sender list), so a legitimate first contact is lost while a gate is on; accepted contacts are not persisted; a policy reject returns `Invalid` to GossipSub, which lowers the forwarding peer's score (same as DM); the counter counts deliveries, not distinct mails; the deposit has no transport.
+
+== V0.9.18 — Observer-weight recomputation throttle (Madli)
+
+_Done on a local branch, not yet released. Internal wave identifier._
+
+* **Done:** `CachedVeritasObserverWeight` recomputes at most once per window (5 s) instead of once per grant change: stale-while-revalidate, single-flight on the supervisor's bounded pool (`NodeServiceSupervisor.launchOneShot`), a safety tick for idle nodes, exponential backoff after failures, rate-limited counter-only logs, a counter of rejected refresh requests, clean stop. The first call computes synchronously and yields `0.0` if that fails. The public constructor without an executor is gone (`startSupervised` is the wiring); `BrowserServer` and `HeadlessNode` use it.
+* **Open:** the window is not an operator option; `/api/timeline` still rebuilds the trust graph per local request (not amplifiable through gossip); no independent review beyond the pipeline's own loops.

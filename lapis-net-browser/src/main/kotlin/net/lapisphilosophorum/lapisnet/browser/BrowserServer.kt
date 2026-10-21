@@ -717,7 +717,7 @@ class BrowserServer private constructor(
                     madliGossip = madli
                     supervisor.register("madli-gossip") { madli.stop() }
                     if (wiring.autoRelay) {
-                        val weights = CachedVeritasObserverWeight(veritas, ownPublicKey)
+                        val weights = CachedVeritasObserverWeight.startSupervised(veritas, ownPublicKey, supervisor)
                         val ranker =
                             MadliRelayRanker(
                                 vectorsFor = madli::currentVectorsForObservedPeer,

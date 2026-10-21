@@ -150,7 +150,7 @@ internal class HeadlessNode private constructor(
                     madli = gossip
                     supervisor.register("madli-gossip") { gossip.stop() }
                     if (options.autoRelay) {
-                        val weights = CachedVeritasObserverWeight(veritas, ownKey)
+                        val weights = CachedVeritasObserverWeight.startSupervised(veritas, ownKey, supervisor)
                         val ranker = MadliRelayRanker(gossip::currentVectorsForObservedPeer, weights::weightOf)
                         val started = node.startAutoRelay({ peerDirectory.relayCandidates() }, ranker)
                         selector = started

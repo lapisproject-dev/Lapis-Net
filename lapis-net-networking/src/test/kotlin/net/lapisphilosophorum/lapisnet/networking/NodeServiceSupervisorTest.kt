@@ -183,4 +183,54 @@ class NodeServiceSupervisorTest :
             val result = runCatching { supervisor.launchPeriodic("late", 1.seconds, 0.milliseconds, 0.milliseconds) {} }
             result.isFailure shouldBe true
         }
+
+        test("launchOneShot runs the block once on the pool") {
+            val supervisor = NodeServiceSupervisor("test-oneshot", poolSize = 2)
+            try {
+                val latch = CountDownLatch(1)
+                supervisor.launchOneShot("once") { latch.countDown() } shouldBe true
+                latch.await(5, TimeUnit.SECONDS) shouldBe true
+            } finally {
+                supervisor.stopAll()
+            }
+        }
+
+        test("launchOneShot returns false after stopAll and runs nothing") {
+            val supervisor = NodeServiceSupervisor("test-oneshot-stopped", poolSize = 2)
+            supervisor.stopAll()
+            var ran = false
+            supervisor.launchOneShot("late") { ran = true } shouldBe false
+            ran shouldBe false
+        }
+
+        test("a throwing one-shot block does not break the pool") {
+            val supervisor = NodeServiceSupervisor("test-oneshot-throw", poolSize = 1)
+            try {
+                supervisor.launchOneShot("boom") { error("boom") } shouldBe true
+                val latch = CountDownLatch(1)
+                supervisor.launchOneShot("after") { latch.countDown() } shouldBe true
+                latch.await(5, TimeUnit.SECONDS) shouldBe true
+            } finally {
+                supervisor.stopAll()
+            }
+        }
+
+        test("stopAll interrupts a blocking one-shot block and the pool terminates") {
+            val supervisor = NodeServiceSupervisor("test-oneshot-block", poolSize = 1)
+            val started = CountDownLatch(1)
+            val interrupted = CountDownLatch(1)
+            supervisor.launchOneShot("block") {
+                started.countDown()
+                try {
+                    CountDownLatch(1).await()
+                } catch (e: InterruptedException) {
+                    interrupted.countDown()
+                    throw e
+                }
+            } shouldBe true
+            started.await(5, TimeUnit.SECONDS) shouldBe true
+            supervisor.stopAll()
+            interrupted.await(5, TimeUnit.SECONDS) shouldBe true
+            supervisor.isTerminated() shouldBe true
+        }
     })

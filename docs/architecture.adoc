@@ -5299,7 +5299,7 @@ c4Model(name = "SingleAcceptancePoint") {
 * `DmSessionManager.classifyQuarantined` marks messages and call signals; `CallManager` drops a quarantined
   `INVITE` silently (no RINGING, no REJECT) and `CallEventHub` shows it as "blocked" with a locally computed reason.
   The reason (`AcceptanceGateEvaluator.failedGates`) is display only and takes no decision.
-* A 60 s job rebuilds the check when the number of known Veritas grants changed and gives the one new instance to both
+* A 60 s job rebuilds the check when the content fingerprint of the latest grants changed (not merely their count) and gives the one new instance to both
   consumers. Gates are off by default. The mail acceptance is wired since V0.9.17 (unreleased), see below.
 * Karma per identity is defined by `PostKarmaScoreLookup` (sum over the sender's 20 newest posts, memoised 60 s).
 
@@ -5323,6 +5323,61 @@ replaces it for both paths atomically, so a refresh cannot leave one path on an 
   counts twice. The status panel shows the gates and the counters; `reason` strings and the JSON name gates only.
 * The deposit key (`mailAcceptance.minDepositMsat`) has no effect until a deposit transport exists
   (`depositLookup` returns nothing), as on the DM side.
+
+=== Observer-weight recomputation throttle (V0.9.18, unreleased)
+
+`CachedVeritasObserverWeight` (the Veritas weight of a Madli observer, asked once per relay candidate by
+`MadliRelayRanker`) used to recompute on every change of the grant index: grant resolution, fingerprint and a full
+`TrustGraph` rebuild. A steady stream of valid grants therefore cost one rebuild per grant. It is now
+stale-while-revalidate with a bounded rate.
+
+* **Refresh gate.** `weightOf` answers from the existing snapshot and, if the index version moved, asks the gate for a
+  refresh. A safety tick (one `NodeServiceSupervisor.launchPeriodic` job, interval = window) asks as well. The gate
+  admits a refresh only if the instance is not stopped, no refresh is running (single-flight: at most one task per
+  instance, no queue) and the window (5 s) has passed since the previous run started. Both triggers share the gate,
+  so tick jitter cannot exceed the rate. The monotonic clock is injected.
+* **Off-thread.** The refresh runs as a one-shot task (`NodeServiceSupervisor.launchOneShot`) on the supervisor's
+  bounded pool, never on the caller. A run is an index scan plus CPU work and contains no network I/O.
+* **Safety rule (revocation).** The weight lags the grant index by at most two windows plus tick jitter (window / 10,
+  about 10.5 s at the 5 s default) plus the duration of a run; after failures by at most the exponential backoff
+  (capped at 60 s). The safety tick makes this hold for an idle node; because the tick has its own phase and the gate
+  rejects a tick just before the window end, an idle node can need the following tick (one interval later). Active
+  readers shorten the bound to one window plus a run. Each run rebuilds the snapshot completely (no merge with old state); the version is read before the
+  grants, so a change during a run leaves the snapshot stale and the next run catches it. Only an unchanged content
+  fingerprint skips the graph rebuild.
+* **First call.** With no snapshot there is no safe default weight, so the first `weightOf` computes synchronously
+  (concurrent first callers share one computation). The caller is the auto-select thread and the path can be
+  triggered once per instance. If it fails, `weightOf` returns `0.0` (no reputation influence; the ranker is advisory)
+  and later refreshes go through the gate asynchronously with backoff.
+* **Failures and counters.** A failed run keeps the old weight and backs off (`interval * 2^failures`, capped).
+  Logs are rate-limited (first failure of a series, then at most once per 60 s) and carry the exception type and the
+  failure counter only. Requests the gate rejects are counted; a summary reaches an injectable hook at most once per
+  60 s and consists of numbers only, so no key or grant content can reach it.
+* **Stop.** `stop()` (registered at the supervisor) forbids new submissions; a running refresh is interrupted by
+  `stopAll` and discards its result.
+
+Other recompute-on-change sites, reviewed in this wave:
+
+[cols="2,3,1"]
+|===
+| Site | Why it is bounded | Change
+
+| `BrowserAcceptance.refresh`
+| 60 s job, compares the content fingerprint
+| unchanged
+
+| DM and mail acceptance checks
+| Use the snapshot built by that 60 s job; no recomputation per change
+| unchanged
+
+| `/api/timeline`
+| Builds a `TrustGraph` per request of the local UI; driven by the local user, not amplifiable through gossip. Known gap
+| unchanged
+
+| `MadliRelayRanker`
+| Consumer of the throttled weight only
+| unchanged
+|===
 
 === Metadata exposure
 
