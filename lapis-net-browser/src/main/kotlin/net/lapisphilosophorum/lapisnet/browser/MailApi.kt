@@ -386,6 +386,9 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
                 return@post
             }
         deps.sentFolder.add(sent)
+        // Local sends only: the recipient becomes an accepted contact so a reply passes the mail acceptance policy.
+        // Nothing a remote peer sends can reach this call.
+        parsedRecipients.forEach { deps.acceptedContacts?.accept(it) }
         call.respond(NewMailResponse(sent.bodyCid.toString()))
     }
 

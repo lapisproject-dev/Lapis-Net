@@ -186,4 +186,130 @@ class TwoNodeMailBrowserIntegrationTest :
                 runCatching { serverB.stop() }
             }
         }
+
+        test(
+            "V0.9.17: with a mail gate on B, a stranger's mail is discarded and counted; after B writes to A, it passes",
+        ).config(timeout = 120.seconds) {
+            val deadline = Instant.now().plus(Duration.ofSeconds(90))
+            val identityA = DualKeyIdentity.generate()
+            val identityB = DualKeyIdentity.generate()
+            val serverA =
+                BrowserServer.start(
+                    identity = identityA,
+                    httpPort = 0,
+                    dataDirectory = Files.createTempDirectory("browser-mail-gate-a"),
+                    karmaAnchorSource = MailDemoNoAnchorSource,
+                )
+            val serverB =
+                BrowserServer.start(
+                    identity = identityB,
+                    httpPort = 0,
+                    dataDirectory = Files.createTempDirectory("browser-mail-gate-b"),
+                    karmaAnchorSource = MailDemoNoAnchorSource,
+                    config = BrowserConfig(mailAcceptance = MailAcceptanceSettings(veritasGate = true)),
+                )
+            val httpClient = HttpClient(CIO)
+            try {
+                val bAddr =
+                    serverB.nodeForTesting
+                        .listenAddresses()
+                        .first()
+                        .withP2P(serverB.nodeForTesting.peerId)
+                httpClient
+                    .post("http://127.0.0.1:${serverA.boundPort}/api/peers/connect") {
+                        contentType(ContentType.Application.Json)
+                        setBody(json.encodeToString(ConnectPeerRequest(bAddr.toString())))
+                    }.status.value shouldBe 200
+                val aAddr =
+                    serverA.nodeForTesting
+                        .listenAddresses()
+                        .first()
+                        .withP2P(serverA.nodeForTesting.peerId)
+                httpClient
+                    .post("http://127.0.0.1:${serverB.boundPort}/api/peers/connect") {
+                        contentType(ContentType.Application.Json)
+                        setBody(json.encodeToString(ConnectPeerRequest(aAddr.toString())))
+                    }.status.value shouldBe 200
+
+                // warm-up both directions on the mesh
+                val warmA = Collections.synchronizedList(mutableListOf<ByteArray>())
+                val warmB = Collections.synchronizedList(mutableListOf<ByteArray>())
+                serverB.pubsubForTesting.subscribe("lapisnet-mail-gate:warmup:b") { b, _ ->
+                    warmB.add(b)
+                    ValidationResult.Valid
+                }
+                serverA.pubsubForTesting.subscribe("lapisnet-mail-gate:warmup:a") { b, _ ->
+                    warmA.add(b)
+                    ValidationResult.Valid
+                }
+                while ((warmA.isEmpty() || warmB.isEmpty()) && Instant.now().isBefore(deadline)) {
+                    runCatching {
+                        serverA.pubsubForTesting.publish(
+                            "lapisnet-mail-gate:warmup:b",
+                            "w".toByteArray(),
+                        )
+                    }
+                    runCatching {
+                        serverB.pubsubForTesting.publish(
+                            "lapisnet-mail-gate:warmup:a",
+                            "w".toByteArray(),
+                        )
+                    }
+                    delay(200)
+                }
+                check(warmA.isNotEmpty() && warmB.isNotEmpty()) { "warm-up did not complete" }
+
+                suspend fun send(
+                    from: BrowserServer,
+                    to: DualKeyIdentity,
+                    subject: String,
+                ): String {
+                    val response =
+                        httpClient.post("http://127.0.0.1:${from.boundPort}/api/mail") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                json.encodeToString(
+                                    NewMailRequest(listOf(recipientHexFor(to)), subject, "body $subject"),
+                                ),
+                            )
+                        }
+                    response.status.value shouldBe 200
+                    return json.decodeFromString<NewMailResponse>(response.bodyAsText()).cid
+                }
+
+                suspend fun inboxOfB(): List<MailSummaryResponse> =
+                    json.decodeFromString(
+                        httpClient.get("http://127.0.0.1:${serverB.boundPort}/api/mail").bodyAsText(),
+                    )
+
+                // 1. stranger mail is discarded and counted; the sender sees a plain 200
+                while (serverB.acceptanceForTesting.mailBlocks.total() == 0L && Instant.now().isBefore(deadline)) {
+                    send(serverA, identityB, "from a stranger")
+                    delay(400)
+                }
+                serverB.acceptanceForTesting.mailBlocks
+                    .total() shouldBe
+                    serverB.acceptanceForTesting.mailBlocks
+                        .total()
+                        .coerceAtLeast(1)
+                inboxOfB() shouldBe emptyList()
+                serverB.acceptanceForTesting.mailBlocks
+                    .snapshot()[MailBlockReason.VERITAS_BELOW_THRESHOLD]
+                    .shouldNotBeNull() shouldBe serverB.acceptanceForTesting.mailBlocks.total()
+
+                // 2. B writes to A (marks A as accepted contact); A's next mail now arrives
+                send(serverB, identityA, "hello A")
+                var arrived: MailSummaryResponse? = null
+                while (arrived == null && Instant.now().isBefore(deadline)) {
+                    val cid = send(serverA, identityB, "reply from A")
+                    delay(400)
+                    arrived = inboxOfB().find { it.cid == cid }
+                }
+                arrived.shouldNotBeNull()
+            } finally {
+                httpClient.close()
+                runCatching { serverA.stop() }
+                runCatching { serverB.stop() }
+            }
+        }
     })

@@ -30,8 +30,14 @@ fun interface KarmaScoreLookup {
 sealed interface MailAcceptanceDecision {
     data object Accept : MailAcceptanceDecision
 
+    /**
+     * [failedGates] lists the configured gates the sender failed (all of them, since a sender who passes
+     * any gate is accepted). It carries gate types only, never keys or envelope content, so it is safe to
+     * hand to a local statistics listener.
+     */
     data class Reject(
         val reason: String,
+        val failedGates: List<MailAcceptanceGate> = emptyList(),
     ) : MailAcceptanceDecision
 }
 
@@ -144,7 +150,11 @@ object MailAcceptancePolicy {
      *  1. **Empty [gates] ([ACCEPT_ALL]) always accepts** - the protocol-mandated default, checked
      *     first so a node running no filters pays no cost at all (no deposit verification, no
      *     Veritas/Karma lookups) for messages it was always going to accept anyway.
-     *  2. **A [deposit] whose [FirstContactDeposit.requiredAmountMsat] is at least [minDepositMsat]
+     *  2. **An accepted contact ([isAcceptedContact], evaluated on the signature-verified
+     *     [MessageEnvelope.sender] only) always accepts**, bypassing every configured gate. This
+     *     mirrors the DM order (empty gates, contact, deposit, gates). The lookup is never called for
+     *     empty gates (step 1 short-circuits first).
+     *  3. **A [deposit] whose [FirstContactDeposit.requiredAmountMsat] is at least [minDepositMsat]
      *     AND that verifies (see [FirstContactDepositVerifier.verify]) always accepts, bypassing
      *     every configured gate** - that is the whole point of the first-contact deposit mechanism:
      *     an unknown sender who paid ENOUGH gets through even with every gate configured and
@@ -154,7 +164,7 @@ object MailAcceptancePolicy {
      *     genuinely-settled, self-consistent 1-msat deposit passes [verify] exactly as validly as a
      *     economically-meaningful one, so without this floor a spammer could mint a bypass for a
      *     cost indistinguishable from free.
-     *  3. Otherwise, accepted iff the sender passes AT LEAST ONE configured gate - see
+     *  4. Otherwise, accepted iff the sender passes AT LEAST ONE configured gate - see
      *     [MailAcceptanceGate]'s class doc comment for the OR-across-gates reasoning. Rejection
      *     reports every gate that failed.
      */
@@ -166,10 +176,13 @@ object MailAcceptancePolicy {
         gates: List<MailAcceptanceGate> = ACCEPT_ALL,
         minDepositMsat: Long = DEFAULT_MIN_DEPOSIT_MSAT,
         deposit: FirstContactDeposit? = null,
+        isAcceptedContact: (Secp256k1PublicKey) -> Boolean = { false },
     ): MailAcceptanceDecision {
         if (gates.isEmpty()) return MailAcceptanceDecision.Accept
 
         val sender = envelope.sender
+
+        if (isAcceptedContact(sender)) return MailAcceptanceDecision.Accept
 
         if (deposit != null &&
             deposit.requiredAmountMsat >= minDepositMsat &&
@@ -182,17 +195,26 @@ object MailAcceptancePolicy {
         // build.gradle.kts header comment for why the gate TYPES stay declared here
         // (MailAcceptanceGate, unchanged public signature) while the evaluation LOGIC now lives in
         // one place shared with lapis-net-dm's DmAcceptancePolicy.
-        val reason =
-            AcceptanceGateEvaluator.firstPassOrFailureReason(
+        val policyGates = gates.map { it.toPolicyGate() }
+        val failed =
+            AcceptanceGateEvaluator.failedGates(
                 sender = sender,
-                gates = gates.map { it.toPolicyGate() },
+                gates = policyGates,
                 hasVeritasPath = hasVeritasPath,
                 karmaScoreOf =
                     net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup { candidate ->
                         karmaScoreOf.karmaScoreOf(candidate)
                     },
-            )
-        return if (reason == null) MailAcceptanceDecision.Accept else MailAcceptanceDecision.Reject(reason)
+            ) ?: return MailAcceptanceDecision.Accept
+        // Same text AcceptanceGateEvaluator.firstPassOrFailureReason formats (pinned by a regression test).
+        val reason =
+            failed.joinToString("; ") { gate ->
+                when (gate) {
+                    is AcceptanceGate.VeritasPath -> "no Veritas path from local identity to sender"
+                    is AcceptanceGate.KarmaThreshold -> "karma below threshold ${gate.minScore}"
+                }
+            }
+        return MailAcceptanceDecision.Reject(reason, failed.map { it.toMailGate() })
     }
 }
 
@@ -203,4 +225,10 @@ private fun MailAcceptanceGate.toPolicyGate(): AcceptanceGate =
     when (this) {
         is MailAcceptanceGate.VeritasPath -> AcceptanceGate.VeritasPath
         is MailAcceptanceGate.KarmaThreshold -> AcceptanceGate.KarmaThreshold(minScore)
+    }
+
+private fun AcceptanceGate.toMailGate(): MailAcceptanceGate =
+    when (this) {
+        is AcceptanceGate.VeritasPath -> MailAcceptanceGate.VeritasPath
+        is AcceptanceGate.KarmaThreshold -> MailAcceptanceGate.KarmaThreshold(minScore)
     }

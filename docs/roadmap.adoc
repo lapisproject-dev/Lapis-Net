@@ -2059,7 +2059,7 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 _Done, part of `v0.11.0`. Internal wave identifier._
 
 * **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapisnet node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
-* **Open:** wire the mail acceptance; editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
+* **Open:** wire the mail acceptance (_done in V0.9.17, unreleased_); editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
 
 == V0.9.16 — Root-cause fixes for two flaky tests (post-v0.11.0 maintenance)
 
@@ -2068,3 +2068,12 @@ _Done on a local branch, not yet released. Internal wave identifier; the fix is 
 * **`MultiNodeIpnsValueTest` (storage):** not timing, a Nabu defect. `KademliaEngine` builds `Router(id, 2, 2, 2)`, i.e. two peers per bucket, so a third peer of a bucket was never routable (about 1 in 7 random three-peer networks, independent of load). `LapisKademliaEngine` now keeps its own routing table (`DhtLimits.routingBucketSize` = 20, `routingReplacementCacheSize` = 8, own ID hashed like every peer ID, monotonic touch times). This also repairs production: Bootstrap, directory DHT and outbox ran on heavily thinned tables. `NabuStorage.connectToDhtPeer` now returns `true` only for a routable peer. Tests: `LapisKademliaEngineRoutingTableTest` and a deterministic three-peers-one-bucket case in `MultiNodeIpnsValueTest` (both red before the fix).
 * **`CallManagerBrowserIntegrationTest`, "a rejected call ends on both sides with DECLINED" (browser/call):** the callee did not know the caller's directory record yet, so its REJECT failed with `DmUnknownRecipientException` (swallowed at debug level) and the caller rang until `RING_TIMEOUT`. The test helper now waits for convergence in both directions and retries a gossip publish that fails because no outbound stream exists yet; `CallManager` logs a lost outbound signal at `warn` and counts it.
 * **Open:** the production gap remains: while the callee lacks the caller's record, ACCEPT / REJECT / HANGUP are lost. Answering over the INVITE's connection is possible but touches the identity rule in `DmProtocol` and needs a decision and a security review.
+
+== V0.9.17 — Mail acceptance wiring (browser)
+
+_Done on a local branch, not yet released. Internal wave identifier._
+
+=== Progress
+
+* **Done:** `MailAcceptanceCheck` is installed in `InboxGossip` for the gossip validator and the DHT fetcher alike; `InboxGossip.updateAcceptanceCheck` / `currentAcceptanceCheck`; accepted-contact bypass in `MailAcceptancePolicy` (empty gates, contact, deposit, gates); `MailRejectListener` and `MailAcceptanceDecision.Reject.failedGates`; `MailAcceptanceSettings` with `--mail-veritas-gate`, `--mail-karma-min-score`, `--mail-min-deposit-msat` (environment `LAPISNET_MAIL_*`, file keys `mailAcceptance.*`); one trust-graph build for DM and mail in `BrowserAcceptance`; refresh job for mail-only setups; local blocked-delivery counters in the status panel; outgoing mail marks its recipients as accepted contacts.
+* **Open:** blocked mail is discarded (no quarantine, no sender list), so a legitimate first contact is lost while a gate is on; accepted contacts are not persisted; a policy reject returns `Invalid` to GossipSub, which lowers the forwarding peer's score (same as DM); the counter counts deliveries, not distinct mails; the deposit has no transport.

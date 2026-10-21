@@ -103,4 +103,51 @@ class NodeStatusAndGuardTest :
                 server.stop()
             }
         }
+
+        test("GET /api/node/status reports mail gates and blocked counters, with no key or path in the JSON").config(
+            timeout = 90.seconds,
+        ) {
+            val config =
+                BrowserConfig(
+                    NodeWiringOptions(dhtFallback = false),
+                    DmAcceptanceSettings(),
+                    MailAcceptanceSettings(veritasGate = true, karmaMinScore = 3.0),
+                )
+            val server = startWiredTestServer(config = config)
+            try {
+                val port = server.boundPort
+
+                fun status(): Pair<NodeStatusResponse, String> {
+                    val (code, body) = rawHttp(port, "GET", "/api/node/status", mapOf("Host" to "127.0.0.1:$port"))
+                    code shouldBe 200
+                    return json.decodeFromString<NodeStatusResponse>(body) to body
+                }
+                val (initial, _) = status()
+                initial.mailAcceptanceGates shouldBe listOf("veritas-path", "karma>=3.0")
+                initial.acceptanceGates shouldBe emptyList()
+                initial.mailBlocked shouldBe MailBlockedStatus()
+
+                server.acceptanceForTesting.mailBlocks.record(MailBlockReason.ALL_ACTIVE_GATES_FAILED, 42L)
+                server.acceptanceForTesting.mailBlocks.record(MailBlockReason.VERITAS_BELOW_THRESHOLD, 43L)
+                val (after, body) = status()
+                after.mailBlocked.total shouldBe 2
+                after.mailBlocked.byReason shouldBe
+                    mapOf("all-active-gates-failed" to 1L, "veritas-below-threshold" to 1L)
+                after.mailBlocked.lastBlockedEpochSecond shouldBe 43L
+                Regex("[0-9a-fA-F]{64}").containsMatchIn(body) shouldBe false
+                body shouldNotContain "/home/"
+                body shouldNotContain "/tmp"
+            } finally {
+                server.stop()
+            }
+        }
+
+        test("a status response without the V0.9.17 fields still decodes (defaults)") {
+            val old =
+                """{"reachability":"public","autoRelay":false,"autoRelayRunning":false,"relayReservations":0,""" +
+                    """"dhtFallback":true,"publishRelayReliability":false,"acceptanceGates":[],"configFile":"browser.properties"}"""
+            val parsed = json.decodeFromString<NodeStatusResponse>(old)
+            parsed.mailAcceptanceGates shouldBe emptyList()
+            parsed.mailBlocked.total shouldBe 0
+        }
     })

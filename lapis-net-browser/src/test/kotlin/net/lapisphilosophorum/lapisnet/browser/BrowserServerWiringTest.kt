@@ -18,7 +18,8 @@ private val NOOP_CONSUMER = OutboxEntryConsumer { _, _, _ -> OutboxIngestOutcome
 private fun configOf(
     wiring: NodeWiringOptions = NodeWiringOptions(),
     acceptance: DmAcceptanceSettings = DmAcceptanceSettings(),
-) = BrowserConfig(wiring, acceptance)
+    mailAcceptance: MailAcceptanceSettings = MailAcceptanceSettings(),
+) = BrowserConfig(wiring, acceptance, mailAcceptance)
 
 /** What `BrowserServer.start` switches on, for every combination of the operator's options. */
 class BrowserServerWiringTest :
@@ -174,6 +175,71 @@ class BrowserServerWiringTest :
                     server.mailboxGossipForTesting.currentAcceptanceCheck() ===
                         server.dmSessionManagerForTesting.currentAcceptanceCheck()
                 }
+            } finally {
+                server.stop()
+            }
+        }
+
+        test(
+            "the mail check is installed in InboxGossip right after start (no unfiltered window), shared by DM's graph",
+        ).config(timeout = 90.seconds) {
+            val server =
+                startWiredTestServer(
+                    config =
+                        configOf(
+                            acceptance = DmAcceptanceSettings(veritasGate = true),
+                            mailAcceptance = MailAcceptanceSettings(veritasGate = true),
+                        ),
+                )
+            try {
+                val mail = server.mailInboxForTesting.currentAcceptanceCheck().shouldNotBeNull()
+                (mail === server.acceptanceForTesting.currentMailForTesting()) shouldBe true
+                val dm = server.mailboxGossipForTesting.currentAcceptanceCheck().shouldNotBeNull()
+                (dm.trustGraph === mail.trustGraph) shouldBe true
+            } finally {
+                server.stop()
+            }
+        }
+
+        test("no mail gate: InboxGossip has no check; mail-only leaves the DM consumers without one").config(
+            timeout = 90.seconds,
+        ) {
+            val off = startWiredTestServer()
+            val mailOnly =
+                startWiredTestServer(config = configOf(mailAcceptance = MailAcceptanceSettings(karmaMinScore = 1.0)))
+            try {
+                off.mailInboxForTesting.currentAcceptanceCheck().shouldBeNull()
+                mailOnly.mailInboxForTesting.currentAcceptanceCheck().shouldNotBeNull()
+                mailOnly.mailboxGossipForTesting.currentAcceptanceCheck().shouldBeNull()
+                mailOnly.dmSessionManagerForTesting.currentAcceptanceCheck().shouldBeNull()
+            } finally {
+                off.stop()
+                mailOnly.stop()
+            }
+        }
+
+        test("the refresh job also runs for a mail-only setup and installs a new mail check").config(
+            timeout = 90.seconds,
+        ) {
+            val server =
+                startWiredTestServer(
+                    config = configOf(mailAcceptance = MailAcceptanceSettings(veritasGate = true)),
+                    acceptanceRefreshInterval = 1.seconds,
+                )
+            try {
+                val before = server.mailInboxForTesting.currentAcceptanceCheck().shouldNotBeNull()
+                server.veritasForTesting().announce(
+                    net.lapisphilosophorum.lapisnet.trust.VeritasGrant.create(
+                        truster = server.identityForTesting().secp256k1KeyPair,
+                        target = randomPeer(),
+                        trustMicros = 800_000,
+                        comment = "refresh",
+                    ),
+                )
+                awaitCondition(30, "mail check was not rebuilt") {
+                    server.mailInboxForTesting.currentAcceptanceCheck() !== before
+                }
+                server.mailboxGossipForTesting.currentAcceptanceCheck().shouldBeNull()
             } finally {
                 server.stop()
             }

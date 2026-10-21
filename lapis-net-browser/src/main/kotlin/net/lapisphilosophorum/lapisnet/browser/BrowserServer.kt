@@ -208,6 +208,7 @@ class BrowserServer private constructor(
     internal val dhtOutboxForTesting: DhtOutbox? get() = dhtOutbox
 
     internal val acceptanceForTesting: BrowserAcceptance get() = acceptance
+    internal val mailInboxForTesting: InboxGossip get() = mailInbox
 
     internal val autoRelaySelectorForTesting: RelayAutoSelector? get() = autoRelaySelector
 
@@ -496,7 +497,28 @@ class BrowserServer private constructor(
                 // MailSender/SentFolder are plain, resource-free objects - constructed here purely so
                 // every BrowserServer has its own instance, never shared across servers in a
                 // multi-node test.
-                val mailInbox = InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey)
+                // Created BEFORE mailInbox and mailboxGossip (V0.9.17: the mail check must exist before InboxGossip subscribes,
+                // otherwise there is a window without a filter; updateAcceptanceCheck afterwards is no substitute): the acceptance check's isAcceptedContact needs it (and the
+                // accept button and outbound sends mark contacts in the same instance).
+                val dmAcceptedContacts = DmAcceptedContacts()
+                // The ONE acceptance instance: handed to MailboxGossip (offline pre-check, gossip AND DHT path)
+                // and to DmSessionManager (post-decrypt classification, also what makes calls "blocked").
+                val acceptance =
+                    BrowserAcceptance(
+                        settings = config.acceptance,
+                        mailSettings = config.mailAcceptance,
+                        localIdentity = identity.secp256k1KeyPair.publicKey,
+                        veritas = veritas,
+                        karmaLookupFactory = { graph ->
+                            karmaLookupOverride
+                                ?: PostKarmaScoreLookup(posts, karma, graph, identity.secp256k1KeyPair.publicKey)
+                        },
+                        acceptedContacts = dmAcceptedContacts,
+                    )
+                val acceptanceChecks = acceptance.buildChecks()
+                val acceptanceCheck = acceptanceChecks.dm
+                val mailInbox =
+                    InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey, acceptanceChecks.mail)
                 cleanupOnFailure += { runCatching { mailInbox.stop() } }
                 // V0.9.15 - the outbox through which mail and DM pointers reach the DHT (no outbox = gossip only).
                 val dhtOutbox = if (wiring.dhtFallback) DhtOutbox() else null
@@ -512,22 +534,6 @@ class BrowserServer private constructor(
                 val prekeyBundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
                 cleanupOnFailure += { runCatching { prekeyBundleGossip.stop() } }
                 val ownPublicKey = identity.secp256k1KeyPair.publicKey
-                // Created BEFORE mailboxGossip: the acceptance check's isAcceptedContact needs it (and the
-                // accept button and outbound sends mark contacts in the same instance).
-                val dmAcceptedContacts = DmAcceptedContacts()
-                // The ONE acceptance instance: handed to MailboxGossip (offline pre-check, gossip AND DHT path)
-                // and to DmSessionManager (post-decrypt classification, also what makes calls "blocked").
-                val acceptance =
-                    BrowserAcceptance(
-                        settings = config.acceptance,
-                        localIdentity = ownPublicKey,
-                        veritas = veritas,
-                        karmaLookupFactory = { graph ->
-                            karmaLookupOverride ?: PostKarmaScoreLookup(posts, karma, graph, ownPublicKey)
-                        },
-                        acceptedContacts = dmAcceptedContacts,
-                    )
-                val acceptanceCheck = acceptance.buildCheck()
                 val mailboxGossip = MailboxGossip.attach(pubsub, storage, ownPublicKey, acceptanceCheck)
                 cleanupOnFailure += { runCatching { mailboxGossip.stop() } }
                 // Resolved EXACTLY ONCE per start() call - not once per PrekeyStore file access. A
@@ -741,18 +747,22 @@ class BrowserServer private constructor(
                     }
                 }
 
-                if (config.acceptance.enabled) {
+                if (acceptance.anyEnabled) {
                     supervisor.launchPeriodic(
                         "acceptance-refresh",
                         interval = acceptanceRefreshInterval,
                         jitter = (acceptanceRefreshInterval.inWholeMilliseconds / 6).milliseconds,
                         initialDelay = acceptanceRefreshInterval,
                     ) {
-                        // One new instance, handed to BOTH consumers: the single acceptance point stays single.
-                        acceptance.refresh { check ->
-                            mailboxGossip.updateAcceptanceCheck(check)
-                            dmSessionManager.updateAcceptanceCheck(check)
-                        }
+                        // One new DM instance handed to BOTH DM consumers (the single acceptance point stays
+                        // single); the mail check goes to the inbox, which feeds gossip AND the DHT fetcher.
+                        acceptance.refresh(
+                            applyDm = { check ->
+                                mailboxGossip.updateAcceptanceCheck(check)
+                                dmSessionManager.updateAcceptanceCheck(check)
+                            },
+                            applyMail = { check -> mailInbox.updateAcceptanceCheck(check) },
+                        )
                     }
                 }
 
@@ -787,6 +797,8 @@ class BrowserServer private constructor(
                         dhtFallback = wiring.dhtFallback,
                         publishRelayReliability = wiring.publishRelayReliability,
                         acceptanceGates = acceptance.gateNames(),
+                        mailAcceptanceGates = acceptance.mailGateNames(),
+                        mailBlocked = acceptance.mailBlocks.toStatus(),
                         configFile = BrowserConfig.FILE_NAME,
                     )
                 }
@@ -806,6 +818,7 @@ class BrowserServer private constructor(
                         dm = DmApiDependencies(peerDirectory, dmSessionManager, dmStore, dmAcceptedContacts),
                         call = callDeps,
                         nodeStatus = nodeStatus,
+                        acceptedContacts = dmAcceptedContacts,
                     )
                 val httpEngine =
                     embeddedServer(Netty, port = httpPort, host = httpHost) {

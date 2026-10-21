@@ -226,7 +226,11 @@ the table above, not a detail to gloss over. One clarification on the first row:
 lapisnet node --reachability=private
 # browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
 lapisnet-browser --reachability=private --dm-veritas-gate=true
+# mail gates (unreleased, V0.9.17): off by default; mail from a sender who passes none of them is discarded
+lapisnet-browser --mail-veritas-gate=true --mail-karma-min-score=2
 ----
+
+Mail acceptance is wired in the browser node (unreleased, after `v0.11.0`). Keys: `--mail-veritas-gate` (`LAPISNET_MAIL_VERITAS_GATE`, file key `mailAcceptance.veritasGate`), `--mail-karma-min-score` (`LAPISNET_MAIL_KARMA_MIN_SCORE`, `mailAcceptance.karmaMinScore`), `--mail-min-deposit-msat` (`LAPISNET_MAIL_MIN_DEPOSIT_MSAT`, `mailAcceptance.minDepositMsat`, no effect yet). All gates are off by default. Accepted contacts are always let through; blocked mail is discarded without reply and only counted in the status panel.
 
 An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
 

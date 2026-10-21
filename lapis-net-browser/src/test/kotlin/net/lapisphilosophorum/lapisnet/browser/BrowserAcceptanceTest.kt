@@ -20,6 +20,7 @@ class BrowserAcceptanceTest :
     FunSpec({
         class Fixture(
             val settings: DmAcceptanceSettings,
+            val mailSettings: MailAcceptanceSettings = MailAcceptanceSettings(),
             karma: (net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey) -> Double = { 0.0 },
         ) {
             val identity = DualKeyIdentity.generate()
@@ -31,6 +32,7 @@ class BrowserAcceptanceTest :
             val acceptance =
                 BrowserAcceptance(
                     settings,
+                    mailSettings,
                     identity.secp256k1KeyPair.publicKey,
                     veritas,
                     { _ -> KarmaScoreLookup(karma) },
@@ -52,7 +54,7 @@ class BrowserAcceptanceTest :
             try {
                 f.acceptance.buildCheck().shouldBeNull()
                 f.acceptance.blockReasonOf(stranger) shouldBe CallBlockReason.POLICY
-                f.acceptance.refresh { error("nothing to refresh") } shouldBe false
+                f.acceptance.refresh({ error("nothing to refresh") }, { error("nothing to refresh") }) shouldBe false
                 f.acceptance.gateNames() shouldBe emptyList()
             } finally {
                 f.stop()
@@ -108,7 +110,11 @@ class BrowserAcceptanceTest :
             val f = Fixture(DmAcceptanceSettings(veritasGate = true))
             try {
                 val first = f.acceptance.buildCheck().shouldNotBeNull()
-                f.acceptance.refresh { error("graph unchanged - must not rebuild") } shouldBe false
+                f.acceptance.refresh(
+                    { error("graph unchanged - must not rebuild") },
+                    { error("no mail gate") },
+                ) shouldBe
+                    false
 
                 val grant =
                     VeritasGrant.create(
@@ -119,17 +125,20 @@ class BrowserAcceptanceTest :
                     )
                 f.veritas.announce(grant)
                 val received = mutableListOf<net.lapisphilosophorum.lapisnet.dm.DmAcceptanceCheck?>()
-                f.acceptance.refresh { check ->
-                    // exactly what BrowserServer does: this one value goes to MailboxGossip AND DmSessionManager
-                    received += check
-                    received += check
-                } shouldBe true
+                f.acceptance.refresh(
+                    applyDm = { check ->
+                        // exactly what BrowserServer does: this one value goes to MailboxGossip AND DmSessionManager
+                        received += check
+                        received += check
+                    },
+                    applyMail = { error("no mail gate") },
+                ) shouldBe true
                 received.size shouldBe 2
                 (received[0] === received[1]) shouldBe true
                 received[0] shouldNotBe first
                 (received[0] === f.acceptance.currentForTesting()) shouldBe true
                 // the new graph now trusts the stranger: no block reason is a veritas block any more
-                f.acceptance.refresh { error("unchanged again") } shouldBe false
+                f.acceptance.refresh({ error("unchanged again") }, { error("no mail gate") }) shouldBe false
             } finally {
                 f.stop()
             }
@@ -149,7 +158,7 @@ class BrowserAcceptanceTest :
                     )
                 f.veritas.announce(grant)
                 f.acceptance.buildCheck().shouldNotBeNull()
-                f.acceptance.refresh { error("unchanged") } shouldBe false
+                f.acceptance.refresh({ error("unchanged") }, { error("no mail gate") }) shouldBe false
 
                 val revocation =
                     VeritasGrant.create(
@@ -162,9 +171,97 @@ class BrowserAcceptanceTest :
                 f.veritas.announce(revocation)
                 f.veritas.currentGrants().size shouldBe 1
                 var rebuilt = false
-                f.acceptance.refresh { rebuilt = true } shouldBe true
+                f.acceptance.refresh({ rebuilt = true }, { error("no mail gate") }) shouldBe true
                 rebuilt shouldBe true
-                f.acceptance.refresh { error("unchanged again") } shouldBe false
+                f.acceptance.refresh({ error("unchanged again") }, { error("no mail gate") }) shouldBe false
+            } finally {
+                f.stop()
+            }
+        }
+
+        test("DM and mail checks come from ONE trust graph; each is null while its own gates are off") {
+            val both =
+                Fixture(DmAcceptanceSettings(veritasGate = true), MailAcceptanceSettings(karmaMinScore = 2.0))
+            val dmOnly = Fixture(DmAcceptanceSettings(veritasGate = true))
+            val mailOnly = Fixture(DmAcceptanceSettings(), MailAcceptanceSettings(veritasGate = true))
+            try {
+                val checks = both.acceptance.buildChecks()
+                checks.dm.shouldNotBeNull()
+                checks.mail.shouldNotBeNull()
+                (checks.dm.trustGraph === checks.mail.trustGraph) shouldBe true
+                both.acceptance.mailGateNames() shouldBe listOf("karma>=2.0")
+                (both.acceptance.currentMailForTesting() === checks.mail) shouldBe true
+                dmOnly.acceptance
+                    .buildChecks()
+                    .mail
+                    .shouldBeNull()
+                mailOnly.acceptance
+                    .buildChecks()
+                    .dm
+                    .shouldBeNull()
+                mailOnly.acceptance
+                    .buildChecks()
+                    .mail
+                    .shouldNotBeNull()
+                mailOnly.acceptance.gateNames() shouldBe emptyList()
+            } finally {
+                listOf(both, dmOnly, mailOnly).forEach { it.stop() }
+            }
+        }
+
+        test("the mail check passes accepted contacts, and a mail-only setup never calls applyDm on refresh").config(
+            timeout = 60.seconds,
+        ) {
+            val f = Fixture(DmAcceptanceSettings(), MailAcceptanceSettings(veritasGate = true))
+            try {
+                val mail =
+                    f.acceptance
+                        .buildChecks()
+                        .mail
+                        .shouldNotBeNull()
+                mail.isAcceptedContact(stranger) shouldBe false
+                f.contacts.accept(stranger)
+                mail.isAcceptedContact(stranger) shouldBe true
+
+                f.veritas.announce(
+                    VeritasGrant.create(
+                        truster = f.identity.secp256k1KeyPair,
+                        target = stranger,
+                        trustMicros = 900_000,
+                        comment = "test",
+                    ),
+                )
+                val applied = mutableListOf<net.lapisphilosophorum.lapisnet.mail.MailAcceptanceCheck?>()
+                f.acceptance.refresh(applyDm = { error("DM gates are off") }, applyMail = { applied += it }) shouldBe
+                    true
+                applied.size shouldBe 1
+                applied[0].shouldNotBeNull() shouldNotBe mail
+                f.acceptance.refresh({ error("unchanged") }, { error("unchanged") }) shouldBe false
+            } finally {
+                f.stop()
+            }
+        }
+
+        test("failed mail gates map to the four block reasons, and the counters survive a refresh") {
+            val veritas = net.lapisphilosophorum.lapisnet.mail.MailAcceptanceGate.VeritasPath
+            val karma =
+                net.lapisphilosophorum.lapisnet.mail.MailAcceptanceGate
+                    .KarmaThreshold(1.0)
+            BrowserAcceptance.mailBlockReasonOf(listOf(veritas)) shouldBe MailBlockReason.VERITAS_BELOW_THRESHOLD
+            BrowserAcceptance.mailBlockReasonOf(listOf(karma)) shouldBe MailBlockReason.KARMA_BELOW_THRESHOLD
+            BrowserAcceptance.mailBlockReasonOf(listOf(veritas, karma)) shouldBe MailBlockReason.ALL_ACTIVE_GATES_FAILED
+            BrowserAcceptance.mailBlockReasonOf(emptyList()) shouldBe MailBlockReason.POLICY
+
+            val f = Fixture(DmAcceptanceSettings(), MailAcceptanceSettings(veritasGate = true))
+            try {
+                f.acceptance.mailBlocks.record(MailBlockReason.VERITAS_BELOW_THRESHOLD, 1234L)
+                f.acceptance.buildChecks()
+                f.acceptance.buildChecks()
+                f.acceptance.mailBlocks.total() shouldBe 1
+                f.acceptance.mailBlocks
+                    .toStatus()
+                    .byReason shouldBe mapOf("veritas-below-threshold" to 1L)
+                f.acceptance.mailBlocks.lastBlockedEpochSecond shouldBe 1234L
             } finally {
                 f.stop()
             }

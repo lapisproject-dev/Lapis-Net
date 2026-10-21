@@ -46,6 +46,12 @@
       <p id="node-status-acceptance-text" class="node-status-note">&hellip;</p>
       <p class="connect-notice">Change them in <code id="node-status-config-file">browser.properties</code> inside your Lapis Net home directory (keys <code>dmAcceptance.veritasGate</code>, <code>dmAcceptance.karmaMinScore</code>, <code>dmAcceptance.minDepositMsat</code>), or on the command line, then restart the node. A sender who passes none of the active rules is quarantined (messages) or silently blocked (calls); you can always accept a contact on the DM page.</p>
     </div>
+    <div id="node-status-mail-acceptance">
+      <h3>Mail rules</h3>
+      <p id="node-status-mail-acceptance-text" class="node-status-note">&hellip;</p>
+      <p id="node-status-mail-blocked" class="node-status-note"></p>
+      <p class="connect-notice">Keys <code>mailAcceptance.veritasGate</code>, <code>mailAcceptance.karmaMinScore</code>, <code>mailAcceptance.minDepositMsat</code> in the same file, then restart the node. Mail from a sender who passes none of the active rules is discarded; the sender is not told. Accepted contacts (accepted on the DM page, or people you have written to) are always let through.</p>
+    </div>
   </section>
 
   <section id="connect-panel">

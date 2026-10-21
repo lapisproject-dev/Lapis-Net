@@ -146,4 +146,75 @@ class BrowserConfigTest :
             shouldThrow<IllegalArgumentException> { DmAcceptanceSettings(karmaMinScore = -0.1) }
             shouldThrow<IllegalArgumentException> { DmAcceptanceSettings(minDepositMsat = 0) }
         }
+
+        test("mail acceptance: defaults off, file keys, environment, arguments, and precedence") {
+            BrowserConfig.DEFAULT.mailAcceptance.enabled shouldBe false
+            val home =
+                homeWith(
+                    """
+                    mailAcceptance.veritasGate=true
+                    mailAcceptance.karmaMinScore=2.5
+                    mailAcceptance.minDepositMsat=5000
+                    """.trimIndent(),
+                )
+            val fromFile = BrowserConfig.load(emptyList(), emptyMap(), home)
+            fromFile.mailAcceptance shouldBe MailAcceptanceSettings(true, 2.5, 5000)
+            // DM and mail are independent
+            fromFile.acceptance shouldBe DmAcceptanceSettings()
+            val env = mapOf("LAPISNET_MAIL_KARMA_MIN_SCORE" to "7")
+            BrowserConfig.load(emptyList(), env, home).mailAcceptance.karmaMinScore shouldBe 7.0
+            BrowserConfig.load(listOf("--mail-karma-min-score=9"), env, home).mailAcceptance.karmaMinScore shouldBe 9.0
+            BrowserConfig
+                .load(listOf("--mail-veritas-gate=true"), emptyMap(), homeWith(null))
+                .mailAcceptance
+                .gates() shouldBe
+                listOf(net.lapisphilosophorum.lapisnet.mail.MailAcceptanceGate.VeritasPath)
+        }
+
+        test("invalid mail values abort in every layer, and the message names the mail option") {
+            listOf("NaN", "-1", "abc", "").forEach {
+                val e =
+                    shouldThrow<InvalidWiringOptionException> {
+                        BrowserConfig.load(listOf("--mail-karma-min-score=$it"), emptyMap(), homeWith(null))
+                    }
+                e.message!! shouldContain "mail-karma-min-score"
+            }
+            listOf("0", "x", "1.5").forEach {
+                val e =
+                    shouldThrow<InvalidWiringOptionException> {
+                        BrowserConfig.load(listOf("--mail-min-deposit-msat=$it"), emptyMap(), homeWith(null))
+                    }
+                e.message!! shouldContain "mail-min-deposit-msat"
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--mail-veritas-gate=yes"), emptyMap(), homeWith(null))
+            }
+            // invalid in the file, overridden by an argument: still aborts
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(
+                    listOf("--mail-karma-min-score=1"),
+                    emptyMap(),
+                    homeWith("mailAcceptance.karmaMinScore=-3"),
+                )
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), mapOf("LAPISNET_MAIL_MIN_DEPOSIT_MSAT" to "0"), homeWith(null))
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), emptyMap(), homeWith("mailAcceptance.foo=1"))
+            }
+            // the DM option error still names the DM option
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--dm-karma-min-score=-1"), emptyMap(), homeWith(null))
+            }.message!! shouldContain "dm-karma-min-score"
+            BrowserConfig.HELP_TEXT shouldContain "--mail-veritas-gate"
+            BrowserConfig.HELP_TEXT shouldContain "--mail-karma-min-score"
+            BrowserConfig.HELP_TEXT shouldContain "--mail-min-deposit-msat"
+        }
+
+        test("MailAcceptanceSettings validates its own invariants") {
+            shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(karmaMinScore = Double.NaN) }
+            shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(karmaMinScore = -0.1) }
+            shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(minDepositMsat = 0) }
+        }
     })

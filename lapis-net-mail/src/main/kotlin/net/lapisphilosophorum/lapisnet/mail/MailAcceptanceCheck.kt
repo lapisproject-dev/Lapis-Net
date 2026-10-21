@@ -1,8 +1,23 @@
 package net.lapisphilosophorum.lapisnet.mail
 
+import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.policy.VeritasPathCache
 import net.lapisphilosophorum.lapisnet.trust.TrustGraph
+
+private val logger = KotlinLogging.logger {}
+
+/**
+ * Receives a [MailAcceptanceDecision.Reject] for local statistics. It deliberately gets neither the sender
+ * nor the envelope, so no key or content can leak through it. Never sent on the wire.
+ */
+fun interface MailRejectListener {
+    fun onRejected(decision: MailAcceptanceDecision.Reject)
+
+    companion object {
+        val NONE: MailRejectListener = MailRejectListener { }
+    }
+}
 
 /**
  * Bundles everything [InboxGossip.onGossipMessage] needs to run [MailAcceptancePolicy.shouldAccept]
@@ -47,7 +62,22 @@ class MailAcceptanceCheck(
     val karmaScoreOf: KarmaScoreLookup,
     val minDepositMsat: Long = MailAcceptancePolicy.DEFAULT_MIN_DEPOSIT_MSAT,
     val depositLookup: (MessageEnvelope) -> FirstContactDeposit? = { null },
+    /** Accepted-contact bypass, evaluated on the signature-verified sender only (V0.9.17). */
+    val isAcceptedContact: (Secp256k1PublicKey) -> Boolean = { false },
+    private val rejectListener: MailRejectListener = MailRejectListener.NONE,
 ) {
+    /**
+     * Local-only notification of a policy reject (V0.9.17); a listener failure never changes the decision.
+     * `internal`: [InboxGossip.checkEnvelope] is the single call site, so gossip and DHT count identically.
+     */
+    internal fun notifyRejected(decision: MailAcceptanceDecision.Reject) {
+        try {
+            rejectListener.onRejected(decision)
+        } catch (e: Exception) {
+            logger.debug { "mail reject listener failed: ${e.javaClass.simpleName}" }
+        }
+    }
+
     /**
      * Memoizes [MailAcceptancePolicy.veritasPathCheck]'s verdict per `(localIdentity, candidate)`
      * pair - closes the round-2 security audit finding that `TrustPathFinder.findPath`'s BFS,

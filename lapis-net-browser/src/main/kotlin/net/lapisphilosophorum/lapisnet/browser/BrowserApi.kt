@@ -29,6 +29,7 @@ import io.libp2p.core.PeerInfo
 import io.libp2p.core.multiformats.Multiaddr
 import kotlinx.serialization.Serializable
 import net.lapisphilosophorum.lapisnet.core.cid.CidBytesValidation
+import net.lapisphilosophorum.lapisnet.dm.DmAcceptedContacts
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.karma.KarmaGossip
@@ -222,6 +223,9 @@ class BrowserApiDependencies(
     val call: CallApiDependencies? = null,
     /** V0.9.15 - source of `GET /api/node/status`; `null` installs no such route (older fixtures stay unchanged). */
     val nodeStatus: (() -> NodeStatusResponse)? = null,
+    /** V0.9.17 - an outbound mail marks its recipients accepted here (same instance as the DM side), so replies pass
+     * the mail acceptance policy. `null` (the default) marks nobody. */
+    val acceptedContacts: DmAcceptedContacts? = null,
 )
 
 /**
@@ -238,6 +242,20 @@ data class NodeStatusResponse(
     val publishRelayReliability: Boolean,
     val acceptanceGates: List<String>,
     val configFile: String,
+    /** V0.9.17 - the mail gates in effect (display names), empty = everybody is accepted. */
+    val mailAcceptanceGates: List<String> = emptyList(),
+    val mailBlocked: MailBlockedStatus = MailBlockedStatus(),
+)
+
+/**
+ * V0.9.17 - local-only count of discarded mail deliveries (not distinct mails: gossip and DHT count separately).
+ * [byReason] keys are fixed enum-derived strings; no sender, key or path ever appears here.
+ */
+@Serializable
+data class MailBlockedStatus(
+    val total: Long = 0,
+    val byReason: Map<String, Long> = emptyMap(),
+    val lastBlockedEpochSecond: Long? = null,
 )
 
 /**

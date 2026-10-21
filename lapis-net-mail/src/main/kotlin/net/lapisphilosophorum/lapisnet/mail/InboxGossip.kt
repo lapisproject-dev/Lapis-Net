@@ -73,7 +73,7 @@ class InboxGossip private constructor(
     private val localIdentity: Secp256k1PublicKey,
     private val index: InboxIndex,
     private val subscription: PubsubSubscription,
-    private val acceptance: MailAcceptanceCheck?,
+    private val acceptanceRef: AcceptanceRef,
 ) {
     /** The GossipSub topic this instance is subscribed to - [InboxTopics.forRecipient] applied to
      * the identity this instance was [attach]ed for. */
@@ -90,7 +90,18 @@ class InboxGossip private constructor(
      * fetcher so the policy cannot be wired differently for that path. See [checkEnvelope].
      */
     internal fun dhtCheckEnvelope(envelopeBytes: ByteArray): EnvelopeCheck =
-        checkEnvelope(envelopeBytes, localIdentity, acceptance, null, "the DHT")
+        checkEnvelope(envelopeBytes, localIdentity, acceptanceRef.value, null, "the DHT")
+
+    /**
+     * Replaces the acceptance policy of BOTH entry paths (gossip validator and DHT fetcher) atomically; takes
+     * effect from the next message. `null` disables filtering. Mirrors `MailboxGossip.updateAcceptanceCheck`.
+     */
+    fun updateAcceptanceCheck(check: MailAcceptanceCheck?) {
+        acceptanceRef.value = check
+    }
+
+    /** The currently installed acceptance policy, or `null`. */
+    fun currentAcceptanceCheck(): MailAcceptanceCheck? = acceptanceRef.value
 
     /** V0.9.14: [ingestChecked] with this instance's storage and index. */
     internal fun dhtIngest(
@@ -123,11 +134,13 @@ class InboxGossip private constructor(
         ): InboxGossip {
             val index = InboxIndex()
             val topic = InboxTopics.forRecipient(localIdentity)
+            // Read on every message (never captured as a value): see updateAcceptanceCheck.
+            val acceptanceRef = AcceptanceRef(acceptance)
             val subscription =
                 pubsub.subscribe(topic) { bytes, from ->
-                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptance)
+                    onGossipMessage(bytes, from, storage, index, localIdentity, acceptanceRef.value)
                 }
-            return InboxGossip(pubsub, storage, localIdentity, index, subscription, acceptance)
+            return InboxGossip(pubsub, storage, localIdentity, index, subscription, acceptanceRef)
         }
 
         /**
@@ -284,8 +297,12 @@ class InboxGossip private constructor(
                         gates = acceptance.gates,
                         minDepositMsat = acceptance.minDepositMsat,
                         deposit = acceptance.depositLookup(envelope),
+                        isAcceptedContact = acceptance.isAcceptedContact,
                     )
                 if (decision is MailAcceptanceDecision.Reject) {
+                    // The one place a policy reject is counted, so gossip and DHT behave identically.
+                    // reason only names gates (never keys or content).
+                    acceptance.notifyRejected(decision)
                     logger.debug { "rejected envelope from $source by mail acceptance policy: ${decision.reason}" }
                     return EnvelopeCheck.Failed("acceptance policy: ${decision.reason}")
                 }
@@ -382,6 +399,11 @@ class InboxGossip private constructor(
         }
     }
 }
+
+/** Holder for the live acceptance policy; read once per message. */
+internal class AcceptanceRef(
+    @Volatile var value: MailAcceptanceCheck?,
+)
 
 /** Result of [InboxGossip.checkEnvelope]. */
 internal sealed interface EnvelopeCheck {

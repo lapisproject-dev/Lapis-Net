@@ -147,6 +147,22 @@ async function loadNodeStatus() {
       status.acceptanceGates.length === 0
         ? "No rule active: everybody is accepted."
         : "Active: " + status.acceptanceGates.join(", ");
+    document.getElementById("node-status-mail-acceptance-text").textContent =
+      status.mailAcceptanceGates.length === 0
+        ? "No rule active: all mail is accepted."
+        : "Active: " + status.mailAcceptanceGates.join(", ");
+    const blocked = status.mailBlocked;
+    const labels = {
+      "veritas-below-threshold": "no Veritas path",
+      "karma-below-threshold": "Karma too low",
+      "all-active-gates-failed": "several rules",
+      "policy": "other",
+    };
+    document.getElementById("node-status-mail-blocked").textContent =
+      !blocked || blocked.total === 0
+        ? "Blocked deliveries so far: 0"
+        : "Blocked deliveries so far: " + blocked.total + " (" +
+          Object.entries(blocked.byReason).map(([k, v]) => (labels[k] || "other") + ": " + v).join(", ") + ")";
     document.getElementById("node-status-config-file").textContent = status.configFile;
   } catch (error) {
     document.getElementById("node-status-dht").textContent = "unavailable";
