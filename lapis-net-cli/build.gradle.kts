@@ -19,6 +19,9 @@ dependencies {
     // V0.9.15 - `node` subcommand: DHT directory + Madli (relay ranking/publishing).
     implementation(project(":lapis-net-directory"))
     implementation(project(":lapis-net-madli"))
+    // V0.10.0-B - `--onion-relay`: onion relay infrastructure (no user traffic is routed over it yet).
+    implementation(project(":lapis-net-onion-wire"))
+    implementation(project(":lapis-net-onion"))
 
     runtimeOnly(rootProject.libs.logback.classic)
 }

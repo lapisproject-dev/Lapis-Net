@@ -227,7 +227,10 @@ the table above, not a detail to gloss over. One clarification on the first row:
 | X25519 encryption sub-key and the X3DH handshake (Signal's Extended Triple Diffie-Hellman, reimplemented from the public specification): `PrekeyBundle`/`PrekeyBundleCodec`, `PrekeyStore` (durable one-time-prekey consumption), and the `X3dh` handshake itself. Deliberately network-free (V0.8.2). Plus the Double Ratchet itself: `DoubleRatchetSession` (forward-secret, post-compromise-secure 1:1 sessions over an HKDF root chain and HMAC symmetric chains), `RatchetMessage`/`RatchetMessageCodec`, a bounded evicting `SkippedMessageKeyStore`, and `DoubleRatchetSessionCodec` for encrypted-at-rest session persistence, including the `encodeWithKey`/`decodeWithKey` Argon2id-bypass pair `lapis-net-dm` uses for per-message persistence (V0.8.3).
 
 | `lapis-net-onion`
-| *Foundation only, not wired* into `LapisNode`, the browser or the CLI (wave V0.10.0-A, unreleased): fixed-size cell format and hardened codec, ntor-style X25519 circuit handshake, per-hop ChaCha20-Poly1305 onion layers with replay/reorder/tagging protection, relay state machine with resource limits. No network code. Provides no anonymity today; see `docs/anonymity.adoc`.
+| Foundation (wave V0.10.0-A, unreleased): fixed-size cell format and hardened codec, ntor-style X25519 circuit handshake, per-hop ChaCha20-Poly1305 onion layers with replay/reorder/tagging protection, relay state machine with resource limits, rotating onion key ring. No network code. Provides no anonymity today; see `docs/anonymity.adoc`.
+
+| `lapis-net-onion-wire`
+| *Onion relay infrastructure only* (wave V0.10.0-B, unreleased): the `/lapis/onion/1.0.0` link protocol, encrypted onion key file with rotation, signed relay descriptors (gossip and DHT), the relay service and a diagnostic circuit client. Opt-in through `lapisnet node --onion-relay=true`; no path selection, no DM, mail or call traffic over circuits, the browser is not wired. *Nothing is anonymised yet*; see `docs/anonymity.adoc`.
 
 | `lapis-net-dm`
 | The custom `/lapis/dm/1.1.0` libp2p stream protocol wiring `lapis-net-ratchet`'s X3DH/Double-Ratchet primitives into a live network path: `DmProtocol`/`DmProtocolHandler` (stream-protocol binding, the first raw-libp2p-stream parser in this codebase — length-validated-before-allocation frame decoding, slowloris/absolute-lifetime timeouts, per-peer stream cap), `DmEnvelope`/`DmEnvelopeCodec` (the outer wire frame), `DmSessionManager` (first-contact/resumed session state machine, durable session persistence, the identity-authority-safe inbound handler), and `DmStore` (in-memory-only conversation history) — online 1:1 direct messages between directly-dialable peers (V0.8.4), plus V0.8.5's offline Nabu mailbox (`MailboxPointer`/`MailboxGossip`/`MailboxPoller`/`MailboxRedeliveryScheduler`, `DmSessionManager.sendOffline`) for offline delivery via a Bitswap-fetched, periodically re-announced signed pointer.
@@ -248,6 +251,8 @@ the table above, not a detail to gloss over. One clarification on the first row:
 ----
 # headless node behind a NAT: reserves relays, uses the DHT directory (no DM, no mail)
 lapisnet node --reachability=private
+# headless node that also serves as an onion relay (infrastructure only, nothing is anonymised)
+lapisnet node --onion-relay=true
 # browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
 lapisnet-browser --reachability=private --dm-veritas-gate=true
 # mail gates (since v0.12.0, V0.9.17): off by default; mail from a sender who passes none of them is discarded

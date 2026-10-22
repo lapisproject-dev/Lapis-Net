@@ -42,6 +42,11 @@ data class NodeWiringOptions(
     val dhtFallback: Boolean = true,
     val publishRelayReliability: Boolean = false,
     val holePunching: HolePunchMode = HolePunchMode.AUTO,
+    /**
+     * V0.10.0-B: serve as an onion relay (`--onion-relay`). Off by default. Infrastructure only: no user traffic is
+     * routed over circuits yet and nothing is anonymised. The switch is consumed by the CLI node; the browser ignores it.
+     */
+    val onionRelay: Boolean = false,
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -77,12 +82,20 @@ data class NodeWiringOptions(
         const val KEY_DHT_FALLBACK = "dht-fallback"
         const val KEY_PUBLISH_RELAY_RELIABILITY = "publish-relay-reliability"
         const val KEY_HOLE_PUNCHING = "hole-punching"
+        const val KEY_ONION_RELAY = "onion-relay"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
 
         val KNOWN_KEYS: Set<String> =
-            setOf(KEY_REACHABILITY, KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY, KEY_HOLE_PUNCHING)
+            setOf(
+                KEY_REACHABILITY,
+                KEY_AUTO_RELAY,
+                KEY_DHT_FALLBACK,
+                KEY_PUBLISH_RELAY_RELIABILITY,
+                KEY_HOLE_PUNCHING,
+                KEY_ONION_RELAY,
+            )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
         fun envNameOf(key: String): String = ENV_PREFIX + key.uppercase().replace('-', '_')
@@ -105,7 +118,8 @@ data class NodeWiringOptions(
             val publish =
                 raw[KEY_PUBLISH_RELAY_RELIABILITY]?.let { parseBoolean(KEY_PUBLISH_RELAY_RELIABILITY, it) } ?: false
             val holePunching = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) } ?: HolePunchMode.AUTO
-            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching)
+            val onionRelay = raw[KEY_ONION_RELAY]?.let { parseBoolean(KEY_ONION_RELAY, it) } ?: false
+            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching, onionRelay)
         }
 
         /**
@@ -116,7 +130,8 @@ data class NodeWiringOptions(
             for ((key, value) in raw) {
                 when (key) {
                     KEY_REACHABILITY -> parseReachability(value)
-                    KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY -> parseBoolean(key, value)
+                    KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY, KEY_ONION_RELAY ->
+                        parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
                     else -> throw InvalidWiringOptionException("unknown option --$key")
                 }
@@ -193,6 +208,12 @@ data class NodeWiringOptions(
             |        Publish the relay reliability observed by this node as signed Madli vectors.
             |        Default off: older nodes reject v2 vectors as invalid and lower the gossip peer score of
             |        whoever forwards them.
+            |  --onion-relay=true|false                   [false]
+            |        Serve as an onion relay (infrastructure only). Creates a rotating onion key (kept
+            |        encrypted with the keystore passphrase, in memory only without one), announces a signed
+            |        relay descriptor (gossip, and the DHT value when --dht-fallback is on) and answers circuit
+            |        CREATE/EXTEND cells. NO user traffic is routed over circuits yet and nothing is anonymised;
+            |        the descriptor makes this node's identity and address publicly known as a relay.
             """.trimMargin()
     }
 }

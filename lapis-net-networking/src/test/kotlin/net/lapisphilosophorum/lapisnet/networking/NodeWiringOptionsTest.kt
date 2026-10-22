@@ -145,4 +145,18 @@ class NodeWiringOptionsTest :
             NodeWiringOptions.HELP_TEXT shouldContain "--hole-punching=auto|on|off"
             NodeWiringOptions.HELP_TEXT shouldContain "SO_REUSEPORT"
         }
+
+        test("onion relay: off by default, on with true, an invalid value aborts, environment name and help") {
+            resolve().onionRelay shouldBe false
+            resolve("--onion-relay=true").onionRelay shouldBe true
+            resolve("--onion-relay=false").onionRelay shouldBe false
+            shouldThrow<InvalidWiringOptionException> { resolve("--onion-relay=yes") }
+            NodeWiringOptions.envNameOf("onion-relay") shouldBe "LAPISNET_ONION_RELAY"
+            NodeWiringOptions.fromEnvironment(mapOf("LAPISNET_ONION_RELAY" to "true")) shouldBe
+                mapOf("onion-relay" to "true")
+            NodeWiringOptions.HELP_TEXT shouldContain "--onion-relay"
+            NodeWiringOptions.HELP_TEXT shouldContain "NO user traffic"
+            // the other switches are unaffected by it
+            resolve("--onion-relay=true").dhtFallback shouldBe true
+        }
     })

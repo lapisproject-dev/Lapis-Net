@@ -53,7 +53,8 @@ object DirectoryDhtValueCodec {
     private const val FLAG_PEER_RECORD = 0x01
     private const val FLAG_PREKEY_BUNDLE = 0x02
     private const val FLAG_OUTBOX = 0x04
-    private const val KNOWN_FLAGS = FLAG_PEER_RECORD or FLAG_PREKEY_BUNDLE or FLAG_OUTBOX
+    private const val FLAG_ONION_DESCRIPTOR = 0x08
+    private const val KNOWN_FLAGS = FLAG_PEER_RECORD or FLAG_PREKEY_BUNDLE or FLAG_OUTBOX or FLAG_ONION_DESCRIPTOR
     private const val PUBLIC_KEY_SIZE = 33
     private const val ED25519_PUBLIC_KEY_SIZE = 32
     private const val SIGNATURE_SIZE = 64
@@ -64,10 +65,12 @@ object DirectoryDhtValueCodec {
         val peerRecord = value.peerRecordBytes
         val bundle = value.prekeyBundleBytes
         val outbox = value.outboxEntries
+        val onionDescriptor = value.onionRelayDescriptorBytes
         val flags =
             (if (peerRecord != null) FLAG_PEER_RECORD else 0) or
                 (if (bundle != null) FLAG_PREKEY_BUNDLE else 0) or
-                (if (outbox.isNotEmpty()) FLAG_OUTBOX else 0)
+                (if (outbox.isNotEmpty()) FLAG_OUTBOX else 0) or
+                (if (onionDescriptor != null) FLAG_ONION_DESCRIPTOR else 0)
         require(outbox.size <= MAX_OUTBOX_ENTRIES_PER_VALUE) { "too many outbox entries: ${outbox.size}" }
         require(outbox.isEmpty() || 1 + outbox.sumOf { it.encodedSize() } <= MAX_OUTBOX_BYTES) {
             "outbox part exceeds $MAX_OUTBOX_BYTES bytes"
@@ -100,6 +103,14 @@ object DirectoryDhtValueCodec {
                     writeShort(payload.size)
                     write(payload)
                 }
+            }
+            // Last part, so a value WITHOUT the flag is byte-identical to what v0.12.0 wrote.
+            if (onionDescriptor != null) {
+                require(onionDescriptor.size <= OnionRelayDescriptorCodec.MAX_ENCODED_BYTES) {
+                    "onion relay descriptor is too large"
+                }
+                writeShort(onionDescriptor.size)
+                write(onionDescriptor)
             }
         }
         val bytes = out.toByteArray()
@@ -164,8 +175,25 @@ object DirectoryDhtValueCodec {
             val peerRecord = if (flags and FLAG_PEER_RECORD != 0) part() else null
             val bundle = if (flags and FLAG_PREKEY_BUNDLE != 0) part() else null
             val outbox = if (flags and FLAG_OUTBOX != 0) outboxEntries(input) else emptyList()
+            val onionDescriptor =
+                if (flags and FLAG_ONION_DESCRIPTOR != 0) {
+                    part().also {
+                        if (it.size > OnionRelayDescriptorCodec.MAX_ENCODED_BYTES) {
+                            throw MalformedDirectoryDhtValueException("onion relay descriptor too large")
+                        }
+                    }
+                } else {
+                    null
+                }
             if (input.available() > 0) throw MalformedDirectoryDhtValueException("trailing bytes")
-            return DirectoryDhtValue(identity, IdentityBinding(edKey, bindingSignature), peerRecord, bundle, outbox)
+            return DirectoryDhtValue(
+                identity,
+                IdentityBinding(edKey, bindingSignature),
+                peerRecord,
+                bundle,
+                outbox,
+                onionDescriptor,
+            )
         } catch (e: EOFException) {
             throw MalformedDirectoryDhtValueException("truncated directory value", e)
         } catch (e: IOException) {

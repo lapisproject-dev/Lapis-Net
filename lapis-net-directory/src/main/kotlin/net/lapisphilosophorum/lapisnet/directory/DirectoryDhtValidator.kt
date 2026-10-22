@@ -23,6 +23,7 @@ internal class ValidatedDirectoryEntry(
     val prekeyBundleBytes: ByteArray?,
     val publisher: PeerId,
     val outboxEntries: List<OutboxEntry>,
+    val onionDescriptor: OnionRelayDescriptor? = null,
 )
 
 /**
@@ -60,6 +61,9 @@ internal object DirectoryDhtValidator {
             null
         } catch (e: MalformedPeerRecordException) {
             logger.debug { "rejected a directory value with a malformed peer record" }
+            null
+        } catch (e: MalformedOnionRelayDescriptorException) {
+            logger.debug { "rejected a directory value with a malformed onion relay descriptor" }
             null
         } catch (e: MalformedPrekeyBundleException) {
             logger.debug { "rejected a directory value with a malformed prekey bundle" }
@@ -109,6 +113,22 @@ internal object DirectoryDhtValidator {
             if (decoded.identity != identity) return reject("prekey bundle is for another identity")
             if (decoded.notValidAfterEpochSecond >= nowEpochSecond) bundle = decoded
         }
+        var onionDescriptor: OnionRelayDescriptor? = null
+        val descriptorBytes = value.onionRelayDescriptorBytes
+        if (descriptorBytes != null) {
+            val decoded = OnionRelayDescriptorCodec.decode(descriptorBytes)
+            // identity AND binding must be those the value (hence the IPNS publisher) vouches for
+            if (decoded.identity != identity || decoded.binding != binding) {
+                return reject("onion relay descriptor is for another identity")
+            }
+            // the same complete check as on the gossip path, including TTL window and key binding
+            if (!OnionRelayDescriptor.verify(decoded, nowEpochSecond)) {
+                // an expired descriptor is dropped like any expired part; anything else is fatal
+                if (decoded.notValidAfterEpochSecond >= nowEpochSecond) return reject("onion relay descriptor invalid")
+            } else {
+                onionDescriptor = decoded
+            }
+        }
         val seen = HashSet<List<Byte>>()
         val outbox =
             value.outboxEntries.filter {
@@ -116,7 +136,9 @@ internal object DirectoryDhtValidator {
                     it.recipient != identity &&
                     seen.add(it.contentId().toList())
             }
-        if (peerRecord == null && bundle == null && outbox.isEmpty()) return reject("no valid part left")
+        if (peerRecord == null && bundle == null && outbox.isEmpty() && onionDescriptor == null) {
+            return reject("no valid part left")
+        }
         return ValidatedDirectoryEntry(
             identity,
             peerRecord,
@@ -125,6 +147,7 @@ internal object DirectoryDhtValidator {
             bundleBytes.takeIf { bundle != null },
             resolved.publisher,
             outbox,
+            onionDescriptor,
         )
     }
 

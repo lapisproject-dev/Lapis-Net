@@ -1,7 +1,6 @@
 package net.lapisphilosophorum.lapisnet.onion
 
 import io.github.oshai.kotlinlogging.KotlinLogging
-import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.X25519PrivateKey
 import net.lapisphilosophorum.lapisnet.onion.OnionConstants.MAX_HOPS
 import org.bouncycastle.util.Arrays
@@ -94,13 +93,22 @@ private class RelayCircuit(
  * Logging: counters and coarse reasons at debug only; never keys, cell contents or link metadata.
  */
 class OnionRelay(
-    private val ownBinding: OnionKeyBinding,
-    private val onionPrivate: X25519PrivateKey,
+    private val keys: OnionKeyRing,
     private val limits: OnionRelayLimits = OnionRelayLimits(),
     private val clock: Clock = Clock.systemUTC(),
     private val random: SecureRandom = SecureRandom(),
 ) : AutoCloseable {
-    private val ownId = ownBinding.relayIdDigest()
+    /** Single-key convenience constructor (wave A API): wraps the key in a one-entry ring. The relay
+     * does not own the ring, so [close] never destroys the key passed here. */
+    constructor(
+        ownBinding: OnionKeyBinding,
+        onionPrivate: X25519PrivateKey,
+        limits: OnionRelayLimits = OnionRelayLimits(),
+        clock: Clock = Clock.systemUTC(),
+        random: SecureRandom = SecureRandom(),
+    ) : this(OnionKeyRing.single(ownBinding, onionPrivate), limits, clock, random)
+
+    private val ownId = keys.relayIdDigest
     private val table = ConcurrentHashMap<CircuitKey, RelayCircuit>()
     private val byHandle = ConcurrentHashMap<Long, RelayCircuit>()
     private val pending = ConcurrentHashMap<Long, RelayCircuit>()
@@ -116,13 +124,16 @@ class OnionRelay(
     /** Test hook, invoked immediately before each X25519 handshake is attempted. */
     internal var beforeHandshake: (() -> Unit)? = null
 
-    init {
-        require(X25519KeyPair.publicKeyFor(onionPrivate) == ownBinding.onionKey) {
-            "onion private key does not match the binding"
-        }
-    }
-
     val circuitCount: Int get() = total.get()
+
+    /** `true` if at least one circuit currently uses [link] as its previous hop. */
+    fun hasCircuitsOn(link: LinkId): Boolean = (perLink[link.value]?.get() ?: 0) > 0
+
+    /** `true` if a circuit with [circuitId] currently exists on [link] (as previous or next hop). */
+    fun knowsCircuit(
+        link: LinkId,
+        circuitId: Int,
+    ): Boolean = table.containsKey(CircuitKey(link.value, circuitId))
 
     fun onCell(
         from: LinkId,
@@ -260,12 +271,16 @@ class OnionRelay(
                     return refuse(DestroyReason.PROTOCOL)
                 }
             beforeHandshake?.invoke()
+            // The ring picks the key by the CREATE's fingerprint (current or previous, never an expired
+            // one). An unknown fingerprint and a failed handshake yield the same coarse reason.
             val result =
                 try {
-                    NtorHandshake.serverRespond(body, onionPrivate, ownBinding, random)
+                    keys.withKeyFor(body.onionKeyFingerprint, clock.millis() / 1000) { b, k ->
+                        NtorHandshake.serverRespond(body, k, b, random)
+                    }
                 } catch (e: OnionHandshakeException) {
                     return refuse(DestroyReason.AUTH_FAILED)
-                }
+                } ?: return refuse(DestroyReason.AUTH_FAILED)
             val hop =
                 try {
                     RelayHopState(body.hopIndex, result.keys)

@@ -28,6 +28,7 @@ sealed interface DirectoryDhtResolution {
         val outboxEntriesDispatched: Int = 0,
         /** Of those, how many the consumer accepted as new. */
         val outboxEntriesAccepted: Int = 0,
+        val onionRelayDescriptorAccepted: Boolean = false,
     ) : DirectoryDhtResolution
 
     /** Nothing (valid) is published under the name, or the lookup failed or ran out of time. */
@@ -73,11 +74,21 @@ data class InboxDiscoveryReport(
     val throttled: Boolean,
 )
 
+/** Outcome of [DirectoryDht.discoverOnionRelays]. */
+data class OnionRelayDiscoveryReport(
+    val providersFound: Int,
+    val resolved: Int,
+    val descriptorsAccepted: Int,
+    val skipped: Int,
+    val throttled: Boolean,
+)
+
 /**
  * Outcome of [DirectoryDht.catchUp] / [refreshStale]: [attempted] identities were looked up on the
  * network, [found] of them had a valid value, [skipped] were not asked (over the cap, no peer ID
  * known, throttled, busy or out of time).
  */
+
 data class CatchUpReport(
     val attempted: Int,
     val found: Int,
@@ -113,6 +124,7 @@ class DirectoryDht internal constructor(
     private val rendezvous: RendezvousStore? = null,
     private val localIdentity: Secp256k1PublicKey? = null,
     private val outbox: DhtOutbox? = null,
+    private val onionDescriptors: OnionRelayDescriptorIndex? = null,
 ) {
     private class Attempt(
         val atNanos: Long,
@@ -155,6 +167,8 @@ class DirectoryDht internal constructor(
 
     private val discoveryLock = Any()
     private var lastDiscoveryAtNanos: Long? = null
+    private var lastOnionDiscoveryAtNanos: Long? = null
+    private var lastOnionAnnounceAtNanos: Long? = null
 
     /**
      * Registers the consumer for entries of [kind] addressed to the local identity. One per kind.
@@ -198,8 +212,13 @@ class DirectoryDht internal constructor(
         peerRecord: PeerRecord?,
         prekeyBundle: PrekeyBundle?,
         timeout: Duration = limits.defaultTimeout,
+        onionRelayDescriptor: OnionRelayDescriptor? = null,
     ): DirectoryDhtPublishResult {
-        require(peerRecord != null || prekeyBundle != null || (outbox?.size() ?: 0) > 0) { "nothing to publish" }
+        require(
+            peerRecord != null || prekeyBundle != null || onionRelayDescriptor != null || (outbox?.size() ?: 0) > 0,
+        ) {
+            "nothing to publish"
+        }
         require(identity.verifyBinding()) { "the identity's own binding does not verify" }
         val identityKey = identity.secp256k1KeyPair.publicKey
         if (peerRecord != null) {
@@ -217,15 +236,30 @@ class DirectoryDht internal constructor(
                     prekeyBundle.verifySignedPrekey(),
             ) { "the prekey bundle does not verify" }
         }
+        if (onionRelayDescriptor != null) {
+            require(
+                onionRelayDescriptor.identity == identityKey,
+            ) { "the onion relay descriptor belongs to another identity" }
+            require(onionRelayDescriptor.binding == identity.binding) {
+                "the onion relay descriptor carries another binding"
+            }
+            require(OnionRelayDescriptor.verify(onionRelayDescriptor, wallClock().epochSecond)) {
+                "the onion relay descriptor does not verify"
+            }
+        }
         val now = wallClock()
-        val directoryParts = peerRecord != null || prekeyBundle != null
+        val descriptorBytes = onionRelayDescriptor?.let { OnionRelayDescriptorCodec.encode(it) }
+        val directoryParts = peerRecord != null || prekeyBundle != null || onionRelayDescriptor != null
         val directoryOnly =
             if (directoryParts) {
+                // The descriptor is part of the fixed base size, so the outbox budget below shrinks first:
+                // outbox entries are omitted before the descriptor or the peer record ever are.
                 DirectoryDhtValue(
                     identityKey,
                     identity.binding,
                     peerRecord?.let { PeerRecordCodec.encode(it) },
                     prekeyBundle?.let { PrekeyBundleCodec.encode(it) },
+                    onionRelayDescriptorBytes = descriptorBytes,
                 )
             } else {
                 null
@@ -255,11 +289,16 @@ class DirectoryDht internal constructor(
                     peerRecord?.let { PeerRecordCodec.encode(it) },
                     prekeyBundle?.let { PrekeyBundleCodec.encode(it) },
                     selection.entries,
+                    descriptorBytes,
                 ),
             )
         val innerExpiry =
             if (directoryParts) {
-                listOfNotNull(peerRecord?.notValidAfterEpochSecond, prekeyBundle?.notValidAfterEpochSecond).min()
+                listOfNotNull(
+                    peerRecord?.notValidAfterEpochSecond,
+                    prekeyBundle?.notValidAfterEpochSecond,
+                    onionRelayDescriptor?.notValidAfterEpochSecond,
+                ).min()
             } else {
                 selection.entries.maxOf { it.notValidAfterEpochSecond }
             }
@@ -295,7 +334,9 @@ class DirectoryDht internal constructor(
                     timeout,
                 )
             lastPublishAtNanos = clock()
-            val announced = announceRendezvous(selection.entries, deadlineNanos)
+            val announced =
+                announceRendezvous(selection.entries, deadlineNanos) +
+                    announceOnionRelay(onionRelayDescriptor != null, deadlineNanos)
             return DirectoryDhtPublishResult(
                 result.acknowledged,
                 result.attempted,
@@ -383,8 +424,12 @@ class DirectoryDht internal constructor(
             entry.prekeyBundle?.let { prekeys.ingestFromDht(it, entry.prekeyBundleBytes!!) } ?: false
         // the peer record is ingested first (above): a consumer that dials the sender needs its address
         val (dispatched, accepted) = dispatchOutbox(entry)
+        val descriptorAccepted =
+            entry.onionDescriptor?.let {
+                onionDescriptors?.add(it, wallClock().epochSecond) == DescriptorIngestOutcome.ACCEPTED
+            } ?: false
         logger.debug { "directory DHT lookup for ${entry.identity.fingerprint()} found a valid value" }
-        return DirectoryDhtResolution.Found(recordAccepted, bundleAccepted, dispatched, accepted)
+        return DirectoryDhtResolution.Found(recordAccepted, bundleAccepted, dispatched, accepted, descriptorAccepted)
     }
 
     /**
@@ -467,6 +512,83 @@ class DirectoryDht internal constructor(
             }
         }
         return InboxDiscoveryReport(providers.size, resolved, accepted, skipped, throttled = false)
+    }
+
+    /**
+     * Announces this node as an onion relay under the fixed [OnionRelayRendezvous] key (at most once per
+     * `rendezvousReannounceInterval`). The key is public and the provider set is eclipse-prone: the result
+     * is a discovery HINT, never a trust anchor - every descriptor found through it is fully verified.
+     */
+    private fun announceOnionRelay(
+        hasDescriptor: Boolean,
+        deadlineNanos: Long,
+    ): Int {
+        val store = rendezvous
+        if (!hasDescriptor || !limits.rendezvousEnabled || store == null) return 0
+        val now = clock()
+        val previous = lastOnionAnnounceAtNanos
+        if (previous != null && now - previous < limits.rendezvousReannounceInterval.toNanos()) return 0
+        val remaining = deadlineNanos - clock()
+        if (remaining <= 0) return 0
+        lastOnionAnnounceAtNanos = now
+        return try {
+            if (store.provide(OnionRelayRendezvous.cid(), Duration.ofNanos(remaining)) > 0) 1 else 0
+        } catch (e: RuntimeException) {
+            logger.debug { "onion relay rendezvous announcement failed: ${e.javaClass.simpleName}" }
+            0
+        }
+    }
+
+    /**
+     * Finds onion relays WITHOUT gossip: looks up the providers of the fixed rendezvous key (at most
+     * `maxRendezvousProviders`, so one call yields at most that many relays), resolves each provider's
+     * directory value and ingests its verified descriptor into the configured index. Rate-limited by
+     * `minDiscoveryInterval`.
+     */
+    fun discoverOnionRelays(timeout: Duration = limits.defaultTimeout): OnionRelayDiscoveryReport {
+        require(!timeout.isNegative && !timeout.isZero) { "timeout must be positive" }
+        val store = rendezvous
+        check(limits.rendezvousEnabled && store != null) { "rendezvous is not enabled" }
+        check(onionDescriptors != null) { "no onion relay descriptor index configured" }
+        synchronized(discoveryLock) {
+            val last = lastOnionDiscoveryAtNanos
+            if (last != null && clock() - last < limits.minDiscoveryInterval.toNanos()) {
+                return OnionRelayDiscoveryReport(0, 0, 0, 0, throttled = true)
+            }
+            lastOnionDiscoveryAtNanos = clock()
+        }
+        val deadline = clock() + timeout.toNanos()
+        val providers =
+            try {
+                store.findProviders(
+                    OnionRelayRendezvous.cid(),
+                    limits.maxRendezvousProviders,
+                    Duration.ofNanos(timeout.toNanos() / 2),
+                )
+            } catch (e: NabuStorageException) {
+                logger.debug { "onion relay rendezvous lookup failed: ${e.javaClass.simpleName}" }
+                emptySet()
+            }
+        var resolved = 0
+        var accepted = 0
+        var skipped = 0
+        for (provider in providers.take(limits.maxRendezvousProviders)) {
+            val remaining = deadline - clock()
+            if (remaining <= 0) {
+                skipped++
+                continue
+            }
+            when (val r = resolveByPeerId(provider, Duration.ofNanos(remaining))) {
+                is DirectoryDhtResolution.Found -> {
+                    resolved++
+                    if (r.onionRelayDescriptorAccepted) accepted++
+                }
+                DirectoryDhtResolution.NotFound, DirectoryDhtResolution.Rejected -> Unit
+                DirectoryDhtResolution.NoPeerIdKnown, DirectoryDhtResolution.Busy, DirectoryDhtResolution.Throttled ->
+                    skipped++
+            }
+        }
+        return OnionRelayDiscoveryReport(providers.size, resolved, accepted, skipped, throttled = false)
     }
 
     /** Announces rendezvous provider records; failures are isolated per recipient. Called under [publishLock]. */
@@ -637,6 +759,7 @@ class DirectoryDht internal constructor(
             limits: DirectoryDhtLimits = DirectoryDhtLimits(),
             localIdentity: Secp256k1PublicKey? = null,
             outbox: DhtOutbox? = null,
+            onionDescriptorIndex: OnionRelayDescriptorIndex? = null,
         ): DirectoryDht =
             DirectoryDht(
                 NabuIpnsValueStore(storage),
@@ -646,6 +769,7 @@ class DirectoryDht internal constructor(
                 rendezvous = NabuRendezvousStore(storage),
                 localIdentity = localIdentity,
                 outbox = outbox,
+                onionDescriptors = onionDescriptorIndex,
             )
     }
 }

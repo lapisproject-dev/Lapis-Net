@@ -125,4 +125,33 @@ class LapisNetCliArgsTest :
                 0
             help.outText shouldContain "--hole-punching=auto|on|off"
         }
+
+        test("--onion-relay=true reaches the node options and is announced as infrastructure only") {
+            val s = Streams()
+            var seen: NodeWiringOptions? = null
+            runCatching {
+                runCli(
+                    listOf("node", "--onion-relay=true"),
+                    s.out,
+                    s.err,
+                    awaitShutdown = {},
+                    startNode = {
+                        seen = it
+                        error("stop here")
+                    },
+                    demo = { error("no demo") },
+                )
+            }
+            seen!!.onionRelay shouldBe true
+            val bad = Streams()
+            runCli(
+                listOf("node", "--onion-relay=maybe"),
+                bad.out,
+                bad.err,
+                startNode = ::neverStart,
+                demo = {},
+            ) shouldBe
+                2
+            bad.errText shouldContain "onion-relay"
+        }
     })

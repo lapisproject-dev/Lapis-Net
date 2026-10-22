@@ -4,11 +4,13 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
+import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
 import net.lapisphilosophorum.lapisnet.madli.CachedVeritasObserverWeight
 import net.lapisphilosophorum.lapisnet.madli.DailyRelayReliabilityPublication
 import net.lapisphilosophorum.lapisnet.madli.MadliGossip
@@ -21,6 +23,8 @@ import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSuperviso
 import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
+import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import java.nio.file.Files
@@ -35,6 +39,9 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toKotlinDuration
 
 private val logger = KotlinLogging.logger {}
+
+/** File name of the (encrypted) onion key file inside the node's data directory. */
+private const val ONION_KEY_FILE = "onion-relay.onionkeys"
 
 /** Validity of the record a headless node publishes; it is refreshed long before. */
 private const val HEADLESS_RECORD_TTL_SECONDS = 24L * 3600
@@ -52,6 +59,7 @@ internal class HeadlessNode private constructor(
     val options: NodeWiringOptions,
     val storage: NabuStorage,
     val directoryDht: DirectoryDht?,
+    val onionWire: OnionWire,
     val madliGossip: MadliGossip?,
     val autoRelaySelector: RelayAutoSelector?,
     val relayReliabilityJob: NodeServiceSupervisor.PeriodicJob?,
@@ -86,6 +94,8 @@ internal class HeadlessNode private constructor(
             maintenanceInterval: Duration = 60.seconds,
             maintenanceInitialDelay: Duration = 5.seconds,
             selfRecordCheckInterval: Duration = 30.seconds,
+            onionWireConfig: OnionWireConfig = OnionWireConfig(relayMode = options.onionRelay),
+            onionKeyPassphrase: () -> CharArray? = ::resolveKeystorePassphrase,
         ): HeadlessNode {
             Files.createDirectories(dataDirectory)
             val rollback = mutableListOf<() -> Unit>()
@@ -114,18 +124,51 @@ internal class HeadlessNode private constructor(
                 val supervisor = NodeServiceSupervisor("lapis-cli-node")
                 rollback += { supervisor.stopAll() }
 
+                // V0.10.0-B: the descriptor index and its gossip are always attached (bounded, read-mostly); the relay
+                // service (key file, protocol handler, descriptor) only with --onion-relay.
+                val passphrase = if (onionWireConfig.relayMode) onionKeyPassphrase() else null
+                val onionWire =
+                    try {
+                        OnionWire.attach(
+                            node,
+                            identity,
+                            onionWireConfig,
+                            pubsub,
+                            peerDirectory,
+                            supervisor,
+                            dataDirectory.resolve(ONION_KEY_FILE),
+                            passphrase,
+                        )
+                    } finally {
+                        passphrase?.fill('\u0000')
+                    }
+                rollback += { runCatching { onionWire.close() } }
+
                 var directoryDht: DirectoryDht? = null
                 if (options.dhtFallback) {
-                    val dht = DirectoryDht.attach(storage, peerDirectory, prekeys, directoryDhtLimits)
+                    val dht =
+                        DirectoryDht.attach(
+                            storage,
+                            peerDirectory,
+                            prekeys,
+                            directoryDhtLimits,
+                            onionDescriptorIndex = onionWire.descriptors,
+                        )
                     directoryDht = dht
                     supervisor.launchPeriodic(
                         "dht-maintenance",
                         interval = maintenanceInterval,
                         jitter = (maintenanceInterval.inWholeMilliseconds / 6).milliseconds,
                         initialDelay = maintenanceInitialDelay,
-                    ) { runCatching { dht.refreshStale() }.onFailure { if (it is InterruptedException) throw it } }
+                    ) {
+                        runCatching { dht.refreshStale() }.onFailure { if (it is InterruptedException) throw it }
+                        // find relays without gossip (rate-limited by the DHT limits)
+                        runCatching { dht.discoverOnionRelays() }.onFailure { if (it is InterruptedException) throw it }
+                    }
                 }
 
+                // The DHT value (one IPNS name per node) is written by this publisher only, so the relay descriptor
+                // is handed to it rather than published separately - a second writer would overwrite the peer record.
                 val publisher =
                     HeadlessSelfPublisher(
                         identity,
@@ -133,6 +176,7 @@ internal class HeadlessNode private constructor(
                         peerDirectory,
                         directoryDht,
                         directoryDhtLimits.minRepublishInterval.toKotlinDuration(),
+                        descriptorProvider = onionWire::currentDescriptor,
                     )
                 publisher.tick(includeDht = false)
                 supervisor.launchPeriodic(
@@ -180,6 +224,7 @@ internal class HeadlessNode private constructor(
                 // Layers below the supervised parts, stopped in reverse attach order after them.
                 val closers =
                     listOf<() -> Unit>(
+                        { onionWire.close() },
                         { prekeys.stop() },
                         { peerDirectory.stop() },
                         { veritas.stop() },
@@ -191,6 +236,7 @@ internal class HeadlessNode private constructor(
                     options,
                     storage,
                     directoryDht,
+                    onionWire,
                     madli,
                     selector,
                     publishJob,
@@ -218,7 +264,10 @@ internal class HeadlessSelfPublisher(
     private val minDhtAttemptInterval: Duration,
     private val maxInterval: Duration = 6.hours,
     private val clockMillis: () -> Long = System::currentTimeMillis,
+    private val descriptorProvider: () -> OnionRelayDescriptor? = { null },
 ) {
+    private var dhtDescriptorSequence: Long? = null
+
     private var gossipAddresses: Set<String>? = null
     private var gossipAt: Long? = null
     private var dhtAddresses: Set<String>? = null
@@ -244,11 +293,16 @@ internal class HeadlessSelfPublisher(
     fun tick(includeDht: Boolean = true) {
         val now = clockMillis()
         val current = addresses().map { it.toString() }.toSet()
+        val descriptor = descriptorProvider()
         val gossipDue = gossipAddresses != current || elapsed(gossipAt, now, maxInterval)
         val dhtDue =
             includeDht &&
                 directoryDht != null &&
-                (dhtAddresses != current || elapsed(dhtDoneAt, now, maxInterval)) &&
+                (
+                    dhtAddresses != current ||
+                        elapsed(dhtDoneAt, now, maxInterval) ||
+                        descriptor?.sequenceNumber != dhtDescriptorSequence
+                ) &&
                 elapsed(dhtAttemptAt, now, minDhtAttemptInterval)
         if (!gossipDue && !dhtDue) return
         val nowSeconds = Instant.ofEpochMilli(now).epochSecond
@@ -271,10 +325,11 @@ internal class HeadlessSelfPublisher(
                 dhtAttemptAt = now
                 dhtAttempts++
                 try {
-                    val result = dht.publishOwn(identity, record, null)
+                    val result = dht.publishOwn(identity, record, null, onionRelayDescriptor = descriptor)
                     // no acknowledging DHT peer (e.g. empty routing table) = held locally only: retry later
                     if (!result.skippedByRateLimit && result.acknowledged > 0) {
                         dhtAddresses = current
+                        dhtDescriptorSequence = descriptor?.sequenceNumber
                         dhtDoneAt = now
                         dhtPublications++
                     }

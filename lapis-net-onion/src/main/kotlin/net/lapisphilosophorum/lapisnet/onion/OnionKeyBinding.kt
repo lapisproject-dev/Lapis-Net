@@ -59,6 +59,10 @@ class OnionKeyBinding(
     companion object {
         const val DOMAIN_TAG = ONION_KEY_DOMAIN_TAG
 
+        /** The relay-id digest of [identity] without needing a binding (same value as [relayIdDigest]). */
+        fun relayIdDigestOf(identity: Secp256k1PublicKey): ByteArray =
+            domainSeparatedDigest(RELAY_ID_DOMAIN_TAG, identity.bytes)
+
         private fun digest(
             identity: Secp256k1PublicKey,
             onionKey: X25519PublicKey,

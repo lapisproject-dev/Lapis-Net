@@ -51,9 +51,16 @@
 // two/three-cap-index machinery rather than duplicating it inside lapis-net-ratchet (which is
 // deliberately network-free - see that module's own build.gradle.kts). `api` because PrekeyBundle
 // appears directly in PrekeyBundleGossip.announce()/lookup()'s public signatures.
+//
+// V0.10.0-B addition: api(lapis-net-onion). OnionRelayDescriptor (a relay's signed, enumerable
+// advertisement of its onion key) belongs with the directory data, like PeerRecord, and
+// DirectoryDht / the gossip validators must know the type. No cycle: lapis-net-onion depends only on
+// lapis-net-core and lapis-net-identity and stays free of any network code (a security property, see
+// docs/architecture.adoc). OnionKeyBinding appears in OnionRelayDescriptor's public signatures, hence `api`.
 dependencies {
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
+    api(project(":lapis-net-onion"))
     api(project(":lapis-net-ratchet"))
     api(project(":lapis-net-storage"))
     api(project(":lapis-net-networking"))

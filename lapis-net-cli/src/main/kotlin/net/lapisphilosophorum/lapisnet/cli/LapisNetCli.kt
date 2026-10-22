@@ -118,13 +118,16 @@ internal fun runCli(
         out.println(
             "  reachability=${options.reachability.name.lowercase()} auto-relay=${options.autoRelay} " +
                 "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability} " +
-                "hole-punching=${options.holePunching.name.lowercase()}" +
+                "hole-punching=${options.holePunching.name.lowercase()} onion-relay=${options.onionRelay}" +
                 if (headless.node.holePunching != null) " (active)" else "",
         )
         if (options.dhtFallback) {
             out.println(
                 "  note: DHT lookups reveal query timing and key interest to DHT peers - disable with --dht-fallback=false",
             )
+        }
+        if (options.onionRelay) {
+            out.println("  onion relay: infrastructure only, no traffic is anonymised")
         }
         out.println("Press Ctrl+C to stop.")
         awaitShutdown(headless::stop)
@@ -140,17 +143,48 @@ private fun lapisnetHome(): Path =
     )
 
 private fun startDefaultHeadlessNode(options: NodeWiringOptions): HeadlessNode {
-    val repository = FileIdentityRepository(defaultIdentityDirectory(), warningPassphraseProvider())
-    val identity = repository.loadDefault() ?: repository.generateAndSave()
-    val bootstrap = BootstrapConfig.resolve()
-    val listen = BootstrapConfig.resolveListenAddress()
-    return HeadlessNode.start(
-        options = options,
-        identity = identity,
-        bootstrapPeers = bootstrap,
-        listenAddress = listen,
-        dataDirectory = lapisnetHome().resolve("cli-node-storage"),
-    )
+    // The passphrase is asked for once and reused for the identity keystore and the onion key file (--onion-relay):
+    // a second prompt could be mistyped on first creation and lock the node out for good.
+    val shared = SharedPassphrase(warningPassphraseProvider())
+    try {
+        val repository = FileIdentityRepository(defaultIdentityDirectory(), shared)
+        val identity = repository.loadDefault() ?: repository.generateAndSave()
+        val bootstrap = BootstrapConfig.resolve()
+        val listen = BootstrapConfig.resolveListenAddress()
+        return HeadlessNode.start(
+            options = options,
+            identity = identity,
+            bootstrapPeers = bootstrap,
+            listenAddress = listen,
+            dataDirectory = lapisnetHome().resolve("cli-node-storage"),
+            onionKeyPassphrase = shared::get,
+        )
+    } finally {
+        shared.wipe()
+    }
+}
+
+/** Resolves the passphrase from [delegate] at most once; every [get] returns a fresh copy (callers zero theirs). */
+private class SharedPassphrase(
+    private val delegate: PassphraseProvider,
+) : PassphraseProvider {
+    private var resolved = false
+    private var value: CharArray? = null
+
+    @Synchronized
+    override fun get(): CharArray? {
+        if (!resolved) {
+            value = delegate.get()
+            resolved = true
+        }
+        return value?.copyOf()
+    }
+
+    @Synchronized
+    fun wipe() {
+        value?.fill('\u0000')
+        value = null
+    }
 }
 
 /** Blocks the calling thread until the JVM receives SIGINT/SIGTERM; [stop] runs inside the shutdown hook. */

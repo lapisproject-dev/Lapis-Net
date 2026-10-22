@@ -25,6 +25,7 @@ class DirectoryDhtValue(
     peerRecordBytes: ByteArray?,
     prekeyBundleBytes: ByteArray?,
     outboxEntries: List<OutboxEntry> = emptyList(),
+    onionRelayDescriptorBytes: ByteArray? = null,
 ) {
     /** The outbox entries (an immutable copy). */
     val outboxEntries: List<OutboxEntry> = outboxEntries.toList()
@@ -38,9 +39,22 @@ class DirectoryDhtValue(
     /** The encoded prekey bundle, or `null` (a fresh copy on every access). */
     val prekeyBundleBytes: ByteArray? get() = storedPrekeyBundle?.copyOf()
 
+    private val storedOnionDescriptor: ByteArray? = onionRelayDescriptorBytes?.copyOf()
+
+    /** Encoded [OnionRelayDescriptor] of a relay node (V0.10.0-B), or null. */
+    val onionRelayDescriptorBytes: ByteArray? get() = storedOnionDescriptor?.copyOf()
+
     init {
-        require(storedPeerRecord != null || storedPrekeyBundle != null || outboxEntries.isNotEmpty()) {
-            "a directory value carries a peer record, a prekey bundle or outbox entries"
+        require(
+            storedPeerRecord != null ||
+                storedPrekeyBundle != null ||
+                outboxEntries.isNotEmpty() ||
+                storedOnionDescriptor != null,
+        ) {
+            "a directory value carries a peer record, a prekey bundle, outbox entries or an onion relay descriptor"
+        }
+        require(storedOnionDescriptor == null || storedOnionDescriptor.isNotEmpty()) {
+            "onion relay descriptor bytes must not be empty"
         }
         require(storedPeerRecord == null || storedPeerRecord.isNotEmpty()) { "peer record bytes must not be empty" }
         require(storedPrekeyBundle == null || storedPrekeyBundle.isNotEmpty()) {
@@ -54,7 +68,8 @@ class DirectoryDhtValue(
             binding == other.binding &&
             (storedPeerRecord?.contentEquals(other.storedPeerRecord) ?: (other.storedPeerRecord == null)) &&
             (storedPrekeyBundle?.contentEquals(other.storedPrekeyBundle) ?: (other.storedPrekeyBundle == null)) &&
-            outboxEntries == other.outboxEntries
+            outboxEntries == other.outboxEntries &&
+            (storedOnionDescriptor?.contentEquals(other.storedOnionDescriptor) ?: (other.storedOnionDescriptor == null))
 
     override fun hashCode(): Int {
         var result = identity.hashCode()
@@ -62,10 +77,12 @@ class DirectoryDhtValue(
         result = 31 * result + (storedPeerRecord?.contentHashCode() ?: 0)
         result = 31 * result + (storedPrekeyBundle?.contentHashCode() ?: 0)
         result = 31 * result + outboxEntries.hashCode()
+        result = 31 * result + (storedOnionDescriptor?.contentHashCode() ?: 0)
         return result
     }
 
     override fun toString(): String =
         "DirectoryDhtValue(identity=${identity.fingerprint()}, peerRecord=${storedPeerRecord != null}, " +
-            "prekeyBundle=${storedPrekeyBundle != null}, outboxEntries=${outboxEntries.size})"
+            "prekeyBundle=${storedPrekeyBundle != null}, outboxEntries=${outboxEntries.size}, " +
+            "onionDescriptor=${storedOnionDescriptor != null})"
 }

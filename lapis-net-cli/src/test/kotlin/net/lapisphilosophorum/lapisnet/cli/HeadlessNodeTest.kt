@@ -13,7 +13,8 @@ import java.nio.file.Files
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-private val OWN_THREADS = listOf("lapis-cli-node-worker", "lapis-cli-node-stop", "lapis-relay-autoselect")
+private val OWN_THREADS =
+    listOf("lapis-cli-node-worker", "lapis-cli-node-stop", "lapis-relay-autoselect", "lapis-net-onion")
 
 private fun ownThreads(): List<String> =
     Thread
@@ -23,13 +24,18 @@ private fun ownThreads(): List<String> =
             t.isAlive && OWN_THREADS.any { t.name.startsWith(it) }
         }.map { it.name }
 
-private fun start(options: NodeWiringOptions): HeadlessNode =
+private fun start(
+    options: NodeWiringOptions,
+    dataDirectory: java.nio.file.Path = Files.createTempDirectory("headless-node-test"),
+    passphrase: () -> CharArray? = { null },
+): HeadlessNode =
     HeadlessNode.start(
         options = options,
         identity = DualKeyIdentity.generate(),
         bootstrapPeers = emptyList(),
         listenAddress = Multiaddr("/ip4/127.0.0.1/tcp/0"),
-        dataDirectory = Files.createTempDirectory("headless-node-test"),
+        dataDirectory = dataDirectory,
+        onionKeyPassphrase = passphrase,
         autoRelayConfig = AutoRelayConfig(allowNonPublicCandidateAddresses = true),
         directoryDhtLimits = DirectoryDhtLimits(),
         maintenanceInterval = 200.milliseconds,
@@ -104,6 +110,54 @@ class HeadlessNodeTest :
                 val deadline = System.nanoTime() + 15_000_000_000L
                 while (System.nanoTime() < deadline && ownThreads().size > baseline) Thread.sleep(100)
                 ownThreads().size shouldBe baseline
+            }
+        }
+
+        test(
+            "onion relay off: the descriptor index exists, but no relay service, key file, descriptor or onion thread",
+        ).config(
+            timeout = 90.seconds,
+        ) {
+            val dir = Files.createTempDirectory("headless-onion-off")
+            val node = start(NodeWiringOptions.resolve(emptyMap()), dir)
+            try {
+                val wire = node.onionWire
+                wire.relayService.shouldBeNull()
+                wire.currentDescriptor().shouldBeNull()
+                Files.exists(dir.resolve("onion-relay.onionkeys")) shouldBe false
+                ownThreads().none { it.startsWith("lapis-net-onion") } shouldBe true
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("onion relay on with a passphrase: encrypted key file, announced descriptor, clean stop").config(
+            timeout = 120.seconds,
+        ) {
+            val dir = Files.createTempDirectory("headless-onion-on")
+            val node = start(NodeWiringOptions.resolve(mapOf("onion-relay" to "true")), dir) { "pw".toCharArray() }
+            try {
+                val wire = node.onionWire
+                wire.relayService.shouldNotBeNull().relayModeActive shouldBe true
+                val d = wire.currentDescriptor().shouldNotBeNull()
+                wire.descriptors.current(d.identity, System.currentTimeMillis() / 1000) shouldBe d
+                Files.exists(dir.resolve("onion-relay.onionkeys")) shouldBe true
+            } finally {
+                node.stop()
+            }
+            node.onionWire.relayService!!.relayModeActive shouldBe false
+        }
+
+        test(
+            "onion relay on without a passphrase runs with in-memory keys and writes no file",
+        ).config(timeout = 90.seconds) {
+            val dir = Files.createTempDirectory("headless-onion-ephemeral")
+            val node = start(NodeWiringOptions.resolve(mapOf("onion-relay" to "true")), dir)
+            try {
+                node.onionWire.currentDescriptor().shouldNotBeNull()
+                Files.exists(dir.resolve("onion-relay.onionkeys")) shouldBe false
+            } finally {
+                node.stop()
             }
         }
     })

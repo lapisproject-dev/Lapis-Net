@@ -1,16 +1,16 @@
-= Traffic anonymisation: design and foundation (wave V0.10.0-A)
+= Traffic anonymisation: design, foundation and wire integration (waves V0.10.0-A and V0.10.0-B)
 :toc:
 
 == Status
 
-*Design and cryptographic foundation only (wave V0.10.0-A, unreleased). Nothing in this document is active in any running node.* The module `lapis-net-onion` exists, is tested, and is not wired into `LapisNode`, the browser or the CLI. No byte of Lapis Net traffic travels through a circuit today; IP addresses remain visible to peers and to the directory.
+*Wave B (wire integration, unreleased): the infrastructure is wired, no user traffic uses it, nothing is anonymised.* `lapis-net-onion` (wave A) holds the cryptographic foundation; the new module `lapis-net-onion-wire` (wave B) carries cells over a libp2p stream, keeps a relay's onion keys, publishes relay descriptors and, only with `--onion-relay=true`, lets a node act as a relay. There is no path selection, no application (DM, mail, call, browser) sends anything over a circuit, and the browser is not wired at all. IP addresses remain visible to peers and to the directory.
 
 [WARNING]
 ====
 *What this wave does not give you.* It provides no anonymity. It provides audited-by-our-own-pipeline building blocks (cell format, ntor-style handshake, onion layering, a relay state machine with resource limits) and a written threat model. Several leaks listed below must be closed before anyone may claim anonymity for DM, mail or call signalling. No external cryptographic review has taken place.
 ====
 
-`V0.10.0-A` is a wave identifier, not a release: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
+`V0.10.0-A` and `V0.10.0-B` are wave identifiers, not releases: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
 
 Diagram sources are committed as kUML; GitHub does not render the `[kuml]` blocks (the rendering pipeline is not wired, see `architecture.adoc`, section Diagrams).
 
@@ -170,7 +170,7 @@ A circuit lives at most 10 minutes (relay-enforced by a sweep) or 2^32 cells per
 
 === Link encryption
 
-The libp2p Noise session protects the link only: cells will travel over a dedicated stream `/lapis/onion/1.0.0` (wave B), hiding circuit ids and commands from an ISP. The onion layers themselves are ntor plus AEAD, independent of Noise.
+The libp2p Noise session protects the link only: cells travel over a dedicated stream `/lapis/onion/1.0.0` (wave B, see below), hiding circuit ids and commands from an ISP. The onion layers themselves are ntor plus AEAD, independent of Noise.
 
 [kuml, onion-circuit-state, svg]
 ----
@@ -238,20 +238,107 @@ Running a relay is opt-in per node and can be switched off. Relay reliability wi
 
 == Per-node switch
 
-The feature is meant to be part of the protocol core and switchable off per node: a configuration option such as `--anonymity=on|off`. *The name and the default are open*; the decision falls in wave E.
+The feature is meant to be part of the protocol core and switchable off per node: a configuration option such as `--anonymity=on|off`. *The name and the default are open*; the decision falls in wave E. Until then the only switch is `--onion-relay=true|false` (default off), which makes a node serve as an infrastructure relay and nothing else.
+
+== Wire integration (wave V0.10.0-B)
+
+=== Module boundary
+
+* `lapis-net-onion` stays free of network code. It only gained `OnionKeyRing` (the current plus the previous onion key during a rotation overlap, with a read/write lock so a scalar is never zeroised while an X25519 operation uses it), a constructor of `OnionRelay` that takes such a ring (the old single-key constructor remains), and the opt-in marker `ExperimentalOnionApi`.
+* `lapis-net-directory` depends on `lapis-net-onion` (no cycle: onion knows only core and identity). The descriptor belongs to the directory data, like `PeerRecord`.
+* `lapis-net-onion-wire` (new) depends on onion, networking, directory and identity. It could not live in `lapis-net-networking`: that would make networking depend on onion and directory, and directory already depends on networking. Pattern as in `lapis-net-dm`: the module owns a `StrictProtocolBinding`; the handler is registered on the host only in relay mode.
+
+[cols="2,3"]
+|===
+| Module | Depends on
+| `lapis-net-onion` | core, identity (no network code)
+| `lapis-net-directory` | onion (new), networking, storage, ratchet, identity
+| `lapis-net-onion-wire` (new) | onion, networking, directory, identity
+| `lapis-net-cli` | onion-wire (new), directory, networking, ...
+|===
+
+=== Stream protocol `/lapis/onion/1.0.0`
+
+Every cell is exactly 1024 bytes on the stream. There is *no length field*: the frame decoder cuts at 1024 bytes, so a frame size can never be attacker-chosen (the off-by-length class of bug found in the length-prefixed DM codec in 2026-08 cannot occur). A started frame that does not complete within the handshake window (10 s) closes the link (slowloris); an inbound link must deliver a first cell within the same window; the read-idle timeout is 5 minutes. Each link has a cell rate limit (4000 cells/s) and a write-queue cap (256 cells, about 256 KiB): exceeding either closes the link, nothing is ever buffered without bound. Deliberate simplification: back-pressure does not propagate to the previous hop's link (no coupling of circuits, no deadlock); an overfull link is closed and the circuits on it die.
+
+Links are limited to 64 in total (reserved with a compare-and-set loop before a stream is accepted) and to 2 inbound links per remote peer. A quarter of the slots (`reservedOutboundLinks`, `maxLinks/4`) is reserved for outbound links, so idle inbound links can never prevent a relay from opening the link of its own EXTEND. An inbound link that carries no circuit is closed after 30 s (`inboundIdleWithoutCircuitTimeout`) unless it keeps delivering useful cells: only a cell processed on an existing circuit or an accepted CREATE counts as activity; PADDING and cells (RELAY, DESTROY, CREATED) for unknown circuit ids do not. A link can be reused in either direction (an inbound link carries an extend to the same peer; the remote peer id always comes from the Noise-authenticated connection, never from payload bytes), and concurrent dials to one peer share one dial. Link ids are random 64-bit values; the mapping from peer to link exists only inside the manager and is never logged. A Circuit Relay v2 connection may carry a link, but a CR-v2 relay is not an onion hop.
+
+=== Onion keys: persistence and rotation
+
+A relay's onion key lives 7 days; after 4 days a new key is generated and the old one stays valid as the `previous` key for the remaining 3 days (the overlap), so circuits built against a not-yet-republished descriptor still succeed. Persistence (`<data dir>/onion-relay.onionkeys`) is encrypted with the keystore passphrase: AES-256-GCM, key from Argon2id (64 MiB, 3 iterations), fresh random salt and nonce for every write, the header including the identity public key is the associated data, so the file is bound to its identity. The write is atomic (`0600` temp file, `fsync`, atomic move), the directory `0700`. Loading verifies every key binding; an expired key is dropped, a manipulated or foreign file, a wrong passphrase or out-of-range KDF parameters make the relay mode refuse to start (the message names the path, never any content). Without a keystore passphrase the keys exist only in memory (a warning is logged) and are lost on restart. The last used descriptor sequence number is persisted too; after a data loss the sequence restarts at the current epoch second, so peers do not reject new descriptors as replays.
+
+=== Relay descriptor
+
+`OnionRelayDescriptor` is a relay's signed, publicly enumerable advertisement: identity, its libp2p transport key (`IdentityBinding` plus an Ed25519 possession proof with its own domain tag, so an identity cannot point at a stranger's peer id), the `OnionKeyBinding`, a sequence number and a validity of at most 24 hours (never beyond the onion key). Fixed 379-byte encoding, no length field, exact length checked first, a reserved family byte that must be zero (families are not part of this wave). `PeerCapability` gets no new bit, because v0.12.0 readers reject unknown bits; the descriptor alone signals the relay property.
+
+* *Gossip* topic `LapisNet:onion-relay-descriptor-gossip:v1`: size check, decoding and an index pre-check (duplicates, replays and stale sequence numbers are `IGNORE` and cost no budget), then a per-author (6/min) and a global (60/min) rate limit whose excess is `IGNORE` (an honest forwarder must not be penalised), then full verification; invalid is `REJECT`, duplicates, replays and capacity refusals are `IGNORE`. Logging has counters only: no peer id, no identity, no bytes.
+* *Index* (`OnionRelayDescriptorIndex`): one current descriptor per identity, strictly increasing sequence numbers, high-water marks that survive eviction (bounded LRU), equivocation at the same sequence is ignored, capacity 1024; a full index never evicts a valid entry for a stranger.
+* *Known limitation (Sybil):* identities are free, so an attacker can sign valid descriptors with fresh keys. About 61 such descriptors per minute exhaust the global budget at every node (honest new or rotated descriptors are then ignored), and about 17 minutes of this fill the index to its capacity of 1024, after which the attacker holds it permanently by refreshing, because a full index never evicts and updates of tracked identities are always accepted. Descriptors with random signatures only exhaust the budget at direct neighbours (REJECT is not forwarded, gossip scoring penalises the sender). Admission is not bound to a cost yet; planned mitigations are a cost per index slot (known peer record or DHT presence, proof of work, or Madli weight) or a fair per-identity or per-mesh-peer budget instead of one global bucket.
+* *DHT fallback:* the descriptor is an optional part (flag `0x08`) of the node's existing directory value, because one Ed25519 key has exactly one IPNS name. It is verified with the same function as on the gossip path and must belong to the value's identity and binding. Additionally relays announce themselves as providers under the fixed key `LapisNet:onion-relays:v1` and `discoverOnionRelays` resolves the providers; this key is public, its provider set is eclipse-prone, and a result is a hint only (every descriptor is fully verified). If peer record, prekey bundle and descriptor together exceed the value limit, outbox entries are dropped first, never the descriptor or the peer record.
+
+[kuml, onion-extend-lookup, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Extend through a relay descriptor") {
+    val client = lifeline(name = "Client")
+    val guard = lifeline(name = "Guard relay")
+    val index = lifeline(name = "Descriptor index")
+    val next = lifeline(name = "Next relay")
+
+    message(from = client, to = guard, label = "EXTEND (relay id digest, CREATE body)")
+    message(from = guard, to = index, label = "lookup relay id digest")
+    reply(from = index, to = guard, label = "verified descriptor or none")
+    message(from = guard, to = next, label = "reuse or open link, then CREATE")
+    reply(from = next, to = guard, label = "CREATED")
+    reply(from = guard, to = client, label = "EXTENDED")
+}
+----
+
+=== Relay mode
+
+`--onion-relay=true` (default off). Off: no protocol handler is registered (a dial of `/lapis/onion/1.0.0` fails multistream negotiation), no onion key is created, no descriptor is published, no key file exists. The descriptor index and its gossip are attached on every CLI node (bounded, read-mostly) so a node can later choose relays. On: the node answers CREATE/EXTEND, publishes its descriptor immediately, re-announces it every 6 hours (and at once after a rotation) and checks the rotation every hour; the DHT copy is written by the node's single IPNS writer (`HeadlessSelfPublisher`), which receives the descriptor, because a second writer would overwrite the peer record.
+
+An EXTEND is executed only towards a relay that has a verified descriptor in the local index and never with a client-supplied link specifier (a non-empty specifier is refused in this wave), so an extend cannot make a relay connect to an arbitrary host. There is no exit service: DATA delivered to a relay is answered with END. A relay's own link cap, circuit cap (1024), creation rates and cell rates apply; pending extends are bounded and time out after 10 seconds.
+
+The relay quality tracker is local and bounded (1024 identities, day buckets, 7 days). It counts extend attempts, reachable links and early destroys with `PROTOCOL` or `AUTH_FAILED` per target relay. It is never published, there is no MadliGossip connection, and it cannot attribute a failure to a specific hop; turning it into Madli metrics is wave E.
+
+=== Assumptions awaiting confirmation
+
+These values and names were chosen by the implementation and must be confirmed:
+
+* *Assumption, confirmation required:* the per-node switch in this wave is only `--onion-relay` (default off); the name and default of the later `--anonymity=on|off` switch remain open (wave E).
+* *Assumption, confirmation required:* at least 3 hops in the production path (not part of this wave; the technical maximum is 5).
+* *Assumption, confirmation required:* ChaCha20-Poly1305 stays the hop cipher.
+* *Assumption, confirmation required:* time and limit constants: onion key 7 days, rotation after 4 days, descriptor TTL 24 hours, republish every 6 hours, 1024 circuits and 64 links per relay, 10 s handshake and extend timeouts.
+* *Assumption, confirmation required:* flag `0x08` in the DHT value. A relay node's DHT value is unreadable for v0.12.0 nodes (they reject the whole value, including the peer record on the DHT path); gossip is unaffected and relay mode is opt-in. Not verified against real v0.12.0 nodes.
+* *Assumption, confirmation required:* without a keystore passphrase the relay runs with in-memory keys (alternative: refuse to start).
+* *Assumption, confirmation required:* every CLI node attaches the descriptor index and gossip (alternative: relay nodes only).
+* *Assumption, confirmation required:* relay discovery through the public provider key `LapisNet:onion-relays:v1` is included in the CLI node (alternative: postpone to wave E).
+
+=== Honest limits of wave B
+
+* A relay's IP address and identity are publicly linked by its descriptor; the descriptor makes the set of relays enumerable. That is inherent to a directory-based design and is not hidden.
+* The rendezvous provider key is eclipse-prone; its provider list is capped at 8 per lookup.
+* Quality values are local and link-level only.
+* Not verified: any real NAT or internet topology, anything against real v0.12.0 nodes, any external cryptographic review. Multi-node tests run on loopback.
+* Zeroisation of key material covers the arrays this code owns, not copies the JVM or BouncyCastle may hold.
+* No anonymity and no user traffic: the client-side circuit API is marked `ExperimentalOnionApi` (an opt-in at compile time) and is meant for tests and diagnostics.
 
 == What the foundation implements
 
 `lapis-net-onion` (pure crypto and state, zero network dependencies): `OnionConstants`, `Cell`/`CellCodec` and the CREATE/CREATED/DESTROY body codecs, `RelayMessageCodec`/`ExtendPayloadCodec`, `OnionKeyBinding`, `NtorHandshake`, `CircuitHopKeys`, `HopCipher`, `OnionLayerCrypto` (`ClientCircuit`, `RelayHopState`), `OnionRelay` (a pure state machine returning actions) with `OnionRelayLimits`, and `ClientCircuitBuilder`. Resource bounds: CREATE rate limits per link and globally before any X25519 work, hard circuit caps reserved with a compare-and-set loop, no per-circuit queues, a per-circuit cell rate, a lifetime sweep, bounded pending extends. Roughly 1 KiB of memory per circuit.
 
-Honest limits: zeroisation covers the arrays this code owns, not copies the JVM or BouncyCastle may hold; no network path exists; the handshake test vector is self-generated; no external review.
+Honest limits: zeroisation covers the arrays this code owns, not copies the JVM or BouncyCastle may hold; the handshake test vector is self-generated; no external review.
+
+`lapis-net-onion-wire` (wave B, unreleased) adds the network side described above: `OnionLinkProtocol`/`OnionLinkManager`, `OnionRelayService`, `OnionKeyStore`, `OnionRelayQualityTracker`, `OnionWire` and the diagnostic `OnionCircuitClient`.
 
 == Wave plan
 
 [cols="1,5"]
 |===
 | A | This wave: threat model, design, `lapis-net-onion` foundation.
-| B | Wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode.
+| B | Done (unreleased): wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode. No user traffic, no path selection.
 | C | Receiver side: decide the rendezvous design, introduction points and rendezvous point.
 | D | Directory anonymity: `PeerRecord` without addresses in anonymity mode, introduction points instead of addresses.
 | E | Path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.

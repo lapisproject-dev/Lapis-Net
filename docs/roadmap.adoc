@@ -2124,3 +2124,11 @@ Follow-up waves (same wording as in `anonymity.adoc`):
 * *H:* padding and timing protection (DROP cell schedule), circuit pre-building.
 * *I:* multi-node tests, Sybil simulation, external cryptographic review recommended.
 * *J (later):* GossipSub, DHT and content fetches.
+
+== V0.10.0-B — Traffic anonymisation, part 2: wire integration
+
+_Unreleased. Internal wave identifier._
+
+* *Done:* module `lapis-net-onion-wire` (stream protocol `/lapis/onion/1.0.0` with fixed 1024-byte frames, link manager with caps, rate and write-queue limits, relay service, encrypted onion key file with rotation overlap, local relay quality tracker, diagnostic circuit client marked `ExperimentalOnionApi`); `OnionKeyRing` in `lapis-net-onion`; `OnionRelayDescriptor` with codec, bounded index and gossip in `lapis-net-directory`; DHT value flag `0x08` and relay discovery through a rendezvous provider key; `--onion-relay=true|false` (default off) in `lapisnet node`. Tested with real multi-node loopback tests (three-hop circuit, rotation, limits, abuse, lifecycle, logging hygiene).
+* *Open:* no path selection, no user traffic over circuits, browser/DM/mail/call not wired; nothing verified behind real NATs or against real v0.12.0 nodes (the DHT flag makes a relay's DHT value unreadable for them); no external cryptographic review; the quality tracker is local and link-level only; relay descriptors make relays enumerable.
+* *Decisions pending:* see "Assumptions awaiting confirmation" in `anonymity.adoc` (DHT flag compatibility, relay without keystore passphrase, index on all CLI nodes, time constants, public relay rendezvous key).
