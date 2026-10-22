@@ -62,8 +62,11 @@ foreign process. Only `ubuntu-latest` is tested.
   a hard-coded string, not derived from the tag; check with `./gradlew properties -q | grep '^version:'`.
   The workflow rejects a tag whose version differs from the code. (kUML pushed a `v0.53.0` tag with
   `version = "0.52.0"` in the code; its Docker push failed. This check is the lesson from that.)
-. **README.** Update the Status section (current release, newly shipped waves).
-. **Documentation gate.** Review README, `docs/roadmap.adoc` and the website for correctness,
+. **Status.** Update `docs/status.adoc` (current release, newly shipped waves, known gaps) and the short
+  Status section and the "current release" mentions in `README.adoc` (Status, Download); add new modules
+  to `docs/modules.adoc` and new options to `docs/running.adoc`.
+. **Documentation gate.** Review `README.adoc`, `docs/status.adoc`, `docs/modules.adoc`,
+  `docs/comparison.adoc`, `docs/roadmap.adoc` and the website for correctness,
   completeness and consistency; no surface may promise more than the code and the release notes
   prove.
 . **Local verification.** `./gradlew clean check`, then

@@ -1,0 +1,43 @@
+= Lapis Net: Comparison
+:toc:
+
+Back to the link:../README.adoc[README]. The website has its own, maintained comparison page at https://net.lapisproject.dev/comparison[net.lapisproject.dev/comparison]; the text below is the table as it appeared in the README.
+
+How Lapis Net stands next to the five closest decentralized social protocols — full
+methodology and sources at https://net.lapisproject.dev/comparison[net.lapisproject.dev/comparison].
+
+[cols="3,1,1,1,1,1,1", options="header"]
+|===
+| Feature | Lapis Net | Nostr | Secure Scuttlebutt | Farcaster | Bluesky / AT Proto | Mastodon / Fediverse
+
+| Genuine peer-to-peer (no required relay, hub, or homeserver)
+| ● | ◐ | ● | ○ | ○ | ○
+
+| Cryptographic identity instead of an account
+| ● | ● | ● | ◐ | ◐ | ○
+
+| Weighted web of trust (transitive trust paths)
+| ● | ◐ | ◐ | ○ | ○ | ○
+
+| Bitcoin/Lightning-native value layer
+| ● | ● | ○ | ○ | ○ | ○
+
+| Market-based visibility (real value at stake, not a black-box algorithm)
+| ● | ○ | ○ | ◐ | ○ | ○
+
+| End-to-end encrypted voice calls
+| ● | ○ | ○ | ○ | ○ | ○
+
+| Asynchronous long-lived messaging (e-mail replacement)
+| ● | ◐ | ◐ | ○ | ○ | ○
+
+| Machine-to-machine node reputation (infrastructure, not opinions)
+| ● | ○ | ○ | ○ | ○ | ○
+|===
+
+`●` yes · `◐` partial · `○` no
+
+Honest caveat: Nostr, Mastodon, Bluesky and Farcaster each already have millions of users
+and mature client ecosystems. Lapis Net is, as of this comparison, a working multi-wave
+prototype (V0.1–V0.9 implemented) without a public network yet — a real trade-off against
+the table above, not a detail to gloss over. One clarification on the first row: Lapis Net can use volunteer relays to reach nodes behind home routers; they forward only end-to-end-encrypted traffic and are never required for a node that is directly reachable.

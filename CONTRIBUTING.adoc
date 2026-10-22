@@ -40,3 +40,13 @@ Never make such a test pass by retrying it or by loosening what it asserts; find
 1. Ensure `./gradlew clean check` passes locally.
 2. Describe what changed and why.
 3. Keep the change scoped — this repo develops in small, reviewable waves.
+
+== Development conventions
+
+* Code style is enforced by https://github.com/JLLeitschuh/ktlint-gradle[ktlint] and checked in CI.
+* Logging uses https://github.com/oshai/kotlin-logging[kotlin-logging]: `private val logger = KotlinLogging.logger {}` in every file that logs.
+* Documentation is written in AsciiDoc; diagrams (once introduced) use kUML via the `kuml` Asciidoctor macro — no PlantUML, Mermaid, or hand-drawn diagrams.
+* All identifiers (classes, interfaces, packages) are named in English. Domain terms (Veritas, Karma, Virtus, Madli) are the one exception, as they are proper nouns from other languages used directly as identifiers: Veritas and Virtus are Latin, Karma is Sanskrit, and Madli is Georgian.
+
+See link:docs/architecture.adoc[docs/architecture.adoc] and link:docs/roadmap.adoc[docs/roadmap.adoc] for more.
+

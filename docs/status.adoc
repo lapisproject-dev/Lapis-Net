@@ -1,0 +1,119 @@
+= Lapis Net: Status
+:toc:
+
+Back to the link:../README.adoc[README].
+
+Every wave through *V0.9* is implemented and merged to `master`, followed by
+post-arc maintenance waves (V0.9.8 to V0.9.20, below), a fix release and two feature releases. The current release is
+*v0.12.0* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
+are wave identifiers (V0.7 was never a standalone wave — its scope was folded into the
+incremental browser growth of V0.2–V0.5), from `v0.10.0` on they count releases in the
+order they ship). See link:roadmap.adoc[roadmap.adoc] for the
+explanation and a map of every tag to its content. Full technical
+detail for each module is in the link:modules.adoc[module table]; the full wave-by-wave
+history — including scope cuts and hardening follow-ups — is in
+link:roadmap.adoc[roadmap.adoc] and
+link:architecture.adoc[architecture.adoc].
+
+[cols="1,4,1"]
+|===
+| Wave | What it added | Status
+
+| V0.1
+| Protocol core: secp256k1/Ed25519 identity, libp2p bootstrap, Nabu (DHT + Bitswap) storage, Veritas (web-of-trust)
+| ✅
+
+| V0.2
+| Virtus (LTR micropayment economy, on-chain `OP_RETURN`) + the first real client, the Minimal-Browser
+| ✅
+
+| V0.3
+| Karma (Sybil-resistant free "likes", Bitcoin time-anchored)
+| ✅
+
+| V0.4
+| Genesis-bootstrap, QR-code/deep-link identity linking, keystore encryption at rest (Argon2id + AES-256-GCM)
+| ✅
+
+| V0.5
+| Madli (machine-to-machine node reputation, weighted-median aggregation)
+| ✅
+
+| V0.6
+| Lightning payment-proof verification (`LightningProof`, a second `LtrProof` type alongside on-chain)
+| ✅
+
+| V0.7
+| _(no standalone wave — folded into V0.2–V0.5's incremental browser growth)_
+| —
+
+| V0.8
+| Direct messages (X3DH/Double Ratchet, online + offline delivery, encrypted attachments, acceptance policy, browser UI) and 1:1 voice calls over WebRTC
+| ✅
+
+| V0.9
+| Asynchronous messages / mail replacement: encryption, threading, attachments, spam protection
+| ✅
+
+| V0.9.8
+| Repair of cross-node DHT provider discovery at the storage layer (broken since V0.1.4)
+| ✅
+
+| V0.9.9
+| NAT traversal over Circuit Relay v2: a node behind NAT publishes a relay address and can be dialled through the relay (opt-in relay operation, no hole punching)
+| ✅
+
+| V0.9.10
+| Relay hardening: a stalled circuit can no longer block the other circuits and reservation renewals sharing its connection (per-circuit stall timeout plus a per-connection stall budget), and a node reuses a relayed connection the peer already opened to it (released in v0.10.0)
+| ✅
+
+| V0.9.11
+| DHT layer hardening in `lapis-net-storage`: absolute deadlines and concurrency caps on provider lookups, bounded provider store, sanitized peer addresses, validated Kademlia requests (released in v0.10.0)
+| ✅
+
+| v0.10.1
+| Fix release: a race in the relay's circuit setup (present in `v0.9.9` and `v0.10.0`) made relay connections hang for 10 s and fail with no warning or error in the log (the decoding exception was visible only in DEBUG output); fixed on both legs; a deterministic regression test covers the hop leg, and the destination's leg is covered only by an assertion that the relay's control-failure counter stays at zero. Adds the release pipeline: a tag push builds, smoke-tests and publishes the downloadable ZIPs with `SHA256SUMS`
+| ✅
+
+| v0.11.0 (V0.9.12)
+| Madli relay-reliability metric (daily vector wire format v2, v1 stays readable; the publisher is off by default), usage-based relay priority (reputation is never a hard gate), automatic relay selection (two relays per node, only for a node declared `PRIVATE`), a reachability heuristic that only warns, a hardened IP classifier. Wired into the browser node and `lapisnet node` in V0.9.15: automatic selection only with `reachability=private`, the publisher only with `publish-relay-reliability=true`
+| ✅
+
+| v0.11.0 (V0.9.13, V0.9.14)
+| DHT fallback next to GossipSub for peer records, prekey bundles, mail and direct-message pointers (IPNS value per identity, own IPNS responder and validator, bounded record store, outbox, rendezvous provider records, consumers). Plaintext mail leaves no DHT pointer. Wired into the browser node and `lapisnet node` in V0.9.15 (on by default, off with `--dht-fallback=false`; `lapisnet node` has no direct messages and no mail)
+| ✅
+
+| v0.11.0 (V0.8.7b)
+| `/call.html`: the browser page as a remote control for voice calls (Server-Sent Events, session-token cookie, `Host` and `Origin` checks, in-memory history)
+| ✅
+
+| v0.12.0 (V0.9.16)
+| Root-cause fixes for two flaky tests, one of them a production defect: Nabu's Kademlia routing table held only 2 peers per bucket, so a third peer of a bucket was never routable; `LapisKademliaEngine` now keeps its own table with 20 peers per bucket. A call signal that cannot be sent is logged at `warn` and counted
+| ✅
+
+| v0.12.0 (V0.9.17)
+| Mail acceptance wired in the browser node: `--mail-veritas-gate`, `--mail-karma-min-score`, `--mail-min-deposit-msat`, all off by default; the gossip and the DHT path apply the same check. The deposit key has no effect yet (no deposit transport)
+| ✅
+
+| v0.12.0 (V0.9.18)
+| Madli observer weight throttled (at most one recomputation per 5 s window, stale-while-revalidate, off the caller's thread); fails closed (weight 0.0) when refreshes keep failing. A revoked grant takes effect after at most two windows plus jitter plus computation time
+| ✅
+
+| v0.12.0 (V0.9.19)
+| Reply route for call signals: ACCEPT, REJECT and HANGUP are answered over the INVITE's still-open connection when the callee has no directory record of the caller. No wire format change
+| ✅
+
+| v0.12.0 (V0.9.20)
+| DCUtR TCP hole punching with a reuse-port transport, `--hole-punching=auto|on|off`. Verified on Linux loopback only, never behind a real router or CGNAT
+| ✅
+|===
+
+Known, deliberate gaps — not oversights, each documented at the point it was cut:
+
+* *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
+* *NAT traversal: relay plus TCP hole punching that is only verified on loopback.* Since `v0.12.0` (V0.9.20) `dcutr` hole punching exists (`--hole-punching=auto|on|off`, default `auto` = only for `--reachability=private`): two NAT'd peers connected through a relay try to open a direct TCP connection, and the relayed connection is released after a verified success. It has been tested on Linux loopback only, never behind a real router or CGNAT; there is no UDP/QUIC punching, no AutoNAT, no Windows support (no `SO_REUSEPORT`), symmetric NATs will not work, and macOS is untested. The concurrency pools are per node, not per relay: an attacker with many identities can exhaust them and keep legitimate connections relayed, and a hostile peer can block the role registry for an address (the punch then fails, the connection stays relayed). It needs a relay that answers Identify and uses a transport whose listener port other processes of the same OS user may share. The rest of this item describes the relay part: A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. Without a successful punch a relayed connection stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and only the operator option `--publish-relay-reliability=true` switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and the browser and `lapisnet node --reachability=private` start it (the publisher stays off unless `--publish-relay-reliability=true`), and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
+* *Browser call remote control (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process. Since V0.9.15 the acceptance policy is wired in the browser: blocked callers are shown locally and nothing is sent to them. No mute, no persisted call history (the history is held in memory).
+* *Traffic anonymisation: design and cryptographic foundation exist, nothing is active.* IP addresses remain visible to peers and to the directory (`PeerRecord` publishes addresses; mail uses one GossipSub topic per recipient). See `docs/anonymity.adoc` for the threat model, the known leaks and the wave plan.
+* *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
+* *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
+* *The DHT fallback is wired since V0.9.15 (V0.9.13, V0.9.14).* The browser publishes and looks up peer records, prekey bundles and mail/DM pointers over the DHT (GossipSub stays the primary path); it is on by default and `--dht-fallback=false` turns it off. The CLI's `node` subcommand uses it for the peer directory only. DHT lookups tell the peers that are asked who is looking for whom, until traffic anonymisation exists (docs/architecture.adoc, section 11); the rendezvous key of a victim can be eclipsed by throwaway identities; plaintext mail is deliberately never recoverable from the DHT; a lookup needs the owner's Ed25519 peer ID.

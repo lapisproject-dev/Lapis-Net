@@ -1,0 +1,63 @@
+= Lapis Net: Modules
+:toc:
+
+Back to the link:../README.adoc[README].
+
+[cols="1,3"]
+|===
+| Module | Purpose
+
+| `lapis-net-core`
+| Base protocol abstractions shared by all other modules.
+
+| `lapis-net-identity`
+| secp256k1 identity keypairs, Ed25519 dual-key binding for the libp2p peer ID, keystore encryption at rest (Argon2id + AES-256-GCM), and multi-device/pseudonym self-trust linking.
+
+| `lapis-net-storage`
+| DHT + Bitswap content storage via Nabu. Cross-node provider discovery works since V0.9.8 (it had been broken since V0.1.4); the DHT layer is bounded and validates untrusted input since V0.9.11.
+
+| `lapis-net-trust`
+| Veritas (web-of-trust): trust-edge data model, shortest-path scoring algorithm, GossipSub propagation, Nabu persistence.
+
+| `lapis-net-networking`
+| libp2p node bootstrap, peer identity derivation, mDNS discovery, GossipSub, the Genesis-bootstrap/QR-code connection flow, and relay-based NAT traversal over Circuit Relay v2 (V0.9.9: reservation client, opt-in relay server, `/p2p-circuit` transport with backpressure and admission limits).
+
+| `lapis-net-virtus`
+| Virtus (the LTR micropayment economy): on-chain (OP_RETURN) and Lightning (BOLT-11) payment proofs, 10%/24h decay, view-specific accumulation.
+
+| `lapis-net-karma`
+| Karma (free likes): Bitcoin time-anchored, Veritas-weighted Sybil-resistant "like" scoring.
+
+| `lapis-net-madli`
+| Madli (machine-to-machine node reputation): five-metric observation vector (plus, since V0.9.12, an optional relay-reliability block in wire format v2, written only if the off-by-default publisher is enabled) with Veritas-weighted, manipulation-resistant weighted-median aggregation.
+
+| `lapis-net-mail`
+| Asynchronous messages (the e-mail replacement), fully implemented (V0.9.1–V0.9.4): a signed, addressed `MessageEnvelope` bound by CID to its own `MessageBody` blob, gossiped on one GossipSub topic per recipient identity, Nabu-persisted at both ends (V0.9.1); hybrid-ecies encryption (HKDF + AES-256-GCM over a secp256k1 ECDH exchange, V0.9.2); cycle-safe, receive-order-independent threading, encrypted attachments, a local sent-folder view, and a browser inbox UI with verified XSS protection (V0.9.3); and a Veritas/Karma scoring filter plus a Lightning first-contact deposit for spam resistance (V0.9.4). A follow-up security-hardening pass closed a critical unauthenticated remote memory-exhaustion bug found in this module and, on audit, in three other already-shipped modules (`lapis-net-trust`, `lapis-net-virtus`, `lapis-net-karma`) plus a fourth instance in `lapis-net-browser`.
+
+| `lapis-net-policy`
+| Acceptance-gate machinery extracted from `lapis-net-mail` in V0.8.6 so `lapis-net-dm` (direct messages) could share it rather than reimplement it: `AcceptanceGate`/`AcceptanceGateEvaluator` (the gate vocabulary and evaluation logic — Veritas distance, Karma threshold, Lightning first-contact deposit, explicit accept/deny lists) and `VeritasPathCache` (a bounded, LRU-evicting cache so a flood of never-repeating throwaway identities can't force an unbounded-heap shortest-path search on the GossipSub validator hot path).
+
+| `lapis-net-directory`
+| Signed peer/presence directory records (`PeerRecord`): identity bound to its current network addresses and libp2p peer identity, with a monotonic sequence number and a heartbeat TTL, gossiped and Nabu-persisted — the foundational discovery layer V0.8's later sub-waves (online DM addressing) resolve recipients through (V0.8.1). Also carries `PrekeyBundle` gossip/indexing (`PrekeyBundleGossip`/`PrekeyBundleIndex`) for `lapis-net-ratchet`'s prekey bundles (V0.8.2).
+
+| `lapis-net-ratchet`
+| X25519 encryption sub-key and the X3DH handshake (Signal's Extended Triple Diffie-Hellman, reimplemented from the public specification): `PrekeyBundle`/`PrekeyBundleCodec`, `PrekeyStore` (durable one-time-prekey consumption), and the `X3dh` handshake itself. Deliberately network-free (V0.8.2). Plus the Double Ratchet itself: `DoubleRatchetSession` (forward-secret, post-compromise-secure 1:1 sessions over an HKDF root chain and HMAC symmetric chains), `RatchetMessage`/`RatchetMessageCodec`, a bounded evicting `SkippedMessageKeyStore`, and `DoubleRatchetSessionCodec` for encrypted-at-rest session persistence, including the `encodeWithKey`/`decodeWithKey` Argon2id-bypass pair `lapis-net-dm` uses for per-message persistence (V0.8.3).
+
+| `lapis-net-onion`
+| Foundation (wave V0.10.0-A, unreleased): fixed-size cell format and hardened codec, ntor-style X25519 circuit handshake, per-hop ChaCha20-Poly1305 onion layers with replay/reorder/tagging protection, relay state machine with resource limits, rotating onion key ring. No network code. Provides no anonymity today; see `docs/anonymity.adoc`.
+
+| `lapis-net-onion-wire`
+| *Onion relay infrastructure only* (wave V0.10.0-B, unreleased): the `/lapis/onion/1.0.0` link protocol, encrypted onion key file with rotation, signed relay descriptors (gossip and DHT), the relay service and a diagnostic circuit client. Opt-in through `lapisnet node --onion-relay=true`; no path selection, no DM, mail or call traffic over circuits, the browser is not wired. *Nothing is anonymised yet*; see `docs/anonymity.adoc`.
+
+| `lapis-net-dm`
+| The custom `/lapis/dm/1.1.0` libp2p stream protocol wiring `lapis-net-ratchet`'s X3DH/Double-Ratchet primitives into a live network path: `DmProtocol`/`DmProtocolHandler` (stream-protocol binding, the first raw-libp2p-stream parser in this codebase — length-validated-before-allocation frame decoding, slowloris/absolute-lifetime timeouts, per-peer stream cap), `DmEnvelope`/`DmEnvelopeCodec` (the outer wire frame), `DmSessionManager` (first-contact/resumed session state machine, durable session persistence, the identity-authority-safe inbound handler), and `DmStore` (in-memory-only conversation history) — online 1:1 direct messages between directly-dialable peers (V0.8.4), plus V0.8.5's offline Nabu mailbox (`MailboxPointer`/`MailboxGossip`/`MailboxPoller`/`MailboxRedeliveryScheduler`, `DmSessionManager.sendOffline`) for offline delivery via a Bitswap-fetched, periodically re-announced signed pointer.
+
+| `lapis-net-call`
+| 1:1 audio calls over WebRTC (V0.8.7): `CallManager` (the call-control state machine — INVITE/ACCEPT/REJECT/HANGUP, a three-executor concurrency model, invite-flood rate limiting), `CallSignal`/`CallSignalCodec` (the wire frame carried as a `DmMessageType.CALL_SIGNAL` envelope's ratchet plaintext), `CallSdpPolicy` (SSRF-class defenses against a peer-supplied SDP), and `WebRtcCallMediaEngine` (the sole `dev.onvoid.webrtc:webrtc-java` consumer — host-ICE-candidates only, no STUN/TURN). Depends on `lapis-net-dm` for signaling transport and DTLS-fingerprint identity binding; `lapis-net-dm` itself stays entirely WebRTC-free.
+
+| `lapis-net-browser`
+| Minimal-Browser — the first real Lapis Net client, exposing Veritas/Virtus/Karma data, the LTR record-authoring endpoints, a mail inbox UI (V0.9.3), and a direct-message UI (V0.8.6b), and the call remote control `/call.html` (V0.8.7b).
+
+| `lapis-net-cli`
+| Entry point / multi-node demo harness proving trust propagation end to end.
+|===

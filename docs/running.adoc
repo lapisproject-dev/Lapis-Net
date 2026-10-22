@@ -1,0 +1,64 @@
+= Lapis Net: Running a node
+:toc:
+
+Back to the link:../README.adoc[README].
+
+== Running a node with the V0.9.x features
+
+[source,bash]
+----
+# headless node behind a NAT: reserves relays, uses the DHT directory (no DM, no mail)
+lapisnet node --reachability=private
+# headless node that also serves as an onion relay (infrastructure only, nothing is anonymised)
+lapisnet node --onion-relay=true
+# browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
+lapisnet-browser --reachability=private --dm-veritas-gate=true
+# mail gates (since v0.12.0, V0.9.17): off by default; mail from a sender who passes none of them is discarded
+lapisnet-browser --mail-veritas-gate=true --mail-karma-min-score=2
+----
+
+Mail acceptance is wired in the browser node (since `v0.12.0`). Keys: `--mail-veritas-gate` (`LAPISNET_MAIL_VERITAS_GATE`, file key `mailAcceptance.veritasGate`), `--mail-karma-min-score` (`LAPISNET_MAIL_KARMA_MIN_SCORE`, `mailAcceptance.karmaMinScore`), `--mail-min-deposit-msat` (`LAPISNET_MAIL_MIN_DEPOSIT_MSAT`, `mailAcceptance.minDepositMsat`, no effect yet). All gates are off by default. Accepted contacts are always let through; blocked mail is discarded without reply and only counted in the status panel.
+
+An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc` and `docs/release-notes/v0.12.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
+
+== Building and running from source
+
+[source,bash]
+----
+./gradlew clean check   # compiles, runs tests, runs ktlint
+./gradlew :lapis-net-cli:run
+----
+
+Requires JDK 25.
+
+To run the reference node together with its minimal browser UI (main view, mail inbox, direct
+messages):
+
+[source,bash]
+----
+./gradlew :lapis-net-browser:run
+----
+
+It prints the local address to open in a browser and the identity fingerprint. For calls it also prints a link of the form `http://127.0.0.1:7878/call.html#t=<token>` (same device only: the token is regenerated on every start and must not be shared or logged; open the link from the console, a bare `/call.html` is refused). The HTTP port is
+currently fixed at `7878` (there is no environment variable for it yet), so only one browser node can
+run per machine; a second instance on the same machine fails with "address already in use" and would
+also share the same identity and storage directory unless `LAPISNET_HOME` is changed. State lives under
+`$LAPISNET_HOME` (default `~/.lapisnet`). Environment variables: `LAPISNET_KEYSTORE_PASSPHRASE` encrypts
+the identity at rest (without it, and without an interactive console, the identity is stored
+unencrypted with POSIX file permissions only and a warning is logged); `LAPISNET_LISTEN_ADDR` sets the
+libp2p listen address (the default is loopback-only, so no other machine can reach the node until this
+is set); `LAPISNET_BOOTSTRAP_PEERS` is a comma-separated list of peer multiaddrs, each including
+`/p2p/<peerId>`, and entries in `$LAPISNET_HOME/bootstrap.peers` (one per line) are added to it.
+
+There is no public network yet, and connecting two real nodes is still a manual step. Set
+`LAPISNET_LISTEN_ADDR` to the machine's concrete LAN address, for example `/ip4/192.168.1.20/tcp/4001`.
+The main page shows a connect link (`lapisnet://connect?maddr=...&pk=...`) and the same link as a QR
+code; on the other node, paste that link into the "Paste a connect link" field of its main page, or
+enter the plain multiaddr, including `/p2p/<peerId>`, in the connect field in the page header. The
+peer ID is also logged at startup (`BrowserServer listening on ... (peer <peerId>)`). A wildcard such
+as `/ip4/0.0.0.0/tcp/4001` makes the node listen on every interface, but the QR code and connect link
+would then carry the wildcard, which another machine cannot dial; in that case type
+`/ip4/<LAN-IP>/tcp/4001/p2p/<peerId>` into the header connect field by hand, taking the peer ID from
+the log. Peers discovered through mDNS are only logged and
+cached, never dialled automatically and not shown in the UI. If you only have one machine,
+`./gradlew :lapis-net-cli:run` runs a multi-node trust-propagation demo inside a single process.
