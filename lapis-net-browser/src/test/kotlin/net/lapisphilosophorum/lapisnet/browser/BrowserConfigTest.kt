@@ -36,6 +36,7 @@ class BrowserConfigTest :
                     autoRelay=true
                     dhtFallback=false
                     publishRelayReliability=true
+                    holePunching=off
                     dmAcceptance.veritasGate=true
                     dmAcceptance.karmaMinScore=2.5
                     dmAcceptance.minDepositMsat=5000
@@ -46,6 +47,7 @@ class BrowserConfigTest :
             config.wiring.autoRelay shouldBe true
             config.wiring.dhtFallback shouldBe false
             config.wiring.publishRelayReliability shouldBe true
+            config.wiring.holePunching shouldBe net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.OFF
             config.acceptance.gates() shouldBe listOf(AcceptanceGate.VeritasPath, AcceptanceGate.KarmaThreshold(2.5))
             config.acceptance.minDepositMsat shouldBe 5000
         }

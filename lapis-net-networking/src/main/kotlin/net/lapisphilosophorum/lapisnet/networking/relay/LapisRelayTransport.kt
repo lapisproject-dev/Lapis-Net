@@ -251,6 +251,9 @@ class LapisRelayTransport internal constructor(
     internal fun liveConnectionTo(peer: PeerId): Connection? =
         liveConnections.firstOrNull { !it.closeFuture().isDone && it.secureSession().remoteId == peer }
 
+    /** Whether [connection] is a relayed connection this transport dialled or accepted. */
+    internal fun owns(connection: Connection): Boolean = liveConnections.contains(connection)
+
     private fun track(connection: Connection) {
         liveConnections += connection
         connection.closeFuture().whenComplete { _, _ -> liveConnections -= connection }

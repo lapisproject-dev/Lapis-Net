@@ -107,6 +107,7 @@ class RelayReservationClient internal constructor(
         }
         ensureRenewalScheduled()
         logger.info { "reserved a relay slot on ${relay.peerId} until ${reservation.expiresAt}" }
+        notifyReservationHeld(relay.peerId)
         return reservation
     }
 
@@ -198,6 +199,18 @@ class RelayReservationClient internal constructor(
         renewer.shutdownNow()
     }
 
+    /**
+     * Called after a reservation was granted or renewed (V0.9.20): lets hole punching ask that relay
+     * for the address it observes this node at. Never allowed to affect the reservation itself.
+     */
+    @Volatile
+    internal var onReservationHeld: (PeerId) -> Unit = {}
+
+    private fun notifyReservationHeld(relay: PeerId) {
+        runCatching { onReservationHeld(relay) }
+            .onFailure { logger.debug { "reservation hook failed: ${it.javaClass.simpleName}" } }
+    }
+
     private fun renewDueReservations() {
         if (stopped.get()) return
         val now = clock()
@@ -212,6 +225,7 @@ class RelayReservationClient internal constructor(
                 .onSuccess { renewed ->
                     entry.reservation = renewed
                     logger.debug { "renewed relay reservation on ${entry.relay.peerId} until ${renewed.expiresAt}" }
+                    notifyReservationHeld(entry.relay.peerId)
                 }.onFailure { error ->
                     // Keep the (possibly already expired) entry rather than dropping it:
                     // circuitAddresses() already filters expired entries out, and keeping it means

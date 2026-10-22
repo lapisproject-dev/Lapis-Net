@@ -245,6 +245,19 @@ data class NodeStatusResponse(
     /** V0.9.17 - the mail gates in effect (display names), empty = everybody is accepted. */
     val mailAcceptanceGates: List<String> = emptyList(),
     val mailBlocked: MailBlockedStatus = MailBlockedStatus(),
+    /** V0.9.20 - TCP hole punching (DCUtR). */
+    val holePunching: HolePunchingStatus = HolePunchingStatus(),
+)
+
+/** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */
+@Serializable
+data class HolePunchingStatus(
+    val mode: String = "off",
+    val active: Boolean = false,
+    val attempts: Long = 0,
+    val succeeded: Long = 0,
+    val failed: Long = 0,
+    val lastFailure: String? = null,
 )
 
 /**

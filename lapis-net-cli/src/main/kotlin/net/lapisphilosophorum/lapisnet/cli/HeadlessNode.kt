@@ -95,6 +95,7 @@ internal class HeadlessNode private constructor(
                         identity,
                         listenAddress,
                         options.relayConfig(RelayConfig.CLIENT_ONLY.copy(autoRelay = autoRelayConfig)),
+                        options.holePunchConfig(),
                     )
                 node.start(bootstrapPeers = bootstrapPeers)
                 rollback += { runCatching { node.stop() } }

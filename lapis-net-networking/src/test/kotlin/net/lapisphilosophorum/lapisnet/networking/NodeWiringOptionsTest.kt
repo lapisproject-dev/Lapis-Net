@@ -7,6 +7,7 @@ import io.kotest.matchers.string.shouldContain
 import net.lapisphilosophorum.lapisnet.networking.config.DeclaredReachability
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode
 import net.lapisphilosophorum.lapisnet.networking.relay.NodeReachability
 
 class NodeWiringOptionsTest :
@@ -116,5 +117,32 @@ class NodeWiringOptionsTest :
             help shouldContain "METADATA"
             help shouldContain "query timing and key interest"
             help shouldContain "--dht-fallback=false"
+        }
+
+        test("hole punching: default auto, active only when the declared reachability is private") {
+            resolve().holePunching shouldBe HolePunchMode.AUTO
+            resolve().holePunchConfig().isActive(false) shouldBe false
+            resolve("--reachability=public").holePunchConfig().isActive(false) shouldBe false
+            resolve("--reachability=private").holePunchConfig().isActive(false) shouldBe true
+            // declared private but auto-relay off: the library RelayConfig is not PRIVATE, the declaration still counts
+            resolve("--reachability=private", "--auto-relay=false").holePunchConfig().isActive(false) shouldBe true
+        }
+
+        test("hole punching: on and off override the reachability, an invalid value aborts") {
+            resolve("--hole-punching=on").holePunchConfig().isActive(false) shouldBe true
+            resolve("--reachability=private", "--hole-punching=off").holePunchConfig().isActive(true) shouldBe false
+            shouldThrow<InvalidWiringOptionException> { resolve("--hole-punching=maybe") }
+                .message shouldContain "auto|on|off"
+            shouldThrow<InvalidWiringOptionException> {
+                NodeWiringOptions.validateValues(mapOf("hole-punching" to "yes"))
+            }
+        }
+
+        test("hole punching: environment name, extraction and help text") {
+            NodeWiringOptions.envNameOf("hole-punching") shouldBe "LAPISNET_HOLE_PUNCHING"
+            NodeWiringOptions.fromEnvironment(mapOf("LAPISNET_HOLE_PUNCHING" to "off")) shouldBe
+                mapOf("hole-punching" to "off")
+            NodeWiringOptions.HELP_TEXT shouldContain "--hole-punching=auto|on|off"
+            NodeWiringOptions.HELP_TEXT shouldContain "SO_REUSEPORT"
         }
     })

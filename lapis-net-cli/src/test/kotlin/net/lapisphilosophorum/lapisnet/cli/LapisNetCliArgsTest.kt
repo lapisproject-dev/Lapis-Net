@@ -43,6 +43,7 @@ class LapisNetCliArgsTest :
                     listOf("node", "--reachability=bogus"),
                     listOf("node", "--auto-relay=true"),
                     listOf("node", "--dht-fallback=yes"),
+                    listOf("node", "--hole-punching=maybe"),
                     listOf("node", "--frobnicate=1"),
                     listOf("node", "positional"),
                     listOf("node", "--dht-fallback=true", "--dht-fallback=false"),
@@ -93,5 +94,35 @@ class LapisNetCliArgsTest :
                 s.outText shouldContain "--dht-fallback=false"
                 s.errText shouldBe ""
             }
+        }
+
+        test("--hole-punching=off is accepted and reaches the node options; the help lists it") {
+            val s = Streams()
+            var seen: NodeWiringOptions? = null
+            runCatching {
+                runCli(
+                    listOf("node", "--hole-punching=off"),
+                    s.out,
+                    s.err,
+                    awaitShutdown = {},
+                    startNode = {
+                        seen = it
+                        error("stop here")
+                    },
+                    demo = { error("no demo") },
+                )
+            }
+            seen!!.holePunching shouldBe net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.OFF
+            val help = Streams()
+            runCli(
+                listOf("node", "--help"),
+                help.out,
+                help.err,
+                awaitShutdown = {},
+                startNode = ::neverStart,
+                demo = {},
+            ) shouldBe
+                0
+            help.outText shouldContain "--hole-punching=auto|on|off"
         }
     })

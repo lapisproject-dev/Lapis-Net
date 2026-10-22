@@ -117,7 +117,9 @@ internal fun runCli(
         out.println("Lapis Net node running. PeerId: ${headless.node.peerId.toBase58().take(12)}...")
         out.println(
             "  reachability=${options.reachability.name.lowercase()} auto-relay=${options.autoRelay} " +
-                "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability}",
+                "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability} " +
+                "hole-punching=${options.holePunching.name.lowercase()}" +
+                if (headless.node.holePunching != null) " (active)" else "",
         )
         if (options.dhtFallback) {
             out.println(

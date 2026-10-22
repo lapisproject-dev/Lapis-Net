@@ -11,9 +11,18 @@ import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.mux.StreamMuxerProtocol
 import io.libp2p.discovery.MDnsDiscovery
+import io.libp2p.protocol.Identify
 import io.libp2p.security.noise.NoiseXXSecureChannel
 import io.libp2p.transport.tcp.TcpTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrBinding
+import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrProtocol
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchAddressFilter
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchConfig
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchManager
+import net.lapisphilosophorum.lapisnet.networking.dcutr.IdentifyObserver
+import net.lapisphilosophorum.lapisnet.networking.dcutr.NodeHolePunchEnvironment
+import net.lapisphilosophorum.lapisnet.networking.dcutr.ObservedAddressBook
 import net.lapisphilosophorum.lapisnet.networking.relay.CircuitFlowStats
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopBinding
 import net.lapisphilosophorum.lapisnet.networking.relay.LapisCircuitHopProtocol
@@ -31,6 +40,9 @@ import net.lapisphilosophorum.lapisnet.networking.relay.RelayReliabilityTracker
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationClient
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayReservationRegistry
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayUsageLedger
+import net.lapisphilosophorum.lapisnet.networking.transport.PunchRoleRegistry
+import net.lapisphilosophorum.lapisnet.networking.transport.ReusePortSupport
+import net.lapisphilosophorum.lapisnet.networking.transport.ReusePortTcpTransport
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.time.Duration
@@ -179,6 +191,18 @@ class LapisNode private constructor(
     private val relayConfig: RelayConfig,
     private val relayLedger: RelayUsageLedger,
     private val relayReliability: RelayReliabilityTracker,
+    /**
+     * TCP hole punching (DCUtR, V0.9.20), or `null` when it is switched off or unavailable on this
+     * platform. Replaces a relayed connection by a direct one where the NATs allow it; a failed
+     * attempt leaves the relayed connection untouched.
+     */
+    val holePunching: HolePunchManager? = null,
+    /** The reuse-port transport and its role register, `null` unless hole punching is active. Tests only. */
+    internal val punchTransport: ReusePortTcpTransport? = null,
+    internal val punchRoles: PunchRoleRegistry? = null,
+    /** Handlers registered through [addConnectionHandler], so a direct connection that replaced a relayed one can be announced again. */
+    private val announcedHandlers: java.util.concurrent.CopyOnWriteArrayList<ConnectionHandler> =
+        java.util.concurrent.CopyOnWriteArrayList(),
 ) {
     @Volatile
     private var autoRelay: RelayAutoSelector? = null
@@ -290,6 +314,7 @@ class LapisNode private constructor(
      * only through a relay is concerned.
      */
     fun addConnectionHandler(handler: ConnectionHandler) {
+        announcedHandlers += handler
         host.addConnectionHandler(handler)
         relayInboundHandlers += handler
     }
@@ -414,6 +439,8 @@ class LapisNode private constructor(
      */
     fun stop(timeout: Duration = DEFAULT_TIMEOUT) {
         if (!stopped.compareAndSet(false, true)) return
+        runCatching { holePunching?.stop() }
+            .onFailure { logger.warn(it) { "failed to stop hole punching cleanly" } }
         // Stop renewing relay reservations before anything else: the renewal task dials, and a
         // dial racing a host shutdown is pure noise. Never fatal - a failure here must not stop the
         // host's own shutdown, same reasoning as the mDNS/host split below.
@@ -462,7 +489,21 @@ class LapisNode private constructor(
             identity: DualKeyIdentity,
             listenAddress: Multiaddr = DEFAULT_LISTEN_ADDRESS,
             relayConfig: RelayConfig = RelayConfig.CLIENT_ONLY,
+            holePunchConfig: HolePunchConfig = HolePunchConfig.DISABLED,
         ): LapisNode {
+            val punchRequested = holePunchConfig.isActive(relayConfig.reachability == NodeReachability.PRIVATE)
+            if (punchRequested && !ReusePortSupport.available) {
+                val message = "hole punching needs SO_REUSEPORT: ${ReusePortSupport.describeUnavailability()}"
+                if (holePunchConfig.mode == net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.ON) {
+                    throw LapisNodeException(message)
+                }
+                logger.warn { "$message - hole punching stays off" }
+            }
+            val punchActive = punchRequested && ReusePortSupport.available
+            val punchRoles = PunchRoleRegistry(holePunchConfig.maxConcurrentUpgrades * 4)
+            var reuseTransport: ReusePortTcpTransport? = null
+            val dcutrProtocol = DcutrProtocol(holePunchConfig.protocolTimeout)
+            val dcutrBinding = DcutrBinding(dcutrProtocol)
             val privKey = identity.deriveLibp2pPrivKey()
             val connectionCap = ConnectionCapHandler()
             // Relayed inbound connections never pass through NetworkImpl's own connection handler
@@ -489,7 +530,13 @@ class LapisNode private constructor(
                         factory = { privKey }
                     }
                     transports {
-                        add(::TcpTransport)
+                        if (punchActive) {
+                            add { upgrader ->
+                                ReusePortTcpTransport(upgrader, punchRoles).also { reuseTransport = it }
+                            }
+                        } else {
+                            add(::TcpTransport)
+                        }
                         add { upgrader ->
                             LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits, ledger, reliability)
                                 .also { relayTransport = it }
@@ -504,6 +551,10 @@ class LapisNode private constructor(
                     protocols {
                         add(hopBinding)
                         add(stopBinding)
+                        // Answers "which address do you see me at" - relays need this even when they do not
+                        // punch themselves. A minimal message: only what the library fills in per request.
+                        if (holePunchConfig.answersIdentify) add(Identify())
+                        if (punchActive) add(dcutrBinding)
                     }
                     network {
                         listen(listenAddress.toString())
@@ -527,6 +578,46 @@ class LapisNode private constructor(
             // that ordering matters here (no "attached too late" gap, unlike GossipPubSub.attach's
             // documented must-be-before-connect() precondition).
             builtHost.addConnectionHandler(connectionCap)
+            val announcedHandlers = java.util.concurrent.CopyOnWriteArrayList<ConnectionHandler>()
+            var holePunchManager: HolePunchManager? = null
+            if (punchActive) {
+                val filter = HolePunchAddressFilter(holePunchConfig.allowNonPublicAddresses)
+                val book = ObservedAddressBook(filter)
+                val observer =
+                    IdentifyObserver(
+                        builtHost,
+                        book,
+                        { relayClient.reservations().map { it.relay } },
+                        { it.remoteAddress().has(Protocol.P2PCIRCUIT) || relayTransport.owns(it) },
+                        holePunchConfig.protocolTimeout,
+                    )
+                val environment =
+                    NodeHolePunchEnvironment(
+                        builtHost,
+                        checkNotNull(reuseTransport),
+                        punchRoles,
+                        relayTransport,
+                        dcutrBinding,
+                        observer,
+                        holePunchConfig.punchTimeout.plus(holePunchConfig.protocolTimeout),
+                    )
+                val manager =
+                    HolePunchManager(
+                        environment,
+                        book,
+                        filter,
+                        holePunchConfig,
+                        onRelayReplaced = { direct ->
+                            announcedHandlers.forEach { runCatching { it.handleConnection(direct) } }
+                        },
+                    )
+                dcutrProtocol.onInbound = manager::onInboundStream
+                // The relayed-inbound path is the "B" trigger; direct connections complete the rendezvous.
+                relayInboundHandlers += manager
+                builtHost.addConnectionHandler(ConnectionHandler { manager.onDirectConnection(it) })
+                relayClient.onReservationHeld = { observer.observeAsync(it) }
+                holePunchManager = manager
+            }
             val mdns = MDnsDiscovery(builtHost)
             val node =
                 LapisNode(
@@ -541,6 +632,10 @@ class LapisNode private constructor(
                     relayConfig,
                     ledger,
                     reliability,
+                    holePunchManager,
+                    reuseTransport,
+                    punchRoles,
+                    announcedHandlers,
                 )
             mdns.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {

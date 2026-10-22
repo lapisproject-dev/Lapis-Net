@@ -459,6 +459,7 @@ class BrowserServer private constructor(
                         identity,
                         listenAddress,
                         relayConfig = wiring.relayConfig(RelayConfig.CLIENT_ONLY.copy(autoRelay = autoRelayConfig)),
+                        holePunchConfig = wiring.holePunchConfig(),
                     )
                 node.start(bootstrapPeers = bootstrapPeers)
                 cleanupOnFailure += { runCatching { node.stop() } }
@@ -800,6 +801,18 @@ class BrowserServer private constructor(
                         mailAcceptanceGates = acceptance.mailGateNames(),
                         mailBlocked = acceptance.mailBlocks.toStatus(),
                         configFile = BrowserConfig.FILE_NAME,
+                        holePunching =
+                            node.holePunching.let { punch ->
+                                val status = punch?.status()
+                                HolePunchingStatus(
+                                    mode = wiring.holePunching.name.lowercase(),
+                                    active = punch != null,
+                                    attempts = status?.attemptsStarted ?: 0,
+                                    succeeded = status?.succeeded ?: 0,
+                                    failed = status?.failed ?: 0,
+                                    lastFailure = status?.lastFailure,
+                                )
+                            },
                     )
                 }
                 val deps =

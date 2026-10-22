@@ -1,5 +1,7 @@
 package net.lapisphilosophorum.lapisnet.networking.config
 
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchConfig
+import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode
 import net.lapisphilosophorum.lapisnet.networking.relay.NodeReachability
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
 
@@ -39,6 +41,7 @@ data class NodeWiringOptions(
     val autoRelay: Boolean = false,
     val dhtFallback: Boolean = true,
     val publishRelayReliability: Boolean = false,
+    val holePunching: HolePunchMode = HolePunchMode.AUTO,
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -57,6 +60,13 @@ data class NodeWiringOptions(
         return base.copy(reachability = effective)
     }
 
+    /**
+     * The hole-punching configuration for [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]. With the
+     * default `auto` it is active exactly when the operator declared `reachability=private`.
+     */
+    fun holePunchConfig(base: HolePunchConfig = HolePunchConfig()): HolePunchConfig =
+        base.copy(mode = holePunching, declaredPrivate = reachability == DeclaredReachability.PRIVATE)
+
     /** `true` when the operator declared `private` but did not switch auto-relay on (the library heuristic then sees UNSPECIFIED). */
     val declaredPrivateWithoutAutoRelay: Boolean
         get() = reachability == DeclaredReachability.PRIVATE && !autoRelay
@@ -66,12 +76,13 @@ data class NodeWiringOptions(
         const val KEY_AUTO_RELAY = "auto-relay"
         const val KEY_DHT_FALLBACK = "dht-fallback"
         const val KEY_PUBLISH_RELAY_RELIABILITY = "publish-relay-reliability"
+        const val KEY_HOLE_PUNCHING = "hole-punching"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
 
         val KNOWN_KEYS: Set<String> =
-            setOf(KEY_REACHABILITY, KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY)
+            setOf(KEY_REACHABILITY, KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY, KEY_HOLE_PUNCHING)
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
         fun envNameOf(key: String): String = ENV_PREFIX + key.uppercase().replace('-', '_')
@@ -93,7 +104,8 @@ data class NodeWiringOptions(
             val dhtFallback = raw[KEY_DHT_FALLBACK]?.let { parseBoolean(KEY_DHT_FALLBACK, it) } ?: true
             val publish =
                 raw[KEY_PUBLISH_RELAY_RELIABILITY]?.let { parseBoolean(KEY_PUBLISH_RELAY_RELIABILITY, it) } ?: false
-            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish)
+            val holePunching = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) } ?: HolePunchMode.AUTO
+            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching)
         }
 
         /**
@@ -105,6 +117,7 @@ data class NodeWiringOptions(
                 when (key) {
                     KEY_REACHABILITY -> parseReachability(value)
                     KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY -> parseBoolean(key, value)
+                    KEY_HOLE_PUNCHING -> parseHolePunching(value)
                     else -> throw InvalidWiringOptionException("unknown option --$key")
                 }
             }
@@ -145,6 +158,9 @@ data class NodeWiringOptions(
                 else -> throw InvalidWiringOptionException("--reachability must be public|private|undeclared")
             }
 
+        private fun parseHolePunching(raw: String): HolePunchMode =
+            HolePunchMode.parse(raw) ?: throw InvalidWiringOptionException("--hole-punching must be auto|on|off")
+
         private fun parseBoolean(
             key: String,
             raw: String,
@@ -168,6 +184,11 @@ data class NodeWiringOptions(
             |        Use the DHT as a fallback for peer records, prekeys and offline mail/DM pointers.
             |        METADATA: DHT lookups reveal query timing and key interest (inbox, prekey and directory
             |        keys) to the DHT peers asked. Disable with --dht-fallback=false.
+            |  --hole-punching=auto|on|off                [auto]
+            |        TCP hole punching (DCUtR): replace a relayed connection by a direct one. auto = only when
+            |        --reachability=private. on = always (aborts the start where SO_REUSEPORT is missing, e.g.
+            |        Windows). off = no hole punching and no Identify. Verified on loopback only. Uses a
+            |        transport whose listener port other processes of the same OS user may share.
             |  --publish-relay-reliability=true|false     [false]
             |        Publish the relay reliability observed by this node as signed Madli vectors.
             |        Default off: older nodes reject v2 vectors as invalid and lower the gossip peer score of

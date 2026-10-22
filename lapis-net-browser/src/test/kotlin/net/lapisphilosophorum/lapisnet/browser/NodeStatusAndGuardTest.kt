@@ -32,6 +32,10 @@ class NodeStatusAndGuardTest :
                 parsed.autoRelayRunning shouldBe false
                 parsed.relayReservations shouldBe 0
                 parsed.publishRelayReliability shouldBe false
+                // hole punching: default auto, but a public node does not punch
+                parsed.holePunching.mode shouldBe "auto"
+                parsed.holePunching.active shouldBe false
+                parsed.holePunching.attempts shouldBe 0L
                 parsed.acceptanceGates shouldBe listOf("veritas-path", "karma>=4.0")
                 parsed.configFile shouldBe "browser.properties"
                 body shouldNotContain "/home/"

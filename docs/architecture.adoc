@@ -169,7 +169,8 @@ dependencies (`java-multibase`, `noise-java`) are split across them.
 
 GossipSub pub/sub and NAT traversal are explicitly out of scope for this wave; GossipSub lands in
 V0.1.7 (see below). **NAT traversal update: relay-based traversal is IMPLEMENTED (see
-"NAT traversal over Circuit Relay v2" below); `dcutr` hole punching remains absent.** The earlier
+"NAT traversal over Circuit Relay v2" below); `dcutr` TCP hole punching was implemented in V0.9.20 (unreleased,
+see "Hole punching (DCUtR, V0.9.20)" below).** The earlier
 statement of this gap (V0.8.7, 2026-09-02) recorded that Circuit-Relay v2
 (`io.libp2p.protocol.circuit.{RelayTransport,CircuitHopProtocol,CircuitStopProtocol}`) and AutoNAT
 were PRESENT in `jvm-libp2p:1.3.5-RELEASE` but unwired in `LapisNode`, while `dcutr` was ABSENT from
@@ -177,8 +178,7 @@ the jar entirely. That reading of the jar was correct as far as it went, but pre
 to imply usability: wiring the relay classes up revealed that the library's own hop and stop
 handlers cannot carry a working circuit at all (three independent defects, enumerated below), so
 this project now implements the Circuit-Relay-v2 handler logic itself on top of jvm-libp2p's wire
-types. `dcutr` remains genuinely absent and out of reach without implementing that protocol from
-scratch. See "1:1 calls over WebRTC (V0.8.7)" below for the wave this distinction originally blocked
+types. `dcutr` was genuinely absent from the jar and is likewise implemented here (V0.9.20). See "1:1 calls over WebRTC (V0.8.7)" below for the wave this distinction originally blocked
 from claiming a `dcutr` fallback it could not deliver.
 
 == Storage (V0.1.4)
@@ -4835,9 +4835,7 @@ capability bit is added.
 
 === What this wave deliberately did not do
 
-* **No `dcutr` hole punching.** Absent from `jvm-libp2p` entirely; implementing a protocol from
-  scratch is a wave of its own. Every relayed connection therefore stays relayed for its whole life,
-  and two NAT'd peers never upgrade to a direct path.
+* **No `dcutr` hole punching in this wave** (added later, see "Hole punching (DCUtR, V0.9.20)" below).
 * **AutoNAT is not wired, and that is a considered refusal rather than an omission.**
   `AutonatProtocol.Receiver` does not implement AutoNAT's dial-back semantics at all: it answers
   based on `InetAddress.isReachable` — an ICMP/echo probe — against an address it has already
@@ -4918,6 +4916,135 @@ entries it invents are discarded; entries it omits are appended.
 closing the check-then-act race between a manual `reserve` and the selector.
 * **Messaging modules untouched.** Routing DMs, mail or calls over relays — and the design questions
   each raises — is a separate wave.
+
+== Hole punching (DCUtR, V0.9.20)
+
+_Implemented on a local branch, not released. TCP only. Verified on loopback only._
+
+Two peers that are both behind a NAT and connected only through a relay can try to open a direct TCP
+connection (libp2p DCUtR). A successful punch replaces the relayed connection; a failed one leaves it
+exactly as it was.
+
+=== Why a transport of our own
+
+`jvm-libp2p:1.3.5-RELEASE` has no `dcutr` protocol, and its TCP transport (`PlainNettyTransport`) cannot be
+configured: its bootstrap objects are private, it sets no `SO_REUSEADDR`/`SO_REUSEPORT`, and a dial is never
+bound to a local address. A punch needs both peers to dial each other *from the port they listen on*, so
+`ReusePortTcpTransport` is a separate `NettyTransport`. It builds each channel through the library's public
+`ConnectionBuilder`, which also lets it choose the Noise/muxer role per channel. No fork and no reflection.
+It is used only when hole punching is active; otherwise the stock `TcpTransport` stays. `SO_REUSEPORT` on a
+listener lets other processes of the same OS user bind that port too, which is why it is not used everywhere.
+
+=== Roles
+
+The libp2p specification fixes the roles, and this implementation follows it:
+
+* *B* is the peer that **received** the relayed connection (the reservation holder). B opens the
+  `/libp2p/dcutr` stream, sends `CONNECT` with its observed addresses and measures the round trip. A answers
+  with its own `CONNECT`. B sends `SYNC` and dials after RTT/2; A dials the moment `SYNC` arrives.
+* For everything above TCP, *A is the client*, **even if the connection arrives at A through its listener**.
+
+The second point is not optional. On loopback the kernel produces either a true simultaneous open or an
+ordinary accept on one side. Without a role override both sides would be Noise initiator (deadlock) or both
+responder. The listener therefore consults a bounded, expiring register (`PunchRoleRegistry`, exact `ip:port`
+match, at most 8 entries) and builds an expected punch connection with the role the state machine decided.
+
+[kuml, dcutr-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "DCUtR hole punch") {
+    val a = lifeline(name = "A (dialled through the relay)")
+    val relay = lifeline(name = "Relay")
+    val b = lifeline(name = "B (reservation holder)")
+
+    message(from = a, to = relay, label = "CONNECT to B")
+    message(from = relay, to = b, label = "relayed connection (end-to-end Noise)")
+    message(from = b, to = a, label = "dcutr CONNECT (observed addresses)")
+    message(from = a, to = b, label = "dcutr CONNECT (observed addresses)")
+    message(from = b, to = a, label = "dcutr SYNC")
+    message(from = b, to = a, label = "TCP dial after RTT/2")
+    message(from = a, to = b, label = "TCP dial at once")
+    reply(from = b, to = a, label = "direct connection, relay released after a grace period")
+}
+----
+
+=== Observed addresses (Identify)
+
+A node does not know its own external address. Every node with hole punching not `off` answers libp2p
+Identify (a minimal message: only what the library fills per request, i.e. the address it sees the asker at).
+A node that punches asks Identify **only of relays it holds a reservation with** (after each grant or renewal,
+and on demand before an attempt). Answers are filtered like peer input (below) and bounded (8 entries, 30 min).
+A relay without Identify (older versions) yields no observed address, and then no punch is attempted. The
+observed address is trusted as far as the relay is honest (threshold of one observer; `observedAddressThreshold`).
+
+=== Limits and defaults
+
+[cols="2,1,4"]
+|===
+| Setting | Default | Meaning
+
+| `maxAttemptsPerPeer` | 3 | failures before giving up for `backoffMax`
+| `backoffBase` / `backoffMax` | 30 s / 30 min | exponential backoff per peer (30 s, 60 s, ... capped)
+| `protocolTimeout` | 10 s | every wait for a dcutr message and the stream open
+| `punchTimeout` | 5 s | wait for the direct connection after the dials start
+| `maxConcurrentUpgrades` | 4 | simultaneous attempts per role (initiator and responder pools), so up to 8 in total
+| `maxTrackedPeers` | 256 | backoff entries (LRU)
+| `relayCloseGrace` | 10 s | the relayed connection is closed this long after a verified success
+| responder window | 3 per 10 min per peer | how often one peer may start a session with us
+|===
+
+Messages are at most 4 KiB with at most 8 addresses of at most 64 bytes. Addresses a peer sends are accepted
+only as exactly `[ip4|ip6, tcp]`, public unicast (`IpClassification`), port 1..65535, not our own, at most one
+per address family: one attempt makes at most two dials. The responder refuses dcutr over a direct connection.
+The authenticated peer id of the result is checked against the target (`Attempt.offer`): a mismatch there is closed and counted.
+In `onDirectConnection`, an inbound connection whose address was registered for another peer is only ignored and counted
+(never closed, as the registered address is attacker-influenced); outbound connections are not checked there. The role register
+is keyed by address and peer, so a first registration does not lock out a later peer's registration on the same address (this is
+not full squatting protection, see the known limit below); an address
+that is the endpoint of an existing connection to a different peer is refused, and a refused target is skipped. If a
+second direct connection appears, both stay open. After the relayed connection is closed, handlers registered
+through `LapisNode.addConnectionHandler` are told about the surviving direct connection again: GossipSub
+forgets a peer when any of its connections closes (found by a test in this wave).
+
+=== Operator switch
+
+`--hole-punching=auto|on|off` (`LAPISNET_HOLE_PUNCHING`, file key `holePunching`), default `auto`: active exactly
+when `reachability=private`. `on` is active always and **aborts the start** if `SO_REUSEPORT` is missing; with
+`auto` a missing `SO_REUSEPORT` only logs a warning. With `auto`, public nodes do not answer dcutr, so only
+two private nodes punch to each other. The library default (`LapisNode.create`) is off.
+
+=== Platforms
+
+Linux: tested. macOS: the JDK supports `SO_REUSEPORT`, untested here. Windows: the JDK does not offer the
+option; hole punching is unavailable there.
+
+=== Verified and not verified
+
+*Verified* (automated, Linux, loopback): the wire codec with golden vectors and tamper cases; the state machine
+with a manual clock (RTT/2 timing, timeouts, backoff, limits, rate limit, stop); the identity check; the
+responder guards; the role override in both accept directions and in 20 simultaneous rounds; end-to-end punch
+through a real relay, a working stream on the punched connection, release of the relayed connection, GossipSub
+across the switch without duplicates; fallback when the peer does not speak dcutr.
+
+*Known limit:* the concurrency pools are per node, not per relay or per source. An attacker with many identities can hold all
+initiator permits (relayed connections it never answers on, up to `protocolTimeout`/`punchTimeout`) and all responder permits
+(dcutr streams) at once, which refuses legitimate punches until they time out; the connection then simply stays relayed.
+No per-relay quota exists yet.
+
+*Known limit (role register):* a hostile peer can still place entries on an honest peer's NAT address by naming it in its own
+CONNECT. With exactly one initiator entry on an address the listener builds the client role for that peer, so foreign responder
+entries do not break the accept case. With several initiator entries on one address the role is ambiguous, no role is
+overridden, both sides may end up as Noise responders, and the punch times out. At most four peers can hold entries on one address
+(`MAX_PEERS_PER_ADDRESS`), so four foreign entries block that address for the honest peer ("role registry full"). Mitigations in
+place: the responder registers only after SYNC, and a failure with reason "role registry full" or on an address that held foreign
+entries is not counted towards the honest peer's backoff. Not closed: the honest punch itself still fails in these cases, and
+the attacker's cost is one cheap attempt per identity.
+
+*Not verified:* the success rate behind real home routers or CGNAT; symmetric NAT (not expected to work, no
+port prediction); macOS; Windows (unsupported); UDP/QUIC (absent); AutoNAT (absent); a lying relay (a single
+relay's word is trusted); the case where both peers hold a relayed connection to each other and start at once
+(both refuse, backoff follows); older relays without Identify.
 
 == DHT fallback for the peer directory and prekey bundles (V0.9.13)
 
