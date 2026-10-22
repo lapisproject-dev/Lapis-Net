@@ -92,6 +92,11 @@ not by version number. Every row below is an annotated git tag on `master`.
 | 2026-10-20
 | the release commit
 
+| `v0.12.0`
+| Feature and fix release. Contains the waves V0.9.16, V0.9.17, V0.9.18, V0.9.19 and V0.9.20: a Kademlia routing table with 20 peers per bucket instead of Nabu's 2 (a production defect, which also fixes two flaky tests), mail acceptance wired in the browser node, a throttled Madli observer weight, a reply route for call signals over the existing connection, and DCUtR TCP hole punching (verified on Linux loopback only)
+| 2026-10-22
+| the release commit
+
 |===
 
 **From `v0.10.0` on, version numbers are chronological** (semantic versioning, `0.MINOR.PATCH`): each
@@ -2059,20 +2064,20 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 _Done, part of `v0.11.0`. Internal wave identifier._
 
 * **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapisnet node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
-* **Security-audit remainder:** recomputing the observer weight on every grant change was named as a remaining gap; _resolved in V0.9.18 (unreleased)_. The remaining bound: the weight lags the grants by at most two windows plus tick jitter and one run (one window plus a run while readers keep asking).
-* **Open:** wire the mail acceptance (_done in V0.9.17, unreleased_); editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
+* **Security-audit remainder:** recomputing the observer weight on every grant change was named as a remaining gap; _resolved in V0.9.18, released in `v0.12.0`_. The remaining bound: the weight lags the grants by at most two windows plus tick jitter and one run (one window plus a run while readers keep asking).
+* **Open:** wire the mail acceptance (_done in V0.9.17, released in `v0.12.0`_); editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
 
 == V0.9.16 — Root-cause fixes for two flaky tests (post-v0.11.0 maintenance)
 
-_Done on a local branch, not yet released. Internal wave identifier; the fix is recorded in the release notes of the next release._
+_Released in `v0.12.0`. Internal wave identifier._
 
 * **`MultiNodeIpnsValueTest` (storage):** not timing, a Nabu defect. `KademliaEngine` builds `Router(id, 2, 2, 2)`, i.e. two peers per bucket, so a third peer of a bucket was never routable (about 1 in 7 random three-peer networks, independent of load). `LapisKademliaEngine` now keeps its own routing table (`DhtLimits.routingBucketSize` = 20, `routingReplacementCacheSize` = 8, own ID hashed like every peer ID, monotonic touch times). This also repairs production: Bootstrap, directory DHT and outbox ran on heavily thinned tables. `NabuStorage.connectToDhtPeer` now returns `true` only for a routable peer. Tests: `LapisKademliaEngineRoutingTableTest` and a deterministic three-peers-one-bucket case in `MultiNodeIpnsValueTest` (both red before the fix).
 * **`CallManagerBrowserIntegrationTest`, "a rejected call ends on both sides with DECLINED" (browser/call):** the callee did not know the caller's directory record yet, so its REJECT failed with `DmUnknownRecipientException` (swallowed at debug level) and the caller rang until `RING_TIMEOUT`. The test helper now waits for convergence in both directions and retries a gossip publish that fails because no outbound stream exists yet; `CallManager` logs a lost outbound signal at `warn` and counts it.
-* **Open:** _resolved in V0.9.19 (unreleased)_ -- the production gap (ACCEPT / REJECT / HANGUP lost while the callee lacks the caller's record) is closed by answering over the INVITE's connection; remaining limits are listed under V0.9.19.
+* **Open:** _resolved in V0.9.19, released in `v0.12.0`_ -- the production gap (ACCEPT / REJECT / HANGUP lost while the callee lacks the caller's record) is closed by answering over the INVITE's connection; remaining limits are listed under V0.9.19.
 
 == V0.9.17 — Mail acceptance wiring (browser)
 
-_Done on a local branch, not yet released. Internal wave identifier._
+_Released in `v0.12.0`. Internal wave identifier._
 
 === Progress
 
@@ -2081,21 +2086,21 @@ _Done on a local branch, not yet released. Internal wave identifier._
 
 == V0.9.18 — Observer-weight recomputation throttle (Madli)
 
-_Done on a local branch, not yet released. Internal wave identifier._
+_Released in `v0.12.0`. Internal wave identifier._
 
 * **Done:** `CachedVeritasObserverWeight` recomputes at most once per window (5 s) instead of once per grant change: stale-while-revalidate, single-flight on the supervisor's bounded pool (`NodeServiceSupervisor.launchOneShot`), a safety tick for idle nodes, exponential backoff after failures, rate-limited counter-only logs, a counter of rejected refresh requests, clean stop. The first call computes synchronously and yields `0.0` if that fails. The public constructor without an executor is gone (`startSupervised` is the wiring); `BrowserServer` and `HeadlessNode` use it.
 * **Open:** the window is not an operator option; `/api/timeline` still rebuilds the trust graph per local request (not amplifiable through gossip); no independent review beyond the pipeline's own loops.
 
 == V0.9.19 — Call reply route without a known directory record
 
-_Done on a local branch, not yet released. Internal wave identifier._
+_Released in `v0.12.0`. Internal wave identifier._
 
 * **Done:** `DmCallReplyRoute` (opaque token, redacted `toString`), registry in `DmSessionManager` (256 routes, 4 per identity, 4 h maximum age on a monotonic clock, issued only after AEAD success and dedup, never for the mailbox path); `DmInboundCallSignal.replyRoute`; `sendCallSignal(..., replyRoute)` resolves the directory first and falls back to an already open connection (`LapisNode.liveConnectionTo`, `DmProtocol.openStreamOn`), never dialling, with the target resolved before the ratchet advances; `CallSignalTransport.send` and `ActiveCall` carry the token to every answer (ACCEPT, REJECT, HANGUP, timeouts, automatic rejects); the quarantine drop and `marksAcceptance` semantics are unchanged. Tests: `DmCallReplyRouteTest`, `CallManagerReplyRouteTest`, `CallReplyRouteIntegrationTest` (callee without a record for the caller: REJECT, ACCEPT and HANGUP arrive, quarantined INVITE sends nothing).
 * **Open:** the connection must still exist (otherwise the signal is lost as before); the `CallManager` does not release a token at call end; no DHT lookup fallback (alternative D); no browser-level test without the convergence workaround; no independent review beyond the pipeline's own loops.
 
 == V0.9.20 — DCUtR hole punching (TCP)
 
-_Done on a local branch, not yet released. Internal wave identifier._
+_Released in `v0.12.0`. Internal wave identifier._
 
 * **Done (parts 1 and 2):** `ReusePortTcpTransport` (listener and every dial share one port; per-channel Noise/muxer role through `PunchRoleRegistry`), the `/libp2p/dcutr` protocol (hand-written codec, spec roles: B measures the RTT and sends SYNC, A is the client), `HolePunchManager` (backoff, concurrency, rate and tracking limits, timeouts, identity check, idempotent stop), Identify toward reservation relays for observed addresses, address filter, `--hole-punching=auto|on|off` in the browser and the CLI, `/api/node/status` field `holePunching`, GossipSub re-announcement after the relayed connection closes.
 * **Open (part 3):** unilateral upgrade (B dials A's public address without a punch); AutoNAT and reachability detection; confirmation of observed addresses by several observers; port prediction for symmetric NAT; UDP/QUIC punching; Windows support; draining instead of a grace-period close of the relayed connection (open streams on it are cut); verification behind real NATs and on macOS; a tie-break when both peers start a session at once; a responder that has no observed address yet answers with an empty list.

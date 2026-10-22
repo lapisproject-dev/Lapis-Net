@@ -1,0 +1,40 @@
+Feature and fix release containing five waves (V0.9.16 to V0.9.20): a production fix in the DHT routing table, mail acceptance in the browser node, a throttled Madli observer weight, a reply route for call signals and TCP hole punching. **Hole punching is verified on Linux loopback only**; whether it works behind real home routers or CGNAT is not known. The two tests that `v0.11.0` named as unstable are fixed at their root cause.
+
+**Fix: Kademlia routing table (V0.9.16).**
+
+* Nabu's Kademlia engine kept only 2 peers per bucket, so a third peer of a bucket was never routable. This is a production defect, not a test artefact: bootstrap, the directory DHT and the outbox ran on heavily thinned routing tables. `LapisKademliaEngine` now keeps its own routing table with 20 peers per bucket (`DhtLimits.routingBucketSize`) and a replacement cache of 8.
+* This was the cause of the unstable `MultiNodeIpnsValueTest`; the second unstable test, `CallManagerBrowserIntegrationTest` (a rejected call), was a missing-record race, see the reply route below.
+* A call signal that cannot be sent is now logged at `warn` and counted; before, it was swallowed at debug level.
+
+**Mail acceptance in the browser node (V0.9.17).**
+
+* The mail acceptance check is installed in the browser node. The gossip validator and the DHT fetcher use the same check, so there is no bypass through the DHT.
+* Options: `--mail-veritas-gate`, `--mail-karma-min-score`, `--mail-min-deposit-msat` (environment `LAPISNET_MAIL_*`, file keys `mailAcceptance.*`). **All gates are off by default.** Accepted contacts are always let through; so is every recipient of an outgoing mail.
+* Blocked mail is discarded without a reply and without quarantine, so a legitimate first contact is lost while a gate is on. The accepted-contacts list is in memory only: after a restart, active gates also block known correspondents until they are marked again. `--mail-min-deposit-msat` has no effect yet because there is no deposit transport.
+
+**Throttled Madli observer weight (V0.9.18).**
+
+* The Veritas weight of a Madli observer was recomputed on every grant change, a full trust-graph rebuild each time. It is now recomputed at most once per 5 s window, stale-while-revalidate, off the caller's thread.
+* **Fails closed:** if refreshes keep failing, the weight drops to 0.0 (no reputation influence) instead of keeping a stale value that could still count a revoked grant.
+* A revoked grant takes effect after at most two windows plus tick jitter plus the computation time. The window is not an operator option.
+
+**Reply route for call signals (V0.9.19).**
+
+* When the callee has no directory record of the caller yet, ACCEPT, REJECT and HANGUP were lost and the caller rang until the timeout. They are now answered over the INVITE's still-open connection, using an opaque in-memory token (at most 256 routes, 4 per identity, 4 hours). The peer ID is only a routing target, never evidence of identity; no wire format changes.
+* If that connection is gone, the signal is lost as before. There is no DHT lookup fallback.
+
+**TCP hole punching with DCUtR (V0.9.20).**
+
+* Two nodes behind NAT that are connected through a relay try to open a direct TCP connection (`/libp2p/dcutr`). After a verified success the relayed connection is closed after a 10 s grace period (streams still open on it are cut); a failed attempt leaves it as it was.
+* Option `--hole-punching=auto|on|off`, default `auto`: active only when `--reachability=private`. `on` aborts the start if `SO_REUSEPORT` is missing. The status panel reports it as `holePunching`.
+* **Verified only on Linux loopback.** Not verified: the success rate behind real home routers or CGNAT. Symmetric NAT will not work. macOS is untested, Windows is not supported (no `SO_REUSEPORT`). There is no UDP/QUIC punching and no AutoNAT. It needs a relay that answers Identify.
+* The listener port is shared with other processes of the same OS user (`SO_REUSEPORT`), which is why the transport is used only when hole punching is active.
+
+**Known limits.**
+
+* The concurrency pools of hole punching are per node, not per relay: an attacker with many identities can hold all permits, and legitimate punches then fail until they time out (the connection stays relayed).
+* The role registry of hole punching can be blocked for an address by a hostile peer (four foreign entries); the honest punch then fails.
+* DHT lookups reveal to the peers that are asked who is looking for whom, until traffic anonymisation exists (section 11 of docs/architecture.adoc). The DHT fallback is **on by default**; switch it off with `--dht-fallback=false`.
+* The acceptance gates for DM, calls and mail are off by default; the Lightning deposit has no transport.
+* The accepted-contacts set, the outbox and the relay usage ledger are held in memory only.
+* The downloads are not signed. The new waves had only the pipeline's own AI-assisted review and security loops, no independent professional audit.

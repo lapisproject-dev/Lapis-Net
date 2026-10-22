@@ -28,9 +28,9 @@ requirements.
 
 == Status
 
-Every wave through *V0.9* is implemented and merged to `master`, followed by four
-post-arc maintenance waves (V0.9.8 to V0.9.14, below), a fix release and a feature release. The current release is
-*v0.11.0* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
+Every wave through *V0.9* is implemented and merged to `master`, followed by
+post-arc maintenance waves (V0.9.8 to V0.9.20, below), a fix release and two feature releases. The current release is
+*v0.12.0* (`v0.10.0` was the first with a chronological version number: up to `v0.9.9` the tags
 are wave identifiers (V0.7 was never a standalone wave — its scope was folded into the
 incremental browser growth of V0.2–V0.5), from `v0.10.0` on they count releases in the
 order they ship). See link:docs/roadmap.adoc[docs/roadmap.adoc] for the
@@ -111,12 +111,32 @@ link:docs/architecture.adoc[docs/architecture.adoc].
 | v0.11.0 (V0.8.7b)
 | `/call.html`: the browser page as a remote control for voice calls (Server-Sent Events, session-token cookie, `Host` and `Origin` checks, in-memory history)
 | ✅
+
+| v0.12.0 (V0.9.16)
+| Root-cause fixes for two flaky tests, one of them a production defect: Nabu's Kademlia routing table held only 2 peers per bucket, so a third peer of a bucket was never routable; `LapisKademliaEngine` now keeps its own table with 20 peers per bucket. A call signal that cannot be sent is logged at `warn` and counted
+| ✅
+
+| v0.12.0 (V0.9.17)
+| Mail acceptance wired in the browser node: `--mail-veritas-gate`, `--mail-karma-min-score`, `--mail-min-deposit-msat`, all off by default; the gossip and the DHT path apply the same check. The deposit key has no effect yet (no deposit transport)
+| ✅
+
+| v0.12.0 (V0.9.18)
+| Madli observer weight throttled (at most one recomputation per 5 s window, stale-while-revalidate, off the caller's thread); fails closed (weight 0.0) when refreshes keep failing. A revoked grant takes effect after at most two windows plus jitter plus computation time
+| ✅
+
+| v0.12.0 (V0.9.19)
+| Reply route for call signals: ACCEPT, REJECT and HANGUP are answered over the INVITE's still-open connection when the callee has no directory record of the caller. No wire format change
+| ✅
+
+| v0.12.0 (V0.9.20)
+| DCUtR TCP hole punching with a reuse-port transport, `--hole-punching=auto|on|off`. Verified on Linux loopback only, never behind a real router or CGNAT
+| ✅
 |===
 
 Known, deliberate gaps — not oversights, each documented at the point it was cut:
 
 * *No embedded Lightning node* — proof verification only, no payment sending; no BOLT-12 offer publication.
-* *NAT traversal: relay plus TCP hole punching that is only verified on loopback.* Since V0.9.20 (unreleased) `dcutr` hole punching exists (`--hole-punching=auto|on|off`, default `auto` = only for `--reachability=private`): two NAT'd peers connected through a relay try to open a direct TCP connection, and the relayed connection is released after a verified success. It has been tested on Linux loopback only, never behind a real router or CGNAT; there is no UDP/QUIC punching, no AutoNAT, no Windows support (no `SO_REUSEPORT`), and symmetric NATs will not work. It needs a relay that answers Identify and uses a transport whose listener port other processes of the same OS user may share. The rest of this item describes the relay part: A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. Without a successful punch a relayed connection stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and no application switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and the browser and `lapisnet node --reachability=private` start it (the publisher stays off unless `--publish-relay-reliability=true`), and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
+* *NAT traversal: relay plus TCP hole punching that is only verified on loopback.* Since `v0.12.0` (V0.9.20) `dcutr` hole punching exists (`--hole-punching=auto|on|off`, default `auto` = only for `--reachability=private`): two NAT'd peers connected through a relay try to open a direct TCP connection, and the relayed connection is released after a verified success. It has been tested on Linux loopback only, never behind a real router or CGNAT; there is no UDP/QUIC punching, no AutoNAT, no Windows support (no `SO_REUSEPORT`), symmetric NATs will not work, and macOS is untested. The concurrency pools are per node, not per relay: an attacker with many identities can exhaust them and keep legitimate connections relayed, and a hostile peer can block the role registry for an address (the punch then fails, the connection stays relayed). It needs a relay that answers Identify and uses a transport whose listener port other processes of the same OS user may share. The rest of this item describes the relay part: A node behind NAT can now be reached: it reserves a slot on a Circuit-Relay-v2 relay and publishes the resulting `/p2p-circuit` address, and a peer that holds only that address dials it through the relay with an end-to-end Noise session the relay cannot read. Acting *as* a relay is opt-in and off by default. Without a successful punch a relayed connection stays relayed for its whole life, and relay operators are not compensated: reputation (Madli) is the intended route: a relay-reliability metric exists since `v0.11.0`, but the publisher that writes it is off by default and only the operator option `--publish-relay-reliability=true` switches it on, and the usage-based priority ledger is local and memory-only (a new identity starts at 0). Using a relay is an explicit, programmatic setting (`LapisNode.relayClient.reserve(relay)`). Since `v0.11.0` the library also has an automatic relay selection (`LapisNode.startAutoRelay`, only for a node declared `NodeReachability.PRIVATE`) and a reachability heuristic that merely warns; there is still no AutoNAT, and the browser and `lapisnet node --reachability=private` start it (the publisher stays off unless `--publish-relay-reliability=true`), and `lapis-net-call` refuses relayed media on purpose, so voice calls still need a direct connection. Rollout constraint: a record advertising the new `RELAY` capability bit is rejected outright by older nodes, so readers must be upgraded everywhere before any node advertises it.
 * *Browser call remote control (V0.8.7b)* — `/call.html` remote-controls a call whose audio runs in the JVM node process. Since V0.9.15 the acceptance policy is wired in the browser: blocked callers are shown locally and nothing is sent to them. No mute, no persisted call history (the history is held in memory).
 * *No group calls, video, multi-device messaging, or MLS* — cut from the V0.8 arc's scope entirely on 2026-08-04, not a partial or stubbed implementation.
 * *No delivery receipts or typing indicators* for direct messages — deliberately deferred, not built even as stubs.
@@ -226,13 +246,13 @@ the table above, not a detail to gloss over. One clarification on the first row:
 lapisnet node --reachability=private
 # browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
 lapisnet-browser --reachability=private --dm-veritas-gate=true
-# mail gates (unreleased, V0.9.17): off by default; mail from a sender who passes none of them is discarded
+# mail gates (since v0.12.0, V0.9.17): off by default; mail from a sender who passes none of them is discarded
 lapisnet-browser --mail-veritas-gate=true --mail-karma-min-score=2
 ----
 
-Mail acceptance is wired in the browser node (unreleased, after `v0.11.0`). Keys: `--mail-veritas-gate` (`LAPISNET_MAIL_VERITAS_GATE`, file key `mailAcceptance.veritasGate`), `--mail-karma-min-score` (`LAPISNET_MAIL_KARMA_MIN_SCORE`, `mailAcceptance.karmaMinScore`), `--mail-min-deposit-msat` (`LAPISNET_MAIL_MIN_DEPOSIT_MSAT`, `mailAcceptance.minDepositMsat`, no effect yet). All gates are off by default. Accepted contacts are always let through; blocked mail is discarded without reply and only counted in the status panel.
+Mail acceptance is wired in the browser node (since `v0.12.0`). Keys: `--mail-veritas-gate` (`LAPISNET_MAIL_VERITAS_GATE`, file key `mailAcceptance.veritasGate`), `--mail-karma-min-score` (`LAPISNET_MAIL_KARMA_MIN_SCORE`, `mailAcceptance.karmaMinScore`), `--mail-min-deposit-msat` (`LAPISNET_MAIL_MIN_DEPOSIT_MSAT`, `mailAcceptance.minDepositMsat`, no effect yet). All gates are off by default. Accepted contacts are always let through; blocked mail is discarded without reply and only counted in the status panel.
 
-An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
+An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc` and `docs/release-notes/v0.12.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
 
 == Building
 
@@ -279,7 +299,7 @@ cached, never dialled automatically and not shown in the UI. If you only have on
 == Download
 
 Releases are listed at https://github.com/lapisproject-dev/Lapis-Net/releases. `v0.10.1` is the first release built by the release pipeline, whose publish step was tested only against local stand-ins before that run, not against GitHub itself. Starting with
-`v0.10.1` (the current release is `v0.11.0`), a release is published together with `lapis-net-browser-<version>.zip`,
+`v0.10.1` (the current release is `v0.12.0`), a release is published together with `lapis-net-browser-<version>.zip`,
 `lapis-net-cli-<version>.zip` and `SHA256SUMS`. Releases before that, including `v0.10.0`, have no
 downloadable files: check the release's asset list, and build from source (see <<Building>>) if none
 are attached.

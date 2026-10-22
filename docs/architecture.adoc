@@ -169,7 +169,7 @@ dependencies (`java-multibase`, `noise-java`) are split across them.
 
 GossipSub pub/sub and NAT traversal are explicitly out of scope for this wave; GossipSub lands in
 V0.1.7 (see below). **NAT traversal update: relay-based traversal is IMPLEMENTED (see
-"NAT traversal over Circuit Relay v2" below); `dcutr` TCP hole punching was implemented in V0.9.20 (unreleased,
+"NAT traversal over Circuit Relay v2" below); `dcutr` TCP hole punching was implemented in V0.9.20 (released in `v0.12.0`,
 see "Hole punching (DCUtR, V0.9.20)" below).** The earlier
 statement of this gap (V0.8.7, 2026-09-02) recorded that Circuit-Relay v2
 (`io.libp2p.protocol.circuit.{RelayTransport,CircuitHopProtocol,CircuitStopProtocol}`) and AutoNAT
@@ -4082,9 +4082,9 @@ also pins `DmCallSignalTransport.send`'s `marksAcceptance` forwarding end to end
 send ACCEPT, REJECT or HANGUP: the caller kept ringing until `CallConfig.ringTimeout` (45 s) and ended with
 `RING_TIMEOUT` instead of `DECLINED`. This was the root cause of the flaky "a rejected call ends on both sides
 with DECLINED" browser test. V0.9.16 only made the loss visible (a failed outbound call signal is logged at `warn`
-level and counted). **Closed in V0.9.19 (unreleased)** by the reply route described below.
+level and counted). **Closed in V0.9.19 (released in `v0.12.0`)** by the reply route described below.
 
-==== Call reply route over the existing connection (V0.9.19, unreleased)
+==== Call reply route over the existing connection (V0.9.19, released in `v0.12.0`)
 
 *Mechanism.* After a call signal arrived over the online path and its AEAD decryption succeeded, `DmSessionManager`
 remembers which libp2p connection (`PeerId`) carried it and hands the `CallManager` an opaque, unguessable
@@ -4919,7 +4919,7 @@ closing the check-then-act race between a manual `reserve` and the selector.
 
 == Hole punching (DCUtR, V0.9.20)
 
-_Implemented on a local branch, not released. TCP only. Verified on loopback only._
+_Released in `v0.12.0`. TCP only. Verified on loopback only._
 
 Two peers that are both behind a NAT and connected only through a relay can try to open a direct TCP
 connection (libp2p DCUtR). A successful punch replaces the relayed connection; a failed one leaves it
@@ -5471,10 +5471,10 @@ c4Model(name = "SingleAcceptancePoint") {
   `INVITE` silently (no RINGING, no REJECT) and `CallEventHub` shows it as "blocked" with a locally computed reason.
   The reason (`AcceptanceGateEvaluator.failedGates`) is display only and takes no decision.
 * A 60 s job rebuilds the check when the content fingerprint of the latest grants changed (not merely their count) and gives the one new instance to both
-  consumers. Gates are off by default. The mail acceptance is wired since V0.9.17 (unreleased), see below.
+  consumers. Gates are off by default. The mail acceptance is wired since V0.9.17 (released in `v0.12.0`), see below.
 * Karma per identity is defined by `PostKarmaScoreLookup` (sum over the sender's 20 newest posts, memoised 60 s).
 
-=== Mail acceptance wiring (V0.9.17, unreleased)
+=== Mail acceptance wiring (V0.9.17, released in `v0.12.0`)
 
 `MailAcceptanceCheck` is now installed in `InboxGossip` by `BrowserServer`. One instance serves both entrances:
 the GossipSub validator and the DHT fetcher (`InboxDhtFetcher` calls `InboxGossip.dhtCheckEnvelope`), because both go
@@ -5495,7 +5495,7 @@ replaces it for both paths atomically, so a refresh cannot leave one path on an 
 * The deposit key (`mailAcceptance.minDepositMsat`) has no effect until a deposit transport exists
   (`depositLookup` returns nothing), as on the DM side.
 
-=== Observer-weight recomputation throttle (V0.9.18, unreleased)
+=== Observer-weight recomputation throttle (V0.9.18, released in `v0.12.0`)
 
 `CachedVeritasObserverWeight` (the Veritas weight of a Madli observer, asked once per relay candidate by
 `MadliRelayRanker`) used to recompute on every change of the grant index: grant resolution, fingerprint and a full
