@@ -16,6 +16,18 @@ enum class RelayCommand(
     EXTENDED(3),
     END(4),
     DROP(5),
+
+    // Hidden-service (rendezvous) commands, wave V0.10.0-C. Direction in docs/anonymity.adoc.
+    ESTABLISH_INTRO(6),
+    INTRO_ESTABLISHED(7),
+    INTRODUCE1(8),
+    INTRODUCE2(9),
+    INTRODUCE_ACK(10),
+    ESTABLISH_RENDEZVOUS(11),
+    RENDEZVOUS_ESTABLISHED(12),
+    RENDEZVOUS1(13),
+    RENDEZVOUS2(14),
+    RENDEZVOUS_DATA(15),
     ;
 
     companion object {

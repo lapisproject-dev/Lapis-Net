@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation and wire integration (waves V0.10.0-A and V0.10.0-B)
+= Traffic anonymisation: design, foundation, wire integration and receiver side (waves V0.10.0-A, V0.10.0-B and V0.10.0-C)
 :toc:
 
 == Status
+
+*Wave C (receiver side and rendezvous, unreleased) adds introduction points, rendezvous points and onion-service descriptors on top of wave B. Still no user traffic uses any of it, there is no path selection, and nothing is anonymised.* See <<receiver-side>>.
 
 *Wave B (wire integration, unreleased): the infrastructure is wired, no user traffic uses it, nothing is anonymised.* `lapis-net-onion` (wave A) holds the cryptographic foundation; the new module `lapis-net-onion-wire` (wave B) carries cells over a libp2p stream, keeps a relay's onion keys, publishes relay descriptors and, only with `--onion-relay=true`, lets a node act as a relay. There is no path selection, no application (DM, mail, call, browser) sends anything over a circuit, and the browser is not wired at all. IP addresses remain visible to peers and to the directory.
 
@@ -10,7 +12,7 @@
 *What this wave does not give you.* It provides no anonymity. It provides audited-by-our-own-pipeline building blocks (cell format, ntor-style handshake, onion layering, a relay state machine with resource limits) and a written threat model. Several leaks listed below must be closed before anyone may claim anonymity for DM, mail or call signalling. No external cryptographic review has taken place.
 ====
 
-`V0.10.0-A` and `V0.10.0-B` are wave identifiers, not releases: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
+`V0.10.0-A`, `V0.10.0-B` and `V0.10.0-C` are wave identifiers, not releases: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
 
 Diagram sources are committed as kUML; GitHub does not render the `[kuml]` blocks (the rendering pipeline is not wired, see `architecture.adoc`, section Diagrams).
 
@@ -83,7 +85,7 @@ c4Model(name = "OnionCircuit") {
         interaction(description = "sees sender IP", from = sender, to = guard, technology = "Noise link, 1024-byte cells")
         interaction(description = "sees neither end", from = guard, to = middle, technology = "Noise link, 1024-byte cells")
         interaction(description = "sees receiver side", from = middle, to = exit, technology = "Noise link, 1024-byte cells")
-        interaction(description = "last layer removed", from = exit, to = receiver, technology = "rendezvous (open, wave C)")
+        interaction(description = "last layer removed", from = exit, to = receiver, technology = "rendezvous (wave C)")
     }
 }
 ----
@@ -202,35 +204,200 @@ stateDiagram(name = "Circuit lifecycle") {
 
 Circuit Relay v2 and DCUtR serve reachability (NAT). Onion circuits serve unobservability. A Circuit Relay v2 relay sees both endpoints and is therefore not an anonymity hop. DCUtR deliberately creates direct IP connections and must be *off* on anonymous paths (policy for wave E). Onion relays may themselves be reached through Circuit Relay v2.
 
-== Receiver side and rendezvous (decision open for part 2)
+[[receiver-side]]
+== Receiver side and rendezvous (wave V0.10.0-C, unreleased)
 
-Options:
+*Decision (2026-10-22): option (a), introduction points plus a rendezvous point (the Tor v3 pattern), for live traffic.* The mailbox variant (b) for offline delivery stays wave F; option (c), a fixed mailbox relay per receiver, is rejected because a stable relay learns the receiver's identity. This wave builds the receiver side as infrastructure. It is not wired into `LapisNode`, the CLI, DM, mail, call or the browser, and an onion address is not yet linked to a Lapis identity: that mapping and its distribution to contacts belong to waves D and F. Tests pass the address explicitly.
 
-. *Introduction points plus rendezvous point* (Tor v3 pattern). Live; good for online DM and call signals; complex.
-. *Mailbox pointer over circuits* (existing mailbox path, store and fetch through circuits). Offline-capable, higher latency; the DHT provider-record leak must be solved first.
-. *Fixed mailbox relay per receiver.* Simple, but a stable relay learns the receiver's identity.
+=== Onion address and why there is no blinding
 
-Recommendation: (a) for live traffic, (b) for offline delivery. *The final decision is open and belongs to wave C.*
+An onion service has its own Ed25519 *service key*, deliberately neither the Lapis identity (secp256k1) nor the libp2p transport key. The address is `base32(serviceKey(32) | checksum(2) | version(1))`, 56 lowercase characters, with `checksum = SHA-256(domainSeparatedDigest("LapisNet:onion-address-checksum:v1", key, version))[0..2]`. The id used in the end-to-end handshake is `domainSeparatedDigest("LapisNet:onion-service-id:v1", key)`.
 
-[kuml, onion-rendezvous-options, svg]
+*Blinding as in Tor v3 was evaluated and rejected.* Ed25519 key blinding needs point arithmetic on the curve that BouncyCastle does not expose as an API; implementing it ourselves would be home-made cryptography, which this project does not do. The consequence is stated plainly: the descriptor is signed in the clear with the service key, so *onion addresses and their introduction points are enumerable by anyone who reads the public descriptor index, and descriptors of one service are linkable over time*. The descriptor contains no Lapis identity, no peer id and no network address.
+
+=== Protocol
+
+Ten relay commands (codes 6 to 15) travel inside ordinary onion cells; every body has a fixed length and no length field, and the exact length is checked first.
+
+[cols="1,1,2,1"]
+|===
+| Command | Direction | Body | Bytes
+
+| `ESTABLISH_INTRO` | receiver to introduction point | `version \| authKey(32) \| notValidAfter(8) \| establishSeq(8) \| signature(64)` | 113
+| `INTRO_ESTABLISHED` | introduction point to receiver | `status(1)` | 1
+| `INTRODUCE1` / `INTRODUCE2` | sender to introduction point / introduction point to receiver (same bytes) | `version \| authKey(32) \| hpkeEnc(32) \| hpkeCiphertext(192+16)` | 273
+| `INTRODUCE_ACK` | introduction point to sender | `status(1)`: 0 forwarded, 1 unknown or replay, 2 rate limited, 3 malformed | 1
+| `ESTABLISH_RENDEZVOUS` | sender to rendezvous point | `cookie(20)` | 20
+| `RENDEZVOUS_ESTABLISHED` | rendezvous point to sender | `status(1)` | 1
+| `RENDEZVOUS1` | receiver to rendezvous point | `cookie(20) \| Y(32) \| AUTH(32)` | 84
+| `RENDEZVOUS2` | rendezvous point to sender | `Y(32) \| AUTH(32)` | 64
+| `RENDEZVOUS_DATA` | both ways over the splice | end-to-end blob | 929
+|===
+
+The HPKE plaintext of an introduction is `rendezvousRelayId(32) | rendezvousOnionKeyFingerprint(32) | cookie(20) | X(32) | random padding(76)`, 192 bytes.
+
+[kuml, onion-rendezvous-sequence, svg]
 ----
 import dev.kuml.core.dsl.sequenceDiagram
 
-sequenceDiagram(name = "Rendezvous option a") {
+sequenceDiagram(name = "Rendezvous") {
     val receiver = lifeline(name = "Receiver")
     val intro = lifeline(name = "Introduction point")
     val sender = lifeline(name = "Sender")
     val rdv = lifeline(name = "Rendezvous point")
 
-    message(from = receiver, to = intro, label = "circuit: establish introduction (identity-signed)")
-    message(from = sender, to = rdv, label = "circuit: establish rendezvous cookie")
-    message(from = sender, to = intro, label = "circuit: INTRODUCE (rendezvous point, cookie, encrypted to receiver)")
-    message(from = intro, to = receiver, label = "forward INTRODUCE")
-    message(from = receiver, to = rdv, label = "circuit: RENDEZVOUS (cookie)")
-    message(from = sender, to = rdv, label = "end-to-end traffic via splice")
-    message(from = rdv, to = receiver, label = "end-to-end traffic via splice")
+    message(from = receiver, to = intro, label = "ESTABLISH_INTRO (auth key, signed)")
+    reply(from = intro, to = receiver, label = "INTRO_ESTABLISHED")
+    message(from = sender, to = rdv, label = "ESTABLISH_RENDEZVOUS (cookie)")
+    reply(from = rdv, to = sender, label = "RENDEZVOUS_ESTABLISHED")
+    message(from = sender, to = intro, label = "INTRODUCE1 (HPKE to the service key)")
+    reply(from = intro, to = sender, label = "INTRODUCE_ACK")
+    message(from = intro, to = receiver, label = "INTRODUCE2")
+    message(from = receiver, to = rdv, label = "RENDEZVOUS1 (cookie, Y, AUTH)")
+    message(from = rdv, to = sender, label = "RENDEZVOUS2 (Y, AUTH)")
+    message(from = sender, to = rdv, label = "RENDEZVOUS_DATA (end-to-end blob)")
+    message(from = rdv, to = receiver, label = "RENDEZVOUS_DATA (same blob)")
 }
 ----
+
+. The receiver builds a circuit to each chosen introduction point (default 3) and sends `ESTABLISH_INTRO`. It signs with a fresh *auth key per introduction point*; the signature covers the introduction point's relay-id digest, the auth key, a validity time and an `establishSeq`. The introduction point checks its own digest (no cross-relay replay), the validity (at most one hour ahead) and that `establishSeq` is larger than any earlier registration of the same auth key (no rollback). A larger `establishSeq` replaces the old registration and closes the old circuit, which is how the receiver refreshes a circuit make-before-break. Only after all introduction points answered does the receiver sign and publish its descriptor.
+. The sender fetches the descriptor (local gossip index, or the DHT), verifies it completely, builds a circuit to a rendezvous point of its own choosing and sends a random 160-bit cookie. It then builds a circuit to one introduction point and sends `INTRODUCE1`; the introduction point checks role, rate and a replay cache, forwards the body as `INTRODUCE2`, and acknowledges. The sender then closes that circuit.
+. The receiver rate-limits, opens the HPKE ciphertext, checks its own replay cache, resolves the rendezvous point *only* through its local relay index (an unknown relay or a fingerprint mismatch is dropped silently, so there is no oracle), answers the end-to-end handshake, builds a circuit to the rendezvous point and sends `RENDEZVOUS1`.
+. The rendezvous point finds the cookie (single use), joins the two circuits and sends `RENDEZVOUS2` to the sender, who completes the handshake and checks `AUTH`. From then on only `RENDEZVOUS_DATA` flows.
+
+A relay accepts a role message only at the *last hop* of a circuit that has no role yet; `EXTEND`, `DATA` and `END` on a role circuit, a second role, a second `INTRODUCE1`, a self-splice and every reply-type command arriving as a request are protocol errors that destroy the circuit.
+
+=== Cryptography (established building blocks only)
+
+* *End-to-end handshake:* the existing ntor construction with its own protocol id `LapisNet:hs-ntor-x25519-sha256:v1`. The receiver plays the server with `ID = serviceId` and `B = ` the X25519 encryption key from the signed descriptor; `AUTH` therefore proves to the sender that the party that read the introduction holds the key listed in the descriptor the service key signed. Forward secrecy comes from the two ephemerals. `NtorHandshake` was parametrised by labels; the relay labels and the pinned regression vector are unchanged.
+* *Introduction:* HPKE (RFC 9180), base mode, `DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, ChaCha20-Poly1305, over BouncyCastle; `info` binds the service id and the auth key, `aad` the version and the auth key. There is *no forward secrecy of the introduction against compromise of the encryption key during its lifetime* (the same holds in Tor); the key rotates every 24 hours and the previous one stays accepted until the old descriptor expires. The same X25519 key serves both HPKE and the ntor handshake, separated by distinct labels.
+* *End-to-end layer:* two `HopCipher`s (ChaCha20-Poly1305, implicit counter nonce, no replay window, poisoned after one failure) with their own AAD label `LapisNet:hs-e2e:v1`. Every blob is exactly 929 bytes (plaintext `type | length | data | random padding`, so at most *910 bytes* of application data); the rendezvous point only ever sees equal-sized ciphertext and cannot alter a bit without the session dying.
+
+=== Descriptor
+
+`ver(1) | serviceKey(32) | seq(8) | notValidAfter(8) | encKey(32) | count(1) | count x [relay onion key binding(137) | authKey(32)] | signature(64)`: exactly `146 + 169 * count` bytes, at most 653, one to three introduction points. Verification checks the window (`now <= notValidAfter <= now + 6 h + 5 min`), that the descriptor never outlives an introduction relay's onion key binding, every binding signature, pairwise distinct relays and auth keys, and the Ed25519 signature. Three places handle it: `OnionServiceDescriptorIndex` (strictly increasing sequence, high-water marks that survive eviction, equivocation ignored, capacity 4096, never evicts a valid entry for a stranger), `OnionServiceDescriptorGossip` (topic `LapisNet:onion-service-descriptor-gossip:v1`; size, decode, index pre-check without spending budget, then per-author, per-peer and global rate limits whose excess is `IGNORE`, then verification) and `OnionServiceDht` (an IPNS record under the *service key's own name*, never in the node's directory value, so there is no flag and no link to a peer id; the validator requires publisher = service key = address). The DHT path is an API only and is not wired into the node.
+
+[kuml, onion-service-intro-slot-state, svg]
+----
+import dev.kuml.core.dsl.stateDiagram
+
+stateDiagram(name = "Introduction slot of an onion service") {
+    val start = initialState()
+    val building = state(name = "Building")
+    val establishing = state(name = "Establishing")
+    val established = state(name = "Established")
+    val backoff = state(name = "Backoff")
+    val replace = state(name = "Needs replacement relay")
+
+    transition(source = start, target = building) { trigger = "start"; effect = "build circuit" }
+    transition(source = building, target = establishing) { trigger = "circuit built"; effect = "ESTABLISH_INTRO" }
+    transition(source = establishing, target = established) { trigger = "INTRO_ESTABLISHED" }
+    transition(source = established, target = building) { trigger = "8 minutes"; effect = "new circuit, establishSeq + 1, then destroy the old one" }
+    transition(source = building, target = backoff) { trigger = "failure or timeout"; effect = "destroy circuit" }
+    transition(source = establishing, target = backoff) { trigger = "failure or timeout"; effect = "destroy circuit" }
+    transition(source = backoff, target = building) { trigger = "delay 1 s to 60 s with jitter" }
+    transition(source = backoff, target = replace) { trigger = "5 consecutive failures" }
+    transition(source = replace, target = building) { trigger = "new relay supplied" }
+}
+----
+
+[kuml, onion-rendezvous-client-state, svg]
+----
+import dev.kuml.core.dsl.stateDiagram
+
+stateDiagram(name = "Rendezvous attempt of a sender") {
+    val start = initialState()
+    val rdvBuilding = state(name = "Rendezvous circuit building")
+    val rdvEstablishing = state(name = "Rendezvous establishing")
+    val introBuilding = state(name = "Introduction circuit building")
+    val introducing = state(name = "Introducing")
+    val await = state(name = "Awaiting RENDEZVOUS2")
+    val open = state(name = "Open")
+    val failed = finalState(name = "Failed")
+
+    transition(source = start, target = rdvBuilding) { trigger = "start (descriptor verified)" }
+    transition(source = rdvBuilding, target = rdvEstablishing) { trigger = "circuit built"; effect = "ESTABLISH_RENDEZVOUS" }
+    transition(source = rdvEstablishing, target = introBuilding) { trigger = "RENDEZVOUS_ESTABLISHED" }
+    transition(source = introBuilding, target = introducing) { trigger = "circuit built"; effect = "INTRODUCE1" }
+    transition(source = introducing, target = await) { trigger = "INTRODUCE_ACK forwarded"; effect = "destroy introduction circuit" }
+    transition(source = introducing, target = introBuilding) { trigger = "negative ACK, timeout, failure"; effect = "next introduction point" }
+    transition(source = await, target = open) { trigger = "RENDEZVOUS2 with valid AUTH" }
+    transition(source = rdvBuilding, target = failed) { trigger = "timeout, wrong AUTH, no introduction point left"; effect = "destroy every circuit" }
+    transition(source = await, target = failed) { trigger = "timeout or wrong AUTH"; effect = "destroy every circuit" }
+}
+----
+
+[kuml, onion-relay-circuit-role-state, svg]
+----
+import dev.kuml.core.dsl.stateDiagram
+
+stateDiagram(name = "Hidden-service role of a circuit at a relay") {
+    val start = initialState()
+    val none = state(name = "No role")
+    val intro = state(name = "Introduction point")
+    val introducing = state(name = "Introducing (one shot)")
+    val waiting = state(name = "Rendezvous waiting")
+    val spliced = state(name = "Spliced")
+    val closed = finalState(name = "Destroyed")
+
+    transition(source = start, target = none) { trigger = "CREATE or EXTEND" }
+    transition(source = none, target = intro) { trigger = "ESTABLISH_INTRO (last hop, valid)" }
+    transition(source = none, target = introducing) { trigger = "INTRODUCE1 (last hop)" }
+    transition(source = none, target = waiting) { trigger = "ESTABLISH_RENDEZVOUS (last hop)" }
+    transition(source = none, target = spliced) { trigger = "RENDEZVOUS1 with a waiting cookie" }
+    transition(source = waiting, target = spliced) { trigger = "partner RENDEZVOUS1"; effect = "RENDEZVOUS2" }
+    transition(source = intro, target = closed) { trigger = "newer establishSeq, DESTROY, lifetime" }
+    transition(source = waiting, target = closed) { trigger = "60 s wait, DESTROY, lifetime" }
+    transition(source = spliced, target = closed) { trigger = "either half ends"; effect = "the other half is destroyed" }
+    transition(source = none, target = closed) { trigger = "protocol violation" }
+}
+----
+
+[kuml, onion-who-sees-what, svg]
+----
+import dev.kuml.c4.dsl.c4Model
+
+c4Model(name = "OnionService") {
+    val sender = person(name = "Sender")
+    val receiver = person(name = "Receiver")
+    val introPoint = softwareSystem(name = "Introduction point")
+    val rdvPoint = softwareSystem(name = "Rendezvous point")
+
+    dynamicDiagram(name = "Who sees what", description = "No relay sees both ends; the descriptor is public") {
+        interaction(description = "sees an auth key, never the receiver IP", from = receiver, to = introPoint, technology = "ESTABLISH_INTRO over a circuit")
+        interaction(description = "sees a cookie, never an end IP", from = sender, to = rdvPoint, technology = "ESTABLISH_RENDEZVOUS over a circuit")
+        interaction(description = "forwards ciphertext it cannot read", from = sender, to = introPoint, technology = "INTRODUCE1 over a circuit")
+        interaction(description = "equal-sized end-to-end ciphertext", from = rdvPoint, to = receiver, technology = "RENDEZVOUS_DATA over a circuit")
+    }
+}
+----
+
+=== Limits and timers
+
+Relay side (`OnionRelayLimits`, validated): 256 introduction points in total and 32 per previous link, 10 `INTRODUCE1` per second per introduction point (checked before any other work), replay cache of 8192 body digests, 512 waiting cookies in total and 64 per link, wait timeout 60 s (shorter than the circuit lifetime), 512 spliced pairs. Receiver side (`OnionServiceConfig`): 3 introduction points, descriptor TTL 3 h (at most 6 h) republished hourly, intro refresh after 8 minutes (relays sweep circuits after 10), build timeout 30 s, establish timeout 15 s, exponential backoff 1 s to 60 s with jitter and a replacement relay after 5 failures, 16 concurrent pending rendezvous builds (before acceptance) and at most 256 open accepted sessions (`maxOpenSessions`; further accepted rendezvous are closed at once), 5 `INTRODUCE2` per second, replay cache of 8192 entries per encryption key which *fails closed* when full (and so can be filled by anyone who can encrypt to the public key: an acknowledged denial-of-service limit, bounded by the rate limits). A full cache forces an early encryption key rotation and republication at the next tick, so the service recovers without waiting for the regular rotation every 24 hours; clients holding an older descriptor are rejected until they have fetched the new one. Sender side (`RendezvousClientConfig`): 30 s to build, 15 s to establish, 15 s for the acknowledgement, 30 s for `RENDEZVOUS2`, 60 s overall; the next introduction point is tried at once (no backoff between introduction attempts). *A rendezvous session lives at most as long as the relays' circuit lifetime (10 minutes); reconnecting is the caller's job (waves E and F).*
+
+=== Assumptions awaiting confirmation (wave C)
+
+* *Assumption, confirmation required:* a dedicated service key per onion service and no link to the Lapis identity in this wave.
+* *Assumption, confirmation required:* no Tor-style key blinding (see above).
+* *Assumption, confirmation required:* HPKE for the introduction rather than a hs-ntor-style composition.
+* *Assumption, confirmation required:* the descriptor index and gossip topic are attached on every node, like the relay descriptor index. Consequence: the Sybil limit described below applies on every node.
+* *Assumption, confirmation required:* `ESTABLISH_INTRO` is signed by a per-introduction-point auth key (the Tor pattern), not directly by the service key.
+* *Assumption, confirmation required:* all constants in the previous section.
+* *Assumption, confirmation required:* sessions of at most 10 minutes; the alternative is a longer lifetime for spliced circuits on every hop.
+* *Assumption, confirmation required:* no proof of work against introduction floods.
+
+=== Honest limits of wave C
+
+* *No user traffic is anonymised and no anonymity is offered.* The hidden-service API is `ExperimentalOnionApi`, takes its paths from an injected provider and chooses nothing itself.
+* Sybil relays, free choice of introduction relays by the receiver (no path selection yet), the predecessor attack without guards, a small anonymity set and a global passive observer are as described in the threat model; wave C changes none of them.
+* Onion addresses and their introduction points are enumerable; descriptors are linkable over time (no blinding).
+* Publishing from the service's own node (gossip, DHT) shows that node's IP to its gossip neighbours and to the DHT peers that store or serve the record, together with the onion address, until wave D publishes through circuits.
+* Teardown correlation still applies: an adversary that provokes a teardown on one half can watch the other half end.
+* No forward secrecy for the introduction content against the encryption key within its lifetime.
+* An introduction flood is only slowed by rates, not by a cost; the receiver's replay cache can be filled. A full cache forces an early key rotation and republication (at 5 `INTRODUCE2` per second at most about every 27 minutes), during which clients with an older descriptor fail until they have fetched a new one.
+* *Known limitation (Sybil, service descriptor index):* a valid service descriptor costs nothing (a fresh Ed25519 service key plus one to three publicly gossiped relay onion key bindings, reusable, and a fresh auth key per entry). About 61 such descriptors per minute exhaust the single global budget (60/min) at every node, so honest new or updated service descriptors are ignored and stop spreading. After about 68 minutes the index is full (capacity 4096) and every new honest service is refused with `CAPACITY`; the attacker keeps the slots by republishing its own keys with a higher sequence number, because a full index never evicts a valid entry and updates of tracked keys are always accepted. The per-author bucket does not help against fresh keys. Gossip discovery of new onion services can thus be stopped network-wide; the DHT path is an API only and not yet wired up. Same class of limit as for the relay descriptor index above. Planned mitigations: a cost per index slot (proof of work, known peer record or Madli weight) or a fair per-mesh-peer budget instead of one global bucket. Not mitigated in wave C.
+* Not verified: real NATs, interoperability with v0.12.0, an external cryptographic review, behaviour under real load, interoperability of the HPKE path with other implementations. Multi-node tests run on loopback.
 
 == Incentives and operation
 
@@ -333,13 +500,15 @@ Honest limits: zeroisation covers the arrays this code owns, not copies the JVM 
 
 `lapis-net-onion-wire` (wave B, unreleased) adds the network side described above: `OnionLinkProtocol`/`OnionLinkManager`, `OnionRelayService`, `OnionKeyStore`, `OnionRelayQualityTracker`, `OnionWire` and the diagnostic `OnionCircuitClient`.
 
+Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServiceAddress`, `OnionServiceDescriptor` with its codec, the HPKE introduction, the end-to-end layer (`RendezvousEndToEnd`, `RendezvousHandshake`), the relay roles and splice inside `OnionRelay` (introduction table, rendezvous table, deferred cross-circuit work so that two circuit locks are never held at once) and the two pure state machines `OnionServiceStateMachine` and `RendezvousClientStateMachine`; to `lapis-net-directory`: `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip` and `OnionServiceDht`; to `lapis-net-onion-wire`: `OnionClientCircuit`/`OnionCircuitFactory`, `OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionPathProvider` and the `OnionWire` factories.
+
 == Wave plan
 
 [cols="1,5"]
 |===
 | A | This wave: threat model, design, `lapis-net-onion` foundation.
 | B | Done (unreleased): wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode. No user traffic, no path selection.
-| C | Receiver side: decide the rendezvous design, introduction points and rendezvous point.
+| C | Done (unreleased): receiver side: introduction points and rendezvous point (decision: option a, live traffic), onion service descriptors (index, gossip, DHT API), hosting and connecting over circuits, relay-side roles and splice. No user traffic, no path selection, no link to the Lapis identity.
 | D | Directory anonymity: `PeerRecord` without addresses in anonymity mode, introduction points instead of addresses.
 | E | Path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.
 | F | DM online and offline over circuits; mail delivery moved off the per-recipient topic.

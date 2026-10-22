@@ -37,10 +37,11 @@ internal class HopCipher(
     private val hopIndex: Int,
     private val maxCells: Long = MAX_CELLS_PER_DIRECTION,
     startCounter: Long = 0,
+    aadLabel: String = PROTOCOL_ID,
 ) : AutoCloseable {
     internal val keyRaw: ByteArray = key
 
-    private val aad = PROTOCOL_ID.toByteArray(Charsets.US_ASCII) + byteArrayOf(direction.code, hopIndex.toByte())
+    private val aad = aadLabel.toByteArray(Charsets.US_ASCII) + byteArrayOf(direction.code, hopIndex.toByte())
     private var counter = startCounter
     private var poisoned = false
     private var closed = false

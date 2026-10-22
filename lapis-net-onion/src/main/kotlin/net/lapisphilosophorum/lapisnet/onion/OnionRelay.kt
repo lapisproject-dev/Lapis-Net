@@ -59,6 +59,10 @@ private data class CircuitKey(
 
 private enum class Notify { PREV, NEXT, BOTH, NONE }
 
+/** The hidden-service role of a circuit at THIS relay (last hop only). `NONE -> INTRO | INTRODUCING |
+ * RENDEZVOUS_WAITING -> SPLICED -> closed`; a circuit has at most one role for its whole life. */
+private enum class CircuitRole { NONE, INTRO, INTRODUCING, RENDEZVOUS_WAITING, SPLICED }
+
 private class RelayCircuit(
     val handle: Long,
     val prevLink: LinkId,
@@ -66,8 +70,17 @@ private class RelayCircuit(
     val hop: RelayHopState,
     val createdAtMillis: Long,
     val cellBucket: TokenBucket,
-) {
+) : RelayCircuitRef {
+    override val linkKey: Long get() = prevLink.value
     val lock = ReentrantLock()
+
+    @Volatile var role = CircuitRole.NONE
+
+    @Volatile var introduceBucket: TokenBucket? = null
+    var partner: RelayCircuit? = null
+    var pairOwner = false
+
+    @Volatile var waitingSinceMillis = 0L
     var nextLink: LinkId? = null
     var nextCircuitId = 0
     var extendPending = false
@@ -120,11 +133,110 @@ class OnionRelay(
     private val handleSeq = AtomicLong(0)
     private val pendingSeq = AtomicLong(0)
     private val closedFlag = AtomicBoolean(false)
+    private val introTable =
+        IntroPointTable(limits.maxIntroPointsTotal, limits.maxIntroPointsPerLink, limits.introReplayCacheEntries)
+    private val rendezvousTable = RendezvousTable(limits.maxPendingRendezvousTotal, limits.maxPendingRendezvousPerLink)
+    private val splicedPairs = AtomicInteger(0)
+
+    // Work that must run OUTSIDE every circuit lock (never hold two circuit locks at once): collected while a
+    // lock is held, executed by the public entry points after all locks are released.
+    private sealed interface Deferred
+
+    private class DeferTeardown(
+        val circuit: RelayCircuit,
+        val reason: DestroyReason,
+        val notify: Notify,
+    ) : Deferred
+
+    private class DeferSend(
+        val circuit: RelayCircuit,
+        val message: RelayMessage,
+    ) : Deferred
+
+    private class DeferSplice(
+        val waiting: RelayCircuit,
+        val receiver: RelayCircuit,
+        val rendezvous2Payload: ByteArray,
+    ) : Deferred
+
+    private val deferred = ThreadLocal.withInitial { ArrayDeque<Deferred>() }
 
     /** Test hook, invoked immediately before each X25519 handshake is attempted. */
     internal var beforeHandshake: (() -> Unit)? = null
 
     val circuitCount: Int get() = total.get()
+
+    /** Introduction points currently registered at this relay (leak checks). */
+    val introPointCount: Int get() = introTable.size
+
+    /** Rendezvous cookies currently waiting for their second circuit (leak checks). */
+    val pendingRendezvousCount: Int get() = rendezvousTable.size
+
+    /** Spliced circuit pairs currently relayed by this relay (leak checks). */
+    val splicedPairCount: Int get() = splicedPairs.get()
+
+    /** Test seam: sees every RENDEZVOUS_DATA blob this relay splices (it is end-to-end ciphertext). */
+    @ExperimentalOnionApi
+    var rendezvousDataObserver: ((ByteArray) -> Unit)? = null
+
+    /** Runs [block], then everything it deferred, after all circuit locks have been released. */
+    private fun entry(block: () -> List<RelayAction>): List<RelayAction> {
+        val queue = deferred.get()
+        val first =
+            try {
+                block()
+            } catch (e: Throwable) {
+                queue.clear()
+                throw e
+            }
+        if (queue.isEmpty()) return first
+        val out = ArrayList(first)
+        try {
+            while (queue.isNotEmpty()) out += runDeferred(queue.removeFirst())
+        } finally {
+            queue.clear()
+        }
+        return out
+    }
+
+    private fun defer(d: Deferred) {
+        deferred.get().addLast(d)
+    }
+
+    private fun runDeferred(d: Deferred): List<RelayAction> =
+        when (d) {
+            is DeferTeardown -> teardown(d.circuit, d.reason, d.notify)
+            is DeferSend ->
+                d.circuit.lock.withLock {
+                    if (d.circuit.closed) {
+                        emptyList()
+                    } else {
+                        sendBackward(d.circuit, d.message)
+                    }
+                }
+            is DeferSplice ->
+                d.waiting.lock.withLock {
+                    if (d.waiting.closed) {
+                        teardown(d.receiver, DestroyReason.FINISHED, Notify.PREV)
+                    } else {
+                        d.waiting.role = CircuitRole.SPLICED
+                        d.waiting.partner = d.receiver
+                        sendBackward(d.waiting, RelayMessage(RelayCommand.RENDEZVOUS2, 0, d.rendezvous2Payload))
+                    }
+                }
+        }
+
+    /** Caller holds [c]'s lock. */
+    private fun sendBackward(
+        c: RelayCircuit,
+        message: RelayMessage,
+    ): List<RelayAction> =
+        try {
+            val body = c.hop.originateBackward(message, random)
+            listOf(RelayAction.SendCell(c.prevLink, Cell(c.prevCircuitId, CellCommand.RELAY, body)))
+        } catch (e: OnionResourceLimitException) {
+            teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+        }
 
     /** `true` if at least one circuit currently uses [link] as its previous hop. */
     fun hasCircuitsOn(link: LinkId): Boolean = (perLink[link.value]?.get() ?: 0) > 0
@@ -138,6 +250,11 @@ class OnionRelay(
     fun onCell(
         from: LinkId,
         cell: Cell,
+    ): List<RelayAction> = entry { onCellInternal(from, cell) }
+
+    private fun onCellInternal(
+        from: LinkId,
+        cell: Cell,
     ): List<RelayAction> {
         if (closedFlag.get()) return emptyList()
         return when (cell.command) {
@@ -149,7 +266,9 @@ class OnionRelay(
         }
     }
 
-    fun onLinkClosed(link: LinkId): List<RelayAction> {
+    fun onLinkClosed(link: LinkId): List<RelayAction> = entry { onLinkClosedInternal(link) }
+
+    private fun onLinkClosedInternal(link: LinkId): List<RelayAction> {
         val out = ArrayList<RelayAction>()
         for (c in byHandle.values.toList()) {
             c.lock.withLock {
@@ -168,6 +287,11 @@ class OnionRelay(
 
     /** Called by the host with the outcome of an [RelayAction.OpenLinkForExtend]. */
     fun onExtendResult(
+        pendingId: Long,
+        link: LinkId?,
+    ): List<RelayAction> = entry { onExtendResultInternal(pendingId, link) }
+
+    private fun onExtendResultInternal(
         pendingId: Long,
         link: LinkId?,
     ): List<RelayAction> {
@@ -209,33 +333,37 @@ class OnionRelay(
     fun reply(
         circuitHandle: Long,
         message: RelayMessage,
-    ): List<RelayAction> {
-        val c = byHandle[circuitHandle] ?: return emptyList()
-        c.lock.withLock {
-            if (c.closed) return emptyList()
-            return try {
-                val body = c.hop.originateBackward(message, random)
-                listOf(RelayAction.SendCell(c.prevLink, Cell(c.prevCircuitId, CellCommand.RELAY, body)))
-            } catch (e: OnionResourceLimitException) {
-                teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+    ): List<RelayAction> =
+        entry {
+            val c = byHandle[circuitHandle] ?: return@entry emptyList()
+            c.lock.withLock {
+                if (c.closed) emptyList() else sendBackward(c, message)
             }
         }
-    }
 
     /** Closes circuits older than the configured lifetime; the host calls this periodically. */
-    fun sweepExpired(): List<RelayAction> {
-        val now = clock.millis()
-        val maxAge = limits.circuitMaxLifetime.inWholeMilliseconds
-        val out = ArrayList<RelayAction>()
-        for (c in byHandle.values.toList()) {
-            if (now - c.createdAtMillis >= maxAge) out += teardown(c, DestroyReason.FINISHED, Notify.BOTH)
+    fun sweepExpired(): List<RelayAction> =
+        entry {
+            val now = clock.millis()
+            val maxAge = limits.circuitMaxLifetime.inWholeMilliseconds
+            val maxWait = limits.rendezvousWaitTimeout.inWholeMilliseconds
+            val out = ArrayList<RelayAction>()
+            for (c in byHandle.values.toList()) {
+                if (now - c.createdAtMillis >= maxAge ||
+                    (c.role == CircuitRole.RENDEZVOUS_WAITING && now - c.waitingSinceMillis >= maxWait)
+                ) {
+                    out += teardown(c, DestroyReason.FINISHED, Notify.BOTH)
+                }
+            }
+            out
         }
-        return out
-    }
 
     override fun close() {
         closedFlag.set(true)
-        for (c in byHandle.values.toList()) teardown(c, DestroyReason.NONE, Notify.NONE)
+        entry {
+            for (c in byHandle.values.toList()) teardown(c, DestroyReason.NONE, Notify.NONE)
+            emptyList()
+        }
     }
 
     // ---- CREATE -------------------------------------------------------------------------------
@@ -410,10 +538,153 @@ class OnionRelay(
     ): List<RelayAction> =
         when (msg.command) {
             RelayCommand.DROP -> emptyList()
-            RelayCommand.DATA, RelayCommand.END -> listOf(RelayAction.DeliverLocal(c.handle, msg))
+            RelayCommand.DATA, RelayCommand.END ->
+                if (c.role != CircuitRole.NONE) {
+                    teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+                } else {
+                    listOf(RelayAction.DeliverLocal(c.handle, msg))
+                }
             RelayCommand.EXTENDED -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
-            RelayCommand.EXTEND -> handleExtend(c, msg)
+            RelayCommand.EXTEND ->
+                if (c.role !=
+                    CircuitRole.NONE
+                ) {
+                    teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+                } else {
+                    handleExtend(c, msg)
+                }
+            RelayCommand.ESTABLISH_INTRO -> handleEstablishIntro(c, msg)
+            RelayCommand.INTRODUCE1 -> handleIntroduce1(c, msg)
+            RelayCommand.ESTABLISH_RENDEZVOUS -> handleEstablishRendezvous(c, msg)
+            RelayCommand.RENDEZVOUS1 -> handleRendezvous1(c, msg)
+            RelayCommand.RENDEZVOUS_DATA -> handleRendezvousData(c, msg)
+            // Replies and forwarded messages never arrive "locally" at a relay.
+            RelayCommand.INTRO_ESTABLISHED,
+            RelayCommand.INTRODUCE2,
+            RelayCommand.INTRODUCE_ACK,
+            RelayCommand.RENDEZVOUS_ESTABLISHED,
+            RelayCommand.RENDEZVOUS2,
+            -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
         }
+
+    // ---- hidden-service roles (wave V0.10.0-C) --------------------------------------------------
+
+    /** Role messages are only accepted at the last hop of a circuit that has not taken a role yet. */
+    private fun canTakeRole(c: RelayCircuit): Boolean =
+        c.role == CircuitRole.NONE && c.nextLink == null && !c.extendPending
+
+    private fun handleEstablishIntro(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        val body =
+            try {
+                EstablishIntroBody.decode(msg.data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        val now = clock.millis() / 1000
+        if (body.notValidAfterEpochSecond < now ||
+            body.notValidAfterEpochSecond > now + HsConstants.MAX_ESTABLISH_WINDOW_SECONDS ||
+            !body.verify(ownId)
+        ) {
+            logger.debug { "establish-intro refused" }
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        return when (val r = introTable.register(body.authKey.bytes, c, body.establishSeq)) {
+            is IntroRegistration.Stale -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            is IntroRegistration.LimitReached -> teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+            is IntroRegistration.Registered -> {
+                c.role = CircuitRole.INTRO
+                c.introduceBucket = TokenBucket(limits.introduce1PerSecondPerIntroPoint, clock)
+                // make-before-break: the superseded circuit of the same auth key is closed (outside this lock)
+                (r.replaced as? RelayCircuit)?.let { defer(DeferTeardown(it, DestroyReason.FINISHED, Notify.BOTH)) }
+                sendBackward(c, RelayMessage(RelayCommand.INTRO_ESTABLISHED, 0, StatusBody.encode(0)))
+            }
+        }
+    }
+
+    private fun handleIntroduce1(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        c.role = CircuitRole.INTRODUCING // at most one INTRODUCE1 per circuit
+
+        fun ack(status: Byte) = sendBackward(c, RelayMessage(RelayCommand.INTRODUCE_ACK, 0, StatusBody.encode(status)))
+        val body = msg.data
+        val authKey = IntroduceBody.peekAuthKey(body) ?: return ack(IntroduceStatus.MALFORMED)
+        val intro = introTable.lookup(authKey) as? RelayCircuit ?: return ack(IntroduceStatus.UNKNOWN)
+        // The rate limit comes BEFORE the replay hash and any other work.
+        if (intro.introduceBucket?.tryAcquire() != true) return ack(IntroduceStatus.RATE_LIMITED)
+        if (introTable.seenBefore(body)) return ack(IntroduceStatus.UNKNOWN)
+        defer(DeferSend(intro, RelayMessage(RelayCommand.INTRODUCE2, 0, body)))
+        return ack(IntroduceStatus.FORWARDED)
+    }
+
+    private fun handleEstablishRendezvous(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        val cookie =
+            try {
+                CookieBody.decode(msg.data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        return when (rendezvousTable.put(cookie, c)) {
+            RendezvousTable.PutResult.DUPLICATE -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            RendezvousTable.PutResult.LIMIT -> teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+            RendezvousTable.PutResult.OK -> {
+                c.role = CircuitRole.RENDEZVOUS_WAITING
+                c.waitingSinceMillis = clock.millis()
+                sendBackward(c, RelayMessage(RelayCommand.RENDEZVOUS_ESTABLISHED, 0, StatusBody.encode(0)))
+            }
+        }
+    }
+
+    private fun handleRendezvous1(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        val body =
+            try {
+                Rendezvous1Body.decode(msg.data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        if (!reserve(splicedPairs, limits.maxSplicedPairsTotal)) {
+            return teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+        }
+        val waiting = rendezvousTable.take(body.cookie) as? RelayCircuit
+        if (waiting == null || waiting === c) {
+            splicedPairs.decrementAndGet()
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        c.role = CircuitRole.SPLICED
+        c.pairOwner = true
+        c.partner = waiting
+        defer(DeferSplice(waiting, c, body.rendezvous2Payload()))
+        return emptyList()
+    }
+
+    private fun handleRendezvousData(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        val partner = c.partner
+        val data = msg.data
+        if (c.role != CircuitRole.SPLICED || partner == null || data.size != HsConstants.E2E_BLOB_SIZE) {
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        @OptIn(ExperimentalOnionApi::class)
+        rendezvousDataObserver?.invoke(data)
+        defer(DeferSend(partner, RelayMessage(RelayCommand.RENDEZVOUS_DATA, 0, data)))
+        return emptyList()
+    }
 
     private fun handleExtend(
         c: RelayCircuit,
@@ -481,6 +752,16 @@ class OnionRelay(
             total.decrementAndGet()
             perLink[c.prevLink.value]?.decrementAndGet()
             if (c.extendPending && pending.remove(c.pendingId) != null) pendingCount.decrementAndGet()
+            when (c.role) {
+                CircuitRole.INTRO -> introTable.remove(c)
+                CircuitRole.RENDEZVOUS_WAITING -> rendezvousTable.remove(c)
+                else -> Unit
+            }
+            if (c.pairOwner) splicedPairs.decrementAndGet()
+            c.partner?.let { p ->
+                // the other half of a splice cannot outlive this one
+                defer(DeferTeardown(p, reason, if (notify == Notify.NONE) Notify.NONE else Notify.PREV))
+            }
             c.hop.close()
             if (notify == Notify.PREV || notify == Notify.BOTH) {
                 out += destroyCell(c.prevLink, c.prevCircuitId, reason)

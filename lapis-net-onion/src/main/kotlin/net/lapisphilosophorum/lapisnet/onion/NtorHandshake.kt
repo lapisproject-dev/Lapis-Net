@@ -11,12 +11,28 @@ import java.security.SecureRandom
 
 private val logger = KotlinLogging.logger {}
 
-private val PROTOID = PROTOCOL_ID.toByteArray(Charsets.US_ASCII)
-private val T_KEY_EXTRACT = PROTOID + ":key_extract".toByteArray(Charsets.US_ASCII)
-private val T_VERIFY = PROTOID + ":verify".toByteArray(Charsets.US_ASCII)
-private val T_MAC = PROTOID + ":mac".toByteArray(Charsets.US_ASCII)
-private val T_EXPAND = PROTOID + ":expand".toByteArray(Charsets.US_ASCII)
 private val SERVER = "Server".toByteArray(Charsets.US_ASCII)
+
+/**
+ * The protocol-ID dependent labels of the ntor construction. The relay (circuit) handshake uses
+ * [RELAY]; the hidden-service end-to-end handshake (wave V0.10.0-C) uses [HS], so the two can never
+ * produce the same keys for the same inputs. [RELAY] is byte-identical to the wave-A constants
+ * (pinned by the golden-vector regression test).
+ */
+internal class NtorLabels(
+    protocolId: String,
+) {
+    val protoId: ByteArray = protocolId.toByteArray(Charsets.US_ASCII)
+    val keyExtract: ByteArray = protoId + ":key_extract".toByteArray(Charsets.US_ASCII)
+    val verify: ByteArray = protoId + ":verify".toByteArray(Charsets.US_ASCII)
+    val mac: ByteArray = protoId + ":mac".toByteArray(Charsets.US_ASCII)
+    val expand: ByteArray = protoId + ":expand".toByteArray(Charsets.US_ASCII)
+
+    companion object {
+        val RELAY = NtorLabels(PROTOCOL_ID)
+        val HS = NtorLabels("LapisNet:hs-ntor-x25519-sha256:v1")
+    }
+}
 
 /** Client-side handshake state: the ephemeral scalar x plus the target relay's public parameters.
  * [close] zeroises x. */
@@ -89,14 +105,25 @@ object NtorHandshake {
             logger.debug { "ntor: create does not address this relay" }
             throw OnionHandshakeException()
         }
+        return serverRespondRaw(id, ownBinding.onionKey, onionPrivate, create.clientEphemeral, NtorLabels.RELAY, random)
+    }
+
+    /** The label-parametrised core shared by the relay and the hidden-service handshake. */
+    internal fun serverRespondRaw(
+        id: ByteArray,
+        onionPublic: X25519PublicKey,
+        onionPrivate: X25519PrivateKey,
+        clientEphemeral: X25519PublicKey,
+        labels: NtorLabels,
+        random: SecureRandom,
+    ): NtorServerResult {
         val ephemeral = X25519KeyPair.generate(random)
         var s1: ByteArray? = null
         var s2: ByteArray? = null
         try {
-            s1 = x25519SharedSecret(ephemeral.privateKey, create.clientEphemeral)
-            s2 = x25519SharedSecret(onionPrivate, create.clientEphemeral)
-            val (auth, keys) =
-                derive(s1, s2, id, ownBinding.onionKey, create.clientEphemeral, ephemeral.publicKey)
+            s1 = x25519SharedSecret(ephemeral.privateKey, clientEphemeral)
+            s2 = x25519SharedSecret(onionPrivate, clientEphemeral)
+            val (auth, keys) = derive(s1, s2, id, onionPublic, clientEphemeral, ephemeral.publicKey, labels)
             return NtorServerResult(CreatedBody(ephemeral.publicKey, auth), keys)
         } catch (e: OnionHandshakeException) {
             throw e
@@ -110,10 +137,26 @@ object NtorHandshake {
         }
     }
 
+    /** Client start for an arbitrary (id, public key) target (hidden-service handshake). */
+    internal fun clientStartRaw(
+        id: ByteArray,
+        onionPublic: X25519PublicKey,
+        random: SecureRandom,
+    ): Pair<NtorClientState, X25519PublicKey> {
+        val pair = X25519KeyPair.generate(random)
+        return NtorClientState(pair.privateKey, pair.publicKey, onionPublic, id.copyOf()) to pair.publicKey
+    }
+
     /** Always zeroises [state], also on failure. Throws [OnionHandshakeException] if AUTH does not match. */
     fun clientFinish(
         state: NtorClientState,
         created: CreatedBody,
+    ): CircuitHopKeys = clientFinishRaw(state, created, NtorLabels.RELAY)
+
+    internal fun clientFinishRaw(
+        state: NtorClientState,
+        created: CreatedBody,
+        labels: NtorLabels,
     ): CircuitHopKeys {
         var s1: ByteArray? = null
         var s2: ByteArray? = null
@@ -121,7 +164,7 @@ object NtorHandshake {
             s1 = x25519SharedSecret(state.x, created.serverEphemeral)
             s2 = x25519SharedSecret(state.x, state.onionKey)
             val (auth, keys) =
-                derive(s1, s2, state.relayIdDigest, state.onionKey, state.clientPublic, created.serverEphemeral)
+                derive(s1, s2, state.relayIdDigest, state.onionKey, state.clientPublic, created.serverEphemeral, labels)
             try {
                 if (!Arrays.constantTimeAreEqual(auth, created.auth)) {
                     logger.debug { "ntor: server authentication failed" }
@@ -154,21 +197,22 @@ object NtorHandshake {
         b: X25519PublicKey,
         x: X25519PublicKey,
         y: X25519PublicKey,
+        labels: NtorLabels,
     ): Pair<ByteArray, CircuitHopKeys> {
         val bBytes = b.bytes
         val xBytes = x.bytes
         val yBytes = y.bytes
-        val secretInput = s1 + s2 + id + bBytes + xBytes + yBytes + PROTOID
+        val secretInput = s1 + s2 + id + bBytes + xBytes + yBytes + labels.protoId
         var keySeed: ByteArray? = null
         var verify: ByteArray? = null
         var authInput: ByteArray? = null
         var okm: ByteArray? = null
         try {
-            keySeed = OnionKdf.hmacSha256(T_KEY_EXTRACT, secretInput)
-            verify = OnionKdf.hmacSha256(T_VERIFY, secretInput)
-            authInput = verify + id + bBytes + yBytes + xBytes + PROTOID + SERVER
-            val auth = OnionKdf.hmacSha256(T_MAC, authInput)
-            okm = OnionKdf.hkdfSha256(keySeed, ByteArray(0), T_EXPAND, 64)
+            keySeed = OnionKdf.hmacSha256(labels.keyExtract, secretInput)
+            verify = OnionKdf.hmacSha256(labels.verify, secretInput)
+            authInput = verify + id + bBytes + yBytes + xBytes + labels.protoId + SERVER
+            val auth = OnionKdf.hmacSha256(labels.mac, authInput)
+            okm = OnionKdf.hkdfSha256(keySeed, ByteArray(0), labels.expand, 64)
             val forward = okm.copyOfRange(0, 32)
             val backward = okm.copyOfRange(32, 64)
             try {

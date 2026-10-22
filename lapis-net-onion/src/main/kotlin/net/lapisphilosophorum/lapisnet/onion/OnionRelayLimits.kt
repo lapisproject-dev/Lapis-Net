@@ -3,6 +3,7 @@ package net.lapisphilosophorum.lapisnet.onion
 import java.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /** Hard resource bounds of one [OnionRelay]. Per-circuit memory is constant (two hop ciphers, two
  * table entries, a few counters; roughly 1 KiB), so these limits bound the relay's total memory. */
@@ -14,11 +15,37 @@ data class OnionRelayLimits(
     val maxPendingExtends: Int = 512,
     val circuitMaxLifetime: Duration = 10.minutes,
     val cellsPerSecondPerCircuit: Int = 2000,
+    // Hidden-service roles (wave V0.10.0-C). Defaults are assumptions awaiting confirmation.
+    val maxIntroPointsTotal: Int = 256,
+    val maxIntroPointsPerLink: Int = 32,
+    val introduce1PerSecondPerIntroPoint: Int = 10,
+    val introReplayCacheEntries: Int = 8192,
+    val maxPendingRendezvousTotal: Int = 512,
+    val maxPendingRendezvousPerLink: Int = 64,
+    val rendezvousWaitTimeout: Duration = 60.seconds,
+    val maxSplicedPairsTotal: Int = 512,
 ) {
     init {
         require(maxCircuitsTotal > 0 && maxCircuitsPerLink > 0 && maxPendingExtends >= 0) { "limits must be positive" }
         require(createsPerSecondPerLink >= 0 && createsPerSecondTotal >= 0 && cellsPerSecondPerCircuit >= 0) {
             "rates must not be negative"
+        }
+        require(
+            maxIntroPointsTotal > 0 &&
+                maxIntroPointsPerLink > 0 &&
+                introReplayCacheEntries > 0 &&
+                maxPendingRendezvousTotal > 0 &&
+                maxPendingRendezvousPerLink > 0 &&
+                maxSplicedPairsTotal > 0,
+        ) { "hidden-service limits must be positive" }
+        require(introduce1PerSecondPerIntroPoint >= 0) { "rates must not be negative" }
+        require(
+            maxIntroPointsPerLink <= maxIntroPointsTotal && maxPendingRendezvousPerLink <= maxPendingRendezvousTotal,
+        ) {
+            "per-link limits must not exceed the totals"
+        }
+        require(rendezvousWaitTimeout.isPositive() && rendezvousWaitTimeout < circuitMaxLifetime) {
+            "rendezvousWaitTimeout must be positive and shorter than the circuit lifetime"
         }
     }
 }

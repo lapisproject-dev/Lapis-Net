@@ -37,7 +37,17 @@ class InMemoryOnionNetwork(
     private class Peer(
         val relay: Int?,
         val link: LinkId?,
+        val inbox: ArrayDeque<Cell>? = null,
     )
+
+    /** An additional client with its own inbox (hidden-service tests need several). */
+    class TestClient(
+        val relayIndex: Int,
+        val link: LinkId,
+        val inbox: ArrayDeque<Cell>,
+    ) {
+        var circuitId = 0
+    }
 
     /** Return the cells to actually deliver: empty drops, two duplicates, a modified copy tampers. */
     var filter: (Transit) -> List<Cell> = { listOf(it.cell) }
@@ -54,6 +64,32 @@ class InMemoryOnionNetwork(
         val link = LinkId(nextLink++)
         peers[relayIndex to link.value] = Peer(null, null)
         return link
+    }
+
+    fun newClient(relayIndex: Int): TestClient {
+        val link = LinkId(nextLink++)
+        val inbox = ArrayDeque<Cell>()
+        peers[relayIndex to link.value] = Peer(null, null, inbox)
+        return TestClient(relayIndex, link, inbox)
+    }
+
+    /** Builds a circuit for [client] (its first hop must be the client's relay). */
+    fun buildCircuitFor(
+        client: TestClient,
+        path: List<Int>,
+        random: SecureRandom = SecureRandom(),
+        clock: Clock = FixedClock(),
+    ): ClientCircuit {
+        require(path[0] == client.relayIndex) { "client is attached to another relay" }
+        val builder = ClientCircuitBuilder(path.map { relays[it].binding }, random, clock)
+        var step: BuilderStep = BuilderStep.Send(builder.start())
+        while (step is BuilderStep.Send) {
+            clientSend(client.relayIndex, client.link, step.cell)
+            step = builder.onCell(client.inbox.removeFirst())
+        }
+        check(step is BuilderStep.Built) { "circuit build failed: $step" }
+        client.circuitId = builder.firstLinkCircuitId
+        return step.circuit
     }
 
     fun clientSend(
@@ -93,7 +129,7 @@ class InMemoryOnionNetwork(
                         if (peer.relay ==
                             null
                         ) {
-                            clientInbox.addLast(it)
+                            (peer.inbox ?: clientInbox).addLast(it)
                         } else {
                             queue.addLast(Triple(peer.relay, peer.link!!, it))
                         }

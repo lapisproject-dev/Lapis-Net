@@ -71,6 +71,18 @@ class OnionRelayService private constructor(
 
     fun circuitCount(): Int = relay.circuitCount
 
+    fun introPointCount(): Int = relay.introPointCount
+
+    fun pendingRendezvousCount(): Int = relay.pendingRendezvousCount
+
+    fun splicedPairCount(): Int = relay.splicedPairCount
+
+    /** Test seam: sees every end-to-end blob this relay splices (it must be unreadable ciphertext). */
+    @ExperimentalOnionApi
+    internal fun observeRendezvousData(observer: ((ByteArray) -> Unit)?) {
+        relay.rendezvousDataObserver = observer
+    }
+
     fun linkCount(): Int = links.linkCount()
 
     /** The descriptor currently announced, or `null` before the first publication. */
