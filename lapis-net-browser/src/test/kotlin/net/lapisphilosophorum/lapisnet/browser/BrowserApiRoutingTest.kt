@@ -715,4 +715,43 @@ class BrowserApiRoutingTest :
                 )
             }
         }
+
+        test("favicons and logo are served with proper content types and pages link them") {
+            val harness = TestHarness()
+            try {
+                testApplication {
+                    application { installBrowserApi(harness.deps) }
+                    val expected =
+                        mapOf(
+                            "/favicon.svg" to "image/svg+xml",
+                            "/favicon-dunkel.svg" to "image/svg+xml",
+                            "/logo.svg" to "image/svg+xml",
+                            "/favicon-32.png" to "image/png",
+                            "/favicon-16.png" to "image/png",
+                            "/apple-touch-icon.png" to "image/png",
+                        )
+                    for ((path, type) in expected) {
+                        val response = client.get(path)
+                        response.status shouldBe HttpStatusCode.OK
+                        response.contentType()?.withoutParameters()?.toString() shouldBe type
+                    }
+                    val ico = client.get("/favicon.ico")
+                    ico.status shouldBe HttpStatusCode.OK
+                    val icoTypes = setOf("image/x-icon", "image/vnd.microsoft.icon")
+                    (ico.contentType()?.withoutParameters()?.toString() in icoTypes) shouldBe true
+                    val faviconHrefs =
+                        listOf("/favicon.svg", "/favicon-dunkel.svg", "/favicon.ico", "/apple-touch-icon.png")
+                    for (page in listOf("/index.html", "/call.html", "/dm.html", "/mail.html")) {
+                        val html = client.get(page).bodyAsText()
+                        for (href in faviconHrefs) {
+                            html.contains("href=\"$href\"") shouldBe true
+                        }
+                        html.contains("class=\"brand-logo\"") shouldBe true
+                    }
+                    client.get("/style.css").bodyAsText().contains("url(\"/logo.svg\")") shouldBe true
+                }
+            } finally {
+                harness.stop()
+            }
+        }
     })

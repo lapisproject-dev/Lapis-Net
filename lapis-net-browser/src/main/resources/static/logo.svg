@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <title>Lapis Net Logo</title>
+  
+  <polygon points="200,48 332,124 332,276 200,352 68,276 68,124" fill="#16284b" stroke="none"/>
+  <g stroke="#8fb0e3" stroke-width="5" stroke-linecap="round" fill="none"><line x1="200" y1="48" x2="332" y2="124"/><line x1="332" y1="124" x2="332" y2="276"/><line x1="332" y1="276" x2="200" y2="352"/><line x1="200" y1="352" x2="68" y2="276"/><line x1="68" y1="276" x2="68" y2="124"/><line x1="68" y1="124" x2="200" y2="48"/><line x1="200" y1="48" x2="332" y2="276"/><line x1="332" y1="276" x2="68" y2="276"/><line x1="68" y1="276" x2="200" y2="48"/><line x1="332" y1="124" x2="200" y2="352"/><line x1="200" y1="352" x2="68" y2="124"/><line x1="68" y1="124" x2="332" y2="124"/></g>
+  <g fill="#16284b" stroke="#8fb0e3" stroke-width="6"><circle cx="200" cy="48" r="13"/><circle cx="332" cy="124" r="13"/><circle cx="332" cy="276" r="13"/><circle cx="200" cy="352" r="13"/><circle cx="68" cy="276" r="13"/><circle cx="68" cy="124" r="13"/></g>
+  <g transform="translate(200 208) scale(.92) translate(-306 -425)" stroke="#0b1630" stroke-width="3.260869565217391" stroke-linejoin="round">
+    <path d="M226 395 L256 350 L281 395 Z" fill="#7ea6e6"/>
+    <path d="M256 350 L356 350 L331 395 L281 395 Z" fill="#bcd3f5"/>
+    <path d="M356 350 L386 395 L331 395 Z" fill="#4f84d2"/>
+    <path d="M226 395 L281 395 L306 500 Z" fill="#3f6fbd"/>
+    <path d="M281 395 L331 395 L306 500 Z" fill="#5d8cd8"/>
+    <path d="M331 395 L386 395 L306 500 Z" fill="#2b55a3"/>
+  </g>
+  <path d="M290 214 L292.8 225.2 L304 228 L292.8 230.8 L290 242 L287.2 230.8 L276 228 L287.2 225.2 Z" fill="#e6bc3a" transform="translate(-90 -124)"/>
+</svg>
