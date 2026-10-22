@@ -1,0 +1,263 @@
+= Traffic anonymisation: design and foundation (wave V0.10.0-A)
+:toc:
+
+== Status
+
+*Design and cryptographic foundation only (wave V0.10.0-A, unreleased). Nothing in this document is active in any running node.* The module `lapis-net-onion` exists, is tested, and is not wired into `LapisNode`, the browser or the CLI. No byte of Lapis Net traffic travels through a circuit today; IP addresses remain visible to peers and to the directory.
+
+[WARNING]
+====
+*What this wave does not give you.* It provides no anonymity. It provides audited-by-our-own-pipeline building blocks (cell format, ntor-style handshake, onion layering, a relay state machine with resource limits) and a written threat model. Several leaks listed below must be closed before anyone may claim anonymity for DM, mail or call signalling. No external cryptographic review has taken place.
+====
+
+`V0.10.0-A` is a wave identifier, not a release: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
+
+Diagram sources are committed as kUML; GitHub does not render the `[kuml]` blocks (the rendering pipeline is not wired, see `architecture.adoc`, section Diagrams).
+
+== Goals and non-goals
+
+*Goal.* No network observer (ISP, local Wi-Fi, a single relay, the receiving peer) can link the IP address of a sender or receiver to a Lapis pseudonym, for direct messages, mail and call signalling. Pseudonymity itself is unchanged: identities stay stable keys.
+
+*Non-goals.*
+
+* Anonymous content. Content confidentiality stays with the existing end-to-end layers (X3DH/Double Ratchet, hybrid ECIES).
+* Protection against a global passive observer who sees both ends of a circuit (traffic confirmation). Not defended, see the threat model.
+* The media path of calls. WebRTC reveals IP addresses through ICE; signalling can be anonymised, media cannot without a separate design.
+* GossipSub, the DHT and content fetches in part 1 (wave J, later).
+* Tor equivalence. This is a small, purpose-built onion design for a small network, with a much smaller anonymity set than Tor.
+
+== Threat model
+
+[cols="2,3,3", options="header"]
+|===
+| Adversary | Defended | Not defended / caveat
+
+| Local observer (ISP, shared network)
+| Sees only encrypted 1024-byte cells to a guard (link encryption: wave B). Cannot see destination identity or content.
+| Sees that the user runs the protocol and when it is active. No padding schedule yet (wave H), so volume and timing leak.
+
+| A single malicious relay
+| Learns at most its two neighbours and its own position (hop index). Cannot read or undetectably alter cell content.
+| A guard sees the client IP; an exit sees the next hop. A relay can destroy circuits (DoS) and observe timing.
+
+| Colluding relays or Sybil identities
+| Per-hop authentication and per-hop regenerated filler remove the classic tagging channel. Path selection will weigh Madli reputation and enforce diversity (wave E).
+| If one adversary controls both guard and exit of a circuit it can correlate by timing and volume. Madli reputation is a weak Sybil defence (identities are free); it is a weight, never a gate.
+
+| Malicious receiver
+| Sees a rendezvous or mailbox, never the sender IP (once wave C/F land).
+| Can correlate by timing with its own observations.
+
+| Global passive observer
+| *Not defended.*
+| End-to-end timing and volume correlation is out of scope.
+|===
+
+== Known leaks today
+
+These exist in the current release and must be closed before any anonymity claim.
+
+. *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses (wave D).
+. *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F). This wave does not change mail.
+. *Gossip timing.* Message publication times and mesh membership leak.
+. *WebRTC media.* ICE exposes IPs to the peer.
+. *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom.
+. *Small anonymity set.* Few relays mean weak anonymity regardless of cryptography.
+. *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
+. *Correlation by provoked teardown.* Any party on a path can destroy a circuit and correlate the effect elsewhere (DoS-based correlation). Not prevented.
+
+== Circuit design
+
+[kuml, onion-circuit-c4, svg]
+----
+import dev.kuml.c4.dsl.c4Model
+
+c4Model(name = "OnionCircuit") {
+    val sender = person(name = "Sender (pseudonym)")
+    val receiver = person(name = "Receiver (pseudonym)")
+    val guard = softwareSystem(name = "Guard relay")
+    val middle = softwareSystem(name = "Middle relay")
+    val exit = softwareSystem(name = "Exit or rendezvous relay")
+
+    dynamicDiagram(name = "Three-hop circuit", description = "Each relay sees only its two neighbours") {
+        interaction(description = "sees sender IP", from = sender, to = guard, technology = "Noise link, 1024-byte cells")
+        interaction(description = "sees neither end", from = guard, to = middle, technology = "Noise link, 1024-byte cells")
+        interaction(description = "sees receiver side", from = middle, to = exit, technology = "Noise link, 1024-byte cells")
+        interaction(description = "last layer removed", from = exit, to = receiver, technology = "rendezvous (open, wave C)")
+    }
+}
+----
+
+=== Cell format
+
+Every cell is exactly 1024 bytes: `circuitId(4) | command(1) | body(1019)`. Commands: PADDING (circuit id 0 only), CREATE, CREATED, RELAY, DESTROY. Unused body space is filled with random bytes, not zeros, so empty fields reveal nothing. The parser has no length field: the input size is compared to 1024 before anything is copied, so no allocation depends on attacker data. Unknown commands and a circuit id of 0 on a non-PADDING cell are rejected.
+
+=== Circuit length
+
+Default 3 hops, technical maximum 5 (`MAX_HOPS`). The library accepts 1 to 5 (1 and 2 for tests); a policy minimum of 3 for the production path is enforced when the module is wired (waves B and E). A relay message addressed to hop 3 carries up to 963 bytes of data (1019 - 3*17 - 5 header bytes).
+
+=== Handshake (ntor over X25519)
+
+The handshake follows the published ntor construction (Goldberg, Stebila, Ustaoglu) and is reimplemented from that description; no code was copied. Wire shapes and labels are Lapis-specific, so the pinned test vector is a self-generated regression vector (cross-checked once against an independent script), not an external known-answer test.
+
+....
+secret_input = X25519(y,X) | X25519(b,X) | ID | B | X | Y | PROTOID      (client: X25519(x,Y) | X25519(x,B))
+KEY_SEED     = HMAC-SHA256(PROTOID:key_extract, secret_input)
+verify       = HMAC-SHA256(PROTOID:verify,      secret_input)
+AUTH         = HMAC-SHA256(PROTOID:mac, verify | ID | B | Y | X | PROTOID | "Server")
+Kf | Kb      = HKDF-SHA256(ikm = KEY_SEED, salt = empty, info = PROTOID:expand, L = 64)
+....
+
+`ID` is the SHA-256 digest of the relay identity key, `B` the relay's onion key, `PROTOID` is `LapisNet:ntor-x25519-sha256:v1`. The client compares AUTH in constant time. Ephemerals x and y and every intermediate secret are overwritten after use; this gives forward secrecy for the circuit keys against a later compromise of `B`. The relay's *onion key* is separate from the X3DH encryption key and is bound to the identity by a signed `OnionKeyBinding` with its own domain tag and an expiry; it is meant to be rotated.
+
+Deviation from the plain ntor message: CREATE and EXTEND carry a `hopIndex` byte (the relay's 1-based position), set by the client. It selects the layer size and is bound into every AEAD's associated data; a wrong value only breaks the client's own circuit.
+
+[kuml, onion-ntor-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "ntor circuit build") {
+    val client = lifeline(name = "Client")
+    val guard = lifeline(name = "Guard (hop 1)")
+    val middle = lifeline(name = "Middle (hop 2)")
+    val exit = lifeline(name = "Exit (hop 3)")
+
+    message(from = client, to = guard, label = "CREATE (X1, hop index 1)")
+    reply(from = guard, to = client, label = "CREATED (Y1, AUTH1)")
+    message(from = client, to = guard, label = "RELAY[Kf1] EXTEND (X2, hop index 2)")
+    message(from = guard, to = middle, label = "CREATE (X2, hop index 2)")
+    reply(from = middle, to = guard, label = "CREATED (Y2, AUTH2)")
+    reply(from = guard, to = client, label = "RELAY[Kb1] EXTENDED (Y2, AUTH2)")
+    message(from = client, to = guard, label = "RELAY[Kf1[Kf2]] EXTEND (X3, hop index 3)")
+    message(from = guard, to = middle, label = "RELAY[Kf2] EXTEND (X3, hop index 3)")
+    message(from = middle, to = exit, label = "CREATE (X3, hop index 3)")
+    reply(from = exit, to = middle, label = "CREATED (Y3, AUTH3)")
+    reply(from = middle, to = client, label = "RELAY EXTENDED (Y3, AUTH3), wrapped on the way back")
+}
+----
+
+=== Onion layers and the anti-tagging rule
+
+Each hop holds two keys. A layer for hop i has size `1019 - (i-1)*17` (16 tag bytes plus one type byte per layer). Layers are sealed with ChaCha20-Poly1305 (RFC 8439) under an *implicit* nonce `directionTag(4) | counter(8)`; the counter is never transmitted. Replay, duplication, drop and reordering all desynchronise the counter, fail the tag and destroy the circuit. There is deliberately no replay window: the transport stream is reliable and ordered, so any deviation is an attack. After one failed open the cipher is poisoned.
+
+*Why ChaCha20-Poly1305 and not AES-256-GCM (which the rest of the project uses).* It is constant-time in software without AES-NI, it comes from the BouncyCastle lightweight API that is already a dependency, and key material can be held in arrays this code zeroises (a JCE `SecretKeySpec` cannot be reliably wiped). If uniformity with AES-GCM is preferred, the change is confined to one class (`HopCipher`).
+
+*Anti-tagging rule.* Every byte that is not covered by the authentication tag of the receiving hop is discarded and regenerated by that hop with fresh random bytes. Unauthenticated filler that an honest hop forwarded unchanged would be a covert channel through which two colluding, non-adjacent relays (guard and exit) could mark a cell. With the rule, every bit that is ever evaluated is authenticated per hop; a flipped bit in an authenticated region is detected at the next honest hop (forward) or at the client (backward). What remains is destroying a circuit on purpose and correlating the teardown, listed above as not defended.
+
+[kuml, onion-cell-layering, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Cell layering and filler regeneration") {
+    val client = lifeline(name = "Client")
+    val guard = lifeline(name = "Guard (hop 1)")
+    val middle = lifeline(name = "Middle (hop 2)")
+    val exit = lifeline(name = "Exit (hop 3)")
+
+    message(from = client, to = guard, label = "1019 B: seal Kf1 (seal Kf2 (seal Kf3 (m, 968 B)))")
+    message(from = guard, to = middle, label = "open 1019 B, pass 1002 B inner layer + 17 B fresh random")
+    message(from = middle, to = exit, label = "open 1002 B, pass 985 B inner layer + 34 B fresh random")
+    message(from = exit, to = exit, label = "open 985 B, deliver 968 B relay message")
+    reply(from = exit, to = middle, label = "seal Kb3 (968 B) + 34 B random")
+    reply(from = middle, to = guard, label = "seal Kb2 (first 985 B) + 17 B random")
+    reply(from = guard, to = client, label = "seal Kb1 (first 1002 B) = 1019 B, client opens layers 1 to 3")
+}
+----
+
+=== Lifetime, rotation, padding
+
+A circuit lives at most 10 minutes (relay-enforced by a sweep) or 2^32 cells per direction, whichever comes first; new destinations get new circuits (policy, wave E). Part 1 has a fixed cell size and a `DROP` relay message. A padding schedule against timing analysis is *open* (wave H).
+
+=== Link encryption
+
+The libp2p Noise session protects the link only: cells will travel over a dedicated stream `/lapis/onion/1.0.0` (wave B), hiding circuit ids and commands from an ISP. The onion layers themselves are ntor plus AEAD, independent of Noise.
+
+[kuml, onion-circuit-state, svg]
+----
+import dev.kuml.core.dsl.stateDiagram
+
+stateDiagram(name = "Circuit lifecycle") {
+    val start = initialState()
+    val building = state(name = "Building")
+    val open = state(name = "Open")
+    val closed = finalState(name = "Destroyed")
+
+    transition(source = start, target = building) { trigger = "CREATE" }
+    transition(source = building, target = building) { trigger = "EXTENDED"; guard = "[hops < path length]" }
+    transition(source = building, target = open) { trigger = "EXTENDED"; guard = "[all hops done]" }
+    transition(source = building, target = closed) { trigger = "AUTH failure"; effect = "zeroise keys" }
+    transition(source = open, target = closed) { trigger = "tag failure, DESTROY, lifetime, cell limit"; effect = "zeroise keys" }
+}
+----
+
+== Relay selection (design, wave E)
+
+* *Madli* reputation weights selection; it is never a hard gate and the minimum weight is above zero, so new relays can be chosen. Honest assessment: in a Sybil scenario Madli helps against lazy or unreliable relays, but it does not stop an adversary that creates many reputable-looking identities.
+* *Diversity:* never twice the same Lapis identity in a circuit, no two hops from the same IPv4 /16 (IPv6 /32), no two hops from the same operator-declared relay family (a signed field to be defined in a later wave). Optionally no two hops with a direct Veritas trust edge between them; this option is not decided.
+* *Guards:* a small, long-lived guard set (1 to 2, rotated over weeks) against the predecessor attack.
+* Path-level duplicate checks live in the client (`ClientCircuitBuilder`): relays do not know their neighbours' identities. The relay state machine only refuses to extend to itself and bounds chain depth by `MAX_HOPS`.
+* A failed or aborted client-side build is not silent for the relays: `BuilderStep.Failed` carries a DESTROY cell (absent only when the peer itself sent DESTROY) and `ClientCircuitBuilder.abort()` returns one; the host must send it to the first hop, otherwise the relays keep the circuit until the lifetime sweep. PADDING and cells of other circuits on the guard link yield `BuilderStep.Ignored`.
+
+== Relationship to Circuit Relay v2 and DCUtR
+
+Circuit Relay v2 and DCUtR serve reachability (NAT). Onion circuits serve unobservability. A Circuit Relay v2 relay sees both endpoints and is therefore not an anonymity hop. DCUtR deliberately creates direct IP connections and must be *off* on anonymous paths (policy for wave E). Onion relays may themselves be reached through Circuit Relay v2.
+
+== Receiver side and rendezvous (decision open for part 2)
+
+Options:
+
+. *Introduction points plus rendezvous point* (Tor v3 pattern). Live; good for online DM and call signals; complex.
+. *Mailbox pointer over circuits* (existing mailbox path, store and fetch through circuits). Offline-capable, higher latency; the DHT provider-record leak must be solved first.
+. *Fixed mailbox relay per receiver.* Simple, but a stable relay learns the receiver's identity.
+
+Recommendation: (a) for live traffic, (b) for offline delivery. *The final decision is open and belongs to wave C.*
+
+[kuml, onion-rendezvous-options, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Rendezvous option a") {
+    val receiver = lifeline(name = "Receiver")
+    val intro = lifeline(name = "Introduction point")
+    val sender = lifeline(name = "Sender")
+    val rdv = lifeline(name = "Rendezvous point")
+
+    message(from = receiver, to = intro, label = "circuit: establish introduction (identity-signed)")
+    message(from = sender, to = rdv, label = "circuit: establish rendezvous cookie")
+    message(from = sender, to = intro, label = "circuit: INTRODUCE (rendezvous point, cookie, encrypted to receiver)")
+    message(from = intro, to = receiver, label = "forward INTRODUCE")
+    message(from = receiver, to = rdv, label = "circuit: RENDEZVOUS (cookie)")
+    message(from = sender, to = rdv, label = "end-to-end traffic via splice")
+    message(from = rdv, to = receiver, label = "end-to-end traffic via splice")
+}
+----
+
+== Incentives and operation
+
+Running a relay is opt-in per node and can be switched off. Relay reliability will be a Madli metric analogous to the existing relay-reliability metric. No payment in part 1; Lightning or Virtus incentives remain an open option. Operators need bandwidth and circuit limits; the foundation already bounds circuits, creation rate and cell rate (`OnionRelayLimits`).
+
+== Per-node switch
+
+The feature is meant to be part of the protocol core and switchable off per node: a configuration option such as `--anonymity=on|off`. *The name and the default are open*; the decision falls in wave E.
+
+== What the foundation implements
+
+`lapis-net-onion` (pure crypto and state, zero network dependencies): `OnionConstants`, `Cell`/`CellCodec` and the CREATE/CREATED/DESTROY body codecs, `RelayMessageCodec`/`ExtendPayloadCodec`, `OnionKeyBinding`, `NtorHandshake`, `CircuitHopKeys`, `HopCipher`, `OnionLayerCrypto` (`ClientCircuit`, `RelayHopState`), `OnionRelay` (a pure state machine returning actions) with `OnionRelayLimits`, and `ClientCircuitBuilder`. Resource bounds: CREATE rate limits per link and globally before any X25519 work, hard circuit caps reserved with a compare-and-set loop, no per-circuit queues, a per-circuit cell rate, a lifetime sweep, bounded pending extends. Roughly 1 KiB of memory per circuit.
+
+Honest limits: zeroisation covers the arrays this code owns, not copies the JVM or BouncyCastle may hold; no network path exists; the handshake test vector is self-generated; no external review.
+
+== Wave plan
+
+[cols="1,5"]
+|===
+| A | This wave: threat model, design, `lapis-net-onion` foundation.
+| B | Wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode.
+| C | Receiver side: decide the rendezvous design, introduction points and rendezvous point.
+| D | Directory anonymity: `PeerRecord` without addresses in anonymity mode, introduction points instead of addresses.
+| E | Path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.
+| F | DM online and offline over circuits; mail delivery moved off the per-recipient topic.
+| G | Call signals over circuits, with an honest note on the media path.
+| H | Padding and timing protection (DROP cell schedule), circuit pre-building.
+| I | Multi-node tests, Sybil simulation, external cryptographic review recommended.
+| J (later) | GossipSub, DHT and content fetches.
+|===

@@ -11,6 +11,7 @@ include(
     "lapis-net-mail",
     "lapis-net-directory",
     "lapis-net-ratchet",
+    "lapis-net-onion",
     "lapis-net-networking",
     "lapis-net-policy",
     "lapis-net-dm",

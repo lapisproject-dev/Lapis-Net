@@ -2104,3 +2104,23 @@ _Released in `v0.12.0`. Internal wave identifier._
 
 * **Done (parts 1 and 2):** `ReusePortTcpTransport` (listener and every dial share one port; per-channel Noise/muxer role through `PunchRoleRegistry`), the `/libp2p/dcutr` protocol (hand-written codec, spec roles: B measures the RTT and sends SYNC, A is the client), `HolePunchManager` (backoff, concurrency, rate and tracking limits, timeouts, identity check, idempotent stop), Identify toward reservation relays for observed addresses, address filter, `--hole-punching=auto|on|off` in the browser and the CLI, `/api/node/status` field `holePunching`, GossipSub re-announcement after the relayed connection closes.
 * **Open (part 3):** unilateral upgrade (B dials A's public address without a punch); AutoNAT and reachability detection; confirmation of observed addresses by several observers; port prediction for symmetric NAT; UDP/QUIC punching; Windows support; draining instead of a grace-period close of the relayed connection (open streams on it are cut); verification behind real NATs and on macOS; a tie-break when both peers start a session at once; a responder that has no observed address yet answers with an empty list.
+
+== V0.10.0-A — Traffic anonymisation, part 1: architecture and foundation
+
+_Unreleased. Internal wave identifier, not a release: `v0.10.0` already exists and release numbers are chronological; the release number is assigned at release time._
+
+* *Done:* `docs/anonymity.adoc` (goals, threat model, known leaks, circuit design, relay selection, rendezvous options, wave plan); the module `lapis-net-onion` (cells and hardened codecs, `OnionKeyBinding`, ntor-style handshake over X25519, ChaCha20-Poly1305 hop ciphers with implicit counters, onion layering without a tagging channel, `OnionRelay` state machine with resource limits, `ClientCircuitBuilder`) with its tests. Not wired into any node, browser or CLI.
+* *Open:* no network path and no anonymity yet; the handshake test vector is self-generated, not an external known-answer test; zeroisation is best effort on the JVM; no external cryptographic review; the leaks listed in `anonymity.adoc` (addresses in `PeerRecord`, per-recipient mail topic, DHT provider records, WebRTC media) remain.
+* *Decisions pending:* rendezvous design (wave C), name and default of the per-node switch (wave E), minimum hop count policy, definition of a relay family.
+
+Follow-up waves (same wording as in `anonymity.adoc`):
+
+* *B:* wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode.
+* *C:* receiver side: decide the rendezvous design, introduction points and rendezvous point.
+* *D:* directory anonymity: `PeerRecord` without addresses in anonymity mode, introduction points instead of addresses.
+* *E:* path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.
+* *F:* DM online and offline over circuits; mail delivery moved off the per-recipient topic.
+* *G:* call signals over circuits, with an honest note on the media path.
+* *H:* padding and timing protection (DROP cell schedule), circuit pre-building.
+* *I:* multi-node tests, Sybil simulation, external cryptographic review recommended.
+* *J (later):* GossipSub, DHT and content fetches.

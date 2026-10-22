@@ -111,6 +111,7 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   `PrekeyBundleCodec`/`PrekeyStore` and the `X3dh` handshake itself. Deliberately ZERO network/
   libp2p/Nabu dependencies — publication over GossipSub lives in `lapis-net-directory` instead (see
   above)
+* `lapis-net-onion` — traffic-anonymisation foundation (wave V0.10.0-A, unreleased): cell format, ntor-style handshake, onion layers, a pure relay state machine. Deliberately ZERO network/libp2p/Nabu dependencies and not wired into any node, browser or CLI; see `link:anonymity.adoc[anonymity.adoc]`
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-cli` — entry point / demo harness, including the multi-node trust-propagation demo
@@ -5581,13 +5582,17 @@ calls block.
 Editable settings page, a quarantine or sender list for blocked mail, a reported "deposit missing" reason, and a default change of the
 relay-reliability publisher.
 
+== Traffic anonymisation foundation (V0.10.0-A, unreleased)
+
+The module `lapis-net-onion` holds the cryptographic and state-machine foundation of onion circuits. Its module boundary is a security property: it depends on `lapis-net-core`, `lapis-net-identity` and BouncyCastle only, never on networking, GossipSub, Nabu or any node class, and no running component calls it. The relay logic (`OnionRelay`) consumes cells and returns actions; the host will perform the I/O in a later wave. Design, threat model, known leaks and the wave plan: link:anonymity.adoc[anonymity.adoc]. The leaks listed there (addresses in `PeerRecord`, the per-recipient mail topic) are unchanged by this wave.
+
 == Diagrams
 
 Diagrams for this repository are authored in kUML and embedded via the
 `[kuml]` Asciidoctor macro once the `kuml-asciidoc` extension is wired into
-the build (not yet done in V0.1.1 — no rendering pipeline exists in this
-wave). No diagrams are embedded here yet; the module map above is prose-only
-until that wiring lands.
+the build (not yet done: no rendering pipeline exists). The `[kuml]` blocks in
+this document are committed as source and are not rendered on GitHub. The module
+map above is prose-only.
 
 link:requirements.adoc[requirements.adoc] holds the first diagram-bearing
 document: a SysML 2 requirement diagram tracing which requirements V0.1
