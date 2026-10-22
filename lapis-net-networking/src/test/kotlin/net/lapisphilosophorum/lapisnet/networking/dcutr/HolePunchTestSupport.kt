@@ -208,12 +208,13 @@ internal fun publicAddress(
 internal class Harness(
     config: HolePunchConfig = HolePunchConfig(mode = HolePunchMode.ON),
     observed: List<String> = listOf("/ip4/9.9.9.9/tcp/4001"),
+    onRelayReplaced: (Connection) -> Unit = {},
 ) {
     val clock = ManualClock()
     val env = FakeEnvironment().also { it.clock = clock }
     val filter = HolePunchAddressFilter(allowNonPublic = config.allowNonPublicAddresses)
     val book = ObservedAddressBook(filter)
-    val manager = HolePunchManager(env, book, filter, config, clock)
+    val manager = HolePunchManager(env, book, filter, config, clock, onRelayReplaced)
     val relayObserver = PeerId.random()
 
     init {

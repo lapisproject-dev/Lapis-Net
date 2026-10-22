@@ -3,6 +3,7 @@ package net.lapisphilosophorum.lapisnet.networking.dcutr
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.libp2p.core.Connection
 import io.libp2p.core.PeerId
 import java.time.Duration
 
@@ -67,6 +68,81 @@ class HolePunchManagerTimingTest :
             h.clock.advance(1)
             relayed.closed.isDone shouldBe true
             direct.closed.isDone shouldBe false
+        }
+
+        context("the direct connection is announced again once the relayed one is gone") {
+            // Both peers run the grace timer; whichever closes the relayed connection first ends it for the
+            // other one too. Each side must announce the direct connection exactly once, whoever closed.
+            fun punched(announced: MutableList<Connection>): Triple<Harness, FakeConnection, FakeConnection> {
+                val h = Harness(onRelayReplaced = { announced += it })
+                val a = PeerId.random()
+                val relayed = fakeConnection(a, relayed = true)
+                h.manager.handleConnection(relayed.connection)
+                h.env.wire.deliver(connect("1.1.1.1"))
+                h.clock.advance(0)
+                val direct = fakeConnection(a, relayed = false)
+                h.env.dials[0]
+                    .future
+                    .complete(direct.connection)
+                return Triple(h, relayed, direct)
+            }
+
+            test("this side closed it after the grace period: announced once") {
+                val announced = mutableListOf<Connection>()
+                val (h, relayed, direct) = punched(announced)
+                h.clock.advance(10_000)
+                relayed.closed.isDone shouldBe true
+                announced.size shouldBe 0
+                h.clock.advance(249)
+                announced.size shouldBe 0
+                h.clock.advance(1)
+                announced shouldBe listOf(direct.connection)
+                h.clock.advance(60_000)
+                announced.size shouldBe 1
+            }
+
+            test("the peer closed it first, before this side's grace timer fires: still announced once") {
+                val announced = mutableListOf<Connection>()
+                val (h, relayed, direct) = punched(announced)
+                h.clock.advance(9_999)
+                relayed.closed.complete(Unit) // the peer's timer won the race by a hair
+                h.clock.advance(1) // our timer fires and finds the connection already closed
+                relayed.closed.isDone shouldBe true
+                h.clock.advance(250)
+                announced shouldBe listOf(direct.connection)
+                h.clock.advance(60_000)
+                announced.size shouldBe 1
+            }
+
+            test("the relayed connection died long before the grace period: announced once, nothing closed twice") {
+                val announced = mutableListOf<Connection>()
+                val (h, relayed, direct) = punched(announced)
+                h.clock.advance(1_000)
+                relayed.closed.complete(Unit)
+                h.clock.advance(250)
+                announced shouldBe listOf(direct.connection)
+                h.clock.advance(60_000)
+                announced.size shouldBe 1
+            }
+
+            test("a direct connection that is gone by then is not announced") {
+                val announced = mutableListOf<Connection>()
+                val (h, relayed, direct) = punched(announced)
+                h.clock.advance(10_000)
+                relayed.closed.isDone shouldBe true
+                direct.closed.complete(Unit)
+                h.clock.advance(60_000)
+                announced.size shouldBe 0
+            }
+
+            test("a stopped manager announces nothing") {
+                val announced = mutableListOf<Connection>()
+                val (h, relayed, _) = punched(announced)
+                h.manager.stop()
+                relayed.closed.complete(Unit)
+                h.clock.advance(60_000)
+                announced.size shouldBe 0
+            }
         }
 
         test("the protocol timeout ends an attempt whose peer never answers") {

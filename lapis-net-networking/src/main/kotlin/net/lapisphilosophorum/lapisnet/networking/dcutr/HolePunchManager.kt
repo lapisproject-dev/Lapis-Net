@@ -358,27 +358,39 @@ class HolePunchManager internal constructor(
 
     internal fun trackedPeerCount(): Int = synchronized(lock) { states.size }
 
+    /**
+     * Lets the relayed connection go once the direct one has replaced it, and re-announces the direct
+     * connection when the relayed one is gone.
+     *
+     * The re-announcement is tied to the relayed connection ending, NOT to this side being the one that
+     * closes it. Both peers run this on their own timer; whichever closes first ends the connection for the
+     * other as well, so the second timer regularly finds it already closed. If only the side that closed it
+     * re-announced, the other side would stay without a GossipSub stream towards the peer for good (a peer's
+     * GossipSub stream is outbound-only): everything it publishes goes nowhere.
+     */
     private fun scheduleRelayClose(
         relayConn: Connection,
         direct: Connection,
     ) {
         if (stopped.get()) return
+        val reannounced = AtomicBoolean(false)
+        relayConn.closeFuture().whenComplete { _, _ ->
+            // A moment later, so every listener of the closed connection has run first.
+            if (!stopped.get() && reannounced.compareAndSet(false, true)) {
+                timers +=
+                    clock.schedule(REANNOUNCE_DELAY_NANOS) {
+                        if (!direct.closeFuture().isDone && !stopped.get()) {
+                            runCatching { onRelayReplaced(direct) }
+                                .onFailure { logger.warn { "re-announcing a direct connection failed" } }
+                        }
+                    }
+            }
+        }
         timers +=
             clock.schedule(config.relayCloseGrace.toNanos()) {
                 if (!direct.closeFuture().isDone && !relayConn.closeFuture().isDone) {
                     logger.debug { "closing the relayed connection, the direct one replaces it" }
-                    relayConn.close().whenComplete { _, _ ->
-                        // A moment later, so every listener of the closed connection has run first.
-                        if (!stopped.get()) {
-                            timers +=
-                                clock.schedule(REANNOUNCE_DELAY_NANOS) {
-                                    if (!direct.closeFuture().isDone && !stopped.get()) {
-                                        runCatching { onRelayReplaced(direct) }
-                                            .onFailure { logger.warn { "re-announcing a direct connection failed" } }
-                                    }
-                                }
-                        }
-                    }
+                    relayConn.close()
                 }
             }
     }
