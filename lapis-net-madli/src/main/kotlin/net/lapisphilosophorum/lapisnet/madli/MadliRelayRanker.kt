@@ -40,6 +40,13 @@ class MadliRelayRanker(
             ).map { it.first }
     }
 
+    /**
+     * The local relay reliability score of [peer] (about `0.0..1.25`), or `null` without any Veritas-weighted
+     * observation. Public accessor for the onion path selection (wave V0.10.0-E), which clamps it to `[0, 1]` and
+     * treats `null` as "no history". Local heuristic, never signed.
+     */
+    fun relayReliability(peer: PeerId): Double? = score(peer)
+
     /** The score of [peer], or `null` when no observer with positive weight reported a relay
      * reliability for it. */
     internal fun score(peer: PeerId): Double? = score(peer, epochDay())

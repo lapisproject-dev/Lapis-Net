@@ -107,6 +107,7 @@ data class BrowserConfig(
                 "dhtFallback" to NodeWiringOptions.KEY_DHT_FALLBACK,
                 "publishRelayReliability" to NodeWiringOptions.KEY_PUBLISH_RELAY_RELIABILITY,
                 "holePunching" to NodeWiringOptions.KEY_HOLE_PUNCHING,
+                "anonymity" to NodeWiringOptions.KEY_ANONYMITY,
                 "dmAcceptance.veritasGate" to KEY_VERITAS_GATE,
                 "dmAcceptance.karmaMinScore" to KEY_KARMA_MIN,
                 "dmAcceptance.minDepositMsat" to KEY_MIN_DEPOSIT,

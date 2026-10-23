@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side and directory (waves V0.10.0-A to V0.10.0-D)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory and path policy (waves V0.10.0-A to V0.10.0-E)
 :toc:
 
 == Status
+
+*Wave E (path selection and policy, unreleased) adds the first thing a user can switch on: `--anonymity=on`. A node in that mode chooses relays with persistent guards and network diversity, builds circuits under a build policy, and publishes its directory entry only through those circuits. It does not make the node anonymous: direct messages, mail and call signalling still use direct connections and show the IP address, and the libp2p transport key is still the identity key. The option is experimental, off by default, and every start says so.* See <<path-policy>>.
 
 *Wave D (directory anonymity, unreleased) lets a node in directory anonymity mode publish an address-free directory entry through a circuit, and keeps every address-bearing publication of its own off the network. It does not make the node anonymous: the libp2p transport key is still the identity key, so every direct connection of the node shows identity and IP together. No user traffic is anonymised and no anonymity is offered.* See <<directory-anonymity>>.
 
@@ -200,6 +202,7 @@ stateDiagram(name = "Circuit lifecycle") {
 * *Diversity:* never twice the same Lapis identity in a circuit, no two hops from the same IPv4 /16 (IPv6 /32), no two hops from the same operator-declared relay family (a signed field to be defined in a later wave). Optionally no two hops with a direct Veritas trust edge between them; this option is not decided.
 * *Guards:* a small, long-lived guard set (1 to 2, rotated over weeks) against the predecessor attack.
 * Path-level duplicate checks live in the client (`ClientCircuitBuilder`): relays do not know their neighbours' identities. The relay state machine only refuses to extend to itself and bounds chain depth by `MAX_HOPS`.
+* *Status after wave E:* implemented as described in <<path-policy>>. The relay family check exists but is inactive (the descriptor has no family field; the count byte must be zero), IPv6 diversity uses the /32, and the Veritas edge check exists as an internal switch with no option. Madli weights apply only to the middle hops and the endpoints; the guard is drawn once with the same weights and then persists.
 * A failed or aborted client-side build is not silent for the relays: `BuilderStep.Failed` carries a DESTROY cell (absent only when the peer itself sent DESTROY) and `ClientCircuitBuilder.abort()` returns one; the host must send it to the first hop, otherwise the relays keep the circuit until the lifetime sweep. PADDING and cells of other circuits on the guard link yield `BuilderStep.Ignored`.
 
 == Relationship to Circuit Relay v2 and DCUtR
@@ -468,7 +471,7 @@ Identities without an anonymous record behave exactly as before. *Remaining wind
 
 === Switching the mode
 
-`DirectoryModeTransition` with a `DirectoryModeStore` (a small state file, `FileDirectoryModeStore`, written atomically; a missing or corrupt file means "no state": nothing is retired, so a normal node never publishes a revocation and a brand-new identity (or a damaged file) that starts directly in anonymity mode never publishes an identity-bound tombstone). *OFF to ON:* only after a persisted `OFF` state (the node demonstrably ran in normal mode), an address-free tombstone `PeerRecord` with a higher sequence number goes out once from the own node (gossip and `publishTombstone`), then the first anonymous record. A normal-mode start must therefore record `OFF` in the store (`nextSequence(OFF)`) for a later switch to retire its address entry. *Open item for wave E:* no production caller writes this state yet (`SelfRecordRepublisher` and `HeadlessNode` never touch the store, `AnonymousDirectoryPublisher` is only wired in wave E); until the normal-mode start persists `OFF`, a real normal-mode node (or one upgraded from v0.12.0 without a state file) sends no tombstone when switching to anonymity mode, and its address entries stay until their TTL ends. *ON to OFF:* an `AnonymousPeerRecord` revocation with a validity that covers every still-valid anonymous record (6 h), then a newer address record. Sequence numbers are `max(last + 1, nowMillis)` and persisted.
+`DirectoryModeTransition` with a `DirectoryModeStore` (a small state file, `FileDirectoryModeStore`, written atomically; a missing or corrupt file means "no state": nothing is retired, so a normal node never publishes a revocation and a brand-new identity (or a damaged file) that starts directly in anonymity mode never publishes an identity-bound tombstone). *OFF to ON:* only after a persisted `OFF` state (the node demonstrably ran in normal mode), an address-free tombstone `PeerRecord` with a higher sequence number goes out once from the own node (gossip and `publishTombstone`), then the first anonymous record. A normal-mode start must therefore record `OFF` in the store (`nextSequence(OFF)`) for a later switch to retire its address entry. *Resolved in wave E:* every normal-mode start now persists `OFF` through the sequence source of the own record republisher (CLI and browser), so a later switch to anonymity mode sends the tombstone. A node upgraded from v0.12.0 has no state file; by the rule above it sends no tombstone on its first switch, and its address entries stay until their TTL ends (at most 24 hours). *ON to OFF:* an `AnonymousPeerRecord` revocation with a validity that covers every still-valid anonymous record (6 h), then a newer address record. Wave E wires this: `DirectoryModeRetirement.onNormalStart` builds the revocation at the first normal-mode start after an anonymity run and sends it from the own node through the anonymous-record gossip (the node is about to publish identity and address anyway, so the revocation links nothing new; in the browser the topic is attached only for this one send). OFF is persisted only after the revocation went out; if it could not be sent, the old state stays and the next start retries with a higher sequence number. Sequence numbers are `max(last + 1, nowMillis)` and persisted.
 
 [kuml, directory-mode-switch, svg]
 ----
@@ -520,6 +523,8 @@ A node that gossips an entry itself shows its IP and peer ID to its mesh neighbo
 | 17 | `lapisnet://connect` QR / deep link (V0.4) | multiaddr | do not use in anonymity mode (browser: wave E)
 |===
 
+Update after wave E (rows are numbered as above): *9* Identify is not answered while `--anonymity=on` (hole punching is forced off, and the Identify protocol is only registered when hole punching is not off); the node's own code never sends an Identify request, so no `listenAddrs` leave through that path (verified in the code, not on the wire). *10* DCUtR is off node-wide in anonymity mode (`HolePunchConfig.anonymityMode` makes any other mode a construction error). *17* the browser answers 409 for `/api/connect/qr.svg` and `/api/connect/info` while the mode is on. *11* (circuit relay v2 reservation, `--auto-relay`) and *12* (Madli gossip, `--publish-relay-reliability`) are *not* blocked: they are documented here and the user chooses; the transport key (*8*, *14*) is unchanged and remains the largest leak.
+
 === Limits, constants and what is checked
 
 Constants (assumptions, see below): entry TTL at most 6 h (default 3 h), republish 60 min; index 16,384 identities, 65,536 high-water marks; gossip rates 6, 12 and 60 per minute; relay publish 4 per circuit, 30 per minute per link, 120 per minute in total, body 720 bytes. Tested: codec and signature properties (every single bit flip is rejected), index and downgrade behaviour, validator order and rates, the fail-closed publishers, the DHT mode, the mode transitions and the state file, resolution, two real nodes with coexistence of old and new topics, the relay role in memory, and seven real loopback nodes (five relays) where a leak scanner searches everything the anonymous node publishes by itself (gossip and plaintext circuit objects) for its multiaddrs, the TCP port component, peer ID, Ed25519 transport key and binding signature; a positive control proves the scanner finds them in an ordinary `PeerRecord`.
@@ -544,13 +549,103 @@ Constants (assumptions, see below): entry TTL at most 6 h (default 3 h), republi
 * The Sybil boundary of the index is the same as in wave C; a small anonymity set and a global passive observer are as in the threat model.
 * Not verified: real NATs, interoperability with v0.12.0 over the network (only the unchanged old topics are tested), an external cryptographic review, behaviour under load, and the decoupling of the transport key.
 
+[[path-policy]]
+== Path selection and policy (wave V0.10.0-E, unreleased)
+
+*What it is.* `--anonymity=on` starts the `AnonymityRuntime` (`lapis-net-onion-wire`, package `anonymity`): persistent guards, diverse weighted paths of three relays, a build policy for client circuits, the circuit-based directory publication of wave D and the hosting of the node's onion service (introduction points chosen the same way). The headless CLI node and the browser both wire it; with `off` nothing of this is built, and the browser does not even create an `OnionWire` in normal mode.
+
+*What it is not.* Direct messages, mail and call signalling are not routed over circuits, the libp2p transport key is the identity key, and every connection of the node (mesh, DHT, Bitswap) still shows identity and IP. At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed): _Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and reveal your IP address; only the directory publication and path selection are active._
+
+=== Path selection
+
+`OnionPathSelector` is network-free and deterministic for a given `SecureRandom` sequence. Hop 1 is the persistent primary guard; the last hop is prescribed by the caller (publish relay, introduction point, rendezvous point) or drawn; the middle hops are drawn with weights.
+
+* *Never shorter:* a path has at least three relays (`PathPolicy.PRODUCTION_PATH_LENGTH`, equal to the default hop count, not configurable). With too few diverse relays the answer is `Insufficient` (an `InsufficientRelaysException` with the text `insufficient relays`, no identity or address in it), never a shorter path. The circuit factory refuses a shorter path too when the policy is installed (second line against a caller that bypasses the selector).
+* *Hard diversity:* no relay twice, not the own identity, no two relays with an overlapping IPv4 /16 or IPv6 /32 bucket, at most one relay of unknown network, no two relays of the same non-null family, optionally no Veritas edge (internal switch, no option). If a last hop chosen by the caller itself collides with the guard the selector throws `PathConflictException` and the caller picks another endpoint. A last hop named by a remote party (the rendezvous point of an INTRODUCE, i.e. `RENDEZVOUS_RECEIVER`, and `INTRODUCE` towards a service-chosen introduction point) is never refused because of the guard: success must not depend on the guard, or a remote party could probe for the guard's identity and network. The diversity rule then applies to the middle hops only (strictly towards the guard, towards the remote last hop as far as possible).
+* *Weights:* the Madli reliability (clamped to 0..1) with a floor of 0.02; 0.05 without history (NaN and infinity count as no history). Relays without history together are capped at 15 % of the weight when others exist. A single network bucket (and a single family) is capped at `max(0.10, 1/buckets)` by water filling, recomputed for every hop on the remaining candidates. Madli is never a gate. A relay with several addresses counts for the cap in its smallest bucket only; for diversity all its buckets count. All relays new or all in one bucket: no scaling, the draw still happens.
+* *Interaction of the two caps:* the new-relay cap is applied first, the bucket cap second. With only a few networks the bucket cap forces weight over to the other relays, which can lift the share of relays without history above 15 %; this is accepted (a feasible distribution has to sum to one).
+* *Randomness:* `SecureRandom` only; `nextDouble()` for the weighted draw, `nextLong(bound)` for the guard lifetime (both without modulo bias).
+
+*Circuit build budgets.* `CircuitBuildGovernor` keeps the attacker-triggerable service rendezvous circuits (`RENDEZVOUS_RECEIVER`) in a separate budget (default 60 per minute, burst 10; over it they are dropped, not delayed) without any backoff, so an INTRODUCE flood or failing rendezvous points can neither starve nor back off the node's own introduction, publication and client circuits.
+
+*Where the network buckets come from.* A relay descriptor carries no address (the family field is a count byte that must be zero). `PeerDirectoryRelayNetworkLocator` reads the relay's `PeerRecord`: only public `ip4`/`ip6` addresses count, `/p2p-circuit`, `dns*`, loopback, private, link-local, CGNAT, unique-local, `0.0.0.0/8`, documentation, benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`) and `2001:db8::/32` addresses are ignored, and a name is never resolved (a resolution would be a network call). A relay without a usable address is in the bucket `Unknown`. *These addresses are self-declared and unverified:* an adversary can declare addresses in networks it does not control and so slip past the diversity check, or declare an honest network to crowd it out. This is a Sybil limit that this wave does not close.
+
+[kuml, path-selection, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Path selection for one circuit") {
+    val caller = lifeline(name = "Caller (publisher, service host)")
+    val selector = lifeline(name = "OnionPathSelector")
+    val guards = lifeline(name = "GuardManager")
+    val governor = lifeline(name = "CircuitBuildGovernor")
+    val circuit = lifeline(name = "Circuit factory")
+
+    message(from = caller, to = selector, label = "pathEndingAt(last hop, purpose)")
+    message(from = selector, to = guards, label = "primaryUsable(candidates)")
+    message(from = guards, to = selector, label = "persistent guard (chosen once, 30 to 60 days)")
+    message(from = selector, to = caller, label = "guard, middle hops (diversity, Madli weights, caps), last; or insufficient relays")
+    message(from = caller, to = circuit, label = "build(path)")
+    message(from = circuit, to = governor, label = "admit: rate, pool, backoff")
+    message(from = circuit, to = guards, label = "first-hop result: success or failure")
+}
+----
+
+=== Guards
+
+Two guards (primary and backup), each with a lifetime drawn uniformly from 30 to 60 days. The first hop of every circuit is the primary. A guard is replaced when it expires (not rate limited), after at least three consecutive *first-hop* failures spanning at least 24 hours, or when its descriptor has been missing or invalid for at least 72 hours; a replacement because of a failure happens at most once per 24 hours, the backup takes over and a new backup is chosen. Only failures at the first hop count (a dial or link failure, a CREATE that times out or is answered invalidly): a failure while extending to the second or third hop must not be usable to force a guard rotation.
+
+The state lives in `onion/guards.bin` in the data directory: `"LNGS" | version | nonce(12) | AES-256-GCM(state) + tag`, key `HKDF-SHA256(identity secp256k1 private key, salt empty, info "LapisNet:guard-state:v1")`, associated data `"LNGS" | version | SHA-256(own identity public key)`, a fresh nonce for every write, atomic write (temp file `0600`, fsync, atomic move), directory `0700`. A damaged, foreign or implausible file (times in the future, lifetime outside 30 to 60 days, negative counters) is `Invalid` and always leads to new guards; a missing file leads to new guards only if the previous run was in anonymity mode (so a first start is silent). A reset logs `guard state invalid, reselected guards` (no content), counts, and shows as the status code `guard-state-reset`, which later routine errors do not hide for an hour. Deleting the file can not be prevented (an attacker with file access can force a new guard choice); it is made visible, and the rate limit of failure rotations deliberately does not apply to it.
+
+=== Circuit policy
+
+`CircuitBuildGovernor`: a token bucket of 6 builds per minute with a burst of 3; after a failed build an exponential backoff from 5 seconds to 5 minutes; at most 4 open or in-flight outgoing client circuits (directory publication, rendezvous client); circuits older than 10 minutes are closed by a sweeper every 30 seconds; after `lockdown` (stop) nothing new is admitted. The long-lived introduction circuits of the hosted service do not count against the pool of four (they would starve the publisher) but pay the rate. Every build goes to a new circuit; there is no circuit reuse anywhere. A build that would wait longer than 30 seconds fails with a `rate-limited` status instead of waiting. Every failed or aborted build sends a DESTROY to the first hop.
+
+=== Status and errors
+
+The CLI start line shows `anonymity=on|off`; the browser status carries `anonymityMode`, `anonymityIncomplete`, `guards`, `activeCircuits` and `lastAnonymityError` (+ age) and shows them in the node status panel. The error code is one of `none`, `insufficient-relays`, `build-failed`, `build-timeout`, `rate-limited`, `guard-state-reset`, `publish-failed`: enums and numbers only, never an address or identity. A successful publication clears the code. On loopback every relay is in the unknown bucket, so a real node there reports `insufficient-relays` and publishes nothing; there is no fallback to publishing from the own node.
+
+=== Conflicts and wiring
+
+* `--anonymity=on` with an explicit `--hole-punching=auto|on` aborts the start (`hole-punching cannot be enabled while anonymity=on`); a missing key resolves to off. DCUtR and Identify are off node-wide in this mode.
+* `--anonymity=on` with `--onion-relay=true` aborts the start (`onion-relay cannot be combined with anonymity=on`). The design text of waves A to D says "`--onion-relay` stays independent"; wave D already enforces the exclusion at `OnionWire.attach` because a relay descriptor binds identity, peer ID and dialability publicly, so the option layer now matches the code.
+* The onion service key of the node is generated freshly at every start (the onion address changes with it); the CLI node publishes no prekey bundle and no DM capability, the browser both.
+* Auto-relay reservations (leak 11) and Madli gossip (12) stay available in this mode and are documented, not forbidden. The Madli gossip topic is subscribed to read the relay reliability.
+
+=== Assumptions awaiting confirmation (wave E)
+
+* *Assumption, confirmation required:* three hops in production, not configurable.
+* *Assumption, confirmation required:* two guards (primary and backup), a lifetime of 30 to 60 days, replacement after three first-hop failures over 24 hours or 72 hours of a missing descriptor, at most one failure replacement per 24 hours.
+* *Assumption, confirmation required:* IPv6 diversity on the /32 and IPv4 on the /16; at most one relay of unknown network per path.
+* *Assumption, confirmation required:* the weights (0.02 floor, 0.05 without history) and the caps (`max(0.10, 1/buckets)`, 15 % for relays without history, new-relay cap first).
+* *Assumption, confirmation required:* the circuit policy constants (6 per minute, burst 3, pool 4, 10 minutes, backoff 5 seconds to 5 minutes, 30 seconds maximum wait).
+* *Assumption, confirmation required:* DCUtR node-wide off while the mode is on; the mode changes only by restarting the node.
+* *Assumption, confirmation required (F1):* `--onion-relay=true` with `--anonymity=on` aborts the start; lifting the exclusion would need a separate relay identity.
+* *Assumption, confirmation required (F2):* an explicit `--hole-punching=auto` or `on` together with `--anonymity=on` aborts the start; only a missing key resolves to off.
+* *Assumption, confirmation required (F3):* the revocation of an ON to OFF switch is sent from the own node through the anonymous-record gossip; going through a circuit would need path selection (and an `OnionWire`) in normal mode.
+* *Assumption, confirmation required (F4):* the pool of 4 counts outgoing client circuits only; introduction circuits are bounded by the host and only pay the rate.
+* *Assumption, confirmation required (F5):* the transport-key decoupling (leaks 8 and 14) is not part of this wave; it remains the largest leak.
+* *Assumption, confirmation required (F6):* auto-relay reservations, Madli gossip and the DHT fallback are allowed in anonymity mode and documented as leaks. The node's own code sends no Identify request (code review, not a wire test); the Identify responder is off.
+
+=== Honest limits of wave E
+
+* *No user traffic is anonymised.* Only the directory publication and the path selection are active; the transport key is the identity key, so any peer that connects to the node learns identity and IP.
+* The network diversity rests on self-declared, unverified addresses; with the real locator it is only as good as those declarations. *It was verified only with an injected locator that gives each relay a synthetic distinct /16*, because on loopback every relay has the same address and no diverse path exists.
+* The relay family check is inactive (no field in the descriptor). The Veritas edge check exists only as an internal switch.
+* While the primary guard's descriptor is missing from the directory (relay offline, descriptor expired), the backup guard serves as first hop; the primary is only replaced after 72 hours without a descriptor, or by the failure rule.
+* A revocation of the anonymous record (switch to normal mode) is only counted as sent after at least one mesh peer received it; otherwise `OFF` is not persisted and the revocation is repeated at the next start.
+* A deleted or replaced guard file forces a new guard choice and can not be prevented; it is only made visible.
+* A guard that is also operated by the adversary sees the node's IP for every circuit; guards reduce the predecessor attack, they do not remove it. A small anonymity set and a global passive observer are as in the threat model.
+* A node upgraded from v0.12.0 sends no tombstone on its first switch to anonymity mode (no persisted `OFF`); its address entries stay until their TTL ends.
+* Not verified: real networks and NATs, behaviour under load, interoperability with v0.12.0 over the network (only local), and no external cryptographic review has taken place.
+
 == Incentives and operation
 
 Running a relay is opt-in per node and can be switched off. Relay reliability will be a Madli metric analogous to the existing relay-reliability metric. No payment in part 1; Lightning or Virtus incentives remain an open option. Operators need bandwidth and circuit limits; the foundation already bounds circuits, creation rate and cell rate (`OnionRelayLimits`).
 
 == Per-node switch
 
-The feature is meant to be part of the protocol core and switchable off per node: a configuration option such as `--anonymity=on|off`. *The name and the default are open*; the decision falls in wave E. Until then the only switch is `--onion-relay=true|false` (default off), which makes a node serve as an infrastructure relay and nothing else.
+`--anonymity=on|off` (environment `LAPISNET_ANONYMITY`, settings file key `anonymity` in the browser), default `off`, experimental. Only the exact lower-case words are accepted. It excludes `--hole-punching=auto|on` and `--onion-relay=true`; see <<path-policy>>. `--onion-relay=true|false` (default off) remains the separate switch that makes a node serve as an infrastructure relay and nothing else.
 
 == Wire integration (wave V0.10.0-B)
 
@@ -655,7 +750,7 @@ Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServi
 | B | Done (unreleased): wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode. No user traffic, no path selection.
 | C | Done (unreleased): receiver side: introduction points and rendezvous point (decision: option a, live traffic), onion service descriptors (index, gossip, DHT API), hosting and connecting over circuits, relay-side roles and splice. No user traffic, no path selection, no link to the Lapis identity.
 | D | Done (unreleased): directory anonymity: `AnonymousPeerRecord` (no address, no peer id, no binding) on its own gossip topic, `DirectoryAnonymityMode` with fail-closed suppression of every address-bearing publication, downgrade protection against replayed address records, mode-switch transition records, publication of the directory objects through a circuit (`DIRECTORY_PUBLISH`). No user traffic, no path selection, and the transport key is still bound to the identity (wave E).
-| E | Path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.
+| E | Done (unreleased): path selection (Madli weighting, diversity, persistent guards), the client circuit policy, and the experimental option `--anonymity=on|off` (DCUtR and Identify off, conflicts with `--hole-punching` and `--onion-relay`), wired into the CLI node and the browser. Only the directory publication and the path selection are active; no user traffic is anonymised and the transport key is still the identity key.
 | F | DM online and offline over circuits; mail delivery moved off the per-recipient topic.
 | G | Call signals over circuits, with an honest note on the media path.
 | H | Padding and timing protection (DROP cell schedule), circuit pre-building.

@@ -226,7 +226,16 @@ class BrowserApiDependencies(
     /** V0.9.17 - an outbound mail marks its recipients accepted here (same instance as the DM side), so replies pass
      * the mail acceptance policy. `null` (the default) marks nobody. */
     val acceptedContacts: DmAcceptedContacts? = null,
+    /**
+     * V0.10.0-E - `true` while anonymity mode is on: the `lapisnet://connect` QR code and the connect info would hand out
+     * the node's dialable address, so those two routes answer 409 (leak #17). Default `false` = unchanged behaviour.
+     */
+    val anonymityActive: Boolean = false,
 )
+
+/** Shown instead of the connect QR code while anonymity mode is on (it would contain the node's own address). */
+internal const val ANONYMITY_CONNECT_REFUSAL: String =
+    "The connect code is disabled while anonymity mode is on: it contains this node's address."
 
 /**
  * V0.9.15 - what the status panel shows. Read-only, loopback-only, deliberately free of absolute paths: [configFile] is
@@ -247,6 +256,15 @@ data class NodeStatusResponse(
     val mailBlocked: MailBlockedStatus = MailBlockedStatus(),
     /** V0.9.20 - TCP hole punching (DCUtR). */
     val holePunching: HolePunchingStatus = HolePunchingStatus(),
+    /** V0.10.0-E - anonymity mode: `"off"` or `"on"`. Enums, booleans and numbers only, never an address or key. */
+    val anonymityMode: String = "off",
+    /** `true` whenever anonymity mode is on: direct messages, mail and calls are not anonymised yet. */
+    val anonymityIncomplete: Boolean = false,
+    val guards: Int = 0,
+    val activeCircuits: Int = 0,
+    /** A fixed error code (`none`, `insufficient-relays`, `build-failed`, ...). */
+    val lastAnonymityError: String = "none",
+    val lastAnonymityErrorAgeSeconds: Long? = null,
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */
@@ -631,6 +649,10 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         // --- V0.4: QR-code / deep-link key exchange (Part B) + self-trust-linking (Part C) ---
 
         get("/api/connect/info") {
+            if (deps.anonymityActive) {
+                call.respondText(ANONYMITY_CONNECT_REFUSAL, ContentType.Text.Plain, HttpStatusCode.Conflict)
+                return@get
+            }
             val maddr = deps.node.bestDialableMultiaddr()
             val pkHex =
                 deps.identity.secp256k1KeyPair.publicKey.bytes
@@ -644,6 +666,10 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         get("/api/connect/qr.svg") {
+            if (deps.anonymityActive) {
+                call.respondText(ANONYMITY_CONNECT_REFUSAL, ContentType.Text.Plain, HttpStatusCode.Conflict)
+                return@get
+            }
             val maddr = deps.node.bestDialableMultiaddr()
             if (maddr == null) {
                 call.respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("no dialable listen address yet"))

@@ -1,24 +1,32 @@
+@file:OptIn(ExperimentalOnionApi::class)
+
 package net.lapisphilosophorum.lapisnet.onionwire
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
+import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.onion.BuilderStep
 import net.lapisphilosophorum.lapisnet.onion.Cell
 import net.lapisphilosophorum.lapisnet.onion.CellCommand
+import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
 import net.lapisphilosophorum.lapisnet.onion.ClientCircuit
 import net.lapisphilosophorum.lapisnet.onion.ClientCircuitBuilder
 import net.lapisphilosophorum.lapisnet.onion.DestroyBody
 import net.lapisphilosophorum.lapisnet.onion.DestroyReason
+import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
 import net.lapisphilosophorum.lapisnet.onion.OnionIntegrityException
 import net.lapisphilosophorum.lapisnet.onion.RelayMessage
+import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
+import net.lapisphilosophorum.lapisnet.onionwire.path.PathPolicy
 import java.security.SecureRandom
 import java.time.Clock
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledFuture
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
 
@@ -51,6 +59,10 @@ internal class OnionClientCircuit(
     /** Invoked once when a BUILT circuit goes away (destroyed, link lost, closed locally). */
     @Volatile var onClosed: () -> Unit = {}
 
+    /** `true` once the first hop answered the CREATE validly (a failure from then on is not a first-hop failure). */
+    @Volatile var progressed: Boolean = false
+        private set
+
     val circuitId: Int get() = builder.firstLinkCircuitId
     val linkId: LinkId get() = link
     val isClosed: Boolean get() = synchronized(lock) { state == State.CLOSED }
@@ -76,8 +88,12 @@ internal class OnionClientCircuit(
         post: MutableList<() -> Unit>,
     ) {
         when (val step = builder.onCell(cell)) {
-            is BuilderStep.Send -> links.send(link, step.cell)
+            is BuilderStep.Send -> {
+                progressed = true
+                links.send(link, step.cell)
+            }
             is BuilderStep.Built -> {
+                progressed = true
                 circuit = step.circuit
                 state = State.BUILT
                 timeout?.cancel(false)
@@ -193,9 +209,30 @@ internal class OnionClientCircuit(
     }
 }
 
+/** Why the client circuit policy refused to build a circuit. The message never carries a target. */
+internal class CircuitAdmissionException(
+    val kind: Kind,
+) : IllegalStateException("circuit not admitted: $kind") {
+    enum class Kind { RATE_LIMITED, POOL_FULL, LOCKED, PATH_TOO_SHORT }
+}
+
 /**
- * Builds [OnionClientCircuit]s over an EXPLICITLY given path of relay descriptors. Like [OnionCircuitClient] it
- * performs no path selection and no policy; the paths come from an injected [OnionPathProvider].
+ * The client circuit policy of anonymity mode (wave V0.10.0-E), installed into the [OnionCircuitFactory]. Without it the
+ * factory builds whatever path it is given (tests, normal mode: nothing uses it then).
+ */
+internal class CircuitPolicy(
+    val governor: CircuitBuildGovernor,
+    /** Outcome of the FIRST hop of a build: `true` = it answered the CREATE, `false` = link or CREATE failure. */
+    val firstHopResult: (Secp256k1PublicKey, Boolean) -> Unit = { _, _ -> },
+    val onError: (Throwable) -> Unit = {},
+    /** A rate-limit delay longer than this fails the build instead of waiting. */
+    val maxDefer: Duration = 30.seconds,
+)
+
+/**
+ * Builds [OnionClientCircuit]s over a path of relay descriptors. Without a [CircuitPolicy] it performs no path
+ * selection and no policy (the paths come from an injected [OnionPathProvider]); with one, every build is admitted by
+ * the [CircuitBuildGovernor] and a path of fewer than [PathPolicy.PRODUCTION_PATH_LENGTH] relays is refused.
  */
 internal class OnionCircuitFactory(
     private val links: OnionLinkManager,
@@ -206,6 +243,8 @@ internal class OnionCircuitFactory(
     private val routes = ConcurrentHashMap<Pair<Long, Int>, OnionClientCircuit>()
 
     @Volatile private var closed = false
+
+    @Volatile internal var policy: CircuitPolicy? = null
 
     init {
         links.addSink({ link, cell ->
@@ -222,9 +261,73 @@ internal class OnionCircuitFactory(
     fun build(
         path: List<OnionRelayDescriptor>,
         timeout: Duration,
+        purpose: CircuitPurpose? = null,
     ): CompletableFuture<OnionClientCircuit> {
         require(path.isNotEmpty()) { "path must not be empty" }
         if (closed) return CompletableFuture.failedFuture(IllegalStateException("closed"))
+        val p = policy ?: return buildNow(path, timeout, null, purpose, "")
+        if (path.size < PathPolicy.PRODUCTION_PATH_LENGTH) {
+            val e = CircuitAdmissionException(CircuitAdmissionException.Kind.PATH_TOO_SHORT)
+            p.onError(e)
+            return CompletableFuture.failedFuture(e)
+        }
+        return admitted(p, path, timeout, purpose, 0L)
+    }
+
+    private fun admitted(
+        p: CircuitPolicy,
+        path: List<OnionRelayDescriptor>,
+        timeout: Duration,
+        purpose: CircuitPurpose?,
+        waitedMillis: Long,
+    ): CompletableFuture<OnionClientCircuit> {
+        if (closed) return CompletableFuture.failedFuture(IllegalStateException("closed"))
+        // the target key only separates circuits inside the governor; it is never logged
+        val target =
+            path
+                .last()
+                .identity.bytes
+                .joinToString("") { "%02x".format(it) }
+
+        fun refuse(kind: CircuitAdmissionException.Kind): CompletableFuture<OnionClientCircuit> {
+            val e = CircuitAdmissionException(kind)
+            p.onError(e)
+            return CompletableFuture.failedFuture(e)
+        }
+        return when (val a = p.governor.admit(purpose, target)) {
+            CircuitBuildGovernor.Admission.Granted -> buildNow(path, timeout, p, purpose, target)
+            CircuitBuildGovernor.Admission.PoolFull -> refuse(CircuitAdmissionException.Kind.POOL_FULL)
+            CircuitBuildGovernor.Admission.Locked -> refuse(CircuitAdmissionException.Kind.LOCKED)
+            CircuitBuildGovernor.Admission.Dropped -> refuse(CircuitAdmissionException.Kind.RATE_LIMITED)
+            is CircuitBuildGovernor.Admission.Delayed -> {
+                val wait = a.retryAfter.inWholeMilliseconds.coerceAtLeast(1)
+                if (waitedMillis + wait >
+                    p.maxDefer.inWholeMilliseconds
+                ) {
+                    return refuse(CircuitAdmissionException.Kind.RATE_LIMITED)
+                }
+                val result = CompletableFuture<OnionClientCircuit>()
+                links.schedule(wait) {
+                    if (closed) {
+                        result.completeExceptionally(IllegalStateException("closed"))
+                    } else {
+                        admitted(p, path, timeout, purpose, waitedMillis + wait).whenComplete { c, e ->
+                            if (e != null) result.completeExceptionally(e) else result.complete(c)
+                        }
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    private fun buildNow(
+        path: List<OnionRelayDescriptor>,
+        timeout: Duration,
+        p: CircuitPolicy?,
+        purpose: CircuitPurpose?,
+        target: String,
+    ): CompletableFuture<OnionClientCircuit> {
         val builder = ClientCircuitBuilder(path.map { it.onionKeyBinding }, random, clock)
         val result = CompletableFuture<OnionClientCircuit>()
         val first = path[0]
@@ -232,17 +335,39 @@ internal class OnionCircuitFactory(
         links.linkTo(first.peerId, addresses).whenComplete { linkId, error ->
             if (error != null || linkId == null || closed) {
                 builder.close()
-                result.completeExceptionally(error ?: IllegalStateException("no link"))
+                val cause = error ?: IllegalStateException("no link")
+                if (p != null) {
+                    p.governor.onFailed(purpose)
+                    if (!closed) p.firstHopResult(first.identity, false)
+                    p.onError(cause)
+                }
+                result.completeExceptionally(cause)
                 return@whenComplete
             }
             lateinit var route: OnionClientCircuit
             route =
                 OnionClientCircuit(links, linkId, builder, random) {
                     routes.remove(it.linkId.value to it.circuitId, it)
+                    p?.governor?.onClosed(it)
                 }
             val firstCell = builder.start()
             routes[linkId.value to builder.firstLinkCircuitId] = route
-            route.built.whenComplete { c, e -> if (e != null) result.completeExceptionally(e) else result.complete(c) }
+            route.built.whenComplete { c, e ->
+                // a build ended by the shutdown of this factory says nothing about the guard and must not be recorded
+                if (p != null && !closed) {
+                    if (e != null) {
+                        p.governor.onFailed(purpose)
+                        p.firstHopResult(first.identity, route.progressed)
+                        p.onError(e)
+                    } else {
+                        p.governor.onBuilt(c, purpose, target, c.isClosed)
+                        // closed between the read above and the registration: take the handle out again
+                        if (c.isClosed) p.governor.onClosed(c)
+                        p.firstHopResult(first.identity, true)
+                    }
+                }
+                if (e != null) result.completeExceptionally(e) else result.complete(c)
+            }
             route.armTimeout(links.schedule(timeout.inWholeMilliseconds) { route.timedOut() })
             if (!links.send(linkId, firstCell)) route.linkLost()
         }

@@ -4,6 +4,7 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
 import net.lapisphilosophorum.lapisnet.networking.config.DeclaredReachability
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.policy.AcceptanceGate
@@ -218,5 +219,55 @@ class BrowserConfigTest :
             shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(karmaMinScore = Double.NaN) }
             shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(karmaMinScore = -0.1) }
             shouldThrow<IllegalArgumentException> { MailAcceptanceSettings(minDepositMsat = 0) }
+        }
+
+        test("anonymity: default off, the file key, environment over file, arguments over environment") {
+            BrowserConfig.load(emptyList(), emptyMap(), homeWith(null)).wiring.anonymity shouldBe AnonymityMode.OFF
+            val home = homeWith("anonymity=on\n")
+            BrowserConfig.load(emptyList(), emptyMap(), home).wiring.anonymity shouldBe AnonymityMode.ON
+            val env = mapOf("LAPISNET_ANONYMITY" to "off")
+            BrowserConfig.load(emptyList(), env, home).wiring.anonymity shouldBe AnonymityMode.OFF
+            BrowserConfig.load(listOf("--anonymity=on"), env, homeWith(null)).wiring.anonymity shouldBe AnonymityMode.ON
+            BrowserConfig
+                .load(
+                    listOf("--anonymity=off"),
+                    mapOf("LAPISNET_ANONYMITY" to "on"),
+                    home,
+                ).wiring.anonymity shouldBe
+                AnonymityMode.OFF
+        }
+
+        test("anonymity: an invalid value in ANY source aborts, even where a higher-priority source overrides it") {
+            val bad = homeWith("anonymity=maybe\n")
+            shouldThrow<InvalidWiringOptionException> { BrowserConfig.load(emptyList(), emptyMap(), bad) }
+            shouldThrow<InvalidWiringOptionException> { BrowserConfig.load(listOf("--anonymity=off"), emptyMap(), bad) }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), mapOf("LAPISNET_ANONYMITY" to "ON"), homeWith(null))
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--anonymity=yes"), emptyMap(), homeWith(null))
+            }.message shouldBe "--anonymity must be on|off"
+            // the environment layer is checked even when the arguments override it
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--anonymity=off"), mapOf("LAPISNET_ANONYMITY" to "1"), homeWith(null))
+            }
+        }
+
+        test("anonymity on: hole punching resolves to off; an explicit auto or on from any source is a conflict") {
+            BrowserConfig.load(listOf("--anonymity=on"), emptyMap(), homeWith(null)).wiring.holePunching shouldBe
+                net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.OFF
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), emptyMap(), homeWith("anonymity=on\nholePunching=auto\n"))
+            }.message shouldContain "hole-punching cannot be enabled while anonymity=on"
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--anonymity=on"), mapOf("LAPISNET_HOLE_PUNCHING" to "on"), homeWith(null))
+            }
+            BrowserConfig
+                .load(
+                    emptyList(),
+                    emptyMap(),
+                    homeWith("anonymity=on\nholePunching=off\n"),
+                ).wiring.anonymity shouldBe
+                AnonymityMode.ON
         }
     })

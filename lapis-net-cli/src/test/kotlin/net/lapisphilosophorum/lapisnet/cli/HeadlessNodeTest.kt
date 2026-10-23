@@ -1,9 +1,12 @@
+@file:OptIn(net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi::class)
+
 package net.lapisphilosophorum.lapisnet.cli
 
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
@@ -159,5 +162,82 @@ class HeadlessNodeTest :
             } finally {
                 node.stop()
             }
+        }
+
+        test("anonymity off: the start line says so, OFF is persisted, no anonymity runtime, status off").config(
+            timeout = 90.seconds,
+        ) {
+            val dir = Files.createTempDirectory("headless-anon-off")
+            val node = start(NodeWiringOptions.resolve(emptyMap()), dir)
+            try {
+                node.anonymity.shouldBeNull()
+                node.anonymityStatus().mode shouldBe "off"
+                val out = java.io.ByteArrayOutputStream()
+                val err = java.io.ByteArrayOutputStream()
+                runCli(
+                    listOf("node"),
+                    java.io.PrintStream(out, true),
+                    java.io.PrintStream(err, true),
+                    awaitShutdown = {},
+                    startNode = { node },
+                    demo = {},
+                ) shouldBe 0
+                out.toString() shouldContain "anonymity=off"
+                err.toString() shouldBe ""
+                // the first tick persisted the normal-mode state (needed so that a later switch to ON sends a tombstone)
+                val state =
+                    net.lapisphilosophorum.lapisnet.directory
+                        .FileDirectoryModeStore(
+                            dir.resolve("directory-mode.state"),
+                        ).load()
+                state.shouldNotBeNull().mode shouldBe
+                    net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode.OFF
+            } finally {
+                node.stop()
+            }
+        }
+
+        test(
+            "anonymity on on loopback: warning on stderr, no diverse path, no direct publication and no fallback",
+        ).config(timeout = 120.seconds) {
+            val dir = Files.createTempDirectory("headless-anon-on")
+            val baseline = ownThreads().size
+            val node = start(NodeWiringOptions.resolve(mapOf("anonymity" to "on")), dir)
+            try {
+                node.anonymity.shouldNotBeNull()
+                node.options.holePunching shouldBe net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.OFF
+                node.node.holePunching.shouldBeNull()
+                // the real locator sees no diverse path (no relays at all): a status code, never a direct publication
+                var status = node.anonymityStatus()
+                val deadline = System.nanoTime() + 20_000_000_000L
+                while (status.lastError.wire != "insufficient-relays" && System.nanoTime() < deadline) {
+                    Thread.sleep(100)
+                    status = node.anonymityStatus()
+                }
+                status.mode shouldBe "on"
+                status.incomplete shouldBe true
+                status.lastError.wire shouldBe "insufficient-relays"
+                status.guards shouldBe 0
+                // nothing was published from this node itself: the normal-mode state file was never written
+                Files.exists(dir.resolve("directory-mode.state")) shouldBe false
+                val out = java.io.ByteArrayOutputStream()
+                val err = java.io.ByteArrayOutputStream()
+                runCli(
+                    listOf("node", "--anonymity=on"),
+                    java.io.PrintStream(out, true),
+                    java.io.PrintStream(err, true),
+                    awaitShutdown = {},
+                    startNode = { node },
+                    demo = {},
+                ) shouldBe 0
+                out.toString() shouldContain "anonymity=on"
+                err.toString() shouldContain "Anonymity mode is incomplete"
+                err.toString() shouldContain "reveal your IP address"
+            } finally {
+                node.stop()
+            }
+            val deadline = System.nanoTime() + 15_000_000_000L
+            while (System.nanoTime() < deadline && ownThreads().size > baseline) Thread.sleep(100)
+            ownThreads().size shouldBe baseline
         }
     })

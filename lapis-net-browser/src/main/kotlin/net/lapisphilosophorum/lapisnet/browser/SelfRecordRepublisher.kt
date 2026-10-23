@@ -55,6 +55,11 @@ internal class SelfRecordRepublisher(
      */
     private val directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
     private val anonymousTick: (() -> Unit)? = null,
+    /**
+     * Sequence number of the next address-bearing record (wave V0.10.0-E). Default: the wall clock, as before. The
+     * node wires the persisted mode transition here so that the OFF state is persisted.
+     */
+    private val sequenceSource: () -> Long = { clockMillis() },
 ) {
     private var gossipAddresses: Set<String>? = null
     private var gossipAtMillis: Long? = null
@@ -113,7 +118,7 @@ internal class SelfRecordRepublisher(
                 addresses = addresses(),
                 capabilities = setOf(PeerCapability.DM),
                 // Wall-clock epoch millis, see BrowserServer.start: anti-rollback needs a restart-safe counter.
-                sequenceNumber = now,
+                sequenceNumber = sequenceSource(),
                 notValidAfterEpochSecond = notValidAfter,
                 nowEpochSecond = nowSeconds,
             )

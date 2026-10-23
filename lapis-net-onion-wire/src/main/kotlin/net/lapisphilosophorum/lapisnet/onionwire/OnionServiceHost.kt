@@ -185,7 +185,7 @@ class OnionServiceHost internal constructor(
                 queue.addLast(HsEvent.CircuitFailed(c.ref))
                 return
             }
-        factory.build(path, config.buildTimeout).whenComplete { circuit, error ->
+        factory.build(path, config.buildTimeout, c.purpose).whenComplete { circuit, error ->
             locked {
                 if (stopped) {
                     circuit?.close()

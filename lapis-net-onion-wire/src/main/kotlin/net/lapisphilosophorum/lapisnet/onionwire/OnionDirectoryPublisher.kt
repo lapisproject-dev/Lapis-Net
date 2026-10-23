@@ -146,7 +146,9 @@ class OnionDirectoryPublisher internal constructor(
             } catch (e: RuntimeException) {
                 return CompletableFuture.completedFuture(Outcome.RETRY)
             }
-        return factory.build(path, buildTimeout).thenCompose { circuit -> exchange(circuit, type, bytes) }
+        return factory.build(path, buildTimeout, CircuitPurpose.DIRECTORY_PUBLISH).thenCompose { circuit ->
+            exchange(circuit, type, bytes)
+        }
     }
 
     private fun exchange(

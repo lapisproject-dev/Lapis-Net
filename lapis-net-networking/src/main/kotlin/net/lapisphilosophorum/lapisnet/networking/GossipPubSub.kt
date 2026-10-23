@@ -159,15 +159,29 @@ class GossipPubSub private constructor(
         bytes: ByteArray,
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
+        publishReporting(topic, bytes, timeout)
+    }
+
+    /**
+     * Like [publish], but reports whether the message had anywhere to go: `false` if the mesh had no peer for [topic]
+     * (the message reached nobody, nothing is retried), `true` if it was handed to the router. For callers that must not
+     * treat "sent into the void" as delivered (for example the revocation of an anonymous record).
+     */
+    fun publishReporting(
+        topic: String,
+        bytes: ByteArray,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): Boolean {
         outboundTap?.invoke(topic, bytes.copyOf())
         try {
             awaitOrWrap("publish to gossip topic $topic", timeout) {
                 publisher.publish(Unpooled.wrappedBuffer(bytes), Topic(topic))
             }
+            return true
         } catch (e: GossipPubSubException) {
             if (e.cause is NoPeersForOutboundMessageException) {
                 logger.debug { "publish to $topic had no mesh peers yet - not delivered (best-effort, no retry)" }
-                return
+                return false
             }
             throw e
         }

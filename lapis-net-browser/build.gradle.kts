@@ -43,6 +43,10 @@ dependencies {
     // acceptance-gate vocabulary (also reachable transitively through lapis-net-dm, declared explicitly).
     implementation(project(":lapis-net-madli"))
     implementation(project(":lapis-net-policy"))
+    // V0.10.0-E - `--anonymity=on`: path selection, guards and circuit-based directory publication. New edge:
+    // onion-wire depends on core, identity, onion, networking and directory only, so no cycle.
+    implementation(project(":lapis-net-onion-wire"))
+    implementation(project(":lapis-net-onion"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)

@@ -154,4 +154,57 @@ class LapisNetCliArgsTest :
                 2
             bad.errText shouldContain "onion-relay"
         }
+
+        test("--anonymity=on reaches the node options; conflicts and bad values exit with 2") {
+            val s = Streams()
+            var seen: NodeWiringOptions? = null
+            runCatching {
+                runCli(
+                    listOf("node", "--anonymity=on"),
+                    s.out,
+                    s.err,
+                    awaitShutdown = {},
+                    startNode = {
+                        seen = it
+                        error("stop here")
+                    },
+                    demo = { error("no demo") },
+                )
+            }
+            seen!!.anonymity shouldBe net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode.ON
+            for (
+            (args, text) in
+            listOf(
+                listOf("node", "--anonymity=ON") to "--anonymity must be on|off",
+                listOf("node", "--anonymity=yes") to "--anonymity must be on|off",
+                listOf("node", "--anonymity=on", "--hole-punching=auto") to "hole-punching cannot be enabled",
+                listOf("node", "--anonymity=on", "--hole-punching=on") to "hole-punching cannot be enabled",
+                listOf("node", "--anonymity=on", "--onion-relay=true") to "onion-relay cannot be combined",
+            )
+            ) {
+                val bad = Streams()
+                runCli(args, bad.out, bad.err, startNode = ::neverStart, demo = {}) shouldBe 2
+                bad.errText shouldContain text
+                bad.errText
+                    .trim()
+                    .lines()
+                    .size shouldBe 1
+            }
+        }
+
+        test("the help documents --anonymity as experimental and incomplete") {
+            val help = Streams()
+            runCli(
+                listOf("node", "--help"),
+                help.out,
+                help.err,
+                awaitShutdown = {},
+                startNode = ::neverStart,
+                demo = {},
+            ) shouldBe
+                0
+            help.outText shouldContain "--anonymity=on|off"
+            help.outText shouldContain "experimental"
+            help.outText shouldContain "does NOT anonymise direct messages, mail or calls yet"
+        }
     })

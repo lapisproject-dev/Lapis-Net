@@ -49,6 +49,32 @@ class AnonymousPeerRecordGossip private constructor(
         return outcome
     }
 
+    /**
+     * Like [announce], but only returns once the record was handed to at least one mesh peer: while the mesh has no peer
+     * for the topic it publishes again every [interval] until [timeout] has passed. Throws [IllegalStateException] if the
+     * record was never delivered (or [announce]'s outcome is neither ACCEPTED nor DUPLICATE). For the revocation of an
+     * anonymous record, whose "sent" state must not be persisted before somebody actually received it.
+     */
+    fun announceDelivered(
+        record: AnonymousPeerRecord,
+        timeout: java.time.Duration = java.time.Duration.ofSeconds(15),
+        interval: java.time.Duration = java.time.Duration.ofMillis(500),
+    ): AnonymousIngestOutcome {
+        val deadline = System.nanoTime() + timeout.toNanos()
+        while (true) {
+            val now = clock.millis() / 1000
+            val outcome = index.add(record, now)
+            check(outcome == AnonymousIngestOutcome.ACCEPTED || outcome == AnonymousIngestOutcome.DUPLICATE) {
+                "record not accepted"
+            }
+            if (pubsub.publishReporting(ANONYMOUS_PEER_RECORD_GOSSIP_TOPIC, AnonymousPeerRecordCodec.encode(record))) {
+                return outcome
+            }
+            check(System.nanoTime() < deadline) { "no mesh peer received the record" }
+            Thread.sleep(interval.toMillis())
+        }
+    }
+
     fun stop() {
         subscription.unsubscribe()
     }

@@ -48,8 +48,17 @@ data class HolePunchConfig(
     val maxResponderSessionsPerPeerPerWindow: Int = 3,
     val responderWindow: Duration = Duration.ofMinutes(10),
     val allowNonPublicAddresses: Boolean = false,
+    /**
+     * Wave V0.10.0-E: the node runs in anonymity mode. Hole punching (DCUtR) and the Identify responder reveal observed
+     * and listen addresses, so they are forbidden here: only [HolePunchMode.OFF] is accepted. This guards the library
+     * level too, not just the option parsing.
+     */
+    val anonymityMode: Boolean = false,
 ) {
     init {
+        require(!anonymityMode || mode == HolePunchMode.OFF) {
+            "hole punching and Identify are not allowed in anonymity mode"
+        }
         require(maxAttemptsPerPeer > 0) { "maxAttemptsPerPeer must be positive" }
         require(!backoffBase.isNegative && !backoffBase.isZero) { "backoffBase must be positive" }
         require(backoffMax >= backoffBase) { "backoffMax must not be below backoffBase" }

@@ -48,6 +48,7 @@ internal fun startWiredTestServer(
     karmaLookupOverride: KarmaScoreLookup? = null,
     listenAddress: Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/0"),
     httpPort: Int = 0,
+    anonymityLocator: ((net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip) -> Any)? = null,
 ): BrowserServer =
     BrowserServer.start(
         identity = identity,
@@ -69,6 +70,7 @@ internal fun startWiredTestServer(
         acceptanceRefreshInterval = acceptanceRefreshInterval,
         autoRelayConfig = autoRelayConfig,
         karmaLookupOverride = karmaLookupOverride,
+        anonymityLocator = anonymityLocator,
     )
 
 /** A raw HTTP/1.1 exchange, because the JDK client forbids setting `Host`. Returns `(status, body)`. */

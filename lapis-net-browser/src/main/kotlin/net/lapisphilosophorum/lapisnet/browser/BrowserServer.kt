@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalOnionApi::class)
+
 package net.lapisphilosophorum.lapisnet.browser
 
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -11,9 +13,14 @@ import net.lapisphilosophorum.lapisnet.call.CallConfig
 import net.lapisphilosophorum.lapisnet.call.CallManager
 import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
 import net.lapisphilosophorum.lapisnet.call.WebRtcCallMediaEngine
+import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordGossip
 import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
+import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeRetirement
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition
+import net.lapisphilosophorum.lapisnet.directory.FileDirectoryModeStore
 import net.lapisphilosophorum.lapisnet.directory.OutboxEntryKind
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
@@ -26,6 +33,7 @@ import net.lapisphilosophorum.lapisnet.dm.MailboxGossip
 import net.lapisphilosophorum.lapisnet.dm.MailboxPoller
 import net.lapisphilosophorum.lapisnet.dm.MailboxRedeliveryScheduler
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
 import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
 import net.lapisphilosophorum.lapisnet.karma.BitcoinTimeAnchorSource
@@ -42,16 +50,27 @@ import net.lapisphilosophorum.lapisnet.mail.MailSender
 import net.lapisphilosophorum.lapisnet.mail.SentFolder
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
 import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
+import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
+import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
+import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
+import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
+import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import net.lapisphilosophorum.lapisnet.virtus.LtrGossip
 import java.nio.file.Path
+import java.time.Clock
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
@@ -75,6 +94,10 @@ private const val HTTP_STOP_TIMEOUT_MILLIS = 5_000L
  * get an OS-assigned port and read it back via [BrowserServer.boundPort] instead, to avoid port
  * collisions between concurrently running test servers. */
 const val DEFAULT_BROWSER_HTTP_PORT = 7878
+
+/** File names inside the data directory (wave V0.10.0-E). */
+private const val DIRECTORY_MODE_FILE = "directory-mode.state"
+private const val ONION_KEY_FILE = "onion-relay.onionkeys"
 
 /** How long a self [PeerRecord]/prekey-bundle publish stays valid for. Since V0.9.15 [SelfRecordRepublisher]
  * re-publishes it (on address changes and well before this expires), so this is no longer the dialability limit of a
@@ -180,6 +203,8 @@ class BrowserServer private constructor(
     private val relayReliabilityJob: NodeServiceSupervisor.PeriodicJob?,
     private val inboxDhtFetcher: InboxDhtFetcher?,
     private val selfRecordRepublisher: SelfRecordRepublisher,
+    /** V0.10.0-E - `null` unless `anonymity=on`. Stopped by the supervisor, ahead of everything it depends on. */
+    private val anonymityRuntime: AnonymityRuntime?,
     private val acceptedContacts: DmAcceptedContacts,
     private val httpEngine: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>,
     /** The HTTP port actually bound, resolved after [httpEngine] started - may differ from the
@@ -224,6 +249,11 @@ class BrowserServer private constructor(
     internal val dmSessionManagerForTesting: DmSessionManager get() = dmSessionManager
 
     internal val selfRecordRepublisherForTesting: SelfRecordRepublisher get() = selfRecordRepublisher
+
+    /** Mode, guard and circuit counts and the last error code; [AnonymityStatus.OFF] in normal mode. */
+    fun anonymityStatus(): AnonymityStatus = anonymityRuntime?.status() ?: AnonymityStatus.OFF
+
+    internal val anonymityRuntimeForTesting: AnonymityRuntime? get() = anonymityRuntime
 
     internal val configForTesting: BrowserConfig get() = config
 
@@ -432,6 +462,12 @@ class BrowserServer private constructor(
             autoRelayConfig: AutoRelayConfig = AutoRelayConfig(),
             /** Test seam: replaces the Karma-per-identity adapter. */
             karmaLookupOverride: KarmaScoreLookup? = null,
+            /**
+             * Test seam: replaces the peer-directory network locator of the path selection (loopback relays have no
+             * public address). Must return a `RelayNetworkLocator`; typed `Any` so that the experimental onion type does
+             * not leak into every caller of this function.
+             */
+            anonymityLocator: ((PeerDirectoryGossip) -> Any)? = null,
         ): BrowserServer {
             require(httpHost == "127.0.0.1") {
                 "BrowserServer must bind 127.0.0.1 only - refusing to start on '$httpHost' " +
@@ -687,8 +723,58 @@ class BrowserServer private constructor(
                     }
                 }
 
+                // The persisted publication mode (wave V0.10.0-D/E). A start in normal mode retires the anonymous record
+                // of an earlier anonymity run (a revocation sent from this node, then OFF is persisted); the sequence
+                // numbers of the own records come from it, so a later tombstone lies above everything ever published.
+                // In normal mode no OnionWire is built and no new gossip topic is subscribed (the revocation topic only
+                // for the one send, and only if the previous run was in anonymity mode).
+                val anonymous = wiring.anonymity == AnonymityMode.ON
+                val modeStore = FileDirectoryModeStore(dataDirectory.resolve(DIRECTORY_MODE_FILE))
+                val modeTransition = DirectoryModeTransition(identity, modeStore)
+                var sequenceSource: () -> Long = { System.currentTimeMillis() }
+                var onionWire: OnionWire? = null
+                if (anonymous) {
+                    val wire =
+                        OnionWire.attach(
+                            node,
+                            identity,
+                            OnionWireConfig(relayMode = false),
+                            pubsub,
+                            peerDirectory,
+                            supervisor,
+                            dataDirectory.resolve(ONION_KEY_FILE),
+                            null,
+                            directoryMode = DirectoryAnonymityMode.ON,
+                            prekeys = prekeyBundleGossip,
+                        )
+                    onionWire = wire
+                    cleanupOnFailure += { runCatching { wire.close() } }
+                    // registered before the runtime, so the supervisor stops the runtime first and the wire second
+                    supervisor.register("onion-wire") { wire.close() }
+                } else {
+                    val retired =
+                        DirectoryModeRetirement.onNormalStart(modeTransition) { revocation ->
+                            if (modeTransition.previousMode() == DirectoryAnonymityMode.ON) {
+                                val gossip =
+                                    AnonymousPeerRecordGossip.attach(
+                                        pubsub,
+                                        peerDirectory.anonymousRecords,
+                                        Clock.systemUTC(),
+                                    )
+                                try {
+                                    gossip.announceDelivered(revocation)
+                                } finally {
+                                    gossip.stop()
+                                }
+                            }
+                        }
+                    val mode = if (retired) DirectoryAnonymityMode.OFF else DirectoryAnonymityMode.ON
+                    sequenceSource = { modeTransition.nextSequence(mode) }
+                }
+
                 // Own record + prekey bundle: published at once, then kept current (a private node learns its
-                // /p2p-circuit addresses only after the reservations exist).
+                // /p2p-circuit addresses only after the reservations exist). In anonymity mode this class publishes
+                // NOTHING itself; the AnonymityRuntime does it through circuits.
                 val selfRecordRepublisher =
                     SelfRecordRepublisher(
                         identity = identity,
@@ -699,6 +785,8 @@ class BrowserServer private constructor(
                         directoryDht = directoryDht,
                         outbox = dhtOutbox,
                         minDhtAttemptInterval = directoryDhtLimits.minRepublishInterval.toKotlinDuration(),
+                        directoryMode = if (anonymous) DirectoryAnonymityMode.ON else DirectoryAnonymityMode.OFF,
+                        sequenceSource = sequenceSource,
                     )
                 // Gossip only at start: a DHT publication may block for seconds and must not delay the start.
                 selfRecordRepublisher.tick(includeDht = false)
@@ -713,17 +801,21 @@ class BrowserServer private constructor(
                 var madliGossip: MadliGossip? = null
                 var autoRelaySelector: RelayAutoSelector? = null
                 var relayReliabilityJob: NodeServiceSupervisor.PeriodicJob? = null
-                if (wiring.autoRelay || wiring.publishRelayReliability) {
+                var relayRanker: MadliRelayRanker? = null
+                if (wiring.autoRelay || wiring.publishRelayReliability || anonymous) {
                     val madli = MadliGossip.attach(pubsub, storage)
                     madliGossip = madli
                     supervisor.register("madli-gossip") { madli.stop() }
-                    if (wiring.autoRelay) {
+                    if (wiring.autoRelay || anonymous) {
                         val weights = CachedVeritasObserverWeight.startSupervised(veritas, ownPublicKey, supervisor)
-                        val ranker =
+                        relayRanker =
                             MadliRelayRanker(
                                 vectorsFor = madli::currentVectorsForObservedPeer,
                                 observerWeight = weights::weightOf,
                             )
+                    }
+                    if (wiring.autoRelay) {
+                        val ranker = checkNotNull(relayRanker)
                         val selector = node.startAutoRelay({ peerDirectory.relayCandidates() }, ranker)
                         autoRelaySelector = selector
                         supervisor.register("auto-relay") { selector.stop() }
@@ -746,6 +838,33 @@ class BrowserServer private constructor(
                                 initialDelay = 1.minutes,
                             ) { daily.runOnce() }
                     }
+                }
+
+                // Anonymity mode: path selection with persistent guards and the circuit-based directory publication.
+                var anonymityRuntime: AnonymityRuntime? = null
+                if (anonymous) {
+                    val ranker = checkNotNull(relayRanker)
+                    val started =
+                        AnonymityRuntime.start(
+                            checkNotNull(onionWire),
+                            identity,
+                            dataDirectory,
+                            RelayReputation { ranker.relayReliability(it) },
+                            (anonymityLocator?.invoke(peerDirectory) as RelayNetworkLocator?)
+                                ?: PeerDirectoryRelayNetworkLocator(peerDirectory),
+                            modeStore,
+                            prekeyStore,
+                            Ed25519KeyPair.generate(),
+                            tombstonePublisher = { tombstone ->
+                                peerDirectory.announce(tombstone)
+                                directoryDht?.publishTombstone(identity, tombstone)
+                            },
+                            supervisor = supervisor,
+                        )
+                    anonymityRuntime = started
+                    cleanupOnFailure += { runCatching { started.close() } }
+                    supervisor.register("anonymity") { started.close() }
+                    logger.warn { ANONYMITY_INCOMPLETE_WARNING }
                 }
 
                 if (acceptance.anyEnabled) {
@@ -813,6 +932,12 @@ class BrowserServer private constructor(
                                     lastFailure = status?.lastFailure,
                                 )
                             },
+                        anonymityMode = anonymityRuntime?.status()?.mode ?: "off",
+                        anonymityIncomplete = anonymityRuntime != null,
+                        guards = anonymityRuntime?.status()?.guards ?: 0,
+                        activeCircuits = anonymityRuntime?.status()?.activeCircuits ?: 0,
+                        lastAnonymityError = anonymityRuntime?.status()?.lastError?.wire ?: "none",
+                        lastAnonymityErrorAgeSeconds = anonymityRuntime?.status()?.lastErrorAgeSeconds,
                     )
                 }
                 val deps =
@@ -832,6 +957,7 @@ class BrowserServer private constructor(
                         call = callDeps,
                         nodeStatus = nodeStatus,
                         acceptedContacts = dmAcceptedContacts,
+                        anonymityActive = anonymous,
                     )
                 val httpEngine =
                     embeddedServer(Netty, port = httpPort, host = httpHost) {
@@ -889,6 +1015,7 @@ class BrowserServer private constructor(
                     relayReliabilityJob,
                     inboxDhtFetcher,
                     selfRecordRepublisher,
+                    anonymityRuntime,
                     dmAcceptedContacts,
                     httpEngine,
                     boundPort,

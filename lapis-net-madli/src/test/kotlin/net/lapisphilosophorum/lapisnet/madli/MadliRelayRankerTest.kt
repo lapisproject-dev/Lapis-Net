@@ -26,6 +26,16 @@ class MadliRelayRankerTest :
         fun ranker(data: Map<PeerId, List<MadliDailyVector>>) =
             MadliRelayRanker(vectorsFor = { data[it].orEmpty() }, observerWeight = { 1.0 }, epochDay = { 10L })
 
+        test("relayReliability exposes the local score, or null without any signal") {
+            val data = mapOf(pid(2) to listOf(relayVector(observer, pid(2), 800_000)))
+            val r = ranker(data)
+            r.relayReliability(pid(1)).shouldBeNull()
+            val score = r.relayReliability(pid(2))!!
+            (score > 0.79 && score <= 1.25) shouldBe true
+            // zero-weight observers give no score either
+            MadliRelayRanker({ data[it].orEmpty() }, { 0.0 }, { 10L }).relayReliability(pid(2)).shouldBeNull()
+        }
+
         test("candidates are ordered by relay reliability, best first") {
             val data =
                 mapOf(

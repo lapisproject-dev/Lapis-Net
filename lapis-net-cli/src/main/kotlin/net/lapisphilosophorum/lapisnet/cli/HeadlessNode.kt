@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalOnionApi::class)
+
 package net.lapisphilosophorum.lapisnet.cli
 
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -5,12 +7,16 @@ import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeRetirement
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition
+import net.lapisphilosophorum.lapisnet.directory.FileDirectoryModeStore
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.resolveKeystorePassphrase
 import net.lapisphilosophorum.lapisnet.madli.CachedVeritasObserverWeight
 import net.lapisphilosophorum.lapisnet.madli.DailyRelayReliabilityPublication
@@ -19,13 +25,20 @@ import net.lapisphilosophorum.lapisnet.madli.MadliRelayRanker
 import net.lapisphilosophorum.lapisnet.madli.MadliRelayReliabilityPublisher
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
 import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
+import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
+import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
+import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
+import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import java.nio.file.Files
@@ -43,6 +56,9 @@ private val logger = KotlinLogging.logger {}
 
 /** File name of the (encrypted) onion key file inside the node's data directory. */
 private const val ONION_KEY_FILE = "onion-relay.onionkeys"
+
+/** File name of the persisted directory publication mode (wave V0.10.0-D/E) inside the node's data directory. */
+private const val DIRECTORY_MODE_FILE = "directory-mode.state"
 
 /** Validity of the record a headless node publishes; it is refreshed long before. */
 private const val HEADLESS_RECORD_TTL_SECONDS = 24L * 3600
@@ -66,8 +82,13 @@ internal class HeadlessNode private constructor(
     val relayReliabilityJob: NodeServiceSupervisor.PeriodicJob?,
     val supervisor: NodeServiceSupervisor,
     private val closers: List<() -> Unit>,
+    /** Anonymity mode (wave V0.10.0-E); `null` in normal mode. */
+    val anonymity: AnonymityRuntime? = null,
 ) {
     private val stopped = AtomicBoolean(false)
+
+    /** Mode, guard and circuit counts and the last error code; [AnonymityStatus.OFF] in normal mode. */
+    fun anonymityStatus(): AnonymityStatus = anonymity?.status() ?: AnonymityStatus.OFF
 
     /** Idempotent teardown: supervised parts first (publisher, auto-relay, Madli, DHT), then the layers below, the node last. */
     fun stop() {
@@ -97,6 +118,8 @@ internal class HeadlessNode private constructor(
             selfRecordCheckInterval: Duration = 30.seconds,
             onionWireConfig: OnionWireConfig = OnionWireConfig(relayMode = options.onionRelay),
             onionKeyPassphrase: () -> CharArray? = ::resolveKeystorePassphrase,
+            /** Test seam: must return a `RelayNetworkLocator`; typed `Any` so the experimental onion type does not leak to callers. */
+            anonymityLocator: ((PeerDirectoryGossip) -> Any)? = null,
         ): HeadlessNode {
             Files.createDirectories(dataDirectory)
             val rollback = mutableListOf<() -> Unit>()
@@ -139,6 +162,12 @@ internal class HeadlessNode private constructor(
                             supervisor,
                             dataDirectory.resolve(ONION_KEY_FILE),
                             passphrase,
+                            directoryMode =
+                                if (options.anonymity == AnonymityMode.ON) {
+                                    DirectoryAnonymityMode.ON
+                                } else {
+                                    DirectoryAnonymityMode.OFF
+                                },
                             prekeys = prekeys,
                         )
                     } finally {
@@ -169,6 +198,19 @@ internal class HeadlessNode private constructor(
                     }
                 }
 
+                // The persisted publication mode: a start in normal mode retires an anonymous record of an earlier
+                // anonymity run (revocation) and persists OFF; the sequence numbers of the own records come from it,
+                // so that a later tombstone lies above everything ever published.
+                val modeStore = FileDirectoryModeStore(dataDirectory.resolve(DIRECTORY_MODE_FILE))
+                val transition = DirectoryModeTransition(identity, modeStore)
+                val anonymous = options.anonymity == AnonymityMode.ON
+                var sequenceSource: () -> Long = { System.currentTimeMillis() }
+                if (!anonymous) {
+                    val retired = DirectoryModeRetirement.onNormalStart(transition) { onionWire.announceRevocation(it) }
+                    val mode = if (retired) DirectoryAnonymityMode.OFF else DirectoryAnonymityMode.ON
+                    sequenceSource = { transition.nextSequence(mode) }
+                }
+
                 // The DHT value (one IPNS name per node) is written by this publisher only, so the relay descriptor
                 // is handed to it rather than published separately - a second writer would overwrite the peer record.
                 val publisher =
@@ -179,6 +221,9 @@ internal class HeadlessNode private constructor(
                         directoryDht,
                         directoryDhtLimits.minRepublishInterval.toKotlinDuration(),
                         descriptorProvider = onionWire::currentDescriptor,
+                        // in anonymity mode this class publishes NOTHING itself (the AnonymityRuntime does it through circuits)
+                        directoryMode = if (anonymous) DirectoryAnonymityMode.ON else DirectoryAnonymityMode.OFF,
+                        sequenceSource = sequenceSource,
                     )
                 publisher.tick(includeDht = false)
                 supervisor.launchPeriodic(
@@ -192,14 +237,17 @@ internal class HeadlessNode private constructor(
                 var selector: RelayAutoSelector? = null
                 var publishJob: NodeServiceSupervisor.PeriodicJob? = null
                 val ownKey = identity.secp256k1KeyPair.publicKey
-                if (options.autoRelay || options.publishRelayReliability) {
+                var ranker: MadliRelayRanker? = null
+                if (options.autoRelay || options.publishRelayReliability || anonymous) {
                     val gossip = MadliGossip.attach(pubsub, storage)
                     madli = gossip
                     supervisor.register("madli-gossip") { gossip.stop() }
-                    if (options.autoRelay) {
+                    if (options.autoRelay || anonymous) {
                         val weights = CachedVeritasObserverWeight.startSupervised(veritas, ownKey, supervisor)
-                        val ranker = MadliRelayRanker(gossip::currentVectorsForObservedPeer, weights::weightOf)
-                        val started = node.startAutoRelay({ peerDirectory.relayCandidates() }, ranker)
+                        ranker = MadliRelayRanker(gossip::currentVectorsForObservedPeer, weights::weightOf)
+                    }
+                    if (options.autoRelay) {
+                        val started = node.startAutoRelay({ peerDirectory.relayCandidates() }, checkNotNull(ranker))
                         selector = started
                         supervisor.register("auto-relay") { started.stop() }
                     }
@@ -223,6 +271,35 @@ internal class HeadlessNode private constructor(
                     }
                 }
 
+                // Anonymity mode (wave V0.10.0-E): path selection with persistent guards, circuit policy and the
+                // circuit-based directory publication. Nothing is published from this node itself (except the one
+                // address-free tombstone of an OFF to ON switch).
+                var anonymity: AnonymityRuntime? = null
+                if (anonymous) {
+                    val relayRanker = checkNotNull(ranker)
+                    anonymity =
+                        AnonymityRuntime.start(
+                            onionWire,
+                            identity,
+                            dataDirectory,
+                            RelayReputation { relayRanker.relayReliability(it) },
+                            (anonymityLocator?.invoke(peerDirectory) as RelayNetworkLocator?)
+                                ?: PeerDirectoryRelayNetworkLocator(peerDirectory),
+                            modeStore,
+                            prekeyStore = null,
+                            serviceKey = Ed25519KeyPair.generate(),
+                            tombstonePublisher = { tombstone ->
+                                peerDirectory.announce(tombstone)
+                                directoryDht?.publishTombstone(identity, tombstone)
+                            },
+                            supervisor = supervisor,
+                            capabilities = emptySet(),
+                        )
+                    val started = anonymity
+                    rollback += { started.close() }
+                    supervisor.register("anonymity") { started.close() }
+                }
+
                 // Layers below the supervised parts, stopped in reverse attach order after them.
                 val closers =
                     listOf<() -> Unit>(
@@ -244,6 +321,7 @@ internal class HeadlessNode private constructor(
                     publishJob,
                     supervisor,
                     closers,
+                    anonymity,
                 )
             } catch (e: Exception) {
                 rollback.asReversed().forEach { runCatching(it) }
@@ -274,6 +352,12 @@ internal class HeadlessSelfPublisher(
      */
     private val directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
     private val anonymousTick: (() -> Unit)? = null,
+    /**
+     * Sequence number of the next address-bearing record. The default is the wall clock (the behaviour before wave
+     * V0.10.0-E); the node wires the persisted [net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition] here so
+     * that the OFF state is persisted and every later tombstone lies above all published sequence numbers.
+     */
+    private val sequenceSource: () -> Long = { clockMillis() },
 ) {
     private var dhtDescriptorSequence: Long? = null
 
@@ -328,7 +412,7 @@ internal class HeadlessSelfPublisher(
                 identity = identity,
                 addresses = addresses(),
                 capabilities = emptySet<PeerCapability>(),
-                sequenceNumber = now,
+                sequenceNumber = sequenceSource(),
                 notValidAfterEpochSecond = nowSeconds + HEADLESS_RECORD_TTL_SECONDS,
                 nowEpochSecond = nowSeconds,
             )

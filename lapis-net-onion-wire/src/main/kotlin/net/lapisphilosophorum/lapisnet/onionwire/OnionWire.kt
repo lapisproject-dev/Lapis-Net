@@ -160,6 +160,26 @@ class OnionWire private constructor(
     fun anonymousDirectory(): AnonymousDirectory =
         AnonymousDirectory(peerDirectory, serviceDescriptors, null) { clock.instant() }
 
+    /**
+     * Sends [record] (the revocation of an ON to OFF switch) through the anonymous-record gossip of THIS node. It is the one
+     * publication from the own node that is acceptable in normal mode: the node is about to publish its identity
+     * together with its address anyway. Throws if the record is stale or invalid.
+     */
+    fun announceRevocation(record: net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord) {
+        check(!closed.get()) { "closed" }
+        // delivery is confirmed: a revocation that reached nobody must not count as sent
+        anonymousGossip.announceDelivered(record)
+    }
+
+    /**
+     * Installs the client circuit policy (governor, minimum path length, first-hop reporting) of anonymity mode
+     * (wave V0.10.0-E). Every circuit built through the hidden-service machinery and the directory publisher passes it.
+     */
+    internal fun installCircuitPolicy(policy: CircuitPolicy) {
+        check(!closed.get()) { "closed" }
+        factory.policy = policy
+    }
+
     /** Circuits currently open through the hidden-service factory (leak checks). */
     internal fun hiddenServiceRoutes(): Int = factory.openRoutes()
 

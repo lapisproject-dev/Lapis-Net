@@ -29,7 +29,7 @@ private val logger = KotlinLogging.logger {}
 
 /**
  * Publishes the directory presence of a node in anonymity mode (wave V0.10.0-D): an [AnonymousPeerRecord] pointing at
- * the node's onion service, and its prekey bundle (reduced to as many one-time prekeys as fit one publish message),
+ * the node's onion service, and its prekey bundle (when it has a [PrekeyStore]) (reduced to as many one-time prekeys as fit one publish message),
  * both through [channel] - in production the circuit-based `OnionDirectoryPublisher`. The service descriptor itself
  * is published by the `OnionServiceHost`, whose publisher callback points at the same channel.
  *
@@ -49,7 +49,7 @@ private val logger = KotlinLogging.logger {}
 class AnonymousDirectoryPublisher(
     private val identity: DualKeyIdentity,
     private val serviceKey: Ed25519KeyPair,
-    private val prekeyStore: PrekeyStore,
+    private val prekeyStore: PrekeyStore?,
     private val channel: DirectoryPublicationChannel,
     modeStore: DirectoryModeStore,
     private val clockMillis: () -> Long = System::currentTimeMillis,
@@ -176,9 +176,11 @@ class AnonymousDirectoryPublisher(
         notValidAfter: Long,
         nowSeconds: Long,
     ): PrekeyBundle? {
+        // a node without a DM capability (the headless CLI node) has no prekeys and publishes no bundle
+        val store = prekeyStore ?: return null
         for (n in generateSequence(MAX_ONE_TIME_PREKEYS) { it - 1 }.takeWhile { it >= 0 }) {
             val bundle =
-                prekeyStore.publishBundle(
+                store.publishBundle(
                     identity,
                     notValidAfter,
                     maxOneTimePrekeys = n,

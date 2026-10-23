@@ -21,6 +21,26 @@ enum class DeclaredReachability {
         }
 }
 
+/**
+ * Wave V0.10.0-E: `--anonymity=on|off`. Only the exact lower-case words are accepted. EXPERIMENTAL and incomplete: in
+ * [ON] the node publishes its directory presence through onion circuits and chooses paths with persistent guards, but
+ * direct messages, mail and call signalling still use direct connections.
+ */
+enum class AnonymityMode {
+    OFF,
+    ON,
+    ;
+
+    companion object {
+        fun parse(raw: String): AnonymityMode? =
+            when (raw) {
+                "on" -> ON
+                "off" -> OFF
+                else -> null
+            }
+    }
+}
+
 /** Thrown for any invalid operator-supplied wiring value. Never swallowed into a default: the process must not start. */
 class InvalidWiringOptionException(
     message: String,
@@ -47,6 +67,11 @@ data class NodeWiringOptions(
      * routed over circuits yet and nothing is anonymised. The switch is consumed by the CLI node; the browser ignores it.
      */
     val onionRelay: Boolean = false,
+    /**
+     * V0.10.0-E: anonymous directory publication over onion circuits (`--anonymity=on`). Experimental, off by default.
+     * Excludes hole punching (forced off) and `--onion-relay` (the relay descriptor would bind identity and address).
+     */
+    val anonymity: AnonymityMode = AnonymityMode.OFF,
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -70,7 +95,12 @@ data class NodeWiringOptions(
      * default `auto` it is active exactly when the operator declared `reachability=private`.
      */
     fun holePunchConfig(base: HolePunchConfig = HolePunchConfig()): HolePunchConfig =
-        base.copy(mode = holePunching, declaredPrivate = reachability == DeclaredReachability.PRIVATE)
+        if (anonymity == AnonymityMode.ON) {
+            // DCUtR and Identify reveal addresses: forced off, whatever the base says
+            base.copy(mode = HolePunchMode.OFF, declaredPrivate = false, anonymityMode = true)
+        } else {
+            base.copy(mode = holePunching, declaredPrivate = reachability == DeclaredReachability.PRIVATE)
+        }
 
     /** `true` when the operator declared `private` but did not switch auto-relay on (the library heuristic then sees UNSPECIFIED). */
     val declaredPrivateWithoutAutoRelay: Boolean
@@ -83,6 +113,7 @@ data class NodeWiringOptions(
         const val KEY_PUBLISH_RELAY_RELIABILITY = "publish-relay-reliability"
         const val KEY_HOLE_PUNCHING = "hole-punching"
         const val KEY_ONION_RELAY = "onion-relay"
+        const val KEY_ANONYMITY = "anonymity"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
@@ -95,6 +126,7 @@ data class NodeWiringOptions(
                 KEY_PUBLISH_RELAY_RELIABILITY,
                 KEY_HOLE_PUNCHING,
                 KEY_ONION_RELAY,
+                KEY_ANONYMITY,
             )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
@@ -117,9 +149,21 @@ data class NodeWiringOptions(
             val dhtFallback = raw[KEY_DHT_FALLBACK]?.let { parseBoolean(KEY_DHT_FALLBACK, it) } ?: true
             val publish =
                 raw[KEY_PUBLISH_RELAY_RELIABILITY]?.let { parseBoolean(KEY_PUBLISH_RELAY_RELIABILITY, it) } ?: false
-            val holePunching = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) } ?: HolePunchMode.AUTO
+            val holePunchingRaw = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) }
             val onionRelay = raw[KEY_ONION_RELAY]?.let { parseBoolean(KEY_ONION_RELAY, it) } ?: false
-            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching, onionRelay)
+            val anonymity = raw[KEY_ANONYMITY]?.let { parseAnonymity(it) } ?: AnonymityMode.OFF
+            if (anonymity == AnonymityMode.ON) {
+                // an explicit auto/on is a conflict, never silently overridden; only a missing key resolves to off
+                if (holePunchingRaw != null && holePunchingRaw != HolePunchMode.OFF) {
+                    throw InvalidWiringOptionException("hole-punching cannot be enabled while anonymity=on")
+                }
+                if (onionRelay) {
+                    throw InvalidWiringOptionException("onion-relay cannot be combined with anonymity=on")
+                }
+            }
+            val holePunching =
+                if (anonymity == AnonymityMode.ON) HolePunchMode.OFF else holePunchingRaw ?: HolePunchMode.AUTO
+            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching, onionRelay, anonymity)
         }
 
         /**
@@ -133,6 +177,7 @@ data class NodeWiringOptions(
                     KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY, KEY_ONION_RELAY ->
                         parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
+                    KEY_ANONYMITY -> parseAnonymity(value)
                     else -> throw InvalidWiringOptionException("unknown option --$key")
                 }
             }
@@ -172,6 +217,9 @@ data class NodeWiringOptions(
                 "undeclared" -> DeclaredReachability.UNDECLARED
                 else -> throw InvalidWiringOptionException("--reachability must be public|private|undeclared")
             }
+
+        private fun parseAnonymity(raw: String): AnonymityMode =
+            AnonymityMode.parse(raw) ?: throw InvalidWiringOptionException("--anonymity must be on|off")
 
         private fun parseHolePunching(raw: String): HolePunchMode =
             HolePunchMode.parse(raw) ?: throw InvalidWiringOptionException("--hole-punching must be auto|on|off")
@@ -214,6 +262,10 @@ data class NodeWiringOptions(
             |        relay descriptor (gossip, and the DHT value when --dht-fallback is on) and answers circuit
             |        CREATE/EXTEND cells. NO user traffic is routed over circuits yet and nothing is anonymised;
             |        the descriptor makes this node's identity and address publicly known as a relay.
+            |  --anonymity=on|off   (experimental, default off) anonymous directory publication over onion circuits; does NOT anonymise direct messages, mail or calls yet
+            |        With on: the directory entry is published only through circuits (persistent guards, diverse
+            |        paths), hole punching is switched off, and the start is refused together with
+            |        --hole-punching=auto|on or --onion-relay=true.
             """.trimMargin()
     }
 }

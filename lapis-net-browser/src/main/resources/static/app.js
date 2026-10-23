@@ -129,6 +129,37 @@ async function loadIdentity() {
   }
 }
 
+// V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
+// not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
+const ANONYMITY_WARNING_TEXT =
+  "Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and reveal your IP address; only the directory publication and path selection are active.";
+const ANONYMITY_ERROR_LABELS = {
+  "insufficient-relays": "not enough different relays known yet",
+  "build-failed": "a circuit could not be built",
+  "build-timeout": "a circuit build timed out",
+  "rate-limited": "circuit builds are being rate limited",
+  "guard-state-reset": "the saved guards were lost and new ones were chosen",
+  "publish-failed": "the directory entry could not be published",
+};
+
+function renderAnonymityStatus(status) {
+  const warning = document.getElementById("anonymity-warning");
+  const line = document.getElementById("node-status-anonymity");
+  const errorLine = document.getElementById("node-status-anonymity-error");
+  const on = status.anonymityMode === "on";
+  warning.hidden = !on;
+  warning.textContent = on ? ANONYMITY_WARNING_TEXT : "";
+  line.textContent = on
+    ? "on (experimental) - " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)"
+    : "off";
+  const code = status.lastAnonymityError;
+  errorLine.textContent =
+    on && code && code !== "none"
+      ? "Last problem: " + (ANONYMITY_ERROR_LABELS[code] || "other") +
+        (typeof status.lastAnonymityErrorAgeSeconds === "number" ? " (" + status.lastAnonymityErrorAgeSeconds + " s ago)" : "")
+      : "";
+}
+
 // V0.9.15 status panel. Every value is written through textContent; the node only ever sends enum-like strings,
 // booleans and numbers here, never absolute paths.
 async function loadNodeStatus() {
@@ -143,6 +174,7 @@ async function loadNodeStatus() {
       ? (status.autoRelayRunning ? "running" : "enabled, not running") + " - " + status.relayReservations + " reservation(s)"
       : "off";
     document.getElementById("node-status-publish").textContent = status.publishRelayReliability ? "on" : "off";
+    renderAnonymityStatus(status);
     document.getElementById("node-status-acceptance-text").textContent =
       status.acceptanceGates.length === 0
         ? "No rule active: everybody is accepted."

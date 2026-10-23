@@ -42,11 +42,13 @@
   <section id="node-status" aria-labelledby="node-status-title">
     <h2 id="node-status-title">Node status</h2>
     <p class="connect-notice">Read-only. These switches are set when the node starts (command line, environment or the settings file) and cannot be changed here.</p>
+    <div id="anonymity-warning" role="status" hidden></div>
     <ul id="node-status-list">
       <li>DHT fallback: <strong id="node-status-dht">loading&hellip;</strong> <span id="node-status-dht-note" class="node-status-note"></span></li>
       <li>Reachability: <strong id="node-status-reachability">&hellip;</strong></li>
       <li>Auto-relay: <strong id="node-status-relay">&hellip;</strong></li>
       <li>Relay reliability publishing: <strong id="node-status-publish">&hellip;</strong></li>
+      <li>Anonymity: <strong id="node-status-anonymity">&hellip;</strong><br><span id="node-status-anonymity-error" class="node-status-note"></span></li>
     </ul>
     <div id="node-status-acceptance">
       <h3>Acceptance rules</h3>

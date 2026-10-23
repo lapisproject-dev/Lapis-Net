@@ -34,9 +34,10 @@ and Farcaster have millions of users and mature client ecosystems; Lapis Net doe
 
 * *Hole punching* (`dcutr`, `--hole-punching=auto|on|off`) is *verified on Linux loopback only*. It is
   *not verified* behind a real router or CGNAT, on macOS, or on Windows.
-* *Traffic anonymisation does not anonymise anything yet.* The onion modules (`lapis-net-onion`,
-  `lapis-net-onion-wire`) are a foundation and a wire layer only: no user traffic is routed through them,
-  and IP addresses remain visible to peers and to the directory. See link:docs/anonymity.adoc[docs/anonymity.adoc].
+* *Traffic anonymisation does not anonymise your traffic yet.* The onion modules (`lapis-net-onion`,
+  `lapis-net-onion-wire`) are a foundation and a wire layer; the experimental, unreleased option
+  `--anonymity=on` only publishes the directory entry through circuits. No user traffic (messages, mail, calls)
+  is routed through them, and IP addresses remain visible to peers. See link:docs/anonymity.adoc[docs/anonymity.adoc].
 * There is no embedded Lightning node (proof verification only), no group calls, no video and no
   multi-device messaging.
 

@@ -206,7 +206,7 @@ class OnionRendezvousClient internal constructor(
                     queue.addLast(HsEvent.CircuitFailed(c.ref))
                     return
                 }
-            factory.build(path, buildTimeout).whenComplete { circuit, error ->
+            factory.build(path, buildTimeout, c.purpose).whenComplete { circuit, error ->
                 synchronized(lock) {
                     if (finished) {
                         circuit?.close()
