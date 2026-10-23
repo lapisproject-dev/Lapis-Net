@@ -127,7 +127,10 @@ private fun possessionDigest(identity: Secp256k1PublicKey): ByteArray =
  * class's doc comment for the audit-round-1 correction on why this is only a PARTIAL mitigation,
  * not a network-wide guarantee against [PeerRecord] being a fine-grained real-time presence oracle:
  * [PeerDirectoryGossip.announce] itself is unrate-limited, and [PeerDirectoryGossip.onGossipMessage]
- * applies no inbound per-identity rate limit at all.
+ * applies no inbound per-identity rate limit at all. Since wave V0.10.0-D a node can opt out of this tension
+ * altogether: in [DirectoryAnonymityMode.ON] it publishes an [AnonymousPeerRecord] (no address, no peer ID) through
+ * a circuit instead, and [IdentitySupersession] keeps an old address-bearing record from coming back. That does not
+ * anonymise the node's direct connections; see docs/anonymity.adoc.
  */
 class PeerRecord private constructor(
     val identity: Secp256k1PublicKey,

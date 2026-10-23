@@ -13,6 +13,7 @@ import net.lapisphilosophorum.lapisnet.onion.Cell
 import net.lapisphilosophorum.lapisnet.onion.CellCommand
 import net.lapisphilosophorum.lapisnet.onion.DestroyBody
 import net.lapisphilosophorum.lapisnet.onion.DestroyReason
+import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
 import net.lapisphilosophorum.lapisnet.onion.OnionKeyRing
@@ -20,6 +21,7 @@ import net.lapisphilosophorum.lapisnet.onion.OnionRelay
 import net.lapisphilosophorum.lapisnet.onion.RelayAction
 import net.lapisphilosophorum.lapisnet.onion.RelayCommand
 import net.lapisphilosophorum.lapisnet.onion.RelayMessage
+import net.lapisphilosophorum.lapisnet.onion.StatusBody
 import java.security.SecureRandom
 import java.time.Clock
 import java.util.concurrent.ConcurrentHashMap
@@ -54,6 +56,7 @@ class OnionRelayService private constructor(
     private val peerDirectory: PeerDirectoryGossip?,
     val quality: OnionRelayQualityTracker,
     private val clock: Clock,
+    private val directorySink: DirectoryPublishSink?,
 ) : AutoCloseable {
     private val ownIdentity: Secp256k1PublicKey = identity.secp256k1KeyPair.publicKey
     private val linkTargets = ConcurrentHashMap<Long, Secp256k1PublicKey>()
@@ -137,6 +140,7 @@ class OnionRelayService private constructor(
                 is RelayAction.SendCell -> links.send(action.link, action.cell)
                 is RelayAction.OpenLinkForExtend -> extend(action)
                 is RelayAction.DeliverLocal -> deliver(action)
+                is RelayAction.DeliverDirectoryPublish -> deliverDirectoryPublish(action)
                 is RelayAction.CircuitClosed -> Unit
             }
         }
@@ -177,6 +181,40 @@ class OnionRelayService private constructor(
                 else -> null
             }
         if (reply != null) execute(relay.reply(action.circuitHandle, reply))
+    }
+
+    /**
+     * Directory publication through a circuit (wave V0.10.0-D): validation and gossip publication run on the bounded
+     * pool of the link manager (signature checks and a blocking publish must not stall an event loop); the status goes
+     * back through the circuit. A saturated pool is answered with the rate-limited status.
+     */
+    private fun deliverDirectoryPublish(action: RelayAction.DeliverDirectoryPublish) {
+        val sink = directorySink
+        val accepted =
+            sink != null &&
+                links.submit {
+                    val status =
+                        try {
+                            sink.publish(action.type, action.objectBytes)
+                        } catch (e: RuntimeException) {
+                            DirectoryPublishStatus.RATE_LIMITED
+                        }
+                    replyPublished(action.circuitHandle, status)
+                }
+        if (!accepted) {
+            replyPublished(
+                action.circuitHandle,
+                if (sink == null) DirectoryPublishStatus.UNKNOWN_TYPE else DirectoryPublishStatus.RATE_LIMITED,
+            )
+        }
+    }
+
+    private fun replyPublished(
+        handle: Long,
+        status: Byte,
+    ) {
+        if (closed) return
+        execute(relay.reply(handle, RelayMessage(RelayCommand.DIRECTORY_PUBLISHED, 0, StatusBody.encode(status))))
     }
 
     // ---- keys and descriptor ---------------------------------------------------------------------
@@ -262,6 +300,7 @@ class OnionRelayService private constructor(
             peerDirectory: PeerDirectoryGossip?,
             supervisor: NodeServiceSupervisor,
             links: OnionLinkManager,
+            directorySink: DirectoryPublishSink? = null,
             quality: OnionRelayQualityTracker = OnionRelayQualityTracker(),
             clock: Clock = Clock.systemUTC(),
             random: SecureRandom = SecureRandom(),
@@ -289,6 +328,7 @@ class OnionRelayService private constructor(
                         peerDirectory,
                         quality,
                         clock,
+                        directorySink,
                     )
                 service = svc
                 links.addClosedSink { svc.onLinkClosed(it) }

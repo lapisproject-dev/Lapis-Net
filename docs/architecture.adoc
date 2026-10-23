@@ -5062,6 +5062,8 @@ unchanged. `lapis-net-mail` and `lapis-net-dm` become consumers in part 2 (V0.9.
 
 === Hybrid model
 
+NOTE: In directory anonymity mode `ON` (wave V0.10.0-D) none of this is published: `publishOwn` throws, the outbox stays queued and no rendezvous provider record is sent; the only permitted write is `publishTombstone`. See "Directory anonymity (V0.10.0-D)" below.
+
 * A node publishes its peer record and its prekey bundle together, as one IPNS value, with
   `DirectoryDht.publishOwn`. Nothing publishes by itself: when and how often is the caller's decision, and
   nothing in this wave wires it into `BrowserServer`.
@@ -5594,6 +5596,26 @@ The boundary of `lapis-net-onion` is kept: the new network code lives in `lapis-
 === Receiver side (V0.10.0-C, unreleased)
 
 The hidden-service work follows the module boundary rule: everything that needs no network lives in `lapis-net-onion` (the descriptor type `OnionServiceDescriptor` and its codec are there because they contain no peer id, plus the relay roles, the HPKE introduction, the end-to-end layer and the two pure state machines, which return commands instead of performing I/O). The index, the gossip topic `LapisNet:onion-service-descriptor-gossip:v1` and the DHT publish/resolve API live in `lapis-net-directory`, next to the relay descriptor equivalents. Hosting and connecting over real circuits (`OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionClientCircuit`) live in `lapis-net-onion-wire`. *DHT decision:* a service descriptor is published as an IPNS record under the *service key's own IPNS name* with the value `LNHS | version | descriptor`, not as a new flag of the node's `DirectoryDhtValue`. That keeps the value free of any link to the node's peer id and Lapis identity and avoids a second writer for the node's single directory name; the dedicated validator requires publisher = service key = address. The relay's `OnionRelay` performs the splice without ever holding two circuit locks: work for another circuit is collected while a lock is held and executed by the public entry points after all locks were released. The DHT publish/resolve API is not wired into any node. See link:anonymity.adoc[anonymity.adoc], section Receiver side and rendezvous.
+
+=== Directory anonymity (V0.10.0-D, unreleased)
+
+`lapis-net-directory` gained a second, address-free entry type, `AnonymousPeerRecord` (248 bytes, no address, no peer ID, no binding; identity plus onion service key with a possession proof), with its own index, its own GossipSub topic `LapisNet:anonymous-peer-record-gossip:v1` (older nodes never subscribe to it) and `DirectoryAnonymityMode` (`OFF` by default). `IdentitySupersession` keeps the address-bearing `PeerRecord` and the anonymous entry of one identity from coexisting and refuses replayed address records, for gossip and for the DHT ingest alike; the gossip validators of `PeerRecord` and the formats `LNPR`, `DirectoryDhtValue` and `PrekeyBundle` are unchanged. In mode `ON` the publishers fail closed (`PeerPresenceAnnouncer`, `DirectoryDht.publishOwn`, the browser and CLI republishers) and the entry, the prekey bundle and the service descriptor go through a circuit (`DIRECTORY_PUBLISH`, `OnionDirectoryPublisher`, `AnonymousDirectoryPublisher`). The DHT fallback section above applies only in mode `OFF`; in mode `ON` the one permitted DHT write is `DirectoryDht.publishTombstone`. Details, leak inventory and limits: link:anonymity.adoc[anonymity.adoc], section Directory anonymity. This is not anonymity: the transport key is still the identity key.
+
+[kuml, directory-mode-transition, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Directory mode transition OFF to ON to OFF") {
+    val node = lifeline(name = "Node")
+    val others = lifeline(name = "Other nodes")
+
+    message(from = node, to = others, label = "OFF: PeerRecord with addresses")
+    message(from = node, to = others, label = "OFF to ON: tombstone PeerRecord (no addresses)")
+    message(from = node, to = others, label = "ON: AnonymousPeerRecord through a circuit")
+    message(from = node, to = others, label = "ON to OFF: revocation through a circuit")
+    message(from = node, to = others, label = "OFF: newer PeerRecord with addresses")
+}
+----
 
 == Diagrams
 

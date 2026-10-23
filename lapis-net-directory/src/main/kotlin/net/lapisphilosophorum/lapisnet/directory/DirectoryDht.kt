@@ -125,6 +125,7 @@ class DirectoryDht internal constructor(
     private val localIdentity: Secp256k1PublicKey? = null,
     private val outbox: DhtOutbox? = null,
     private val onionDescriptors: OnionRelayDescriptorIndex? = null,
+    private val anonymityMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
 ) {
     private class Attempt(
         val atNanos: Long,
@@ -214,6 +215,15 @@ class DirectoryDht internal constructor(
         timeout: Duration = limits.defaultTimeout,
         onionRelayDescriptor: OnionRelayDescriptor? = null,
     ): DirectoryDhtPublishResult {
+        // Wave V0.10.0-D, fail closed: the IPNS value lives under the node's transport key (= peer ID = identity key)
+        // and may carry addresses, a relay descriptor and outbox pointers. Nothing of that leaves a node in
+        // anonymity mode; the only permitted write is publishTombstone. Outbox entries stay queued.
+        if (anonymityMode == DirectoryAnonymityMode.ON) {
+            logger.info {
+                "DHT publication withheld in anonymity mode; ${outbox?.size() ?: 0} outbox entries stay queued"
+            }
+            throw IllegalStateException("the DHT value is not published in anonymity mode (see publishTombstone)")
+        }
         require(
             peerRecord != null || prekeyBundle != null || onionRelayDescriptor != null || (outbox?.size() ?: 0) > 0,
         ) {
@@ -345,6 +355,56 @@ class DirectoryDht internal constructor(
                 outboxEntriesOmitted = selection.omitted,
                 rendezvousAnnounced = announced,
             )
+        }
+    }
+
+    /**
+     * The ONE permitted DHT write in anonymity mode (wave V0.10.0-D, OFF-to-ON transition): replaces the node's value
+     * by an address-free tombstone [PeerRecord] (`addresses = []`), without prekey bundle, outbox entries or relay
+     * descriptor, so that a catch-up lookup no longer yields a stale address. It is written once, from the own node:
+     * the identity-to-IP link is public in normal mode up to this moment anyway. Not rate limited (a mode switch is
+     * rare and must not be skipped), but it shares the sequence counter with [publishOwn].
+     *
+     * @throws IllegalArgumentException if the record is foreign, invalid, carries addresses or is already expired.
+     * @throws NabuStorageException if the DHT layer fails.
+     */
+    fun publishTombstone(
+        identity: DualKeyIdentity,
+        tombstone: PeerRecord,
+        timeout: Duration = limits.defaultTimeout,
+    ): DirectoryDhtPublishResult {
+        require(identity.verifyBinding()) { "the identity's own binding does not verify" }
+        require(
+            tombstone.identity == identity.secp256k1KeyPair.publicKey,
+        ) { "the tombstone belongs to another identity" }
+        require(tombstone.addresses.isEmpty()) { "a tombstone must not carry addresses" }
+        require(tombstone.binding == identity.binding) { "the tombstone carries another binding" }
+        require(PeerRecord.verify(tombstone) && tombstone.verifyBinding() && tombstone.verifyPossession()) {
+            "the tombstone does not verify"
+        }
+        val now = wallClock()
+        require(tombstone.notValidAfterEpochSecond > now.epochSecond) { "the tombstone has already expired" }
+        val encoded =
+            DirectoryDhtValueCodec.encode(
+                DirectoryDhtValue(
+                    identity.secp256k1KeyPair.publicKey,
+                    identity.binding,
+                    PeerRecordCodec.encode(tombstone),
+                    null,
+                ),
+            )
+        val notValidAfter =
+            minOf(
+                Instant.ofEpochSecond(tombstone.notValidAfterEpochSecond),
+                now.plus(minOf(limits.maxRecordValidity, values.maxRecordValidity ?: limits.maxRecordValidity)),
+            )
+        synchronized(publishLock) {
+            val sequence = maxOf(lastSequence + 1, now.toEpochMilli())
+            lastSequence = sequence
+            val result =
+                values.publish(identity.deriveLibp2pPrivKey(), encoded, sequence, notValidAfter, IPNS_TTL, timeout)
+            lastPublishAtNanos = clock()
+            return DirectoryDhtPublishResult(result.acknowledged, result.attempted, skippedByRateLimit = false)
         }
     }
 
@@ -524,6 +584,7 @@ class DirectoryDht internal constructor(
         deadlineNanos: Long,
     ): Int {
         val store = rendezvous
+        if (anonymityMode == DirectoryAnonymityMode.ON) return 0
         if (!hasDescriptor || !limits.rendezvousEnabled || store == null) return 0
         val now = clock()
         val previous = lastOnionAnnounceAtNanos
@@ -597,6 +658,7 @@ class DirectoryDht internal constructor(
         deadlineNanos: Long,
     ): Int {
         val store = rendezvous
+        if (anonymityMode == DirectoryAnonymityMode.ON) return 0 // provider records carry peer ID and addresses
         if (!limits.rendezvousEnabled || store == null || entries.isEmpty()) return 0
         val now = clock()
         val recipients = entries.map { it.recipient }.distinct()
@@ -760,6 +822,7 @@ class DirectoryDht internal constructor(
             localIdentity: Secp256k1PublicKey? = null,
             outbox: DhtOutbox? = null,
             onionDescriptorIndex: OnionRelayDescriptorIndex? = null,
+            anonymityMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
         ): DirectoryDht =
             DirectoryDht(
                 NabuIpnsValueStore(storage),
@@ -770,6 +833,7 @@ class DirectoryDht internal constructor(
                 localIdentity = localIdentity,
                 outbox = outbox,
                 onionDescriptors = onionDescriptorIndex,
+                anonymityMode = anonymityMode,
             )
     }
 }

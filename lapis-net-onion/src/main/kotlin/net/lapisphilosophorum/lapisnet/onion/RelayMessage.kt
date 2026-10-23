@@ -28,6 +28,10 @@ enum class RelayCommand(
     RENDEZVOUS1(13),
     RENDEZVOUS2(14),
     RENDEZVOUS_DATA(15),
+
+    // Directory publication through a circuit (wave V0.10.0-D): client to last hop, and its acknowledgement.
+    DIRECTORY_PUBLISH(16),
+    DIRECTORY_PUBLISHED(17),
     ;
 
     companion object {

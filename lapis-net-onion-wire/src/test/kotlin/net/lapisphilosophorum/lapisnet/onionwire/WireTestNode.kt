@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.onionwire
 
 import io.libp2p.core.PeerInfo
+import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
@@ -47,19 +48,33 @@ class WireTestNode(
     passphrase: CharArray? = null,
     val identity: DualKeyIdentity = DualKeyIdentity.generate(),
     clock: Clock = Clock.systemUTC(),
+    directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
+    directorySink: DirectoryPublishSink? = null,
 ) : AutoCloseable {
     val node: LapisNode = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
-    private val storage: NabuStorage =
+    val storage: NabuStorage =
         NabuStorage.attach(
             node,
             dir.resolve("storage").also { Files.createDirectories(it) },
         )
-    private val pubsub: GossipPubSub = GossipPubSub.attach(node)
+    val pubsub: GossipPubSub = GossipPubSub.attach(node)
     val peerDirectory: PeerDirectoryGossip = PeerDirectoryGossip.attach(pubsub, storage)
     val supervisor = NodeServiceSupervisor("onion-wire-test")
     val keyFile: Path = dir.resolve("relay.onionkeys")
     val wire: OnionWire =
-        OnionWire.attach(node, identity, config, pubsub, peerDirectory, supervisor, keyFile, passphrase, clock)
+        OnionWire.attach(
+            node,
+            identity,
+            config,
+            pubsub,
+            peerDirectory,
+            supervisor,
+            keyFile,
+            passphrase,
+            clock,
+            directoryMode,
+            directorySink,
+        )
 
     fun connectTo(other: WireTestNode) {
         node.connect(PeerInfo(other.node.peerId, other.node.listenAddresses()))

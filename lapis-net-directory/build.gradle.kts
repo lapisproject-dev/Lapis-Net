@@ -58,6 +58,8 @@
 // lapis-net-core and lapis-net-identity and stays free of any network code (a security property, see
 // docs/architecture.adoc). OnionKeyBinding appears in OnionRelayDescriptor's public signatures, hence `api`.
 dependencies {
+    // Test-only SLF4J backend: the anonymity tests capture log output to prove it stays free of addresses and keys.
+    testImplementation(rootProject.libs.logback.classic)
     implementation(project(":lapis-net-core"))
     api(project(":lapis-net-identity"))
     api(project(":lapis-net-onion"))

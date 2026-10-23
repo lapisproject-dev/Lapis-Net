@@ -26,7 +26,8 @@ private val logger = KotlinLogging.logger {}
  * ([OnionCircuitFactory]), publishes the signed descriptor through [publisher], and hands every accepted rendezvous to
  * [onConnection] as an [OnionRendezvousStream]. Paths come from an injected [OnionPathProvider]; there is no path
  * selection. NOT an anonymity feature: see docs/anonymity.adoc (publishing from the own node shows its IP to the gossip
- * neighbours and DHT peers together with the onion address).
+ * neighbours and DHT peers together with the onion address, unless the publisher callback hands the descriptor to a
+ * circuit-based publication channel, wave V0.10.0-D).
  *
  * Thread model: events arrive from link event loops and timers; every event runs through one session lock and a
  * re-entrancy-safe queue, and no circuit lock is held while that lock is taken (see [OnionClientCircuit]).

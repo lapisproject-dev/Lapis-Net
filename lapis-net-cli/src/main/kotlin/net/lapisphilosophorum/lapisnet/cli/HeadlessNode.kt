@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.cli
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.libp2p.core.multiformats.Multiaddr
+import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
@@ -138,6 +139,7 @@ internal class HeadlessNode private constructor(
                             supervisor,
                             dataDirectory.resolve(ONION_KEY_FILE),
                             passphrase,
+                            prekeys = prekeys,
                         )
                     } finally {
                         passphrase?.fill('\u0000')
@@ -265,6 +267,13 @@ internal class HeadlessSelfPublisher(
     private val maxInterval: Duration = 6.hours,
     private val clockMillis: () -> Long = System::currentTimeMillis,
     private val descriptorProvider: () -> OnionRelayDescriptor? = { null },
+    /**
+     * Wave V0.10.0-D. [DirectoryAnonymityMode.OFF] (default everywhere until wave E) keeps this class unchanged.
+     * With [DirectoryAnonymityMode.ON] it publishes nothing itself (no address-bearing record, no DHT value);
+     * [anonymousTick] (the circuit-based publisher, wired in wave E) does the publishing instead.
+     */
+    private val directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
+    private val anonymousTick: (() -> Unit)? = null,
 ) {
     private var dhtDescriptorSequence: Long? = null
 
@@ -291,6 +300,14 @@ internal class HeadlessSelfPublisher(
 
     @Synchronized
     fun tick(includeDht: Boolean = true) {
+        if (directoryMode == DirectoryAnonymityMode.ON) {
+            try {
+                anonymousTick?.invoke()
+            } catch (e: RuntimeException) {
+                logger.debug { "anonymous directory tick failed: ${e.javaClass.simpleName}" }
+            }
+            return
+        }
         val now = clockMillis()
         val current = addresses().map { it.toString() }.toSet()
         val descriptor = descriptorProvider()

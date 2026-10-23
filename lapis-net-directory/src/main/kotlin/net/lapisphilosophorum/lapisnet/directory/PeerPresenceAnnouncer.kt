@@ -1,5 +1,10 @@
 package net.lapisphilosophorum.lapisnet.directory
 
+import io.github.oshai.kotlinlogging.KotlinLogging
+import java.util.concurrent.CompletableFuture
+
+private val logger = KotlinLogging.logger {}
+
 /**
  * Client-side rate limiter wrapping [PeerDirectoryGossip.announce] with an enforced
  * minimum-republish-interval - a PARTIAL mitigation for the "known, accepted tension" with the
@@ -64,6 +69,7 @@ package net.lapisphilosophorum.lapisnet.directory
 class PeerPresenceAnnouncer(
     private val gossip: PeerDirectoryGossip,
     private val minRepublishIntervalSeconds: Long = MIN_REPUBLISH_INTERVAL_SECONDS,
+    private val anonymityMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
 ) {
     private val minRepublishIntervalNanos: Long = minRepublishIntervalSeconds * NANOS_PER_SECOND
 
@@ -94,6 +100,12 @@ class PeerPresenceAnnouncer(
         record: PeerRecord,
         nowNanos: Long = System.nanoTime(),
     ): Boolean {
+        if (anonymityMode == DirectoryAnonymityMode.ON && record.addresses.isNotEmpty()) {
+            // Fail closed (wave V0.10.0-D): in anonymity mode no address-bearing record leaves the node. Only an
+            // address-free tombstone (the OFF-to-ON transition) is allowed. Nothing about the record is logged.
+            logger.warn { "refusing to announce an address-bearing peer record in anonymity mode" }
+            return false
+        }
         val last = lastAnnouncedAtNanos
         if (last != null && nowNanos - last < minRepublishIntervalNanos) {
             return false
@@ -101,6 +113,36 @@ class PeerPresenceAnnouncer(
         gossip.announce(record)
         lastAnnouncedAtNanos = nowNanos
         return true
+    }
+
+    /** The monotonic floor of [announceAnonymousIfDue], separate from the address-bearing one. */
+    private var lastAnonymousAtNanos: Long? = null
+
+    /**
+     * Publishes [record] through [channel] iff the same monotonic floor as [announceIfDue] allows it. The returned
+     * future completes with `true` iff the record was published; a suppressed call returns an already completed
+     * `false`. A failed publication does not consume the floor, so a retry through another path is allowed.
+     */
+    @Synchronized
+    fun announceAnonymousIfDue(
+        record: AnonymousPeerRecord,
+        channel: DirectoryPublicationChannel,
+        nowNanos: Long = System.nanoTime(),
+    ): CompletableFuture<Boolean> {
+        if (anonymityMode == DirectoryAnonymityMode.ON && channel.exposesOrigin) {
+            logger.warn { "refusing to publish an anonymous peer record from the own node in anonymity mode" }
+            return CompletableFuture.completedFuture(false)
+        }
+        val last = lastAnonymousAtNanos
+        if (last != null && nowNanos - last < minRepublishIntervalNanos) {
+            return CompletableFuture.completedFuture(false)
+        }
+        lastAnonymousAtNanos = nowNanos
+        return channel.publishAnonymousPeerRecord(record).whenComplete { ok, error ->
+            if (error != null || ok != true) {
+                synchronized(this) { if (lastAnonymousAtNanos == nowNanos) lastAnonymousAtNanos = last }
+            }
+        }
     }
 
     companion object {

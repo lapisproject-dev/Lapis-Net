@@ -64,6 +64,12 @@ class PrekeyBundleGossip private constructor(
         return if (bundle.notValidAfterEpochSecond < nowEpochSecond) null else bundle
     }
 
+    /**
+     * Cheap, no-I/O pre-check against this node's own bundle index: `false` if the bundle is a duplicate or stale
+     * relative to what the node already knows (receivers would rate a republish Invalid).
+     */
+    fun canAccept(bundle: PrekeyBundle): Boolean = index.canAccept(bundle)
+
     /** Identities this node holds a bundle for, expired or not (V0.9.13: input of [DirectoryDht.refreshStale]). */
     internal fun knownIdentities(): Set<Secp256k1PublicKey> = index.allIdentities()
 

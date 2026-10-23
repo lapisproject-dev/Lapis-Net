@@ -45,6 +45,19 @@ sealed interface RelayAction {
         val message: RelayMessage,
     ) : RelayAction
 
+    /**
+     * A DIRECTORY_PUBLISH message arrived at this relay (wave V0.10.0-D). The host validates [objectBytes] completely,
+     * publishes the verified object on the directory gossip and answers through [OnionRelay.reply] with a
+     * DIRECTORY_PUBLISHED message. [objectBytes] is public directory data, but still never logged.
+     */
+    class DeliverDirectoryPublish(
+        val circuitHandle: Long,
+        val type: DirectoryObjectType,
+        val objectBytes: ByteArray,
+    ) : RelayAction {
+        override fun toString(): String = "DeliverDirectoryPublish(type=$type)"
+    }
+
     /** The circuit identified by [circuitHandle] is gone. */
     data class CircuitClosed(
         val circuitHandle: Long,
@@ -61,7 +74,7 @@ private enum class Notify { PREV, NEXT, BOTH, NONE }
 
 /** The hidden-service role of a circuit at THIS relay (last hop only). `NONE -> INTRO | INTRODUCING |
  * RENDEZVOUS_WAITING -> SPLICED -> closed`; a circuit has at most one role for its whole life. */
-private enum class CircuitRole { NONE, INTRO, INTRODUCING, RENDEZVOUS_WAITING, SPLICED }
+private enum class CircuitRole { NONE, INTRO, INTRODUCING, RENDEZVOUS_WAITING, SPLICED, DIRECTORY_PUBLISHING }
 
 private class RelayCircuit(
     val handle: Long,
@@ -88,6 +101,7 @@ private class RelayCircuit(
     var pendingId = 0L
     var pendingExtend: ExtendPayload? = null
     var closed = false
+    var directoryPublishes = 0
 }
 
 /**
@@ -137,6 +151,8 @@ class OnionRelay(
         IntroPointTable(limits.maxIntroPointsTotal, limits.maxIntroPointsPerLink, limits.introReplayCacheEntries)
     private val rendezvousTable = RendezvousTable(limits.maxPendingRendezvousTotal, limits.maxPendingRendezvousPerLink)
     private val splicedPairs = AtomicInteger(0)
+    private val globalPublishCounter = WindowCounter(limits.directoryPublishGlobalPerMinute, clock)
+    private val linkPublishCounters = ConcurrentHashMap<Long, WindowCounter>()
 
     // Work that must run OUTSIDE every circuit lock (never hold two circuit locks at once): collected while a
     // lock is held, executed by the public entry points after all locks are released.
@@ -282,6 +298,7 @@ class OnionRelay(
         }
         perLink.remove(link.value)
         linkCreateBuckets.remove(link.value)
+        linkPublishCounters.remove(link.value)
         return out
     }
 
@@ -558,12 +575,14 @@ class OnionRelay(
             RelayCommand.ESTABLISH_RENDEZVOUS -> handleEstablishRendezvous(c, msg)
             RelayCommand.RENDEZVOUS1 -> handleRendezvous1(c, msg)
             RelayCommand.RENDEZVOUS_DATA -> handleRendezvousData(c, msg)
+            RelayCommand.DIRECTORY_PUBLISH -> handleDirectoryPublish(c, msg)
             // Replies and forwarded messages never arrive "locally" at a relay.
             RelayCommand.INTRO_ESTABLISHED,
             RelayCommand.INTRODUCE2,
             RelayCommand.INTRODUCE_ACK,
             RelayCommand.RENDEZVOUS_ESTABLISHED,
             RelayCommand.RENDEZVOUS2,
+            RelayCommand.DIRECTORY_PUBLISHED,
             -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
         }
 
@@ -684,6 +703,49 @@ class OnionRelay(
         rendezvousDataObserver?.invoke(data)
         defer(DeferSend(partner, RelayMessage(RelayCommand.RENDEZVOUS_DATA, 0, data)))
         return emptyList()
+    }
+
+    /**
+     * Directory publication (wave V0.10.0-D): accepted only at the last hop of a circuit that has no other role, at
+     * most `directoryPublishPerCircuit` times per circuit (every attempt counts, also a rate-limited one). The rate
+     * limits are checked BEFORE the body is looked at. A body of the wrong length or with an overflowing length
+     * field is a protocol violation and destroys the circuit; an unknown object type is answered with a status.
+     */
+    private fun handleDirectoryPublish(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (c.role == CircuitRole.NONE) {
+            if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        } else if (c.role != CircuitRole.DIRECTORY_PUBLISHING) {
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        if (c.directoryPublishes >= limits.directoryPublishPerCircuit) {
+            return teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+        }
+        c.role = CircuitRole.DIRECTORY_PUBLISHING
+        c.directoryPublishes++
+
+        fun ack(status: Byte) =
+            sendBackward(c, RelayMessage(RelayCommand.DIRECTORY_PUBLISHED, 0, StatusBody.encode(status)))
+        val linkCounter =
+            linkPublishCounters.computeIfAbsent(c.prevLink.value) {
+                WindowCounter(limits.directoryPublishPerLinkPerMinute, clock)
+            }
+        if (!linkCounter.tryAcquire() || !globalPublishCounter.tryAcquire()) {
+            logger.debug { "directory publish refused: rate limit" }
+            return ack(DirectoryPublishStatus.RATE_LIMITED)
+        }
+        val data = msg.data
+        if (data.size != DirectoryPublishBody.BODY_SIZE) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        if (!DirectoryPublishBody.knownType(data)) return ack(DirectoryPublishStatus.UNKNOWN_TYPE)
+        val request =
+            try {
+                DirectoryPublishBody.decode(data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        return listOf(RelayAction.DeliverDirectoryPublish(c.handle, request.type, request.objectBytes))
     }
 
     private fun handleExtend(

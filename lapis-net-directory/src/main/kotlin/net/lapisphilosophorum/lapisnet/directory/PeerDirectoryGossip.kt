@@ -40,6 +40,13 @@ class PeerDirectoryGossip private constructor(
     private val subscription: PubsubSubscription,
 ) {
     /**
+     * The anonymous-record index built on this node's [PeerRecordIndex] (wave V0.10.0-D): both share one
+     * [IdentitySupersession], so an anonymous record and an address-bearing record of the same identity can
+     * never both be current and an old address record can not be replayed after an anonymous one.
+     */
+    val anonymousRecords: AnonymousPeerRecordIndex = AnonymousPeerRecordIndex(index)
+
+    /**
      * Persists, indexes, then publishes an already-locally-verified (self-signed) [record]. Order
      * matters (see class doc comment): `pubsub.publish()` is the only externally-visible step and
      * always happens last.

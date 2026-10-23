@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration and receiver side (waves V0.10.0-A, V0.10.0-B and V0.10.0-C)
+= Traffic anonymisation: design, foundation, wire integration, receiver side and directory (waves V0.10.0-A to V0.10.0-D)
 :toc:
 
 == Status
+
+*Wave D (directory anonymity, unreleased) lets a node in directory anonymity mode publish an address-free directory entry through a circuit, and keeps every address-bearing publication of its own off the network. It does not make the node anonymous: the libp2p transport key is still the identity key, so every direct connection of the node shows identity and IP together. No user traffic is anonymised and no anonymity is offered.* See <<directory-anonymity>>.
 
 *Wave C (receiver side and rendezvous, unreleased) adds introduction points, rendezvous points and onion-service descriptors on top of wave B. Still no user traffic uses any of it, there is no path selection, and nothing is anonymised.* See <<receiver-side>>.
 
@@ -12,7 +14,7 @@
 *What this wave does not give you.* It provides no anonymity. It provides audited-by-our-own-pipeline building blocks (cell format, ntor-style handshake, onion layering, a relay state machine with resource limits) and a written threat model. Several leaks listed below must be closed before anyone may claim anonymity for DM, mail or call signalling. No external cryptographic review has taken place.
 ====
 
-`V0.10.0-A`, `V0.10.0-B` and `V0.10.0-C` are wave identifiers, not releases: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
+`V0.10.0-A` to `V0.10.0-D` are wave identifiers, not releases: `v0.10.0` is an existing tag and release numbers are chronological since then. The release number is assigned when the arc ships.
 
 Diagram sources are committed as kUML; GitHub does not render the `[kuml]` blocks (the rendering pipeline is not wired, see `architecture.adoc`, section Diagrams).
 
@@ -59,7 +61,7 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 
 These exist in the current release and must be closed before any anonymity claim.
 
-. *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses (wave D).
+. *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses. Directory side addressed in wave D (see <<directory-anonymity>>); the transport-level link between identity and IP remains until wave E.
 . *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F). This wave does not change mail.
 . *Gossip timing.* Message publication times and mesh membership leak.
 . *WebRTC media.* ICE exposes IPs to the peer.
@@ -392,12 +394,155 @@ Relay side (`OnionRelayLimits`, validated): 256 introduction points in total and
 * *No user traffic is anonymised and no anonymity is offered.* The hidden-service API is `ExperimentalOnionApi`, takes its paths from an injected provider and chooses nothing itself.
 * Sybil relays, free choice of introduction relays by the receiver (no path selection yet), the predecessor attack without guards, a small anonymity set and a global passive observer are as described in the threat model; wave C changes none of them.
 * Onion addresses and their introduction points are enumerable; descriptors are linkable over time (no blinding).
-* Publishing from the service's own node (gossip, DHT) shows that node's IP to its gossip neighbours and to the DHT peers that store or serve the record, together with the onion address, until wave D publishes through circuits.
+* Publishing from the service's own node (gossip, DHT) shows that node's IP to its gossip neighbours and to the DHT peers that store or serve the record, together with the onion address. Wave D adds publication through circuits, see <<directory-anonymity>>; it is opt-in and not used by default.
 * Teardown correlation still applies: an adversary that provokes a teardown on one half can watch the other half end.
 * No forward secrecy for the introduction content against the encryption key within its lifetime.
 * An introduction flood is only slowed by rates, not by a cost; the receiver's replay cache can be filled. A full cache forces an early key rotation and republication (at 5 `INTRODUCE2` per second at most about every 27 minutes), during which clients with an older descriptor fail until they have fetched a new one.
 * *Known limitation (Sybil, service descriptor index):* a valid service descriptor costs nothing (a fresh Ed25519 service key plus one to three publicly gossiped relay onion key bindings, reusable, and a fresh auth key per entry). About 61 such descriptors per minute exhaust the single global budget (60/min) at every node, so honest new or updated service descriptors are ignored and stop spreading. After about 68 minutes the index is full (capacity 4096) and every new honest service is refused with `CAPACITY`; the attacker keeps the slots by republishing its own keys with a higher sequence number, because a full index never evicts a valid entry and updates of tracked keys are always accepted. The per-author bucket does not help against fresh keys. Gossip discovery of new onion services can thus be stopped network-wide; the DHT path is an API only and not yet wired up. Same class of limit as for the relay descriptor index above. Planned mitigations: a cost per index slot (proof of work, known peer record or Madli weight) or a fair per-mesh-peer budget instead of one global bucket. Not mitigated in wave C.
 * Not verified: real NATs, interoperability with v0.12.0, an external cryptographic review, behaviour under real load, interoperability of the HPKE path with other implementations. Multi-node tests run on loopback.
+
+[[directory-anonymity]]
+== Directory anonymity (wave V0.10.0-D, unreleased)
+
+Wave D closes the *directory* side of the pseudonym-to-IP link: what a node publishes about itself. It does not close the *transport* side (see the leak inventory, rows 8 to 14). Nothing here anonymises user traffic; nothing is wired into DM, mail or call. The mode is `DirectoryAnonymityMode` (`OFF` by default everywhere; wave E maps `--anonymity` onto it).
+
+[WARNING]
+====
+*Wave D offers no anonymity.* A node in directory anonymity mode still opens direct libp2p connections whose peer ID is its identity key (`DualKeyIdentity.deriveLibp2pPrivKey`), so every peer it connects to sees identity and IP together. Only the *directory entries* stop carrying addresses, peer ID and binding. Decoupling the transport key is wave E.
+====
+
+=== The entry: `AnonymousPeerRecord`
+
+A fixed 248-byte record, no length fields and no free-form field, therefore no tagging or covert channel:
+
+[source]
+----
+"LNAP"(4) | version(1)=1 | flags(1) [bit0 REVOKED, rest 0] | identity(33, secp256k1)
+| serviceKey(32, Ed25519) | servicePossessionProof(64, Ed25519) | capabilities(1) [DM, MAIL, CALL_SIGNAL, rest 0]
+| prekeyBundleDigest(32, all zero = none) | sequenceNumber(8) | notValidAfter(8) | signature(64, secp256k1)
+----
+
+It contains *no network address, no libp2p peer ID and no `IdentityBinding`*. Two signatures: the outer secp256k1 signature of the identity (domain tag `LapisNet:anonymous-peer-record:v1`) and an Ed25519 possession proof of the *service key* over `identity || sequenceNumber` (tag `LapisNet:anonymous-peer-record-service-possession:v1`). The proof is the mutual binding: nobody can claim a foreign onion service for their identity, and because it is bound to the sequence number an old proof does not transplant into a newer entry. Unknown flag or capability bits are rejected, all-zero and all-ones keys and signatures are rejected, the validity window is `now <= notValidAfter <= now + 6 h + 300 s`. There is no `RELAY` capability: a relay is public by design. A *revocation* (flag bit 0) has no service key, proof, capabilities or digest and is the way back to normal mode.
+
+*Why no transport peer ID in the entry.* The peer ID is the identity's Ed25519 key, publicly bound to the secp256k1 identity by every `PeerRecord`, `OnionRelayDescriptor` and DHT name published so far, and every direct connection shows peer ID and IP together. Putting it into the entry would create the link exactly where it is to be hidden. A rotating, identity-independent key would not help either, because in anonymity mode a sender never dials the recipient but goes through its introduction points. Decoupling the host key itself is wave E.
+
+=== Index, topic and rates
+
+`AnonymousPeerRecordIndex` follows `OnionServiceDescriptorIndex`: one record per identity, strictly rising sequence numbers, high-water marks (65,536) that survive eviction, equivocation ignored, capacity 16,384 identities, a full index refuses new identities and never evicts a valid entry (updates of known identities always pass: the same Sybil boundary as in wave C, documented and not solved). The gossip topic is `LapisNet:anonymous-peer-record-gossip:v1`, a topic of its own that v0.12.0 nodes never subscribe to; every node attaches it so senders can resolve. Validator order: exact size, decode, cheap index pre-check (no rate budget spent), rate limits per author identity (6/min), per forwarding peer (12/min) and global (60/min), whose excess is IGNORE, then full verification. Log lines carry a reason class only.
+
+=== Downgrade protection between the two record types
+
+Both record types use epoch milliseconds as sequence numbers, so they are comparable. `IdentitySupersession` (shared between `PeerRecordIndex` and `AnonymousPeerRecordIndex`, LRU-bounded, in memory) records the highest accepted sequence number of each type per identity:
+
+* an accepted anonymous record removes the identity's address record (`seq <=`) and later address records with `seq <=` are refused, through gossip *and* through the DHT ingest (both go through `PeerRecordIndex.canAccept` and `add`);
+* an accepted address record newer than the anonymous one hides the anonymous record (the way back); on a tie the anonymous record wins.
+
+Identities without an anonymous record behave exactly as before. *Remaining window:* a node that saw neither the anonymous record nor the tombstone accepts an old address record until its TTL ends, at most 24 hours; an address that was published once stays visible to archives forever. Persisted address records are restored from local storage on restart before the floor is known again, until the anonymous record is seen again.
+
+=== What mode ON suppresses
+
+[cols="1,3,3"]
+|===
+| Place | Behaviour in mode ON | Notes
+
+| `PeerPresenceAnnouncer`
+| `announceIfDue` refuses any record with addresses, returns `false`, logs without the record. An address-free tombstone is allowed.
+| fail closed
+
+| `DirectoryDht.publishOwn`
+| throws `IllegalStateException`: no address record, no bundle, no outbox pointers, no relay descriptor, no rendezvous provider record.
+| outbox entries stay queued
+
+| `DirectoryDht.publishTombstone`
+| the only permitted DHT write: an address-free `PeerRecord` replaces the node's value once.
+| sent from the own node
+
+| `SelfRecordRepublisher`, `HeadlessSelfPublisher`
+| new parameter `directoryMode` (default `OFF`, unchanged behaviour). With `ON` they publish nothing themselves and call an injected tick instead.
+| wiring in wave E
+
+| `OnionWire`
+| `experimentalServiceHost` demands a publication channel that does not expose the origin; relay mode and anonymity mode are mutually exclusive.
+| a relay descriptor publicly binds identity, peer ID and dialability
+|===
+
+=== Switching the mode
+
+`DirectoryModeTransition` with a `DirectoryModeStore` (a small state file, `FileDirectoryModeStore`, written atomically; a missing or corrupt file means "no state": nothing is retired, so a normal node never publishes a revocation and a brand-new identity (or a damaged file) that starts directly in anonymity mode never publishes an identity-bound tombstone). *OFF to ON:* only after a persisted `OFF` state (the node demonstrably ran in normal mode), an address-free tombstone `PeerRecord` with a higher sequence number goes out once from the own node (gossip and `publishTombstone`), then the first anonymous record. A normal-mode start must therefore record `OFF` in the store (`nextSequence(OFF)`) for a later switch to retire its address entry. *Open item for wave E:* no production caller writes this state yet (`SelfRecordRepublisher` and `HeadlessNode` never touch the store, `AnonymousDirectoryPublisher` is only wired in wave E); until the normal-mode start persists `OFF`, a real normal-mode node (or one upgraded from v0.12.0 without a state file) sends no tombstone when switching to anonymity mode, and its address entries stay until their TTL ends. *ON to OFF:* an `AnonymousPeerRecord` revocation with a validity that covers every still-valid anonymous record (6 h), then a newer address record. Sequence numbers are `max(last + 1, nowMillis)` and persisted.
+
+[kuml, directory-mode-switch, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Directory mode switch OFF to ON to OFF") {
+    val node = lifeline(name = "Node")
+    val network = lifeline(name = "Directory (gossip, DHT)")
+    val relay = lifeline(name = "Publish relay (via circuit)")
+
+    message(from = node, to = network, label = "OFF: PeerRecord with addresses, seq n")
+    message(from = node, to = network, label = "ON: tombstone PeerRecord, no addresses, seq n+1 (once, from the own node)")
+    message(from = node, to = relay, label = "DIRECTORY_PUBLISH AnonymousPeerRecord, seq n+2")
+    message(from = relay, to = network, label = "relay announces on the anonymous topic")
+    message(from = node, to = relay, label = "back to OFF: DIRECTORY_PUBLISH revocation, seq n+3")
+    message(from = relay, to = network, label = "relay announces the revocation")
+    message(from = node, to = network, label = "OFF: PeerRecord with addresses, seq n+4")
+}
+----
+
+=== Publication through circuits
+
+A node that gossips an entry itself shows its IP and peer ID to its mesh neighbours (the envelope of every GossipSub message is signed with the host key). Therefore the objects go through a circuit: relay command `DIRECTORY_PUBLISH` (client to last hop) with a body of exactly 720 bytes, `type(1) | length(2) | object(<= 717) | random padding`, and the acknowledgement `DIRECTORY_PUBLISHED` with a status byte (0 accepted, 1 invalid, 2 rate limited, 3 malformed, 4 unknown type). Types: anonymous record, onion service descriptor, prekey bundle (a bundle with up to 11 one-time prekeys fits). 720 bytes fit the relay message capacity at the maximum of five hops (929 bytes). The role is accepted only at the last hop of a circuit without another role; at most 4 publishes per circuit, 30 per minute per link and 120 per minute in total (`OnionRelayLimits`), checked before the body is looked at. A wrong body length or an overflowing length field destroys the circuit. The relay validates the object completely with the same functions as the gossip validators and then announces it, so the mesh sees the *relay* as publisher. A valid but already known or superseded object is acknowledged with the same status as a new one, so the status is no oracle on the relay's index.
+
+`OnionDirectoryPublisher` builds the circuit over a path from the injected `OnionPathProvider`, sends one message, waits up to 15 s for the acknowledgement and closes the circuit. A failing relay is put on an exponential backoff and another relay is tried; there is *no fallback to publishing from the own node*. `AnonymousDirectoryPublisher` publishes the anonymous record and the reduced prekey bundle every 60 minutes (record TTL 3 h) and detects the mode switch. `AnonymousDirectory.resolve` answers `Hidden`, `HiddenDescriptorMissing`, `Direct`, `Revoked` or `Unknown`; no DM, mail or call code calls it yet. Resolving the descriptor from the DHT shows the DHT the sender's interest.
+
+=== Leak inventory
+
+[cols="1,3,3,3"]
+|===
+| # | Place | What is published | In mode ON (wave D)
+
+| 1 | `PeerRecord` gossip | identity, binding / peer ID, addresses | suppressed; tombstone without addresses
+| 2 | `DirectoryDhtValue` (IPNS under the transport key) | record, bundle, outbox, relay descriptor | suppressed; one tombstone value
+| 3 | rendezvous provider records | peer ID and addresses of the provider | suppressed; offline path unavailable until wave F
+| 4 | `DhtOutbox` | pointers to recipients | held back in the queue
+| 5 | prekey bundle gossip | bundle (no address), envelope `from` = peer ID | only through a circuit
+| 6 | onion service descriptor (gossip, DHT) | no address, envelope `from` | only through a circuit; DHT put not done
+| 7 | `OnionRelayDescriptor` | identity and peer ID of a relay | combination with mode ON refused
+| 8 | GossipSub envelope (`from`, host key signature) | peer ID | *remaining leak*, wave E (transport key)
+| 9 | Identify (`listenAddrs`, `observedAddr`) | addresses including private ones | *remaining leak*, wave E (policy)
+| 10 | dcutr, observed address book | observed addresses to the peer | *remaining leak*, wave E (dcutr off on anonymous paths)
+| 11 | circuit relay v2 reservation | relay sees peer ID and IP | address no longer published; the reservation itself remains (wave E)
+| 12 | Madli gossip | observer identity, observed relay peer IDs, no address | address free; envelope `from` remains (wave E)
+| 13 | mail topic per recipient | identity and IP to mesh neighbours | unchanged, wave F
+| 14 | direct connections in general (mesh, DHT, Bitswap) with an identity-bound peer ID | identity and IP | *largest remaining leak*, wave E
+| 15 | DHT lookups (`resolve`, `findProviders`) | who looks for whom | remaining leak
+| 16 | `seq` and `notValidAfter` in epoch milliseconds | publication time, clock fingerprint | small remaining leak
+| 17 | `lapisnet://connect` QR / deep link (V0.4) | multiaddr | do not use in anonymity mode (browser: wave E)
+|===
+
+=== Limits, constants and what is checked
+
+Constants (assumptions, see below): entry TTL at most 6 h (default 3 h), republish 60 min; index 16,384 identities, 65,536 high-water marks; gossip rates 6, 12 and 60 per minute; relay publish 4 per circuit, 30 per minute per link, 120 per minute in total, body 720 bytes. Tested: codec and signature properties (every single bit flip is rejected), index and downgrade behaviour, validator order and rates, the fail-closed publishers, the DHT mode, the mode transitions and the state file, resolution, two real nodes with coexistence of old and new topics, the relay role in memory, and seven real loopback nodes (five relays) where a leak scanner searches everything the anonymous node publishes by itself (gossip and plaintext circuit objects) for its multiaddrs, the TCP port component, peer ID, Ed25519 transport key and binding signature; a positive control proves the scanner finds them in an ordinary `PeerRecord`.
+
+=== Assumptions awaiting confirmation (wave D)
+
+* *Assumption, confirmation required:* publication through circuits belongs to this wave (as announced in wave C), as a new relay role `DIRECTORY_PUBLISH` for gossip only.
+* *Assumption, confirmation required:* the transport-key decoupling is wave E; wave D only documents it as the largest remaining leak.
+* *Assumption, confirmation required:* relay mode and anonymity mode exclude each other on one identity; a relay with a separate identity is later work.
+* *Assumption, confirmation required:* no DHT write path for anonymous entries in this wave (an IPNS put through a relay would need pre-signed records; a lookup by identity alone would need a new DHT namespace).
+* *Assumption, confirmation required:* all constants in the previous section.
+* *Assumption, confirmation required:* offline DM and mail through the DHT outbox are unavailable in anonymity mode until wave F (entries stay queued); the alternative, publishing with a documented leak, is not recommended.
+* *Assumption, confirmation required:* the publish relay may see the clear object; this is accepted because every object is public by nature.
+* *Assumption, confirmation required:* the mode state file is `OFF` when missing or corrupt, the safe direction for a normal node.
+
+=== Honest limits of wave D
+
+* *No user traffic is anonymised and no anonymity is offered.* There is no path selection (the provider is injected), and the transport key is still identity-bound: the largest remaining leak.
+* An address that was published before the switch stays visible until its TTL ends (at most 24 hours) and in archives forever; nodes that saw neither the tombstone nor an anonymous record accept an old address record until then.
+* The publish relay sees the object, and a relay is an amplifier, bounded by the limits above. The entry is public and enumerable: identity, onion address and introduction points are linkable over time.
+* The sequence number and validity reveal publication time and clock offset.
+* The Sybil boundary of the index is the same as in wave C; a small anonymity set and a global passive observer are as in the threat model.
+* Not verified: real NATs, interoperability with v0.12.0 over the network (only the unchanged old topics are tested), an external cryptographic review, behaviour under load, and the decoupling of the transport key.
 
 == Incentives and operation
 
@@ -509,7 +654,7 @@ Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServi
 | A | This wave: threat model, design, `lapis-net-onion` foundation.
 | B | Done (unreleased): wire integration: libp2p stream `/lapis/onion/1.0.0`, link management, onion key persistence and rotation (encrypted at rest), relay descriptor publication in the directory, opt-in relay mode. No user traffic, no path selection.
 | C | Done (unreleased): receiver side: introduction points and rendezvous point (decision: option a, live traffic), onion service descriptors (index, gossip, DHT API), hosting and connecting over circuits, relay-side roles and splice. No user traffic, no path selection, no link to the Lapis identity.
-| D | Directory anonymity: `PeerRecord` without addresses in anonymity mode, introduction points instead of addresses.
+| D | Done (unreleased): directory anonymity: `AnonymousPeerRecord` (no address, no peer id, no binding) on its own gossip topic, `DirectoryAnonymityMode` with fail-closed suppression of every address-bearing publication, downgrade protection against replayed address records, mode-switch transition records, publication of the directory objects through a circuit (`DIRECTORY_PUBLISH`). No user traffic, no path selection, and the transport key is still bound to the identity (wave E).
 | E | Path selection (Madli weighting, diversity, guards) and policy (`--anonymity`, DCUtR off on anonymous paths), wiring into `LapisNode`, the browser and the CLI.
 | F | DM online and offline over circuits; mail delivery moved off the per-recipient topic.
 | G | Call signals over circuits, with an honest note on the media path.

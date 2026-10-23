@@ -3,6 +3,7 @@ package net.lapisphilosophorum.lapisnet.browser
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
+import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDht
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtPublishResult
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
@@ -46,6 +47,14 @@ internal class SelfRecordRepublisher(
     private val minDhtAttemptInterval: Duration = 300.seconds,
     private val recordTtlSeconds: Long = DM_SELF_RECORD_TTL_SECONDS,
     private val clockMillis: () -> Long = System::currentTimeMillis,
+    /**
+     * Wave V0.10.0-D. [DirectoryAnonymityMode.OFF] (the default everywhere until wave E) keeps this class
+     * byte-identical in behaviour. With [DirectoryAnonymityMode.ON] it publishes NOTHING itself: no address-bearing
+     * record, no gossip of the prekey bundle from this node, no DHT value; [anonymousTick] (the circuit-based
+     * `AnonymousDirectoryPublisher`, wired in wave E) does the publishing instead.
+     */
+    private val directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
+    private val anonymousTick: (() -> Unit)? = null,
 ) {
     private var gossipAddresses: Set<String>? = null
     private var gossipAtMillis: Long? = null
@@ -74,6 +83,14 @@ internal class SelfRecordRepublisher(
 
     @Synchronized
     fun tick(includeDht: Boolean = true) {
+        if (directoryMode == DirectoryAnonymityMode.ON) {
+            try {
+                anonymousTick?.invoke()
+            } catch (e: RuntimeException) {
+                logger.debug { "anonymous directory tick failed: ${e.javaClass.simpleName}" }
+            }
+            return
+        }
         val now = clockMillis()
         val current = addresses().map { it.toString() }.toSet()
         val gossipDue = gossipAddresses != current || elapsed(gossipAtMillis, now, maxGossipInterval)

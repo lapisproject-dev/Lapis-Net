@@ -24,6 +24,10 @@ data class OnionRelayLimits(
     val maxPendingRendezvousPerLink: Int = 64,
     val rendezvousWaitTimeout: Duration = 60.seconds,
     val maxSplicedPairsTotal: Int = 512,
+    // Directory publication through circuits (wave V0.10.0-D). Defaults are assumptions awaiting confirmation.
+    val directoryPublishPerCircuit: Int = 4,
+    val directoryPublishPerLinkPerMinute: Int = 30,
+    val directoryPublishGlobalPerMinute: Int = 120,
 ) {
     init {
         require(maxCircuitsTotal > 0 && maxCircuitsPerLink > 0 && maxPendingExtends >= 0) { "limits must be positive" }
@@ -39,6 +43,11 @@ data class OnionRelayLimits(
                 maxSplicedPairsTotal > 0,
         ) { "hidden-service limits must be positive" }
         require(introduce1PerSecondPerIntroPoint >= 0) { "rates must not be negative" }
+        require(
+            directoryPublishPerCircuit > 0 &&
+                directoryPublishPerLinkPerMinute >= 0 &&
+                directoryPublishGlobalPerMinute >= 0,
+        ) { "directory publish limits must not be negative (and the per-circuit limit must be positive)" }
         require(
             maxIntroPointsPerLink <= maxIntroPointsTotal && maxPendingRendezvousPerLink <= maxPendingRendezvousTotal,
         ) {
@@ -70,5 +79,27 @@ internal class TokenBucket(
             return true
         }
         return false
+    }
+}
+
+/** Fixed-window counter (per minute by default), used for the directory-publish limits. */
+internal class WindowCounter(
+    private val limit: Int,
+    private val clock: Clock,
+    private val windowMillis: Long = 60_000L,
+) {
+    private var windowStart = clock.millis()
+    private var count = 0
+
+    @Synchronized
+    fun tryAcquire(): Boolean {
+        val now = clock.millis()
+        if (now - windowStart >= windowMillis || now < windowStart) {
+            windowStart = now
+            count = 0
+        }
+        if (count >= limit) return false
+        count++
+        return true
     }
 }

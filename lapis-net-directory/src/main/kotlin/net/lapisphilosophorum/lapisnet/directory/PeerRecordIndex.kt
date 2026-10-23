@@ -116,8 +116,12 @@ class PeerRecordIndex internal constructor(
      * mirroring `VeritasGrantIndex`'s own constructor pattern. */
     constructor() : this(MAX_TRACKED_RECORDS, MAX_PERSISTED_RECORDS, MAX_HIGH_WATER_MARKS)
 
+    /** Cross-type downgrade protection shared with the [AnonymousPeerRecordIndex] built on this index (wave V0.10.0-D). */
+    internal val supersession = IdentitySupersession()
+
     /** The current (highest-sequence-number, tie-broken deterministically) record per identity -
      * every value here is also a value in [recordsByContentId], see this class's doc comment. */
+
     private val currentByIdentity = HashMap<Secp256k1PublicKey, PeerRecord>()
 
     /** Backed by a [LinkedHashMap] with access-order tracking enabled, mirroring
@@ -268,6 +272,8 @@ class PeerRecordIndex internal constructor(
             if (!PeerRecord.verify(record)) return@runCatching false
             if (!record.verifyBinding()) return@runCatching false
             if (!record.verifyPossession()) return@runCatching false
+            // Wave V0.10.0-D: an anonymous record of this identity with a sequence number >= this one supersedes it.
+            if (record.sequenceNumber <= supersession.peerRecordFloor(record.identity)) return@runCatching false
 
             val id = PeerRecordContentId(record.contentId())
             if (recordsByContentId.containsKey(id)) return@runCatching false
@@ -316,6 +322,7 @@ class PeerRecordIndex internal constructor(
             // there is no longer a reason to skip tracking a brand-new identity just because the
             // map happens to be at capacity.
             highestSequenceByIdentity[record.identity] = record.sequenceNumber
+            supersession.raisePeerRecord(record.identity, record.sequenceNumber)
             true
         }.getOrDefault(false)
 
@@ -366,6 +373,7 @@ class PeerRecordIndex internal constructor(
      */
     @Synchronized
     fun canAccept(record: PeerRecord): Boolean {
+        if (record.sequenceNumber <= supersession.peerRecordFloor(record.identity)) return false
         val id = PeerRecordContentId(record.contentId())
         if (recordsByContentId.containsKey(id)) return false
         val existing = currentByIdentity[record.identity]
@@ -413,9 +421,29 @@ class PeerRecordIndex internal constructor(
         persistedContentIds.remove(PeerRecordContentId(record.contentId()))
     }
 
+    /**
+     * Removes the tracked record of [identity] if its sequence number is `<= [sequenceNumber]` (wave V0.10.0-D: an
+     * anonymous record superseded it), releasing its persistence reservation. Returns whether one was removed.
+     * The high-water mark is kept, so the removed record can not come back through [add].
+     */
+    @Synchronized
+    internal fun supersede(
+        identity: Secp256k1PublicKey,
+        sequenceNumber: Long,
+    ): Boolean {
+        val existing = currentByIdentity[identity] ?: return false
+        if (existing.sequenceNumber > sequenceNumber) return false
+        val id = PeerRecordContentId(existing.contentId())
+        recordsByContentId.remove(id)
+        currentByIdentity.remove(identity)
+        persistedContentIds.remove(id)
+        return true
+    }
+
     /** The current (latest-by-sequence-number) record for [identity], regardless of whether it has
      * expired - TTL filtering happens ONLY in [PeerDirectoryGossip.lookup], never here. `internal`:
      * only [PeerDirectoryGossip] (same module) and this module's own tests need read access. */
+
     @Synchronized
     internal fun current(identity: Secp256k1PublicKey): PeerRecord? = currentByIdentity[identity]
 

@@ -134,6 +134,13 @@ class GossipPubSub private constructor(
     }
 
     /**
+     * Test seam (wave V0.10.0-D): sees `(topic, bytes)` of every message THIS node publishes itself (not the ones it
+     * merely forwards). `null` in production. The leak scanner of the anonymity tests uses it to prove that a node in
+     * anonymity mode publishes nothing that contains its addresses or transport identity.
+     */
+    @Volatile var outboundTap: ((topic: String, bytes: ByteArray) -> Unit)? = null
+
+    /**
      * Publishes [bytes] on [topic]. No delivery guarantee - GossipSub propagation is best-effort.
      * See [subscribe]'s doc comment: this node's own [subscribe] handlers never see this call's
      * message.
@@ -152,6 +159,7 @@ class GossipPubSub private constructor(
         bytes: ByteArray,
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
+        outboundTap?.invoke(topic, bytes.copyOf())
         try {
             awaitOrWrap("publish to gossip topic $topic", timeout) {
                 publisher.publish(Unpooled.wrappedBuffer(bytes), Topic(topic))

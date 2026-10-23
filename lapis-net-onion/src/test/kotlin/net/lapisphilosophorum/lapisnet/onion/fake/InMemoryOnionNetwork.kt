@@ -28,6 +28,13 @@ class InMemoryOnionNetwork(
         val message: RelayMessage,
     )
 
+    class PublishDelivered(
+        val relayIndex: Int,
+        val circuitHandle: Long,
+        val type: net.lapisphilosophorum.lapisnet.onion.DirectoryObjectType,
+        val objectBytes: ByteArray,
+    )
+
     class Closed(
         val relayIndex: Int,
         val circuitHandle: Long,
@@ -54,6 +61,9 @@ class InMemoryOnionNetwork(
 
     val clientInbox = ArrayDeque<Cell>()
     val delivered = mutableListOf<Delivered>()
+
+    /** DIRECTORY_PUBLISH objects handed to the host (wave V0.10.0-D). */
+    val publishes = mutableListOf<PublishDelivered>()
     val closed = mutableListOf<Closed>()
 
     private val peers = HashMap<Pair<Int, Long>, Peer>()
@@ -148,6 +158,8 @@ class InMemoryOnionNetwork(
                     }
                 }
                 is RelayAction.DeliverLocal -> delivered += Delivered(idx, a.circuitHandle, a.message)
+                is RelayAction.DeliverDirectoryPublish ->
+                    publishes += PublishDelivered(idx, a.circuitHandle, a.type, a.objectBytes)
                 is RelayAction.CircuitClosed -> closed += Closed(idx, a.circuitHandle, a.reason)
             }
         }
