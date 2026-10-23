@@ -16,6 +16,7 @@ import net.lapisphilosophorum.lapisnet.onion.CellFormatException
 import net.lapisphilosophorum.lapisnet.onion.LinkId
 import java.security.SecureRandom
 import java.time.Clock
+import java.util.Arrays
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -107,6 +108,9 @@ internal class OnionLink(
     @Volatile var lastUsefulMillis: Long = 0
     val ended = AtomicBoolean(false)
 
+    /** Set (once) as soon as this link's id may have been given to a caller; a link claimed this way is never closed by the dial tie-break. */
+    val handedOut = AtomicBoolean(false)
+
     fun attach(c: ChannelHandlerContext) {
         ctx = c
         ready.complete(Unit)
@@ -170,6 +174,15 @@ internal class OnionLinkManager(
     private val timer =
         ScheduledThreadPoolExecutor(1) { Thread(it, "lapis-net-onion-timer").also { t -> t.isDaemon = true } }
             .also { it.removeOnCancelPolicy = true }
+
+    /** Local peer id for the deterministic tie-break; null without a node (unit use). */
+    private val localPeer: PeerId? = node?.peerId
+
+    /** Test seam (null in production): runs between admission and attaching the Netty handler of a link. */
+    @Volatile internal var beforeAttachForTest: ((OnionLink) -> Unit)? = null
+
+    /** Test seam (null in production): runs on the dial thread after the stream is open, before the tie-break. */
+    @Volatile internal var beforeDialResultForTest: ((PeerId) -> Unit)? = null
 
     val protocolHandler = OnionProtocolHandler(this, config)
     val binding = OnionProtocolBinding(protocolHandler)
@@ -392,8 +405,49 @@ internal class OnionLinkManager(
         }
     }
 
+    /** Compares peer ids by their raw bytes, unsigned: the same answer on both sides. */
+    internal fun lowerPeer(
+        a: PeerId,
+        b: PeerId,
+    ): PeerId = if (Arrays.compareUnsigned(a.bytes, b.bytes) <= 0) a else b
+
+    /**
+     * `true` if [link] was opened by the side with the lower peer id: the canonical link of a pair. Without a local peer
+     * id, or with equal ids, no link is canonical (no tie-break).
+     */
+    internal fun isCanonical(link: OnionLink): Boolean {
+        val me = localPeer ?: return false
+        if (me == link.peer) return false
+        val opener = if (link.inbound) link.peer else me
+        return lowerPeer(me, link.peer) == opener
+    }
+
+    /**
+     * Best open or opening link to [peer]: canonical first, then attached (ctx != null), then outbound. Includes links that
+     * are admitted (and counted) but not yet attached, so counting and reuse see the same entry.
+     */
     private fun existingLinkTo(peer: PeerId): OnionLink? =
-        links.values.filter { it.peer == peer && !it.ended.get() && it.ctx != null }.minByOrNull { it.inbound }
+        links.values
+            .filter { it.peer == peer && !it.ended.get() }
+            .minWithOrNull(compareBy<OnionLink>({ !isCanonical(it) }, { it.ctx == null }, { it.inbound }))
+
+    /**
+     * Future of [link]'s id once it is ready; marks the link as handed out. Completion is normally handed to the dial pool
+     * (callers run blocking or synchronized work in their callbacks), but when that pool is saturated or closed it is done
+     * inline, which may be a Netty event-loop thread: callbacks must therefore not block. A link that ends before it is ready fails the future; there is deliberately no silent re-dial. Inbound waits
+     * are bounded by the handshake timer, outbound ones by the dial timeout.
+     */
+    private fun whenReady(link: OnionLink): CompletableFuture<LinkId> {
+        link.handedOut.set(true)
+        val ready = link.ready
+        if (ready.isDone && !ready.isCompletedExceptionally) return CompletableFuture.completedFuture(link.id)
+        val out = CompletableFuture<LinkId>()
+        ready.whenComplete { _, e ->
+            val finish = Runnable { if (e != null) out.completeExceptionally(e) else out.complete(link.id) }
+            if (!submit(finish)) finish.run()
+        }
+        return out
+    }
 
     /**
      * An open link to [peer] (reusing an existing one in either direction), or a new one. Concurrent requests for one peer
@@ -403,7 +457,7 @@ internal class OnionLinkManager(
         peer: PeerId,
         addresses: List<Multiaddr>,
     ): CompletableFuture<LinkId> {
-        existingLinkTo(peer)?.let { return CompletableFuture.completedFuture(it.id) }
+        existingLinkTo(peer)?.let { return whenReady(it) }
         val lan = node ?: return CompletableFuture.failedFuture(IllegalStateException("no node"))
         if (closedFlag.get()) return CompletableFuture.failedFuture(IllegalStateException("closed"))
         val fresh = CompletableFuture<LinkId>()
@@ -436,12 +490,39 @@ internal class OnionLinkManager(
                 } catch (e: Exception) {
                     failure = e
                 }
+                runCatching { beforeDialResultForTest?.invoke(peer) }
+                // Tie-break for simultaneous dials: if the canonical link of the pair is already there and ours is not, and
+                // ours was never handed out, close ours and complete the waiters with the canonical one. A link that was
+                // already handed out is never closed from outside; the idle check retires it once its circuits are gone.
+                var redirect: CompletableFuture<LinkId>? = null
+                if (failure == null && linkId != null) {
+                    val mine = links[linkId.value]
+                    val winner = existingLinkTo(peer)
+                    if (mine != null &&
+                        winner != null &&
+                        winner !== mine &&
+                        isCanonical(winner) &&
+                        !isCanonical(mine) &&
+                        !hasCircuits(mine.id) &&
+                        mine.handedOut.compareAndSet(false, true)
+                    ) {
+                        close(mine.id)
+                        redirect = whenReady(winner)
+                    }
+                }
                 // bookkeeping first, then the result: a waiter that sees the outcome also sees a clean table
                 dials.remove(peer, fresh)
                 when {
                     failure != null -> fresh.completeExceptionally(failure)
                     linkId == null -> fresh.completeExceptionally(IllegalStateException("link refused"))
-                    else -> fresh.complete(linkId)
+                    redirect != null ->
+                        redirect.whenComplete { id, e ->
+                            if (e != null) fresh.completeExceptionally(e) else fresh.complete(id)
+                        }
+                    else -> {
+                        links[linkId.value]?.handedOut?.set(true)
+                        fresh.complete(linkId)
+                    }
                 }
             }
         if (!accepted) {

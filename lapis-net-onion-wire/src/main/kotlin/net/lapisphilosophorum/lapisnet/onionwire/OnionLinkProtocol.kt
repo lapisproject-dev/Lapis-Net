@@ -114,13 +114,30 @@ internal class OnionProtocolHandler(
         stream.pushHandler(CellFrameDecoder(config.linkHandshakeTimeout.inWholeMilliseconds))
     }
 
+    /** Attaches the Netty handler; if that fails the admitted link is closed so no counter or pending waiter leaks. */
+    private fun attach(
+        stream: Stream,
+        link: OnionLink,
+    ): Boolean {
+        try {
+            manager.beforeAttachForTest?.invoke(link)
+            stream.pushHandler(OnionLinkChannelHandler(manager, link))
+            return true
+        } catch (e: Exception) {
+            logger.debug { "onion link handler attach failed: ${e.javaClass.simpleName}" }
+            manager.close(link.id)
+            return false
+        }
+    }
+
     override fun onStartResponder(stream: Stream): CompletableFuture<OnionLinkHandle> {
         val link = manager.admit(stream, inbound = true)
         if (link == null) {
             stream.reset()
             return CompletableFuture.completedFuture(RejectedLinkHandle)
         }
-        stream.pushHandler(OnionLinkChannelHandler(manager, link))
+        // Until the handler is attached the link counts but is not usable; the inbound handshake timer bounds that window.
+        if (!attach(stream, link)) return CompletableFuture.completedFuture(RejectedLinkHandle)
         return CompletableFuture.completedFuture(link)
     }
 
@@ -130,7 +147,7 @@ internal class OnionProtocolHandler(
             stream.reset()
             return CompletableFuture.completedFuture(RejectedLinkHandle)
         }
-        stream.pushHandler(OnionLinkChannelHandler(manager, link))
+        if (!attach(stream, link)) return CompletableFuture.completedFuture(RejectedLinkHandle)
         return link.ready.thenApply { link }
     }
 }
