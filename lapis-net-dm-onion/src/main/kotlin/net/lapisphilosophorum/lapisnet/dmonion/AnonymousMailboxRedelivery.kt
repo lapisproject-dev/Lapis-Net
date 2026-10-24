@@ -60,7 +60,7 @@ class AnonymousMailboxRedelivery(
     private val closed = AtomicBoolean(false)
     private val scheduler: ScheduledExecutorService =
         Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "lapis-net-dm-onion-redelivery").apply { isDaemon = true }
+            Thread(r, SCHEDULER_THREAD_NAME).apply { isDaemon = true }
         }
 
     init {
@@ -150,6 +150,11 @@ class AnonymousMailboxRedelivery(
             inFlight.set(false)
             return
         }
+        if (closed.get()) {
+            // closed while sealing: do not publish anything after close()
+            inFlight.set(false)
+            return
+        }
         val future =
             try {
                 port.publishMailboxItems(items)
@@ -173,6 +178,15 @@ class AnonymousMailboxRedelivery(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         scheduler.shutdownNow()
+        // Wait (bounded) for a tick that is already running, so that nothing is sealed from the zeroed key material
+        // below and nothing is published after close() returned. Not when close() runs on the scheduler thread itself.
+        if (Thread.currentThread().name != SCHEDULER_THREAD_NAME) {
+            try {
+                scheduler.awaitTermination(CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
         synchronized(lock) {
             entries.forEach { it.envelopeBytes.fill(0) }
             entries.clear()
@@ -180,6 +194,8 @@ class AnonymousMailboxRedelivery(
     }
 
     companion object {
+        private const val SCHEDULER_THREAD_NAME = "lapis-net-dm-onion-redelivery"
+        private const val CLOSE_WAIT_MILLIS = 2_000L
         const val MAX_ENTRIES = 256
         const val MAX_PER_RECIPIENT = 32
         const val ITEMS_PER_CIRCUIT = 4

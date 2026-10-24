@@ -63,6 +63,29 @@ class AnonymousMailboxRedeliveryTest :
             }
         }
 
+        test("close() waits for a running tick: nothing is published or counted after close() returned") {
+            repeat(30) { round ->
+                val port = FakePort()
+                val r =
+                    AnonymousMailboxRedelivery(
+                        port,
+                        intervalMillis = 1,
+                        jitterMillis = 0,
+                        retryMillis = 1,
+                        tickMillis = 1,
+                    )
+                val peer = Peer()
+                r.add(peer.key, peer.bundle.x25519IdentityKey, envelope(round), expiry())
+                waitFor { port.published.isNotEmpty() } shouldBe true
+                r.close()
+                val published = port.published.size
+                val announced = r.announcementCount()
+                Thread.sleep(25)
+                port.published.size shouldBe published
+                r.announcementCount() shouldBe announced
+            }
+        }
+
         test("a failed announcement is retried, an expired entry is dropped") {
             val port = FakePort()
             port.publishResult = CompletableFuture.completedFuture(false)
