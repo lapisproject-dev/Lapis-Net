@@ -36,7 +36,7 @@ object PathPolicy {
     /** Relays without history together never receive more than this share of the weight (if others exist). */
     const val NEW_RELAYS_TOTAL_CAP = 0.15
     const val IPV4_PREFIX = 16
-    const val IPV6_PREFIX = 32
+    const val IPV6_PREFIX = 48
 }
 
 /**
@@ -50,9 +50,9 @@ sealed interface NetworkBucket : Comparable<NetworkBucket> {
         val prefix16: Int,
     ) : NetworkBucket
 
-    /** The /32 of an IPv6 address (upper 32 bits, as an unsigned value). */
+    /** The /48 of an IPv6 address (upper 48 bits, as an unsigned value). */
     data class V6(
-        val prefix32: Long,
+        val prefix48: Long,
     ) : NetworkBucket
 
     data object Unknown : NetworkBucket
@@ -63,7 +63,7 @@ sealed interface NetworkBucket : Comparable<NetworkBucket> {
 private fun rankOf(b: NetworkBucket): Long =
     when (b) {
         is NetworkBucket.V4 -> b.prefix16.toLong() and 0xFFFF
-        is NetworkBucket.V6 -> 0x1_0000_0000L + (b.prefix32 and 0xFFFF_FFFFL)
+        is NetworkBucket.V6 -> (1L shl 48) + (b.prefix48 and 0xFFFF_FFFF_FFFFL)
         NetworkBucket.Unknown -> Long.MAX_VALUE
     }
 
@@ -147,8 +147,9 @@ class PeerDirectoryRelayNetworkLocator(
                     val doc = intArrayOf(0x20, 0x01, 0x0d, 0xb8)
                     if (doc.indices.all { (b[it].toInt() and 0xFF) == doc[it] }) return null
                     val p =
-                        ((b[0].toLong() and 0xFF) shl 24) or ((b[1].toLong() and 0xFF) shl 16) or
-                            ((b[2].toLong() and 0xFF) shl 8) or (b[3].toLong() and 0xFF)
+                        ((b[0].toLong() and 0xFF) shl 40) or ((b[1].toLong() and 0xFF) shl 32) or
+                            ((b[2].toLong() and 0xFF) shl 24) or ((b[3].toLong() and 0xFF) shl 16) or
+                            ((b[4].toLong() and 0xFF) shl 8) or (b[5].toLong() and 0xFF)
                     NetworkBucket.V6(p)
                 }
                 else -> null

@@ -33,4 +33,11 @@ class NetworkBucketTest :
             bucket("198.20.0.1") shouldBe NetworkBucket.V4((198 shl 8) or 20)
             (bucket("2001:4860::1") != null) shouldBe true
         }
+
+        test("IPv6 buckets are the /48: same /48 equal, same /32 but different /48 differ") {
+            bucket("2001:4860:1234:1::1") shouldBe NetworkBucket.V6(0x200148601234L)
+            bucket("2001:4860:1234:ffff::9") shouldBe bucket("2001:4860:1234:1::1")
+            (bucket("2001:4860:1235:1::1") != bucket("2001:4860:1234:1::1")) shouldBe true
+            (bucket("2001:4861:1234:1::1") != bucket("2001:4860:1234:1::1")) shouldBe true
+        }
     })

@@ -34,7 +34,7 @@ class Candidate internal constructor(
  * [PathPolicy.PRODUCTION_PATH_LENGTH] relays: if not enough diverse relays exist the answer is
  * [PathSelectionResult.Insufficient], never a shorter path.
  *
- * **Diversity (hard):** no relay twice, no two relays with an overlapping /16 (IPv4) or /32 (IPv6) bucket, at most one
+ * **Diversity (hard):** no relay twice, no two relays with an overlapping /16 (IPv4) or /48 (IPv6) bucket, at most one
  * relay of unknown network, no two relays of the same non-null family, optionally no Veritas edge. The addresses come
  * from [locator] and are self-declared by the relays, so an adversary can lie about them (documented limit).
  *

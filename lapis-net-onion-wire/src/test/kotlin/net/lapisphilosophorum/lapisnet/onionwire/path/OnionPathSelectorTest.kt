@@ -57,12 +57,12 @@ class OnionPathSelectorDiversityTest :
             }
         }
 
-        test("IPv6: the same /32 conflicts, even if the /48 differs; different /32 do not") {
+        test("IPv6: the same /48 conflicts, even if the /64 differs; different /48 do not, even within one /32") {
             val f = SelectorFixture()
-            val a = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db8L)).also { f.relays += it }
-            val b = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db8L)).also { f.relays += it }
-            val c = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db9L)).also { f.relays += it }
-            val d = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010dbaL)).also { f.relays += it }
+            val a = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db80001L)).also { f.relays += it }
+            val b = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db80001L)).also { f.relays += it }
+            val c = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db80002L)).also { f.relays += it }
+            val d = f.locator.put(syntheticDescriptor(), NetworkBucket.V6(0x20010db90001L)).also { f.relays += it }
             repeat(20) {
                 val hops =
                     f.selector
