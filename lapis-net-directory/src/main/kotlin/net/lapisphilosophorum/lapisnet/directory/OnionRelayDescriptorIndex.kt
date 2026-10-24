@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.directory
 
+import io.libp2p.core.PeerId
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.nio.ByteBuffer
 
@@ -35,6 +36,7 @@ class OnionRelayDescriptorIndex(
     private val lock = Any()
     private val records = HashMap<Secp256k1PublicKey, OnionRelayDescriptor>()
     private val byDigest = HashMap<ByteBuffer, Secp256k1PublicKey>()
+    private val byPeer = HashMap<PeerId, Secp256k1PublicKey>()
     private val highWater =
         object : LinkedHashMap<Secp256k1PublicKey, Long>(16, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Secp256k1PublicKey, Long>): Boolean =
@@ -75,9 +77,13 @@ class OnionRelayDescriptorIndex(
                 evictExpiredLocked(nowEpochSecond)
                 if (records.size >= maxTracked) return DescriptorIngestOutcome.CAPACITY
             }
-            if (current != null) byDigest.remove(digestKey(current))
+            if (current != null) {
+                byDigest.remove(digestKey(current))
+                byPeer.remove(current.peerId)
+            }
             records[d.identity] = d
             byDigest[digestKey(d)] = d.identity
+            byPeer[d.peerId] = d.identity
             highWater[d.identity] = d.sequenceNumber
             return DescriptorIngestOutcome.ACCEPTED
         }
@@ -98,6 +104,16 @@ class OnionRelayDescriptorIndex(
             records[identity]?.takeIf { it.notValidAfterEpochSecond >= nowEpochSecond }
         }
 
+    /** The current descriptor of the relay whose libp2p transport peer id is [peerId] (wave V0.10.0-F1), or `null`. */
+    fun byPeerId(
+        peerId: PeerId,
+        nowEpochSecond: Long,
+    ): OnionRelayDescriptor? =
+        synchronized(lock) {
+            val identity = byPeer[peerId] ?: return@synchronized null
+            records[identity]?.takeIf { it.notValidAfterEpochSecond >= nowEpochSecond }
+        }
+
     fun snapshot(
         nowEpochSecond: Long,
         limit: Int = maxTracked,
@@ -113,6 +129,7 @@ class OnionRelayDescriptorIndex(
         for (d in expired) {
             records.remove(d.identity)
             byDigest.remove(digestKey(d))
+            byPeer.remove(d.peerId)
         }
         return expired.size
     }

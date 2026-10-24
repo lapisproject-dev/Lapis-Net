@@ -74,9 +74,17 @@ class OnionPathSelector(
         val last = lastHop?.let { toCandidate(it, now) }
         if (last != null && last.identity == ownIdentity) throw PathConflictException()
         val guardDescriptor = guards.primaryUsable(cands.map { it.descriptor }) { pickGuard(cands, it, null, hops) }
-        val guard =
+        var guard =
             guardDescriptor?.let { d -> cands.firstOrNull { it.identity == d.identity } }
                 ?: return PathSelectionResult.Insufficient
+        if (lastHopChosenRemotely && last != null && last.identity == guard.identity) {
+            // A relay can not appear twice in a path, and the build must not fail because of the guard (that would let
+            // a remote party probe for it): enter through the persistent backup guard for this one circuit.
+            val backupId = guards.snapshot().backup?.identity
+            guard =
+                cands.firstOrNull { it.identity == backupId && it.identity != last.identity }
+                    ?: return PathSelectionResult.Insufficient
+        }
         if (!lastHopChosenRemotely) {
             if (last != null && last.identity == guard.identity) throw PathConflictException()
             if (last != null && conflicts(guard, last)) throw PathConflictException()

@@ -15,6 +15,41 @@
 
 const MAX_DM_BODY_BYTES = 32768;
 
+// V0.10.0-F1 anonymity mode. Every text below is fixed in this file; nothing from the server response is ever shown
+// for an error (only the code is looked up here), and everything is written through setText()/textContent.
+const DM_ANONYMITY_NOTICE =
+  "Anonymity mode: messages travel over circuits. The recipient sees who you are. Only people who are in anonymity mode as well can be reached, and there are no attachments.";
+const DM_ATTACHMENT_NOTE = "Attachments are not available in anonymity mode.";
+const DM_ERROR_TEXTS = {
+  "recipient-not-reachable-anonymously":
+    "This person cannot be reached anonymously. Nothing was sent.",
+  "anonymity-not-ready": "Anonymity mode is not ready yet. Nothing was sent, please try again shortly.",
+  "rate-limited": "Circuit builds are being rate limited. Nothing was sent, please try again later.",
+  "message-too-large-anonymous": "This message is too long for anonymity mode (about 5 KB). Nothing was sent.",
+  "attachments-unavailable-anonymous": "Attachments are not available in anonymity mode. Nothing was sent.",
+  "dm-send-failed": "The message could not be sent.",
+};
+const DM_ERROR_FALLBACK = "The message could not be sent.";
+const DM_DELIVERY_TEXTS = {
+  direct: { SENT: "SENT", QUEUED_FOR_PICKUP: "QUEUED_FOR_PICKUP" },
+  circuit: {
+    SENT: "delivered through circuits",
+    QUEUED_FOR_PICKUP: "queued: announced through relays until the recipient picks it up (up to 48 hours)",
+  },
+};
+let anonymousMode = false;
+
+function dmErrorText(error) {
+  const code = error && error.message;
+  return Object.prototype.hasOwnProperty.call(DM_ERROR_TEXTS, code) ? DM_ERROR_TEXTS[code] : DM_ERROR_FALLBACK;
+}
+
+function deliveryText(message) {
+  const route = message.route === "circuit" ? "circuit" : "direct";
+  const table = DM_DELIVERY_TEXTS[route];
+  return Object.prototype.hasOwnProperty.call(table, message.deliveryState) ? table[message.deliveryState] : message.deliveryState;
+}
+
 function utf8ByteLength(text) {
   return new TextEncoder().encode(text).length;
 }
@@ -148,10 +183,16 @@ function renderMessageAttachmentsInto(container, peerHex, attachments) {
     const linkEl = fragment.querySelector(".dm-message-attachment-link");
     const metaEl = fragment.querySelector(".dm-message-attachment-meta");
     setText(linkEl, attachment.name);
-    // DOM property assignment, never string-concatenated into markup - mirrors mail.js's
-    // identical established pattern (see that file's header comment, rule 3).
-    linkEl.href = attachmentDownloadHref(peerHex, attachment.cid);
-    setText(metaEl, `${attachment.mime}, ${attachment.size} bytes`);
+    if (anonymousMode) {
+      // no link and no automatic fetch: the blob would have to be requested from the sender's node directly
+      linkEl.removeAttribute("href");
+      linkEl.classList.add("dm-attachment-plain");
+    } else {
+      // DOM property assignment, never string-concatenated into markup - mirrors mail.js's
+      // identical established pattern (see that file's header comment, rule 3).
+      linkEl.href = attachmentDownloadHref(peerHex, attachment.cid);
+    }
+    setText(metaEl, anonymousMode ? `${attachment.size} bytes` : `${attachment.mime}, ${attachment.size} bytes`);
     container.appendChild(fragment);
   }
 }
@@ -164,7 +205,7 @@ function renderMessageItem(peerHex, message) {
   setText(li.querySelector(".dm-message-time"), formatRelativeTime(message.epochSecond));
   const statusEl = li.querySelector(".dm-message-status");
   if (message.direction === "outbound") {
-    setText(statusEl, message.deliveryState);
+    setText(statusEl, deliveryText(message));
   } else {
     setText(statusEl, message.quarantined ? "quarantined" : "");
   }
@@ -282,9 +323,27 @@ composeForm.addEventListener("submit", (event) => {
       loadConversationList();
     })
     .catch((error) => {
-      setText(composeStatusEl, `failed: ${error.message}`);
+      setText(composeStatusEl, anonymousMode ? dmErrorText(error) : `failed: ${error.message}`);
     });
 });
 
+// Anonymity mode is read once; the notice is fixed text and can not be dismissed, the attachment button is disabled.
+function applyAnonymityMode() {
+  return fetchJson("/api/node/status")
+    .then((status) => {
+      anonymousMode = status.anonymityMode === "on";
+      const notice = document.getElementById("dm-anonymity-notice");
+      const note = document.getElementById("dm-attachment-note");
+      notice.hidden = !anonymousMode;
+      note.hidden = !anonymousMode;
+      if (anonymousMode) {
+        setText(notice, DM_ANONYMITY_NOTICE);
+        setText(note, DM_ATTACHMENT_NOTE);
+        addAttachmentButton.disabled = true;
+      }
+    })
+    .catch(() => {});
+}
+
 loadIdentity();
-loadConversationList();
+applyAnonymityMode().then(() => loadConversationList());

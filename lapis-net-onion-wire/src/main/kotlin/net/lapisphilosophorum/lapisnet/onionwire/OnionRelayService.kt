@@ -16,6 +16,7 @@ import net.lapisphilosophorum.lapisnet.onion.DestroyReason
 import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
+import net.lapisphilosophorum.lapisnet.onion.MailboxPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.OnionKeyRing
 import net.lapisphilosophorum.lapisnet.onion.OnionRelay
 import net.lapisphilosophorum.lapisnet.onion.RelayAction
@@ -57,6 +58,7 @@ class OnionRelayService private constructor(
     val quality: OnionRelayQualityTracker,
     private val clock: Clock,
     private val directorySink: DirectoryPublishSink?,
+    private val mailboxSink: MailboxPublishSink?,
 ) : AutoCloseable {
     private val ownIdentity: Secp256k1PublicKey = identity.secp256k1KeyPair.publicKey
     private val linkTargets = ConcurrentHashMap<Long, Secp256k1PublicKey>()
@@ -141,6 +143,7 @@ class OnionRelayService private constructor(
                 is RelayAction.OpenLinkForExtend -> extend(action)
                 is RelayAction.DeliverLocal -> deliver(action)
                 is RelayAction.DeliverDirectoryPublish -> deliverDirectoryPublish(action)
+                is RelayAction.DeliverMailboxItem -> deliverMailboxItem(action)
                 is RelayAction.CircuitClosed -> Unit
             }
         }
@@ -207,6 +210,30 @@ class OnionRelayService private constructor(
                 if (sink == null) DirectoryPublishStatus.UNKNOWN_TYPE else DirectoryPublishStatus.RATE_LIMITED,
             )
         }
+    }
+
+    private fun deliverMailboxItem(action: RelayAction.DeliverMailboxItem) {
+        val sink = mailboxSink
+        val accepted =
+            sink != null &&
+                links.submit {
+                    val status =
+                        try {
+                            sink.publish(action.itemBytes)
+                        } catch (e: RuntimeException) {
+                            MailboxPublishStatus.RATE_LIMITED
+                        }
+                    replyMailbox(action.circuitHandle, status)
+                }
+        if (!accepted) replyMailbox(action.circuitHandle, MailboxPublishStatus.RATE_LIMITED)
+    }
+
+    private fun replyMailbox(
+        handle: Long,
+        status: Byte,
+    ) {
+        if (closed) return
+        execute(relay.reply(handle, RelayMessage(RelayCommand.MAILBOX_PUBLISHED, 0, StatusBody.encode(status))))
     }
 
     private fun replyPublished(
@@ -301,6 +328,7 @@ class OnionRelayService private constructor(
             supervisor: NodeServiceSupervisor,
             links: OnionLinkManager,
             directorySink: DirectoryPublishSink? = null,
+            mailboxSink: MailboxPublishSink? = null,
             quality: OnionRelayQualityTracker = OnionRelayQualityTracker(),
             clock: Clock = Clock.systemUTC(),
             random: SecureRandom = SecureRandom(),
@@ -329,6 +357,7 @@ class OnionRelayService private constructor(
                         quality,
                         clock,
                         directorySink,
+                        mailboxSink,
                     )
                 service = svc
                 links.addClosedSink { svc.onLinkClosed(it) }

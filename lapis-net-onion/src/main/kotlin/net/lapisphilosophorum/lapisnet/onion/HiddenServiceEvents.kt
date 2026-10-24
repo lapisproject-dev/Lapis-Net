@@ -7,7 +7,14 @@ value class CircuitRef(
 )
 
 /** Why a circuit is built; the host uses it to choose a path whose LAST hop is the given relay. */
-enum class CircuitPurpose { INTRO, RENDEZVOUS_SENDER, RENDEZVOUS_RECEIVER, INTRODUCE, DIRECTORY_PUBLISH }
+enum class CircuitPurpose {
+    INTRO,
+    RENDEZVOUS_SENDER,
+    RENDEZVOUS_RECEIVER,
+    INTRODUCE,
+    DIRECTORY_PUBLISH,
+    MAILBOX_PUBLISH,
+}
 
 /** Input of the pure hidden-service state machines. */
 sealed interface HsEvent {

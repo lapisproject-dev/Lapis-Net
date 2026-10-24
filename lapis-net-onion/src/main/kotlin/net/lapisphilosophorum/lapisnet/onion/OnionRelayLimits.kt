@@ -28,6 +28,11 @@ data class OnionRelayLimits(
     val directoryPublishPerCircuit: Int = 4,
     val directoryPublishPerLinkPerMinute: Int = 30,
     val directoryPublishGlobalPerMinute: Int = 120,
+    // Mailbox item publication through circuits (wave V0.10.0-F1). Counted per item. Assumptions awaiting confirmation.
+    val mailboxPublishPerCircuit: Int = 4,
+    val mailboxPublishPerLinkPerMinute: Int = 10,
+    val mailboxPublishGlobalPerMinute: Int = 60,
+    val mailboxAssembleTimeout: Duration = 15.seconds,
 ) {
     init {
         require(maxCircuitsTotal > 0 && maxCircuitsPerLink > 0 && maxPendingExtends >= 0) { "limits must be positive" }
@@ -48,6 +53,12 @@ data class OnionRelayLimits(
                 directoryPublishPerLinkPerMinute >= 0 &&
                 directoryPublishGlobalPerMinute >= 0,
         ) { "directory publish limits must not be negative (and the per-circuit limit must be positive)" }
+        require(
+            mailboxPublishPerCircuit > 0 &&
+                mailboxPublishPerLinkPerMinute >= 0 &&
+                mailboxPublishGlobalPerMinute >= 0 &&
+                mailboxAssembleTimeout.isPositive(),
+        ) { "mailbox publish limits must not be negative (per-circuit limit and timeout must be positive)" }
         require(
             maxIntroPointsPerLink <= maxIntroPointsTotal && maxPendingRendezvousPerLink <= maxPendingRendezvousTotal,
         ) {

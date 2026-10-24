@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side, directory and path policy (waves V0.10.0-A to V0.10.0-E)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy and direct messages (waves V0.10.0-A to V0.10.0-F1)
 :toc:
 
 == Status
+
+*Wave F1 (direct messages over circuits, unreleased) carries direct messages, online and offline, over circuits for a node in anonymity mode. The sender reaches the recipient's onion service through a rendezvous point; an undeliverable message is sealed to the recipient and announced by relays on one shared topic. Mail, call media, GossipSub, the DHT and content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode (refused before any ratchet step). The recipient learns the sender's identity. Both sides must be in anonymity mode; there is no fallback to a direct connection and no attachments.* See <<dm-over-circuits>>.
 
 *Wave E (path selection and policy, unreleased) adds the first thing a user can switch on: `--anonymity=on`. A node in that mode chooses relays with persistent guards and network diversity, builds circuits under a build policy, and publishes its directory entry only through those circuits. It does not make the node anonymous: direct messages, mail and call signalling still use direct connections and show the IP address, and the libp2p transport key is still the identity key. The option is experimental, off by default, and every start says so.* See <<path-policy>>.
 
@@ -64,10 +66,10 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 These exist in the current release and must be closed before any anonymity claim.
 
 . *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses. Directory side addressed in wave D (see <<directory-anonymity>>); the transport-level link between identity and IP remains until wave E.
-. *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F). This wave does not change mail.
+. *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F2). Wave F1 does not change mail; it removes the same leak for direct messages (a node in anonymity mode does not subscribe to its own direct-message mailbox topic).
 . *Gossip timing.* Message publication times and mesh membership leak.
 . *WebRTC media.* ICE exposes IPs to the peer.
-. *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom.
+. *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom. Closed for direct messages in anonymity mode by wave F1 (no pointer, no Nabu blob, no IPNS value); still present for mail and for nodes in the normal mode.
 . *Small anonymity set.* Few relays mean weak anonymity regardless of cryptography.
 . *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
 . *Correlation by provoked teardown.* Any party on a path can destroy a circuit and correlate the effect elsewhere (DoS-based correlation). Not prevented.
@@ -536,7 +538,7 @@ Constants (assumptions, see below): entry TTL at most 6 h (default 3 h), republi
 * *Assumption, confirmation required:* relay mode and anonymity mode exclude each other on one identity; a relay with a separate identity is later work.
 * *Assumption, confirmation required:* no DHT write path for anonymous entries in this wave (an IPNS put through a relay would need pre-signed records; a lookup by identity alone would need a new DHT namespace).
 * *Assumption, confirmation required:* all constants in the previous section.
-* *Assumption, confirmation required:* offline DM and mail through the DHT outbox are unavailable in anonymity mode until wave F (entries stay queued); the alternative, publishing with a documented leak, is not recommended.
+* *Assumption, confirmation required:* offline DM and mail through the DHT outbox are unavailable in anonymity mode until wave F (entries stay queued); the alternative, publishing with a documented leak, is not recommended. Update after wave F1: offline direct messages work in anonymity mode through sealed mailbox items (see <<dm-over-circuits>>); offline mail stays unavailable until wave F2.
 * *Assumption, confirmation required:* the publish relay may see the clear object; this is accepted because every object is public by nature.
 * *Assumption, confirmation required:* the mode state file is `OFF` when missing or corrupt, the safe direction for a normal node.
 
@@ -554,7 +556,7 @@ Constants (assumptions, see below): entry TTL at most 6 h (default 3 h), republi
 
 *What it is.* `--anonymity=on` starts the `AnonymityRuntime` (`lapis-net-onion-wire`, package `anonymity`): persistent guards, diverse weighted paths of three relays, a build policy for client circuits, the circuit-based directory publication of wave D and the hosting of the node's onion service (introduction points chosen the same way). The headless CLI node and the browser both wire it; with `off` nothing of this is built, and the browser does not even create an `OnionWire` in normal mode.
 
-*What it is not.* Direct messages, mail and call signalling are not routed over circuits, the libp2p transport key is the identity key, and every connection of the node (mesh, DHT, Bitswap) still shows identity and IP. At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed): _Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and reveal your IP address; only the directory publication and path selection are active._
+*What it is not (state of wave E; wave F1 changed the first point).* Direct messages, mail and call signalling are not routed over circuits, the libp2p transport key is the identity key, and every connection of the node (mesh, DHT, Bitswap) still shows identity and IP. At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). The text of wave E was: _Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and reveal your IP address; only the directory publication and path selection are active._ (historical; wave F1 replaced it, see <<dm-over-circuits>> for the current text, which `ANONYMITY_INCOMPLETE_WARNING` and `app.js` carry character for character).
 
 === Path selection
 
@@ -638,6 +640,125 @@ The CLI start line shows `anonymity=on|off`; the browser status carries `anonymi
 * A guard that is also operated by the adversary sees the node's IP for every circuit; guards reduce the predecessor attack, they do not remove it. A small anonymity set and a global passive observer are as in the threat model.
 * A node upgraded from v0.12.0 sends no tombstone on its first switch to anonymity mode (no persisted `OFF`); its address entries stay until their TTL ends.
 * Not verified: real networks and NATs, behaviour under load, interoperability with v0.12.0 over the network (only local), and no external cryptographic review has taken place.
+
+[[dm-over-circuits]]
+== Direct messages over circuits (wave V0.10.0-F1, unreleased)
+
+*What it is.* A node in anonymity mode sends and receives direct messages only through circuits. The ratchet (X3DH and Double Ratchet) is unchanged and keeps protecting the content; what changes is the transport. A new module `lapis-net-dm-onion` is the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed item format and does not depend on any onion code) and `lapis-net-onion-wire` (which knows nothing about direct messages). `DmSessionManager` is attached with `anonymous = true`: it then registers no `/lapis/dm/1.1.0` protocol, starts no mailbox poller, publishes no pointer on any per-recipient topic and offers nothing to the DHT outbox. There is one inbound pipeline for both entrances (circuit stream and sealed item): `processInboundDmEnvelope`, with duplicate check, X3DH replay register, prekey rate limiter, ratchet decryption and acceptance policy. The sender of an incoming message is known only after decryption.
+
+*What it is not.* Mail and call media still use direct connections; call signalling is not available in anonymity mode (a call attempt is refused up front). GossipSub, the DHT and content fetches still show identity and IP. The recipient learns the sender's identity (it is in the envelope; the point is that the network does not learn who talks to whom, not that the peer is anonymous to the peer). Both sides must be in anonymity mode: a recipient in the normal mode, an unknown identity, a recipient without the DM service and a recipient without a prekey bundle all give the same refusal. There is no fallback to a direct connection, ever. A call invitation over this path is rejected (calls follow in wave G).
+
+At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed): _Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address._ The browser's status panel shows seven fixed lines (directory entries, direct messages, mail, call signalling, call media, mesh/DHT/fetches, and the guard and circuit counts) and the DM page shows a fixed notice above the input field and a disabled attachment button.
+
+=== Online path
+
+The sender looks the recipient up in the local directory only (`AnonymousDirectory`, built without a DHT: a DHT lookup would show the DHT neighbours the sender's interest together with its IP). With a service descriptor it opens a rendezvous stream (`AnonymityRuntime.connectToService`): the rendezvous point is a path-selector endpoint, the first frame is a HELLO naming the application (`"LNSV" | version | appId`, DM = 1), the service side dispatches by HELLO (`OnionServiceStreamRouter`; MAIL and CALL are reserved for later waves) and closes a stream without a valid HELLO after 10 seconds.
+
+[kuml, dm-online-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Direct message over a rendezvous stream") {
+    val sender = lifeline(name = "Sender (anonymity mode)")
+    val circuits = lifeline(name = "Circuits and rendezvous point")
+    val receiver = lifeline(name = "Recipient (onion service)")
+
+    message(from = sender, to = sender, label = "resolve: directory entry, descriptor, prekey bundle (local)")
+    message(from = sender, to = sender, label = "encrypt once (X3DH_INITIAL or TEXT), persist session")
+    message(from = sender, to = circuits, label = "INTRODUCE, rendezvous (new circuits, never reused)")
+    message(from = circuits, to = receiver, label = "rendezvous stream, HELLO(DM)")
+    message(from = sender, to = receiver, label = "ENVELOPE frame (the same bytes as the offline copy)")
+    reply(from = receiver, to = sender, label = "ACK (one constant byte, sent before processing)")
+    message(from = receiver, to = receiver, label = "processInboundDmEnvelope on a bounded executor")
+}
+----
+
+The stream carries `type(1) | len(4) | bytes` frames split into messages of at most 910 bytes. The receiver checks the length against the envelope maximum before it allocates, accepts at most 16 envelopes per stream, 120 per minute over all streams, waits at most 10 seconds between the pieces of one frame and keeps a stream at most 10 minutes. The acknowledgement is sent as soon as a frame is complete and was queued, never after the envelope was processed: its timing says nothing about decryption, the acceptance policy or duplicates (no oracle). A full work queue closes the stream without an acknowledgement; the sender then deposits offline and the duplicate suppression absorbs the possible double. A reply does not use the incoming stream: the answering node resolves the sender and builds its own circuit, so no stream is ever tied to an identity. The sender keeps at most 2 streams (one per onion address, 60 seconds idle) and a new onion address always gets a new circuit.
+
+=== Offline path (design M: sealed mailbox items)
+
+Before wave F1 the sender gossiped a signed pointer on the recipient's own topic (subscribing to it links the recipient's identity and IP for every mesh neighbour), the recipient fetched the blob directly from the sender over Bitswap, and the DHT outbox carried provider records and IPNS values with addresses. None of that is acceptable in anonymity mode. The design keeps no address anywhere on the offline path:
+
+. The sender seals the already encrypted envelope to the recipient's X25519 identity key (the one bound into the prekey bundle). An item is always exactly 5,728 bytes: `version(1) | ephemeralX25519(32) | AEAD(notValidAfter(8) | envLen(2) | envelope | zero padding) | tag(16)`; the key is `HKDF-SHA256(X25519(ephemeral, recipient), salt = ephemeral || recipient, info = "LapisNet:anonymous-mailbox-item:v1")`, used once, ChaCha20-Poly1305 with a zero nonce. The item has no sender signature: the ratchet decryption inside is the only proof of who sent it. There is no forward secrecy for this sealing layer (the long-term identity key is the recipient key); the content stays ratchet-protected.
+. The sender sends the item through a circuit to a relay (new relay role `MAILBOX_PUBLISH`, see below). The relay checks only the size and announces the item on the one shared GossipSub topic `LapisNet:anonymous-mailbox:v1`.
+. Every node in anonymity mode subscribes to that topic and tries to open every item that passes the validator. An item for someone else does not open and is dropped without a trace. Items are tried on a small bounded executor; the topic's global budget (120 per minute) bounds the work.
+. The sender announces the item again every 10 minutes (plus or minus 2 minutes), sealed afresh each time, until its lifetime (48 hours) ends: a recipient that is offline now can only receive an item announced after it comes back. This is the honest limit: *offline delivery works only while the sender keeps announcing*. The queue is in memory (lost on restart, as the pointer queue was), at most 256 entries and 32 per recipient, oldest dropped first.
+
+[kuml, dm-offline-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Offline direct message: sealed mailbox item") {
+    val sender = lifeline(name = "Sender")
+    val relay = lifeline(name = "Relay (last hop, MAILBOX_PUBLISH)")
+    val topic = lifeline(name = "Shared topic")
+    val recipient = lifeline(name = "Recipient (anonymity mode)")
+
+    message(from = sender, to = sender, label = "seal(envelope, recipient identity key), 5,728 bytes")
+    message(from = sender, to = relay, label = "8 fragments of 716 bytes through a circuit")
+    message(from = relay, to = topic, label = "announce (the relay is the author)")
+    message(from = topic, to = recipient, label = "every subscriber receives the item")
+    message(from = recipient, to = recipient, label = "try to open with the own key, drop silently if not ours")
+    message(from = sender, to = relay, label = "again after 10 minutes, sealed afresh (until 48 h)")
+}
+----
+
+*Why not the alternatives.* IPNS over circuits would need pre-signed records and a new name space (see assumption D of wave D) and would put values with addresses into the DHT. Relays chosen by the recipient as mailboxes (option c of wave C) would need a new field in the service descriptor and make the recipient's relays targets. The chosen design reveals to a subscriber only "this node is in anonymity mode", which its public record shows anyway, and no third party sees sender or recipient.
+
+*The relay role.* `MAILBOX_PUBLISH` and `MAILBOX_PUBLISHED` are accepted only at the last hop of a circuit without another role. The body is exactly 720 bytes: `itemIndex(1) | fragIndex(1) | fragCount(1) = 8 | reserved(1) = 0 | data(716)`. At most 4 items per circuit, 10 items per minute per link and 60 per minute in total (counted when an item starts, before any payload byte is copied); a wrong length, a broken header, a wrong order or an item not completed within 15 seconds destroys the circuit. Only a rate limit is answered with a status; a circuit that continues after it is destroyed. The relay validator on the topic accepts only items of the exact size from an author that is a relay with a current descriptor (otherwise ignore, so a forwarder that is not yet synced is not penalised), ignores duplicates by SHA-256 and a budget of 10 per minute per author and 120 per minute in total.
+
+=== Refusals the user sees
+
+[cols="2,1,3", options="header"]
+|===
+| Code | HTTP | Meaning
+| `recipient-not-reachable-anonymously` | 503 | Unknown, not in anonymity mode, no DM service or no prekey bundle: one answer for all of them. No session is created.
+| `anonymity-not-ready` | 503 | No guards yet or the service host is not started (also before the runtime exists at start). No fallback.
+| `rate-limited` | 503 | Reserved: circuit builds are being throttled. Today an undeliverable online attempt is queued for the offline path instead, so the browser does not currently produce it.
+| `message-too-large-anonymous` | 413 | The content is larger than a sealed item (about 5.4 KB). Checked before anything is encrypted, so no half-sent state or phantom session exists.
+| `attachments-unavailable-anonymous` | 409 | Attachments are fetched from the sender's node, which would be a direct connection; refused before storage, cipher or session are touched, and a download of a blob that is not local is refused too.
+| `dm-send-failed` | 502 | Any other send failure, in both modes. The exception message (which names peers) is never passed on or logged.
+|===
+
+The refusal for the recipient happens before any session work, so a refused first contact leaves no session on the sender's side that the recipient never bootstrapped. A message that could not be delivered online is not re-encrypted for the offline path: the same envelope bytes are sealed, because a second encryption would turn the first message into a `TEXT` envelope that the recipient cannot open.
+
+=== Leak inventory after wave F1
+
+[cols="1,3,3", options="header"]
+|===
+| # | Place | Status in anonymity mode
+| 3, 4 | DM mailbox pointer in the DHT outbox, provider records | no pointer exists, nothing is offered to the outbox
+| new | the node's own direct-message mailbox topic | not subscribed; offline items arrive on the shared topic
+| new | the direct DM protocol `/lapis/dm/1.1.0` | not registered (a dial fails at protocol negotiation)
+| 13 | mail topic per recipient | unchanged until wave F2
+| call signalling | direct | not available in anonymity mode until wave G (refused up front, no ratchet step consumed); a call to a node in anonymity mode fails because no direct entry exists
+| call media | WebRTC | unchanged, not anonymisable by this design
+| 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged (transport key, wave J)
+|===
+
+=== Honest limits of wave F1
+
+* The recipient learns the sender's identity; only the network is blinded. Both ends must be in anonymity mode.
+* A small anonymity set, Sybil relays and a global passive observer are as in the threat model. Timing correlation is possible, including the pattern of the re-announcement; padding to the cell size is wave H. The fixed 5,728 bytes of the offline items are already uniform.
+* Spam on the shared topic can starve its budget (a denial of service limit, not a confidentiality problem). The relay sees that one circuit carried several items, but neither sender, recipient nor content. A relay that is also a subscriber sees every item that passes it, like everybody.
+* No per-peer limit exists on the receiving side (the peer is anonymous); the global and per-stream limits are what protects the node.
+* Offline delivery needs the sender to keep announcing; the queue is lost on a restart. The sender cannot tell whether an item was delivered, so it announces until the lifetime ends.
+* An item is sealed to the long-term X25519 identity key: no forward secrecy for the sender and recipient metadata of the sealing layer.
+* A call invitation over this path is rejected; calls to a node in anonymity mode fail until wave G.
+* One selector fix belongs to this wave: a remotely chosen last hop (an introduction point named by a descriptor) that equals the node's primary guard used to produce a path with the guard twice, which the circuit builder refuses. The circuit now enters through the backup guard in that case; without a backup the build reports "insufficient relays" and is retried later.
+* Not verified: real NATs and real networks (all tests use loopback nodes with an injected locator that gives each relay a synthetic /16), behaviour under load, an external cryptographic review of the sealing construction, and interoperability with v0.12.0 over the network.
+
+=== Assumptions awaiting confirmation (wave F1)
+
+* *Assumption, confirmation required:* the wave is one unit with ordered commits on one branch (not split into F1a online and F1b offline).
+* *Assumption, confirmation required:* the offline design is M (sealed items announced by relays on one shared topic), not IPNS over circuits and not recipient-chosen mailbox relays.
+* *Assumption, confirmation required:* the content size in anonymity mode is limited to what fits one sealed item (about 5.4 KB), online and offline alike, and `message-too-large-anonymous` is a fourth refusal code (the design team had fixed three).
+* *Assumption, confirmation required:* the sealing key is the X25519 identity key of the prekey bundle, not the (rotating) signed prekey.
+* *Assumption, confirmation required:* constants: re-announcement every 10 minutes plus or minus 2 minutes, offline lifetime 48 hours (not 7 days), at most 4 items per circuit, at most 256 pending items and 32 per recipient, topic budgets 120 per minute in total and 10 per relay author, at most 2 cached streams with 60 seconds idle, 30 seconds for one online delivery attempt, relay limits 10 items per minute per link and 60 in total, 15 seconds to assemble an item.
+* *Assumption, confirmation required:* attachments are refused in anonymity mode in this wave; whether they travel over circuits later (waves F2 or J) is open.
+* *Assumption, confirmation required:* call signalling is refused in anonymity mode until wave G, so a call from or to a node in anonymity mode fails.
+* *Assumption, confirmation required:* the browser banner text (current text of `ANONYMITY_INCOMPLETE_WARNING`) and the seven fixed lines of the status panel were written for this wave from the facts above; the design team's wording was not available to the implementation and should replace them if it differs.
+* *Assumption, confirmation required:* the digest of the prekey bundle in the anonymous record is not compared with the bundle found in the directory (a legitimate bundle refresh would make such a comparison fail spuriously).
 
 == Incentives and operation
 
@@ -742,6 +863,8 @@ Honest limits: zeroisation covers the arrays this code owns, not copies the JVM 
 
 Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServiceAddress`, `OnionServiceDescriptor` with its codec, the HPKE introduction, the end-to-end layer (`RendezvousEndToEnd`, `RendezvousHandshake`), the relay roles and splice inside `OnionRelay` (introduction table, rendezvous table, deferred cross-circuit work so that two circuit locks are never held at once) and the two pure state machines `OnionServiceStateMachine` and `RendezvousClientStateMachine`; to `lapis-net-directory`: `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip` and `OnionServiceDht`; to `lapis-net-onion-wire`: `OnionClientCircuit`/`OnionCircuitFactory`, `OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionPathProvider` and the `OnionWire` factories.
 
+Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and `lapis-net-onion-wire`: `OnionDmTransport`, `DmCircuitFraming`, `OnionDmInboundHandler`, `AnonymousMailboxRedelivery`, `AnonymousMailboxSubscriber`); to `lapis-net-dm`: `AnonymousDmTransport`, `DmInboundSink`, `DmRoute`, `DmAnonymousFailure` and `SealedMailboxItemCodec`; to `lapis-net-onion`: the `MAILBOX_PUBLISH` relay role (`MailboxPublishBody`); to `lapis-net-directory`: `AnonymousMailboxGossip`; to `lapis-net-onion-wire`: `MailboxPublishSink`, `OnionMailboxPublisher`, `OnionServiceStreamRouter` and the `AnonymityRuntime` methods used by the adapter.
+
 == Wave plan
 
 [cols="1,5"]
@@ -751,7 +874,8 @@ Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServi
 | C | Done (unreleased): receiver side: introduction points and rendezvous point (decision: option a, live traffic), onion service descriptors (index, gossip, DHT API), hosting and connecting over circuits, relay-side roles and splice. No user traffic, no path selection, no link to the Lapis identity.
 | D | Done (unreleased): directory anonymity: `AnonymousPeerRecord` (no address, no peer id, no binding) on its own gossip topic, `DirectoryAnonymityMode` with fail-closed suppression of every address-bearing publication, downgrade protection against replayed address records, mode-switch transition records, publication of the directory objects through a circuit (`DIRECTORY_PUBLISH`). No user traffic, no path selection, and the transport key is still bound to the identity (wave E).
 | E | Done (unreleased): path selection (Madli weighting, diversity, persistent guards), the client circuit policy, and the experimental option `--anonymity=on|off` (DCUtR and Identify off, conflicts with `--hole-punching` and `--onion-relay`), wired into the CLI node and the browser. Only the directory publication and the path selection are active; no user traffic is anonymised and the transport key is still the identity key.
-| F | DM online and offline over circuits; mail delivery moved off the per-recipient topic.
+| F1 | Done (unreleased): direct messages online and offline over circuits (rendezvous streams, sealed mailbox items announced by relays on one shared topic), new module `lapis-net-dm-onion`, new relay role `MAILBOX_PUBLISH`. No attachments, no fallback, mail and calls unchanged.
+| F2 | Mail delivery over circuits and off the per-recipient topic.
 | G | Call signals over circuits, with an honest note on the media path.
 | H | Padding and timing protection (DROP cell schedule), circuit pre-building.
 | I | Multi-node tests, Sybil simulation, external cryptographic review recommended.

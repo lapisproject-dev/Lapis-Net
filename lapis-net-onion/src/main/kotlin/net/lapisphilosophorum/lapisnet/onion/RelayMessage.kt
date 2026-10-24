@@ -32,6 +32,10 @@ enum class RelayCommand(
     // Directory publication through a circuit (wave V0.10.0-D): client to last hop, and its acknowledgement.
     DIRECTORY_PUBLISH(16),
     DIRECTORY_PUBLISHED(17),
+
+    // Sealed mailbox item publication through a circuit (wave V0.10.0-F1): client to last hop, and its acknowledgement.
+    MAILBOX_PUBLISH(18),
+    MAILBOX_PUBLISHED(19),
     ;
 
     companion object {

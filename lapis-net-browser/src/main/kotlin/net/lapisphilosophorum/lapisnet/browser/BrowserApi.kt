@@ -265,6 +265,8 @@ data class NodeStatusResponse(
     /** A fixed error code (`none`, `insufficient-relays`, `build-failed`, ...). */
     val lastAnonymityError: String = "none",
     val lastAnonymityErrorAgeSeconds: Long? = null,
+    /** Sends that found no anonymous way to the recipient since start (wave V0.10.0-F1); a number, no target. */
+    val recipientUnreachableCount: Long = 0,
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */

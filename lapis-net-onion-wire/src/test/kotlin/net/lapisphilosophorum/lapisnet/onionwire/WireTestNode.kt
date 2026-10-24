@@ -50,6 +50,7 @@ class WireTestNode(
     clock: Clock = Clock.systemUTC(),
     directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
     directorySink: DirectoryPublishSink? = null,
+    mailboxSink: MailboxPublishSink? = null,
 ) : AutoCloseable {
     val node: LapisNode = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
     val storage: NabuStorage =
@@ -74,6 +75,7 @@ class WireTestNode(
             clock,
             directoryMode,
             directorySink,
+            mailboxSinkOverride = mailboxSink,
         )
 
     fun connectTo(other: WireTestNode) {

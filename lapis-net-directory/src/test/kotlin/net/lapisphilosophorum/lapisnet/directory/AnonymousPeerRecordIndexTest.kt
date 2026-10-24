@@ -97,6 +97,6 @@ class AnonymousPeerRecordIndexTest :
             idx.add(r, now)
             idx.precheck(r, now) shouldBe AnonymousIngestOutcome.DUPLICATE
             idx.precheck(p.record(4), now) shouldBe AnonymousIngestOutcome.REPLAYED_OR_STALE
-            idx.precheck(p.record(6, expiresInSeconds = -1), now) shouldBe AnonymousIngestOutcome.EXPIRED
+            idx.precheck(p.record(6, expiresInSeconds = -1, now = now), now) shouldBe AnonymousIngestOutcome.EXPIRED
         }
     })

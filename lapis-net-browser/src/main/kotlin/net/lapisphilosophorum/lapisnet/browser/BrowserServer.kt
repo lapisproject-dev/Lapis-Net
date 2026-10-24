@@ -32,6 +32,11 @@ import net.lapisphilosophorum.lapisnet.dm.DmStore
 import net.lapisphilosophorum.lapisnet.dm.MailboxGossip
 import net.lapisphilosophorum.lapisnet.dm.MailboxPoller
 import net.lapisphilosophorum.lapisnet.dm.MailboxRedeliveryScheduler
+import net.lapisphilosophorum.lapisnet.dmonion.AnonymityRuntimePort
+import net.lapisphilosophorum.lapisnet.dmonion.AnonymousMailboxRedelivery
+import net.lapisphilosophorum.lapisnet.dmonion.AnonymousMailboxSubscriber
+import net.lapisphilosophorum.lapisnet.dmonion.OnionDmInboundHandler
+import net.lapisphilosophorum.lapisnet.dmonion.OnionDmTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
@@ -56,6 +61,7 @@ import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayAutoSelector
 import net.lapisphilosophorum.lapisnet.networking.relay.RelayConfig
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
+import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
@@ -175,7 +181,8 @@ class BrowserServer private constructor(
      * [PrekeyBundleGossip]/[MailboxGossip]/[DmSessionManager] teardown in [stop]. */
     private val peerDirectory: PeerDirectoryGossip,
     private val prekeyBundleGossip: PrekeyBundleGossip,
-    private val mailboxGossip: MailboxGossip,
+    /** `null` in anonymity mode: the own direct mailbox topic is deliberately NOT subscribed (wave V0.10.0-F1). */
+    private val mailboxGossip: MailboxGossip?,
     private val dmSessionManager: DmSessionManager,
     private val dmPrekeyStore: PrekeyStore,
     /** The single, once-resolved DM prekey-store passphrase for this server's entire lifetime -
@@ -244,7 +251,9 @@ class BrowserServer private constructor(
 
     internal val inboxDhtFetcherForTesting: InboxDhtFetcher? get() = inboxDhtFetcher
 
-    internal val mailboxGossipForTesting: MailboxGossip get() = mailboxGossip
+    internal val mailboxGossipForTesting: MailboxGossip get() = checkNotNull(mailboxGossip)
+
+    internal val mailboxGossipOrNullForTesting: MailboxGossip? get() = mailboxGossip
 
     internal val dmSessionManagerForTesting: DmSessionManager get() = dmSessionManager
 
@@ -364,7 +373,7 @@ class BrowserServer private constructor(
             // subscriptions/handles - exactly the failure mode this method's own doc comment
             // describes for httpEngine/node.stop().
             runCatching { dmSessionManager.stop() }
-            mailboxGossip.stop()
+            mailboxGossip?.stop()
             prekeyBundleGossip.stop()
             peerDirectory.stop()
             mailInbox.stop()
@@ -571,8 +580,12 @@ class BrowserServer private constructor(
                 val prekeyBundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
                 cleanupOnFailure += { runCatching { prekeyBundleGossip.stop() } }
                 val ownPublicKey = identity.secp256k1KeyPair.publicKey
-                val mailboxGossip = MailboxGossip.attach(pubsub, storage, ownPublicKey, acceptanceCheck)
-                cleanupOnFailure += { runCatching { mailboxGossip.stop() } }
+                // Anonymity mode (wave V0.10.0-F1): subscribing to the own mailbox topic would tie identity and IP
+                // together for every gossip neighbour, so it does not exist; offline items arrive on the shared topic.
+                val anonymousDm = wiring.anonymity == AnonymityMode.ON
+                val mailboxGossip =
+                    if (anonymousDm) null else MailboxGossip.attach(pubsub, storage, ownPublicKey, acceptanceCheck)
+                cleanupOnFailure += { runCatching { mailboxGossip?.stop() } }
                 // Resolved EXACTLY ONCE per start() call - not once per PrekeyStore file access. A
                 // prior revision of this code re-resolved via dmKeystorePassphraseSource() on every
                 // single provider.get() call, on the theory that a captured-then-zeroed local was
@@ -669,7 +682,8 @@ class BrowserServer private constructor(
                         // V0.9.15: the SAME DmAcceptanceCheck instance as MailboxGossip above (null while no gate is on).
                         acceptance = acceptanceCheck,
                         acceptedContacts = dmAcceptedContacts,
-                        dhtOutbox = dhtOutbox,
+                        dhtOutbox = if (anonymousDm) null else dhtOutbox,
+                        anonymous = anonymousDm,
                     )
                 cleanupOnFailure += { runCatching { dmSessionManager.stop() } }
                 dmSessionManager.addInboundListener { message -> dmStore.recordInbound(message) }
@@ -699,7 +713,13 @@ class BrowserServer private constructor(
                     // mailboxGossip.dhtConsumer(), i.e. the very same acceptance as the gossip validator;
                     // registerOutboxConsumer rejects a second registration, so there is no other way in.
                     supervisor.register("directory-dht") { logger.debug { "directory DHT detached" } }
-                    dht.registerOutboxConsumer(OutboxEntryKind.DM_MAILBOX_POINTER, mailboxGossip.dhtConsumer())
+                    // no direct mailbox pointers exist in anonymity mode, hence no consumer for them
+                    mailboxGossip?.let {
+                        dht.registerOutboxConsumer(
+                            OutboxEntryKind.DM_MAILBOX_POINTER,
+                            it.dhtConsumer(),
+                        )
+                    }
                     val fetcher = InboxDhtFetcher.attach(mailInbox, storage, peerDirectory, dht, ownPublicKey)
                     inboxDhtFetcher = fetcher
                     supervisor.register("inbox-dht-fetcher") { fetcher.stop() }
@@ -864,6 +884,32 @@ class BrowserServer private constructor(
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
                     supervisor.register("anonymity") { started.close() }
+                    // Direct messages over circuits (wave V0.10.0-F1). The DM manager was attached before the runtime
+                    // existed and refuses every send (anonymity-not-ready, no fallback) until the transport is
+                    // installed here. Registered after the runtime, so the supervisor stops it FIRST.
+                    val redelivery = AnonymousMailboxRedelivery(AnonymityRuntimePort(started))
+                    val dmTransport =
+                        OnionDmTransport(
+                            AnonymityRuntimePort(started),
+                            { id -> prekeyBundleGossip.lookup(id) },
+                            redelivery,
+                        )
+                    dmSessionManager.installAnonymousTransport(dmTransport)
+                    val dmInbound = OnionDmInboundHandler(dmSessionManager.inboundSink())
+                    started.serviceRouter().register(OnionServiceApp.DM, dmInbound::handle)
+                    val mailboxSubscriber =
+                        AnonymousMailboxSubscriber.attach(
+                            checkNotNull(started.mailboxGossip()),
+                            dmSessionManager.inboundSink(),
+                        )
+                    val stopDm = {
+                        runCatching { mailboxSubscriber.close() }
+                        runCatching { dmInbound.close() }
+                        runCatching { dmTransport.close() }
+                        Unit
+                    }
+                    cleanupOnFailure += stopDm
+                    supervisor.register("anonymity-dm") { stopDm() }
                     logger.warn { ANONYMITY_INCOMPLETE_WARNING }
                 }
 
@@ -878,7 +924,7 @@ class BrowserServer private constructor(
                         // single); the mail check goes to the inbox, which feeds gossip AND the DHT fetcher.
                         acceptance.refresh(
                             applyDm = { check ->
-                                mailboxGossip.updateAcceptanceCheck(check)
+                                mailboxGossip?.updateAcceptanceCheck(check)
                                 dmSessionManager.updateAcceptanceCheck(check)
                             },
                             applyMail = { check -> mailInbox.updateAcceptanceCheck(check) },
@@ -938,6 +984,7 @@ class BrowserServer private constructor(
                         activeCircuits = anonymityRuntime?.status()?.activeCircuits ?: 0,
                         lastAnonymityError = anonymityRuntime?.status()?.lastError?.wire ?: "none",
                         lastAnonymityErrorAgeSeconds = anonymityRuntime?.status()?.lastErrorAgeSeconds,
+                        recipientUnreachableCount = anonymityRuntime?.status()?.recipientUnreachableCount ?: 0,
                     )
                 }
                 val deps =

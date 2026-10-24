@@ -4,11 +4,13 @@ package net.lapisphilosophorum.lapisnet.onionwire.anonymity
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.directory.AnonymousCapability
+import net.lapisphilosophorum.lapisnet.directory.AnonymousMailboxGossip
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeStore
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition
 import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
+import net.lapisphilosophorum.lapisnet.directory.DirectoryReachability
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
@@ -23,7 +25,13 @@ import net.lapisphilosophorum.lapisnet.onionwire.CircuitAdmissionException
 import net.lapisphilosophorum.lapisnet.onionwire.CircuitPolicy
 import net.lapisphilosophorum.lapisnet.onionwire.OnionClientCircuit
 import net.lapisphilosophorum.lapisnet.onionwire.OnionDirectoryPublisher
+import net.lapisphilosophorum.lapisnet.onionwire.OnionMailboxPublisher
+import net.lapisphilosophorum.lapisnet.onionwire.OnionRendezvousClient
+import net.lapisphilosophorum.lapisnet.onionwire.OnionRendezvousStream
+import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
+import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceHello
 import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceHost
+import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceStreamRouter
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
 import net.lapisphilosophorum.lapisnet.onionwire.path.EncryptedFileGuardStateStore
@@ -43,7 +51,9 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
@@ -53,9 +63,11 @@ private val logger = KotlinLogging.logger {}
  * circuit-based directory publication of wave D, all started and stopped as one unit.
  *
  * **What it does:** the node publishes its directory presence (anonymous peer record, prekey bundle, service
- * descriptor) ONLY through circuits whose first hop is a persistent guard. **What it does NOT do:** direct messages,
- * mail and call signalling still use direct connections and reveal the IP address; the libp2p transport key is still
- * the identity key (see docs/anonymity.adoc). Hence [ANONYMITY_INCOMPLETE_WARNING] at every start.
+ * descriptor) ONLY through circuits whose first hop is a persistent guard, and (wave V0.10.0-F1) carries direct messages
+ * over rendezvous circuits and sealed mailbox items announced by relays. **What it does NOT do:** mail and call
+ * signalling still use direct connections and reveal the IP address; GossipSub, the DHT and fetches still show
+ * identity and IP; the libp2p transport key is still the identity key (see docs/anonymity.adoc). Hence
+ * [ANONYMITY_INCOMPLETE_WARNING] at every start.
  *
  * Lifecycle: `start` -> running -> [close]. [close] is idempotent, stops new circuit builds first, then closes the
  * publisher, the service host and every remaining circuit (each sends DESTROY), and releases the guard key. A `start`
@@ -73,13 +85,25 @@ class AnonymityRuntime private constructor(
     private val anonymousPublisher: AnonymousDirectoryPublisher,
     private val clock: Clock,
     private val lastError: AtomicReference<Pair<AnonymityErrorCode, Long>?>,
+    private val wire: OnionWire,
+    private val selector: OnionPathSelector,
+    private val paths: SelectingOnionPathProvider,
+    private val rendezvousClient: OnionRendezvousClient,
+    private val mailboxPublisher: OnionMailboxPublisher,
+    private val router: OnionServiceStreamRouter,
 ) : AutoCloseable {
     private val lifecycle = Any()
+
+    @Volatile internal var hostStarted = false
+    private val recipientUnreachable = AtomicLong(0)
     private var state = State.RUNNING
     private var maintenance: NodeServiceSupervisor.PeriodicJob? = null
     internal var maintenanceTick: () -> Unit = {}
 
     private enum class State { RUNNING, STOPPING, STOPPED }
+
+    /** Runs one maintenance round now (the supervisor does this every 30 s); safe to call from any thread. */
+    fun maintainNow() = maintenanceTick()
 
     internal fun attachMaintenance(job: NodeServiceSupervisor.PeriodicJob) {
         maintenance = job
@@ -97,7 +121,77 @@ class AnonymityRuntime private constructor(
             activeCircuits = governor.openCount(),
             lastError = e?.first ?: AnonymityErrorCode.NONE,
             lastErrorAgeSeconds = e?.let { ((clock.millis() - it.second) / 1000).coerceAtLeast(0) },
+            recipientUnreachableCount = recipientUnreachable.get(),
         )
+    }
+
+    /** The router that dispatches the streams reaching this node's onion service by application (wave V0.10.0-F1). */
+    fun serviceRouter(): OnionServiceStreamRouter = router
+
+    /** The shared anonymous mailbox topic; its consumer receives every validated sealed item. */
+    fun mailboxGossip(): AnonymousMailboxGossip? = wire.mailboxGossip
+
+    /** `true` while guards exist, the service host is started and nothing is shutting down. */
+    fun ready(): Boolean =
+        synchronized(lifecycle) { state == State.RUNNING } &&
+            hostStarted &&
+            !governor.isLocked() &&
+            guards.guardCount() > 0
+
+    /**
+     * Resolves [identity] over the mixed directory. The directory is built WITHOUT a DHT: a DHT lookup would tell the
+     * DHT neighbours, together with this node's IP address, whom it wants to reach.
+     */
+    fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability =
+        wire.anonymousDirectory().resolve(identity)
+
+    /**
+     * Opens a rendezvous stream to the onion service described by [descriptor] and sends the HELLO frame for [app].
+     * The rendezvous point is a path-selector endpoint; an endpoint that conflicts with the guard is replaced (at most
+     * [RENDEZVOUS_ENDPOINT_TRIES] times). Fails with the cause of the underlying build/rendezvous failure; a failed
+     * attempt is never retried here, the circuit governor's backoff applies.
+     */
+    fun connectToService(
+        descriptor: OnionServiceDescriptor,
+        app: OnionServiceApp,
+        timeout: Duration,
+    ): CompletableFuture<OnionRendezvousStream> {
+        if (!ready()) return CompletableFuture.failedFuture(InsufficientRelaysException())
+        val exclude = HashSet<Secp256k1PublicKey>()
+        var endpoint: OnionRelayDescriptor? = null
+        repeat(RENDEZVOUS_ENDPOINT_TRIES) {
+            if (endpoint != null) return@repeat
+            val candidate = selector.selectEndpoint(exclude) ?: return@repeat
+            try {
+                selector.select(candidate, lastHopChosenRemotely = false)
+                endpoint = candidate
+            } catch (e: PathConflictException) {
+                exclude += candidate.identity
+            }
+        }
+        val rendezvousPoint = endpoint ?: return CompletableFuture.failedFuture(InsufficientRelaysException())
+        return rendezvousClient
+            .connect(descriptor.address(), paths, rendezvousPoint, descriptor, timeout)
+            .thenCompose { stream ->
+                if (stream.send(OnionServiceHello.encode(app))) {
+                    CompletableFuture.completedFuture(stream)
+                } else {
+                    stream.close()
+                    CompletableFuture.failedFuture(IllegalStateException("could not send the service HELLO"))
+                }
+            }
+    }
+
+    /**
+     * Hands up to four sealed mailbox items to a relay through one circuit. Completes with `true` only after every item
+     * was acknowledged; there is no fallback to announcing from the own node.
+     */
+    fun publishMailboxItems(items: List<ByteArray>): CompletableFuture<Boolean> = mailboxPublisher.publishItems(items)
+
+    /** Counts a send that found no anonymous way to the recipient; keeps no target and records the coarse code. */
+    fun recordRecipientUnreachable() {
+        recipientUnreachable.incrementAndGet()
+        lastError.set(AnonymityErrorCode.RECIPIENT_UNREACHABLE to clock.millis())
     }
 
     /** Number of directory objects the publisher handed to circuits successfully (tests). */
@@ -113,6 +207,9 @@ class AnonymityRuntime private constructor(
         try {
             governor.lockdown()
             maintenance?.cancel()
+            runCatching { router.close() }
+            runCatching { rendezvousClient.close() }
+            runCatching { mailboxPublisher.close() }
             runCatching { anonymousPublisher.close() }
             runCatching { host.close() }
             runCatching { channel.close() }
@@ -134,6 +231,7 @@ class AnonymityRuntime private constructor(
         private val stopping = ConcurrentHashMap<Path, CountDownLatch>()
         private const val INTRO_POINTS = 3
         private const val PUBLISH_CANDIDATES = 3
+        private const val RENDEZVOUS_ENDPOINT_TRIES = 3
 
         /**
          * Starts anonymity mode on [wire], which must have been attached with [DirectoryAnonymityMode.ON].
@@ -235,6 +333,13 @@ class AnonymityRuntime private constructor(
                         recording,
                     )
                 closers += { host.close() }
+                val router = OnionServiceStreamRouter()
+                closers += { router.close() }
+                host.onConnection = router::route
+                val rendezvousClient = wire.experimentalRendezvousClient()
+                closers += { rendezvousClient.close() }
+                val mailboxPublisher = wire.experimentalMailboxPublisher(paths) { endpoints(PUBLISH_CANDIDATES) }
+                closers += { mailboxPublisher.close() }
                 val anonymousPublisher =
                     AnonymousDirectoryPublisher(
                         identity,
@@ -258,9 +363,14 @@ class AnonymityRuntime private constructor(
                         anonymousPublisher,
                         clock,
                         lastError,
+                        wire,
+                        selector,
+                        paths,
+                        rendezvousClient,
+                        mailboxPublisher,
+                        router,
                     )
 
-                var hostStarted = false
                 var publisherStarted = false
                 var lastPublications = 0
                 val maintenanceLock = Any()
@@ -272,14 +382,14 @@ class AnonymityRuntime private constructor(
                             runCatching { (h as OnionClientCircuit).close() }
                             governor.onClosed(h)
                         }
-                        if (!hostStarted) {
+                        if (!runtime.hostStarted) {
                             val intro = endpoints(INTRO_POINTS)
                             if (intro.size >= INTRO_POINTS) {
                                 host.start(intro)
-                                hostStarted = true
+                                runtime.hostStarted = true
                             }
                         }
-                        if (hostStarted && !publisherStarted) {
+                        if (runtime.hostStarted && !publisherStarted) {
                             anonymousPublisher.start()
                             publisherStarted = true
                         }

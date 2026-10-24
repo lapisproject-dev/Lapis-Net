@@ -11,6 +11,9 @@ enum class AnonymityErrorCode(
     RATE_LIMITED("rate-limited"),
     GUARD_STATE_RESET("guard-state-reset"),
     PUBLISH_FAILED("publish-failed"),
+
+    /** A send found no anonymous way to the recipient (a counter and this code only, never the recipient). */
+    RECIPIENT_UNREACHABLE("recipient-unreachable"),
 }
 
 /** Status of anonymity mode for the node status (CLI start line, browser panel). Enums and numbers only. */
@@ -23,6 +26,8 @@ data class AnonymityStatus(
     val activeCircuits: Int,
     val lastError: AnonymityErrorCode,
     val lastErrorAgeSeconds: Long?,
+    /** Sends that found no anonymous way to the recipient since start (a number, no target). */
+    val recipientUnreachableCount: Long = 0,
 ) {
     companion object {
         val OFF = AnonymityStatus("off", false, 0, 0, AnonymityErrorCode.NONE, null)
@@ -31,5 +36,6 @@ data class AnonymityStatus(
 
 /** Logged once at start and shown in the CLI and the browser whenever anonymity mode is on. */
 const val ANONYMITY_INCOMPLETE_WARNING: String =
-    "Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and " +
-        "reveal your IP address; only the directory publication and path selection are active."
+    "Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media " +
+        "still use direct connections and reveal your IP address, call signalling is not available, " +
+        "and the network mesh, DHT lookups and fetches still show your identity and address."

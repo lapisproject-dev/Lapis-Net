@@ -47,6 +47,8 @@ dependencies {
     // onion-wire depends on core, identity, onion, networking and directory only, so no cycle.
     implementation(project(":lapis-net-onion-wire"))
     implementation(project(":lapis-net-onion"))
+    // V0.10.0-F1 - direct messages over circuits (adapter between lapis-net-dm and lapis-net-onion-wire).
+    implementation(project(":lapis-net-dm-onion"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)

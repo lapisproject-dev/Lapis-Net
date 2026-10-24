@@ -81,6 +81,7 @@ class CircuitBuildGovernor(
     private fun isPool(purpose: CircuitPurpose?): Boolean =
         purpose == null ||
             purpose == CircuitPurpose.DIRECTORY_PUBLISH ||
+            purpose == CircuitPurpose.MAILBOX_PUBLISH ||
             purpose == CircuitPurpose.RENDEZVOUS_SENDER ||
             purpose == CircuitPurpose.INTRODUCE
 

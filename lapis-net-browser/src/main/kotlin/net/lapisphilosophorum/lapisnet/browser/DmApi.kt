@@ -15,6 +15,8 @@ import io.ktor.server.routing.post
 import kotlinx.serialization.Serializable
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.dm.DmAcceptedContacts
+import net.lapisphilosophorum.lapisnet.dm.DmAnonymousDeliveryException
+import net.lapisphilosophorum.lapisnet.dm.DmAnonymousFailure
 import net.lapisphilosophorum.lapisnet.dm.DmAttachmentCipher
 import net.lapisphilosophorum.lapisnet.dm.DmAttachmentFetcher
 import net.lapisphilosophorum.lapisnet.dm.DmAttachmentRef
@@ -22,6 +24,7 @@ import net.lapisphilosophorum.lapisnet.dm.DmContent
 import net.lapisphilosophorum.lapisnet.dm.DmContentCodec
 import net.lapisphilosophorum.lapisnet.dm.DmDeliveryState
 import net.lapisphilosophorum.lapisnet.dm.DmHistoryEntry
+import net.lapisphilosophorum.lapisnet.dm.DmRoute
 import net.lapisphilosophorum.lapisnet.dm.DmSendOutcome
 import net.lapisphilosophorum.lapisnet.dm.DmSessionException
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
@@ -87,6 +90,8 @@ data class DmMessageResponse(
     /** `null` for [DmHistoryEntry.Inbound] - mirrors [DmDeliveryState]'s own enum name for
      * `Outbound`. */
     val deliveryState: String?,
+    /** V0.10.0-F1: `"direct"` or `"circuit"`; the UI picks its delivery texts by it. */
+    val route: String = "direct",
 )
 
 @Serializable
@@ -114,6 +119,8 @@ data class NewDmRequest(
 @Serializable
 data class NewDmResponse(
     val deliveryState: String,
+    /** V0.10.0-F1: `"direct"` or `"circuit"`. */
+    val route: String = "direct",
 )
 
 @Serializable
@@ -168,7 +175,8 @@ class DmApiDependencies(
     val dmAcceptedContacts: DmAcceptedContacts,
 )
 
-private fun DmHistoryEntry.toResponse(): DmMessageResponse =
+/** [inboundRoute] is the route of this node's own mode: an anonymity-mode node receives over circuits only. */
+private fun DmHistoryEntry.toResponse(inboundRoute: DmRoute): DmMessageResponse =
     when (this) {
         is DmHistoryEntry.Inbound ->
             DmMessageResponse(
@@ -178,6 +186,7 @@ private fun DmHistoryEntry.toResponse(): DmMessageResponse =
                 epochSecond = epochSecond,
                 quarantined = quarantined,
                 deliveryState = null,
+                route = inboundRoute.wire,
             )
         is DmHistoryEntry.Outbound ->
             DmMessageResponse(
@@ -187,6 +196,7 @@ private fun DmHistoryEntry.toResponse(): DmMessageResponse =
                 epochSecond = epochSecond,
                 quarantined = false,
                 deliveryState = deliveryState.name,
+                route = route.wire,
             )
     }
 
@@ -199,6 +209,8 @@ internal fun Route.installDmRoutes(
     storage: NabuStorage,
     localPublicKey: Secp256k1PublicKey,
 ) {
+    val route = deps.dmSessionManager.routeMode()
+    val anonymous = route == DmRoute.CIRCUIT
     get("/api/dm") {
         val conversations =
             deps.dmStore.peers().mapNotNull { peer ->
@@ -206,7 +218,7 @@ internal fun Route.installDmRoutes(
                 DmConversationSummary(
                     peerPublicKeyHex = peer.bytes.toHexString(),
                     peerFingerprint = peer.fingerprint(),
-                    lastMessage = last.toResponse(),
+                    lastMessage = last.toResponse(route),
                     accepted = deps.dmAcceptedContacts.isAccepted(peer),
                 )
             }
@@ -219,7 +231,7 @@ internal fun Route.installDmRoutes(
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("peerHex must be a valid secp256k1 public key hex"))
             return@get
         }
-        call.respond(deps.dmStore.historyFor(peer).map { it.toResponse() })
+        call.respond(deps.dmStore.historyFor(peer).map { it.toResponse(route) })
     }
 
     post("/api/dm/{peerHex}") {
@@ -232,6 +244,13 @@ internal fun Route.installDmRoutes(
         // same DNS-rebinding / foreign-origin defence as /accept.
         if (!call.requireLoopbackRequest()) return@post
         val request = call.receive<NewDmRequest>()
+
+        // Anonymity mode: attachments are fetched from the sender's node, which would break the mode, so they are
+        // refused up front - before storage, cipher or any session is touched.
+        if (anonymous && request.attachments.isNotEmpty()) {
+            call.respond(HttpStatusCode.Conflict, ErrorResponse("attachments-unavailable-anonymous"))
+            return@post
+        }
 
         val bodyBytes = request.body.toByteArray(Charsets.UTF_8)
         if (bodyBytes.size > DmContentCodec.MAX_DM_BODY_BYTES) {
@@ -359,9 +378,21 @@ internal fun Route.installDmRoutes(
         val outcome =
             try {
                 deps.dmSessionManager.sendAuto(peer, content)
+            } catch (e: DmAnonymousDeliveryException) {
+                // Fixed codes only; never a cause chain, an address, a peer id or a fingerprint.
+                logger.debug { "anonymous DM send refused: ${e.failure.code}" }
+                val status =
+                    if (e.failure == DmAnonymousFailure.MESSAGE_TOO_LARGE) {
+                        HttpStatusCode.PayloadTooLarge
+                    } else {
+                        HttpStatusCode.ServiceUnavailable
+                    }
+                call.respond(status, ErrorResponse(e.failure.code))
+                return@post
             } catch (e: DmSessionException) {
-                logger.debug(e) { "DM send to ${peer.fingerprint()} failed" }
-                call.respond(HttpStatusCode.BadGateway, ErrorResponse("DM send failed: ${e.message}"))
+                // The message (which names peers) is never passed on to the client or logged.
+                logger.debug { "DM send failed (${e.javaClass.simpleName})" }
+                call.respond(HttpStatusCode.BadGateway, ErrorResponse("dm-send-failed"))
                 return@post
             }
 
@@ -370,8 +401,8 @@ internal fun Route.installDmRoutes(
                 DmSendOutcome.SENT_ONLINE -> DmDeliveryState.SENT
                 DmSendOutcome.QUEUED_FOR_PICKUP -> DmDeliveryState.QUEUED_FOR_PICKUP
             }
-        deps.dmStore.recordOutbound(peer, content, deliveryState)
-        call.respond(NewDmResponse(deliveryState.name))
+        deps.dmStore.recordOutbound(peer, content, deliveryState, route = route)
+        call.respond(NewDmResponse(deliveryState.name, route.wire))
     }
 
     post("/api/dm/{peerHex}/accept") {
@@ -425,6 +456,12 @@ internal fun Route.installDmRoutes(
             return@get
         }
 
+        // Anonymity mode: never ask the sender's node for the blob (that is a direct connection); a blob that is
+        // not already local is simply unavailable.
+        if (anonymous && storage.getLocal(foundRef.cid) == null) {
+            call.respond(HttpStatusCode.Conflict, ErrorResponse("attachments-unavailable-anonymous"))
+            return@get
+        }
         val plaintext =
             DmAttachmentFetcher.fetchAndDecrypt(foundRef, foundSender, deps.peerDirectory, storage)
         if (plaintext == null) {

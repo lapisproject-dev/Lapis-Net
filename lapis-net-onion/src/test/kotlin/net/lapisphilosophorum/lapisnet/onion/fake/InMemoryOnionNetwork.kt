@@ -64,6 +64,7 @@ class InMemoryOnionNetwork(
 
     /** DIRECTORY_PUBLISH objects handed to the host (wave V0.10.0-D). */
     val publishes = mutableListOf<PublishDelivered>()
+    val mailboxItems = mutableListOf<Pair<Long, ByteArray>>()
     val closed = mutableListOf<Closed>()
 
     private val peers = HashMap<Pair<Int, Long>, Peer>()
@@ -160,6 +161,7 @@ class InMemoryOnionNetwork(
                 is RelayAction.DeliverLocal -> delivered += Delivered(idx, a.circuitHandle, a.message)
                 is RelayAction.DeliverDirectoryPublish ->
                     publishes += PublishDelivered(idx, a.circuitHandle, a.type, a.objectBytes)
+                is RelayAction.DeliverMailboxItem -> mailboxItems += a.circuitHandle to a.itemBytes
                 is RelayAction.CircuitClosed -> closed += Closed(idx, a.circuitHandle, a.reason)
             }
         }

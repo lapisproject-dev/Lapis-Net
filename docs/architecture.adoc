@@ -113,6 +113,7 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   above)
 * `lapis-net-onion` — traffic-anonymisation foundation (wave V0.10.0-A, unreleased): cell format, ntor-style handshake, onion layers, a pure relay state machine, and (V0.10.0-B) the onion key ring for rotation; (V0.10.0-C) hidden-service roles and splice in the relay, onion addresses and descriptors, the HPKE introduction, the end-to-end layer and the two pure hidden-service state machines. Deliberately ZERO network/libp2p/Nabu dependencies; see `link:anonymity.adoc[anonymity.adoc]`
 * `lapis-net-onion-wire` — wire integration of the onion foundation (wave V0.10.0-B, unreleased): stream protocol `/lapis/onion/1.0.0`, link management, onion key file and rotation, relay service, quality tracker, diagnostic circuit client, and (V0.10.0-C) the onion service host, the rendezvous client and the rendezvous stream. Opt-in relay mode (`lapisnet node --onion-relay=true`) in the CLI only. Since wave V0.10.0-E the package `path` (selector, guards, circuit governor) and `anonymity` (`AnonymityRuntime`) add the experimental `--anonymity=on`, wired into the CLI node and the browser; this adds the dependency edge `lapis-net-browser` to `lapis-net-onion-wire` and `lapis-net-onion` (no cycle: onion-wire depends on core, identity, onion, networking and directory only). DM, mail and call are not wired and no user traffic is anonymised
+* `lapis-net-dm-onion` — direct messages over circuits (wave V0.10.0-F1, unreleased): the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed mailbox item format) and `lapis-net-onion-wire` (which knows nothing about direct messages). Contains `OnionDmTransport`, the rendezvous framing with a constant acknowledgement, the receiving handler, the re-announcement queue of sealed items and the subscriber of the shared mailbox topic. Neither of the two modules it joins may depend on the other, hence this module.
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-cli` — entry point / demo harness, including the multi-node trust-propagation demo
@@ -5616,6 +5617,10 @@ sequenceDiagram(name = "Directory mode transition OFF to ON to OFF") {
     message(from = node, to = others, label = "OFF: newer PeerRecord with addresses")
 }
 ----
+
+=== Direct messages over circuits (V0.10.0-F1, unreleased)
+
+Module boundary: `lapis-net-dm` has no dependency on any onion module; it owns the `AnonymousDmTransport` interface, `DmInboundSink` and `SealedMailboxItemCodec` (built only from identity and JCE primitives). `lapis-net-dm-onion` depends on `lapis-net-dm` and `lapis-net-onion-wire`. `lapis-net-onion` gained the `MAILBOX_PUBLISH` relay role (a pure state machine with a codec), `lapis-net-directory` the shared topic with its validator (`AnonymousMailboxGossip`) and `OnionRelayDescriptorIndex.byPeerId`, `lapis-net-onion-wire` the `MailboxPublishSink`, `OnionMailboxPublisher`, `OnionServiceStreamRouter` and the new `AnonymityRuntime` methods (`serviceRouter`, `resolveIdentity`, `connectToService`, `publishMailboxItems`, `ready`). The browser attaches `DmSessionManager` before the anonymity runtime exists, so the transport is installed afterwards and sends fail with `anonymity-not-ready` until then. Design, formats, limits and honest limits: `anonymity.adoc`, section "Direct messages over circuits".
 
 == Diagrams
 

@@ -332,6 +332,8 @@ class DmApiRoutingTest :
                             setBody(json.encodeToString(NewDmRequest(body = "hi")))
                         }
                     response.status shouldBe HttpStatusCode.BadGateway
+                    // the exception message (which names peers) is never passed on
+                    response.bodyAsText() shouldBe """{"error":"dm-send-failed"}"""
                 }
                 harness.dmStore.historyFor(peer).size shouldBe 0
             } finally {

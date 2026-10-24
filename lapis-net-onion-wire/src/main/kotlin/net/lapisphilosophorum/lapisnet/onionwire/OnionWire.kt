@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.onionwire
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.directory.AnonymousDirectory
+import net.lapisphilosophorum.lapisnet.directory.AnonymousMailboxGossip
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordGossip
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
@@ -51,6 +52,11 @@ class OnionWire private constructor(
     private val anonymousGossip: AnonymousPeerRecordGossip,
     /** The publication mode of the directory entries of THIS node; [DirectoryAnonymityMode.OFF] unless wave E wires it. */
     val directoryMode: DirectoryAnonymityMode,
+    /**
+     * The shared anonymous mailbox topic (wave V0.10.0-F1); `null` unless this node is a relay (it announces items) or
+     * in anonymity mode (it receives them). A node in the normal mode never subscribes to it.
+     */
+    val mailboxGossip: AnonymousMailboxGossip?,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val hidden = CopyOnWriteArrayList<AutoCloseable>()
@@ -156,6 +162,39 @@ class OnionWire private constructor(
         return publisher
     }
 
+    /**
+     * Publishes sealed mailbox items through circuits (wave V0.10.0-F1). [publishRelays] names the candidate last hops
+     * (anonymity mode passes path-selector endpoints); [paths] decides the path. Closed with this facade.
+     */
+    @ExperimentalOnionApi
+    fun experimentalMailboxPublisher(
+        paths: OnionPathProvider,
+        publishRelays: () -> List<OnionRelayDescriptor>,
+    ): OnionMailboxPublisher = mailboxPublisher(paths, publishRelays)
+
+    /** Test seam: like [experimentalMailboxPublisher] with the acknowledgement timeout and attempt limit adjustable. */
+    @ExperimentalOnionApi
+    internal fun mailboxPublisher(
+        paths: OnionPathProvider,
+        publishRelays: () -> List<OnionRelayDescriptor>,
+        ackTimeout: Duration = 15.seconds,
+        maxAttempts: Int = 3,
+    ): OnionMailboxPublisher {
+        check(!closed.get()) { "closed" }
+        val publisher =
+            OnionMailboxPublisher(
+                factory,
+                paths,
+                publishRelays,
+                ackTimeout = ackTimeout,
+                maxAttempts = maxAttempts,
+                clock = clock,
+            )
+        hidden += publisher
+        publisher.onClosed = { hidden.remove(publisher) }
+        return publisher
+    }
+
     /** Resolution over the mixed directory (anonymous and address-bearing entries); no caller is wired to it yet. */
     fun anonymousDirectory(): AnonymousDirectory =
         AnonymousDirectory(peerDirectory, serviceDescriptors, null) { clock.instant() }
@@ -192,6 +231,7 @@ class OnionWire private constructor(
         hidden.forEach { runCatching { it.close() } }
         if (factoryHolder.isInitialized()) runCatching { factory.close() }
         runCatching { relayService?.close() }
+        runCatching { mailboxGossip?.stop() }
         runCatching { serviceGossip.stop() }
         runCatching { anonymousGossip.stop() }
         runCatching { descriptorGossip.stop() }
@@ -212,6 +252,7 @@ class OnionWire private constructor(
             directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
             directorySinkOverride: DirectoryPublishSink? = null,
             prekeys: PrekeyBundleGossip? = null,
+            mailboxSinkOverride: MailboxPublishSink? = null,
         ): OnionWire {
             // A relay descriptor binds identity, peer ID and dialability publicly: a node can not be both (wave V0.10.0-D).
             require(!(directoryMode == DirectoryAnonymityMode.ON && config.relayMode)) {
@@ -224,6 +265,12 @@ class OnionWire private constructor(
             val anonymousGossip = AnonymousPeerRecordGossip.attach(pubsub, peerDirectory.anonymousRecords, clock)
             val links = OnionLinkManager(config, node, clock)
             var service: OnionRelayService? = null
+            val mailboxGossip =
+                if (config.relayMode || directoryMode == DirectoryAnonymityMode.ON) {
+                    AnonymousMailboxGossip.attach(pubsub, index, clock)
+                } else {
+                    null
+                }
             try {
                 if (config.relayMode) {
                     val store = OnionKeyStore(keyFile, identity, keystorePassphrase, clock)
@@ -248,6 +295,9 @@ class OnionWire private constructor(
                                         clock,
                                         prekeys,
                                     ),
+                            mailboxSink =
+                                mailboxSinkOverride
+                                    ?: mailboxGossip?.let { GossipMailboxPublishSink(it) },
                             clock = clock,
                         )
                 } else {
@@ -264,8 +314,10 @@ class OnionWire private constructor(
                     serviceGossip,
                     anonymousGossip,
                     directoryMode,
+                    mailboxGossip,
                 )
             } catch (e: Exception) {
+                runCatching { mailboxGossip?.stop() }
                 runCatching { service?.close() }
                 runCatching { anonymousGossip.stop() }
                 runCatching { serviceGossip.stop() }

@@ -132,7 +132,7 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections and reveal your IP address; only the directory publication and path selection are active.";
+  "Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -140,7 +140,17 @@ const ANONYMITY_ERROR_LABELS = {
   "rate-limited": "circuit builds are being rate limited",
   "guard-state-reset": "the saved guards were lost and new ones were chosen",
   "publish-failed": "the directory entry could not be published",
+  "recipient-unreachable": "a recipient could not be reached anonymously",
 };
+// The seven fixed lines of the anonymity status (wave V0.10.0-F1). Fixed text only; the two counts are numbers.
+const ANONYMITY_STATUS_LINES = [
+  "Directory entries: published through circuits",
+  "Direct messages: over circuits (no attachments)",
+  "Mail: direct connection, your IP address is visible",
+  "Call signalling: not available in anonymity mode",
+  "Call media: direct connection, your IP address is visible",
+  "Network mesh, DHT and fetches: direct, identity and address are visible",
+];
 
 function renderAnonymityStatus(status) {
   const warning = document.getElementById("anonymity-warning");
@@ -149,9 +159,17 @@ function renderAnonymityStatus(status) {
   const on = status.anonymityMode === "on";
   warning.hidden = !on;
   warning.textContent = on ? ANONYMITY_WARNING_TEXT : "";
-  line.textContent = on
-    ? "on (experimental) - " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)"
-    : "off";
+  line.textContent = "";
+  const lines = on
+    ? ANONYMITY_STATUS_LINES.concat([
+        "On (experimental): " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)",
+      ])
+    : ["off"];
+  for (const text of lines) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    line.appendChild(item);
+  }
   const code = status.lastAnonymityError;
   errorLine.textContent =
     on && code && code !== "none"

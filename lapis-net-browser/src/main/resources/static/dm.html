@@ -47,6 +47,10 @@
   #dm-compose-attachments { display: flex; flex-direction: column; gap: 0.4rem; }
   .dm-attachment-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   #dm-compose-status { font-size: 0.85rem; color: var(--muted); }
+  #dm-anonymity-notice { margin: 0; padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; }
+  #dm-anonymity-notice[hidden], #dm-attachment-note[hidden] { display: none; }
+  #dm-attachment-note { font-size: 0.85rem; color: var(--muted); }
+  .dm-attachment-plain { font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -90,10 +94,12 @@
     </div>
     <ul id="dm-message-list"></ul>
     <form id="dm-compose-form">
+      <p id="dm-anonymity-notice" role="status" hidden></p>
       <textarea id="dm-compose-body" placeholder="Message"></textarea>
       <div id="dm-compose-attachments">
         <div id="dm-compose-attachment-rows"></div>
         <button type="button" id="dm-add-attachment" class="btn-secondary">Add attachment</button>
+        <span id="dm-attachment-note" hidden></span>
       </div>
       <button type="submit" id="dm-compose-submit">Send</button>
       <span id="dm-compose-status"></span>

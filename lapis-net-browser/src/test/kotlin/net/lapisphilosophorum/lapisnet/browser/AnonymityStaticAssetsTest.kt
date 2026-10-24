@@ -4,6 +4,7 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
 
 private fun resource(name: String): String =
     AnonymityStaticAssetsTest::class.java
@@ -14,9 +15,8 @@ private fun resource(name: String): String =
 /** The browser UI shows the incomplete-anonymity notice with fixed text, through textContent only. */
 class AnonymityStaticAssetsTest :
     FunSpec({
-        val warning =
-            "Anonymity mode is incomplete: direct messages, mail and call signalling still use direct connections " +
-                "and reveal your IP address; only the directory publication and path selection are active."
+        // the very constant the log, the CLI and the status use: the browser text must be character-identical
+        val warning = ANONYMITY_INCOMPLETE_WARNING
 
         test("app.js carries the exact warning text and writes the anonymity status through textContent only") {
             val js = resource("app.js")
@@ -49,5 +49,50 @@ class AnonymityStaticAssetsTest :
             }
             css shouldContain "#anonymity-warning"
             css shouldContain "@media (prefers-color-scheme: light)"
+        }
+
+        test("the node status shows seven fixed anonymity lines, written as list items through textContent") {
+            val js = resource("app.js")
+            js shouldContain "ANONYMITY_STATUS_LINES"
+            val lines =
+                js.substring(
+                    js.indexOf("const ANONYMITY_STATUS_LINES"),
+                    js.indexOf("];", js.indexOf("const ANONYMITY_STATUS_LINES")),
+                )
+            // six fixed lines plus the seventh, built from two numbers
+            Regex("\"[A-Z][^\"]*\"").findAll(lines).count() shouldBe 6
+            val fn = js.substring(js.indexOf("function renderAnonymityStatus"), js.indexOf("// V0.9.15 status panel."))
+            fn shouldContain "item.textContent"
+            fn shouldNotContain "innerHTML"
+            js shouldContain "\"recipient-unreachable\""
+        }
+
+        test("dm.js maps error codes to fixed texts, never shows the server's text, and disables attachments") {
+            val js = resource("dm.js")
+            for (
+            code in
+            listOf(
+                "recipient-not-reachable-anonymously",
+                "anonymity-not-ready",
+                "rate-limited",
+                "message-too-large-anonymous",
+                "attachments-unavailable-anonymous",
+                "dm-send-failed",
+            )
+            ) {
+                js shouldContain "\"$code\""
+            }
+            js shouldContain "dmErrorText(error)"
+            js shouldContain "addAttachmentButton.disabled = true"
+            js shouldContain "DM_ANONYMITY_NOTICE"
+            js
+                .lines()
+                .filterNot { it.trimStart().let { l -> l.startsWith("//") || l.startsWith("/*") || l.startsWith("*") } }
+                .joinToString("\n") shouldNotContain "innerHTML"
+            val html = resource("dm.html")
+            html shouldContain "id=\"dm-anonymity-notice\" role=\"status\""
+            html shouldNotContain "dm-anonymity-notice-close"
+            // the notice sits above the input field and has no button inside it
+            (html.indexOf("id=\"dm-anonymity-notice\"") < html.indexOf("id=\"dm-compose-body\"")) shouldBe true
         }
     })

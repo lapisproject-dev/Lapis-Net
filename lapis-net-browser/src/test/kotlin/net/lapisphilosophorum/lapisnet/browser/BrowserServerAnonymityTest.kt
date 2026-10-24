@@ -2,6 +2,7 @@
 
 package net.lapisphilosophorum.lapisnet.browser
 
+import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
@@ -12,6 +13,10 @@ import kotlinx.serialization.json.Json
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeState
 import net.lapisphilosophorum.lapisnet.directory.FileDirectoryModeStore
+import net.lapisphilosophorum.lapisnet.dm.DmAnonymousDeliveryException
+import net.lapisphilosophorum.lapisnet.dm.DmAnonymousFailure
+import net.lapisphilosophorum.lapisnet.dm.DmContent
+import net.lapisphilosophorum.lapisnet.dm.DmRoute
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
@@ -46,6 +51,9 @@ class BrowserServerAnonymityTest :
                 parsed.activeCircuits shouldBe 0
                 parsed.lastAnonymityError shouldBe "none"
                 server.anonymityRuntimeForTesting.shouldBeNull()
+                // normal mode: the direct DM path with the own mailbox topic, exactly as before
+                server.mailboxGossipOrNullForTesting.shouldNotBeNull()
+                server.dmSessionManagerForTesting.routeMode() shouldBe DmRoute.DIRECT
                 server.anonymityStatus().mode shouldBe "off"
                 onionThreads() shouldBe emptyList()
                 FileDirectoryModeStore(dir.resolve("directory-mode.state")).load().shouldNotBeNull().mode shouldBe
@@ -91,6 +99,18 @@ class BrowserServerAnonymityTest :
             try {
                 val port = server.boundPort
                 server.anonymityRuntimeForTesting.shouldNotBeNull()
+                // the own direct mailbox topic is NOT subscribed and sends use circuits only; until the runtime is
+                // ready a send is refused (no fallback to a direct connection)
+                server.mailboxGossipOrNullForTesting.shouldBeNull()
+                server.dmSessionManagerForTesting.routeMode() shouldBe DmRoute.CIRCUIT
+                val refused =
+                    shouldThrow<DmAnonymousDeliveryException> {
+                        server.dmSessionManagerForTesting.sendAuto(
+                            DualKeyIdentity.generate().secp256k1KeyPair.publicKey,
+                            DmContent(body = "no route yet"),
+                        )
+                    }
+                refused.failure shouldBe DmAnonymousFailure.ANONYMITY_NOT_READY
                 // the periodic maintenance runs once after a second; loopback has no relay at all
                 var parsed: NodeStatusResponse
                 var body: String

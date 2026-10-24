@@ -58,6 +58,18 @@ sealed interface RelayAction {
         override fun toString(): String = "DeliverDirectoryPublish(type=$type)"
     }
 
+    /**
+     * A complete sealed mailbox item arrived at this relay (wave V0.10.0-F1). The host announces [itemBytes]
+     * on the shared mailbox topic and answers through [OnionRelay.reply] with a MAILBOX_PUBLISHED message.
+     * The relay cannot read the item and it is never logged.
+     */
+    class DeliverMailboxItem(
+        val circuitHandle: Long,
+        val itemBytes: ByteArray,
+    ) : RelayAction {
+        override fun toString(): String = "DeliverMailboxItem(length=${itemBytes.size})"
+    }
+
     /** The circuit identified by [circuitHandle] is gone. */
     data class CircuitClosed(
         val circuitHandle: Long,
@@ -74,7 +86,15 @@ private enum class Notify { PREV, NEXT, BOTH, NONE }
 
 /** The hidden-service role of a circuit at THIS relay (last hop only). `NONE -> INTRO | INTRODUCING |
  * RENDEZVOUS_WAITING -> SPLICED -> closed`; a circuit has at most one role for its whole life. */
-private enum class CircuitRole { NONE, INTRO, INTRODUCING, RENDEZVOUS_WAITING, SPLICED, DIRECTORY_PUBLISHING }
+private enum class CircuitRole {
+    NONE,
+    INTRO,
+    INTRODUCING,
+    RENDEZVOUS_WAITING,
+    SPLICED,
+    DIRECTORY_PUBLISHING,
+    MAILBOX_PUBLISHING,
+}
 
 private class RelayCircuit(
     val handle: Long,
@@ -102,6 +122,13 @@ private class RelayCircuit(
     var pendingExtend: ExtendPayload? = null
     var closed = false
     var directoryPublishes = 0
+
+    // Mailbox item reassembly (wave V0.10.0-F1); guarded by [lock].
+    var mailboxItemsDone = 0
+    var mailboxBuffer: ByteArray? = null
+    var mailboxNextFragment = 0
+    var mailboxStartedMillis = 0L
+    var mailboxBlocked = false
 }
 
 /**
@@ -153,6 +180,8 @@ class OnionRelay(
     private val splicedPairs = AtomicInteger(0)
     private val globalPublishCounter = WindowCounter(limits.directoryPublishGlobalPerMinute, clock)
     private val linkPublishCounters = ConcurrentHashMap<Long, WindowCounter>()
+    private val globalMailboxCounter = WindowCounter(limits.mailboxPublishGlobalPerMinute, clock)
+    private val linkMailboxCounters = ConcurrentHashMap<Long, WindowCounter>()
 
     // Work that must run OUTSIDE every circuit lock (never hold two circuit locks at once): collected while a
     // lock is held, executed by the public entry points after all locks are released.
@@ -284,6 +313,9 @@ class OnionRelay(
 
     fun onLinkClosed(link: LinkId): List<RelayAction> = entry { onLinkClosedInternal(link) }
 
+    /** Number of links with a live mailbox-publish rate counter; for tests of the per-link cleanup. */
+    internal fun mailboxCounterLinkCount(): Int = linkMailboxCounters.size
+
     private fun onLinkClosedInternal(link: LinkId): List<RelayAction> {
         val out = ArrayList<RelayAction>()
         for (c in byHandle.values.toList()) {
@@ -299,6 +331,7 @@ class OnionRelay(
         perLink.remove(link.value)
         linkCreateBuckets.remove(link.value)
         linkPublishCounters.remove(link.value)
+        linkMailboxCounters.remove(link.value)
         return out
     }
 
@@ -364,10 +397,16 @@ class OnionRelay(
             val now = clock.millis()
             val maxAge = limits.circuitMaxLifetime.inWholeMilliseconds
             val maxWait = limits.rendezvousWaitTimeout.inWholeMilliseconds
+            val maxAssemble = limits.mailboxAssembleTimeout.inWholeMilliseconds
             val out = ArrayList<RelayAction>()
             for (c in byHandle.values.toList()) {
                 if (now - c.createdAtMillis >= maxAge ||
-                    (c.role == CircuitRole.RENDEZVOUS_WAITING && now - c.waitingSinceMillis >= maxWait)
+                    (c.role == CircuitRole.RENDEZVOUS_WAITING && now - c.waitingSinceMillis >= maxWait) ||
+                    (
+                        c.role == CircuitRole.MAILBOX_PUBLISHING &&
+                            c.mailboxBuffer != null &&
+                            now - c.mailboxStartedMillis > maxAssemble
+                    )
                 ) {
                     out += teardown(c, DestroyReason.FINISHED, Notify.BOTH)
                 }
@@ -576,6 +615,7 @@ class OnionRelay(
             RelayCommand.RENDEZVOUS1 -> handleRendezvous1(c, msg)
             RelayCommand.RENDEZVOUS_DATA -> handleRendezvousData(c, msg)
             RelayCommand.DIRECTORY_PUBLISH -> handleDirectoryPublish(c, msg)
+            RelayCommand.MAILBOX_PUBLISH -> handleMailboxPublish(c, msg)
             // Replies and forwarded messages never arrive "locally" at a relay.
             RelayCommand.INTRO_ESTABLISHED,
             RelayCommand.INTRODUCE2,
@@ -583,6 +623,7 @@ class OnionRelay(
             RelayCommand.RENDEZVOUS_ESTABLISHED,
             RelayCommand.RENDEZVOUS2,
             RelayCommand.DIRECTORY_PUBLISHED,
+            RelayCommand.MAILBOX_PUBLISHED,
             -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
         }
 
@@ -746,6 +787,78 @@ class OnionRelay(
                 return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
             }
         return listOf(RelayAction.DeliverDirectoryPublish(c.handle, request.type, request.objectBytes))
+    }
+
+    /**
+     * Sealed mailbox item publication (wave V0.10.0-F1): accepted only at the last hop of a circuit with no other
+     * role. An item arrives as exactly eight consecutive fragments of 716 bytes; at most `mailboxPublishPerCircuit`
+     * items per circuit. The body length is checked first, then the four header bytes; the per-link and global
+     * rate limits are applied when an item STARTS, before any payload byte is copied. A wrong length, a broken
+     * header, a wrong item or fragment order, a timeout (`mailboxAssembleTimeout`) or any traffic after a refusal
+     * destroys the circuit. Only a rate limit is answered with a status, so the answer is no oracle for the item.
+     */
+    private fun handleMailboxPublish(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (c.role == CircuitRole.NONE) {
+            if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        } else if (c.role != CircuitRole.MAILBOX_PUBLISHING) {
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        c.role = CircuitRole.MAILBOX_PUBLISHING
+        if (c.mailboxBlocked) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        val data = msg.data
+        val header =
+            try {
+                MailboxPublishBody.decodeHeader(data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        val now = clock.millis()
+        if (header.fragIndex == 0) {
+            if (c.mailboxBuffer != null || header.itemIndex != c.mailboxItemsDone) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+            if (c.mailboxItemsDone >= limits.mailboxPublishPerCircuit) {
+                return teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+            }
+            val linkCounter =
+                linkMailboxCounters.computeIfAbsent(c.prevLink.value) {
+                    WindowCounter(limits.mailboxPublishPerLinkPerMinute, clock)
+                }
+            if (!linkCounter.tryAcquire() || !globalMailboxCounter.tryAcquire()) {
+                logger.debug { "mailbox publish refused: rate limit" }
+                c.mailboxBlocked = true
+                return sendBackward(
+                    c,
+                    RelayMessage(
+                        RelayCommand.MAILBOX_PUBLISHED,
+                        0,
+                        StatusBody.encode(MailboxPublishStatus.RATE_LIMITED),
+                    ),
+                )
+            }
+            c.mailboxBuffer = ByteArray(MailboxPublishBody.ITEM_SIZE)
+            c.mailboxNextFragment = 0
+            c.mailboxStartedMillis = now
+        }
+        val buffer = c.mailboxBuffer
+        if (buffer == null ||
+            header.itemIndex != c.mailboxItemsDone ||
+            header.fragIndex != c.mailboxNextFragment ||
+            now - c.mailboxStartedMillis > limits.mailboxAssembleTimeout.inWholeMilliseconds
+        ) {
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        MailboxPublishBody
+            .fragmentOf(data)
+            .copyInto(buffer, header.fragIndex * MailboxPublishBody.FRAGMENT_SIZE)
+        c.mailboxNextFragment++
+        if (c.mailboxNextFragment < MailboxPublishBody.FRAGMENT_COUNT) return emptyList()
+        c.mailboxBuffer = null
+        c.mailboxItemsDone++
+        return listOf(RelayAction.DeliverMailboxItem(c.handle, buffer))
     }
 
     private fun handleExtend(

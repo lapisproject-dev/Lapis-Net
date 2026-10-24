@@ -39,6 +39,8 @@ sealed class DmHistoryEntry {
         override val content: DmContent,
         override val epochSecond: Long,
         val deliveryState: DmDeliveryState,
+        /** V0.10.0-F1: which transport carried the message ([DmRoute.CIRCUIT] in anonymity mode). */
+        val route: DmRoute = DmRoute.DIRECT,
     ) : DmHistoryEntry()
 }
 
@@ -91,8 +93,9 @@ class DmStore(
         content: DmContent,
         deliveryState: DmDeliveryState,
         epochSecond: Long = Instant.now().epochSecond,
+        route: DmRoute = DmRoute.DIRECT,
     ) {
-        record(DmHistoryEntry.Outbound(peer, content, epochSecond, deliveryState))
+        record(DmHistoryEntry.Outbound(peer, content, epochSecond, deliveryState, route))
     }
 
     private fun record(entry: DmHistoryEntry) {

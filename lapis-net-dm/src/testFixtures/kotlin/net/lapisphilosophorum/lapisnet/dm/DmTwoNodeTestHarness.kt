@@ -94,6 +94,8 @@ fun buildDmTestNode(
     acceptedContacts: DmAcceptedContacts? = null,
     // V0.9.14 - null (the default) preserves every prior test's gossip-only behavior exactly.
     dhtOutbox: DhtOutbox? = null,
+    // V0.10.0-F1 - anonymity-mode manager (no DmProtocol, no poller); default keeps every prior test unchanged.
+    anonymous: Boolean = false,
 ): DmTestNode {
     val node = LapisNode.create(identity)
     node.start(bootstrapPeers = emptyList())
@@ -130,6 +132,7 @@ fun buildDmTestNode(
             acceptance = acceptance,
             acceptedContacts = acceptedContacts,
             dhtOutbox = dhtOutbox,
+            anonymous = anonymous,
         )
     return DmTestNode(
         identity,

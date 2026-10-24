@@ -214,6 +214,13 @@ class OnionPathSelectorDiversityTest :
                 val self = f.selector.select(guardDescriptor, lastHopChosenRemotely = true).hops()
                 self shouldHaveSize 3
                 self.last().identity shouldBe guardId
+                // a relay never appears twice: the circuit enters through the backup guard instead
+                self.map { it.identity }.toSet() shouldHaveSize 3
+                self.first().identity shouldBe
+                    f.guards
+                        .snapshot()
+                        .backup!!
+                        .identity
             }
         }
 

@@ -252,8 +252,113 @@ class DmSessionManager private constructor(
      * [net.lapisphilosophorum.lapisnet.directory.DhtOutbox]). `null` (the default) keeps every prior wave's
      * behavior: pointers travel by gossip only. */
     private val dhtOutbox: DhtOutbox?,
+    /** V0.10.0-F1 - anonymity-mode flag, fixed for the lifetime of this manager (never toggled at
+     * runtime). When `true` there is no [DmProtocol], no [MailboxPoller] and no direct mailbox
+     * pointers: every send goes through the [AnonymousDmTransport] installed via
+     * [installAnonymousTransport], and the only inbound doors are [inboundSink]'s two methods. */
+    private val anonymous: Boolean,
 ) {
     private lateinit var dmProtocol: DmProtocol
+
+    @Volatile
+    private var anonymousTransport: AnonymousDmTransport? = null
+
+    /** Identity text for logs and exception messages: the short fingerprint in direct mode, nothing in anonymity mode. */
+    private fun who(peer: Secp256k1PublicKey): String = if (anonymous) "<peer>" else peer.fingerprint()
+
+    /** The route this manager's sends take; fixed at [attach] time. */
+    fun routeMode(): DmRoute = if (anonymous) DmRoute.CIRCUIT else DmRoute.DIRECT
+
+    /**
+     * V0.10.0-F1: installs the anonymity transport exactly once. Anonymity-mode managers exist before
+     * the anonymity runtime has started (the browser attaches the manager first), so until this is
+     * called every send fails with `anonymity-not-ready` and never falls back to the direct path.
+     */
+    fun installAnonymousTransport(transport: AnonymousDmTransport) {
+        check(anonymous) { "anonymous transport requires an anonymity-mode manager" }
+        check(anonymousTransport == null) { "anonymous transport already installed" }
+        anonymousTransport = transport
+    }
+
+    /** V0.10.0-F1: the two inbound doors of an anonymity-mode manager (see [DmInboundSink]). */
+    fun inboundSink(): DmInboundSink {
+        check(anonymous) { "inbound sink is only available in anonymity mode" }
+        return inboundSinkImpl
+    }
+
+    private val inboundSinkImpl =
+        object : DmInboundSink {
+            override fun acceptCircuitEnvelope(envelopeBytes: ByteArray) {
+                try {
+                    val envelope = DmEnvelopeCodec.decode(envelopeBytes)
+                    dispatchAnonymousInbound(envelope, "circuit")
+                } catch (e: MalformedDmEnvelopeException) {
+                    logger.debug { "rejected malformed DM envelope from a circuit" }
+                } catch (e: RuntimeException) {
+                    logger.warn { "unexpected failure on the circuit DM path - rejecting (${e::class.simpleName})" }
+                }
+            }
+
+            override fun acceptSealedMailboxItem(itemBytes: ByteArray) {
+                var privateKey: net.lapisphilosophorum.lapisnet.identity.X25519PrivateKey? = null
+                try {
+                    privateKey = localPrekeyStore.x25519IdentityPrivateKey()
+                    val envelope =
+                        SealedMailboxItemCodec.open(itemBytes, privateKey, Instant.now().epochSecond) ?: return
+                    dispatchAnonymousInbound(envelope, "anonymous mailbox")
+                } catch (e: RuntimeException) {
+                    logger.warn {
+                        "unexpected failure on the anonymous mailbox path - rejecting (${e::class.simpleName})"
+                    }
+                } finally {
+                    privateKey?.destroy()
+                }
+            }
+        }
+
+    /** The single anonymity-mode funnel into the shared inbound core. `onlinePeerId` is always `null`:
+     * no libp2p context exists on this path, and no call reply route may be issued for it. */
+    private fun dispatchAnonymousInbound(
+        envelope: DmEnvelope,
+        sourceDescription: String,
+    ) {
+        if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
+            logger.debug { "call signal arrived over the anonymity path - rejected (calls are not routed here yet)" }
+            return
+        }
+        processInboundDmEnvelope(envelope, sourceDescription, null)
+    }
+
+    /** Pre-session refusal checks of an anonymity-mode send; returns the resolved target. */
+    private fun resolveAnonymousTarget(
+        recipient: Secp256k1PublicKey,
+        plaintext: ByteArray,
+    ): Pair<AnonymousDmTransport, AnonymousDmTarget> {
+        if (plaintext.size + SealedMailboxItemCodec.ENVELOPE_OVERHEAD_BYTES >
+            SealedMailboxItemCodec.MAX_ENVELOPE_BYTES
+        ) {
+            throw DmAnonymousDeliveryException(DmAnonymousFailure.MESSAGE_TOO_LARGE)
+        }
+        val transport =
+            anonymousTransport ?: throw DmAnonymousDeliveryException(DmAnonymousFailure.ANONYMITY_NOT_READY)
+        return transport to transport.resolve(recipient)
+    }
+
+    private fun sendAnonymousAutoLocked(
+        recipient: Secp256k1PublicKey,
+        plaintext: ByteArray,
+    ): DmSendOutcome {
+        // Every refusal happens BEFORE prepareEnvelopeLocked: a failure here must not leave a session.
+        val (transport, target) = resolveAnonymousTarget(recipient, plaintext)
+        val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+        if (target.online &&
+            transport.deliverOnline(target, envelopeBytes, Instant.now().plus(ANONYMOUS_SEND_DEADLINE))
+        ) {
+            return DmSendOutcome.SENT_ONLINE
+        }
+        transport.depositOffline(target, envelopeBytes, Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS)
+        return DmSendOutcome.QUEUED_FOR_PICKUP
+    }
 
     /** V0.8.5 - lateinit for the exact same reason as [dmProtocol]: [MailboxPoller.attach] needs a
      * bound method reference to this manager (`this::handleOfflineEnvelope`) that does not fully
@@ -611,7 +716,7 @@ class DmSessionManager private constructor(
     ): Pair<DoubleRatchetSession, X3dhPreKeyMessageHeader> {
         val bundle =
             prekeyBundleGossip.lookup(recipient)
-                ?: throw DmUnknownRecipientException("no prekey bundle for recipient ${recipient.fingerprint()}")
+                ?: throw DmUnknownRecipientException("no prekey bundle for recipient ${who(recipient)}")
         val ownBinding =
             EncryptionKeyBinding.create(
                 localIdentity.secp256k1KeyPair,
@@ -629,7 +734,7 @@ class DmSessionManager private constructor(
                 )
             } catch (e: X3dhException) {
                 throw DmHandshakeFailedException(
-                    "X3DH initiation failed against ${recipient.fingerprint()}'s bundle",
+                    "X3DH initiation failed against ${who(recipient)}'s bundle",
                     e,
                 )
             } finally {
@@ -667,6 +772,10 @@ class DmSessionManager private constructor(
         content: DmContent,
     ) {
         val plaintext = DmContentCodec.encode(content)
+        if (anonymous) {
+            withPeerLock(recipient) { sendAnonymousAutoLocked(recipient, plaintext) }
+            return
+        }
         withPeerLock(recipient) {
             // Directory lookup happens FIRST, before any X3DH/encrypt/persist work below - see this
             // function's own doc comment and the CRITICAL review finding it fixes. PeerRecord and
@@ -679,7 +788,7 @@ class DmSessionManager private constructor(
             // state exists yet, makes the whole first-contact attempt a no-op on failure.
             val record =
                 peerDirectory.lookup(recipient)
-                    ?: throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
+                    ?: throw DmUnknownRecipientException("no directory record for ${who(recipient)}")
 
             val envelope = prepareEnvelopeLocked(recipient, plaintext)
             dispatchOnlineLocked(recipient, record, DmEnvelopeCodec.encode(envelope))
@@ -763,6 +872,18 @@ class DmSessionManager private constructor(
         notValidAfterEpochSecond: Long = Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
     ) {
         val plaintext = DmContentCodec.encode(content)
+        if (anonymous) {
+            withPeerLock(recipient) {
+                val (transport, target) = resolveAnonymousTarget(recipient, plaintext)
+                val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+                transport.depositOffline(
+                    target,
+                    envelopeBytes,
+                    minOf(notValidAfterEpochSecond, Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS),
+                )
+            }
+            return
+        }
         withPeerLock(recipient) {
             val envelope = prepareEnvelopeLocked(recipient, plaintext)
             depositOfflineLocked(recipient, DmEnvelopeCodec.encode(envelope), notValidAfterEpochSecond)
@@ -792,6 +913,7 @@ class DmSessionManager private constructor(
         content: DmContent,
     ): DmSendOutcome {
         val plaintext = DmContentCodec.encode(content)
+        if (anonymous) return withPeerLock(recipient) { sendAnonymousAutoLocked(recipient, plaintext) }
         return withPeerLock(recipient) {
             val envelope = prepareEnvelopeLocked(recipient, plaintext)
             val envelopeBytes = DmEnvelopeCodec.encode(envelope)
@@ -803,7 +925,7 @@ class DmSessionManager private constructor(
                     return@withPeerLock DmSendOutcome.SENT_ONLINE
                 } catch (e: DmSessionException) {
                     logger.debug(e) {
-                        "sendAuto: online dial/send to ${recipient.fingerprint()} failed - falling back to an " +
+                        "sendAuto: online dial/send to ${who(recipient)} failed - falling back to an " +
                             "offline mailbox deposit of the SAME already-built envelope (no re-encrypt)"
                     }
                 }
@@ -863,6 +985,11 @@ class DmSessionManager private constructor(
         marksAcceptance: Boolean,
         replyRoute: DmCallReplyRoute? = null,
     ) {
+        // Anonymity mode has no direct DM protocol and no inbound call path: refuse BEFORE any
+        // ratchet step is consumed.
+        if (anonymous) {
+            throw DmSessionException("call signalling is not available in anonymity mode")
+        }
         if (payload.size > MAX_CALL_SIGNAL_PAYLOAD_BYTES) {
             throw DmSessionException(
                 "call signal payload (${payload.size} bytes) exceeds $MAX_CALL_SIGNAL_PAYLOAD_BYTES bytes",
@@ -881,7 +1008,7 @@ class DmSessionManager private constructor(
             } else {
                 dispatchOnConnectionLocked(recipient, connection!!, bytes)
                 callSignalsSentViaReplyRoute.incrementAndGet()
-                logger.debug { "call signal to ${recipient.fingerprint()} sent via reply route" }
+                logger.debug { "call signal to ${who(recipient)} sent via reply route" }
             }
         }
     }
@@ -933,7 +1060,7 @@ class DmSessionManager private constructor(
         replyRoute: DmCallReplyRoute?,
     ): Connection {
         if (replyRoute == null) {
-            throw DmUnknownRecipientException("no directory record for ${recipient.fingerprint()}")
+            throw DmUnknownRecipientException("no directory record for ${who(recipient)}")
         }
         val key = replyRoute.token.joinToString("") { "%02x".format(it) }
         val peerId: PeerId =
@@ -941,13 +1068,13 @@ class DmSessionManager private constructor(
                 val entry =
                     replyRoutes[key]
                         ?: throw DmUnknownRecipientException(
-                            "no directory record and no valid reply route for ${recipient.fingerprint()}",
+                            "no directory record and no valid reply route for ${who(recipient)}",
                         )
                 if (nanoClock() - entry.touchedNanos > CALL_REPLY_ROUTE_MAX_AGE.toNanos()) {
                     replyRoutes.remove(key)
                     replyRouteByPair.remove(entry.identity to entry.peerId)
                     throw DmUnknownRecipientException(
-                        "no directory record and reply route expired for ${recipient.fingerprint()}",
+                        "no directory record and reply route expired for ${who(recipient)}",
                     )
                 }
                 if (entry.identity != recipient) {
@@ -957,7 +1084,7 @@ class DmSessionManager private constructor(
             }
         return node.liveConnectionTo(peerId)
             ?: throw DmUnknownRecipientException(
-                "no directory record and no live connection for ${recipient.fingerprint()}",
+                "no directory record and no live connection for ${who(recipient)}",
             )
     }
 
@@ -967,7 +1094,7 @@ class DmSessionManager private constructor(
         recipient: Secp256k1PublicKey,
         connection: Connection,
         envelopeBytes: ByteArray,
-    ) = dispatchViaLocked(recipient, envelopeBytes, "open stream to ${recipient.fingerprint()} for call signal") {
+    ) = dispatchViaLocked(recipient, envelopeBytes, "open stream to ${who(recipient)} for call signal") {
         dmProtocol.openStreamOn(connection)
     }
 
@@ -997,7 +1124,7 @@ class DmSessionManager private constructor(
             // @throws taxonomy - pre-existing, not introduced by this wave. See the historical note
             // this comment used to carry in send()'s/sendOffline()'s own former inline bodies.
             check(session.canSend) {
-                "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
+                "session with ${who(recipient)} cannot currently send (receiver-only, awaiting first inbound reply)"
             }
             val ratchetMessage = session.encrypt(plaintext)
             envelope = DmEnvelope(DmMessageType.TEXT, localIdentity.secp256k1KeyPair.publicKey, null, ratchetMessage)
@@ -1036,10 +1163,10 @@ class DmSessionManager private constructor(
         val session =
             getCachedOrLoad(recipient)
                 ?: throw DmNoSessionException(
-                    "no established session with ${recipient.fingerprint()} - a call never begins a first contact",
+                    "no established session with ${who(recipient)} - a call never begins a first contact",
                 )
         check(session.canSend) {
-            "session with ${recipient.fingerprint()} cannot currently send (receiver-only, awaiting first inbound reply)"
+            "session with ${who(recipient)} cannot currently send (receiver-only, awaiting first inbound reply)"
         }
         val ratchetMessage = session.encrypt(payload)
         val envelope =
@@ -1067,7 +1194,7 @@ class DmSessionManager private constructor(
         recipient: Secp256k1PublicKey,
         record: PeerRecord,
         envelopeBytes: ByteArray,
-    ) = dispatchViaLocked(recipient, envelopeBytes, "dial ${recipient.fingerprint()} for DM send") {
+    ) = dispatchViaLocked(recipient, envelopeBytes, "dial ${who(recipient)} for DM send") {
         dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
     }
 
@@ -1101,13 +1228,13 @@ class DmSessionManager private constructor(
                     // a caller-level retry would then see getCachedOrLoad(recipient) != null and
                     // deposit a TEXT (not X3DH_INITIAL) envelope offline: the exact wrong-typed
                     // first-message trap sendAuto's own doc comment says it eliminates.
-                    throw DmSessionException("failed to dial ${recipient.fingerprint()} for DM send", e)
+                    throw DmSessionException("failed to dial ${who(recipient)} for DM send", e)
                 }
             val controller = await(promise.controller, awaitDescription)
             val sendHandle =
                 controller as? DmSendHandle
                     ?: throw DmSessionException(
-                        "dial controller for ${recipient.fingerprint()} was a " +
+                        "dial controller for ${who(recipient)} was a " +
                             "${controller::class.qualifiedName}, not a DmSendHandle",
                     )
             sendHandle.sendEnvelope(envelopeBytes)
@@ -1292,7 +1419,7 @@ class DmSessionManager private constructor(
                 val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
                 if (isRecentlyDelivered(dedupKey)) {
                     logger.debug {
-                        "skipping envelope from $sourceDescription claimed sender ${claimedSender.fingerprint()} " +
+                        "skipping envelope from $sourceDescription claimed sender ${who(claimedSender)} " +
                             "- already delivered (dedup key match)"
                     }
                     return@withPeerLock true
@@ -1332,7 +1459,7 @@ class DmSessionManager private constructor(
                                 EncryptionKeyBinding.verify(header.initiatorIdentity, header.initiatorEncryptionBinding)
                             if (!headerBindingVerifies) {
                                 logger.debug {
-                                    "X3DH_INITIAL from claimed sender ${claimedSender.fingerprint()} carries an " +
+                                    "X3DH_INITIAL from claimed sender ${who(claimedSender)} carries an " +
                                         "encryption key binding that does not verify against the claimed identity " +
                                         "- rejecting BEFORE any one-time prekey consumption"
                                 }
@@ -1357,7 +1484,7 @@ class DmSessionManager private constructor(
                                 }
                             ) {
                                 logger.debug {
-                                    "rejecting X3DH_INITIAL from claimed sender ${claimedSender.fingerprint()} - " +
+                                    "rejecting X3DH_INITIAL from claimed sender ${who(claimedSender)} - " +
                                         "this exact ephemeral key was already accepted for a prior handshake " +
                                         "(durable, survives a restart) - replay, not a legitimate re-handshake"
                                 }
@@ -1426,7 +1553,7 @@ class DmSessionManager private constructor(
                                     if (!prekeyConsumptionRateLimiter.tryAcquire()) {
                                         logger.debug {
                                             "rejecting X3DH_INITIAL from claimed sender " +
-                                                "${claimedSender.fingerprint()} - " +
+                                                "${who(claimedSender)} - " +
                                                 "MAX_PREKEY_CONSUMPTIONS_PER_WINDOW " +
                                                 "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
                                                 "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
@@ -1438,7 +1565,7 @@ class DmSessionManager private constructor(
                                     if (!prekeyConsumptionSemaphore.tryAcquire()) {
                                         logger.debug {
                                             "rejecting X3DH_INITIAL from claimed sender " +
-                                                "${claimedSender.fingerprint()} - " +
+                                                "${who(claimedSender)} - " +
                                                 "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
                                                 "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
                                         }
@@ -1453,7 +1580,7 @@ class DmSessionManager private constructor(
                                     } catch (e: PrekeyConsumptionException) {
                                         logger.debug(e) {
                                             "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
-                                                "${claimedSender.fingerprint()} - rejecting"
+                                                "${who(claimedSender)} - rejecting"
                                         }
                                         // this specific one-time-prekey id will never become valid again
                                         return@withPeerLock true
@@ -1495,7 +1622,9 @@ class DmSessionManager private constructor(
                                         } catch (e: X3dhException) {
                                             logger.debug(e) {
                                                 "X3DH respond failed for claimed sender " +
-                                                    "${claimedSender.fingerprint()} - rejecting, never falls back to trusting the claim"
+                                                    "${who(
+                                                        claimedSender,
+                                                    )} - rejecting, never falls back to trusting the claim"
                                             }
                                             // crypto verification failure - these exact bytes will never verify
                                             return@withPeerLock true
@@ -1531,7 +1660,7 @@ class DmSessionManager private constructor(
                                 // X3DH_INITIAL pointer has been processed and installed a session - can
                                 // deliver it, instead of permanently losing a genuinely valid message.
                                 logger.debug {
-                                    "no session for claimed sender ${claimedSender.fingerprint()} - rejecting TEXT " +
+                                    "no session for claimed sender ${who(claimedSender)} - rejecting TEXT " +
                                         "envelope for now, not marking permanently resolved"
                                 }
                                 return@withPeerLock false
@@ -1553,7 +1682,7 @@ class DmSessionManager private constructor(
                                 getCachedOrLoad(claimedSender)
                                     ?: run {
                                         logger.debug {
-                                            "call signal from ${claimedSender.fingerprint()} without an " +
+                                            "call signal from ${who(claimedSender)} without an " +
                                                 "established session - rejected (a call never begins a " +
                                                 "first contact)"
                                         }
@@ -1574,7 +1703,7 @@ class DmSessionManager private constructor(
                         session.decrypt(envelope.ratchetMessage)
                     } catch (e: DoubleRatchetException) {
                         logger.debug(e) {
-                            "ratchet decrypt failed under session claimed for ${claimedSender.fingerprint()} - " +
+                            "ratchet decrypt failed under session claimed for ${who(claimedSender)} - " +
                                 "rejecting; the claimed field alone is never trusted"
                         }
                         if (isFreshHandshake) session.destroy()
@@ -1634,7 +1763,7 @@ class DmSessionManager private constructor(
                         DmContentCodec.decode(plaintext)
                     } catch (e: MalformedDmContentException) {
                         logger.debug(e) {
-                            "authenticated peer ${claimedSender.fingerprint()} sent an unparseable DmContent - dropping"
+                            "authenticated peer ${who(claimedSender)} sent an unparseable DmContent - dropping"
                         }
                         return@withPeerLock true // final - the bytes never change
                     }
@@ -1689,7 +1818,7 @@ class DmSessionManager private constructor(
             // for a pointer attempt that throws ("leaving pending, will retry next poll").
             logger.warn(e) {
                 "unexpected exception handling inbound DM envelope from $sourceDescription " +
-                    "(claimed sender ${claimedSender.fingerprint()})"
+                    "(claimed sender ${who(claimedSender)})"
             }
             false
         }
@@ -1751,13 +1880,26 @@ class DmSessionManager private constructor(
                         localPrekeyStore.generateOneTimePrekeys(deficit, random)
                         val notValidAfterEpochSecond =
                             Instant.now().epochSecond + PREKEY_REPLENISH_BUNDLE_TTL.toSeconds()
-                        val bundle = localPrekeyStore.publishBundle(localIdentity, notValidAfterEpochSecond)
-                        prekeyBundleGossip.announce(bundle)
-                        logger.info {
-                            "replenished one-time prekey pool for " +
-                                "${localIdentity.secp256k1KeyPair.publicKey.fingerprint()} - generated $deficit " +
-                                "fresh prekeys (was $currentCount, target $PREKEY_REPLENISH_TARGET_COUNT) and " +
-                                "republished the prekey bundle"
+                        if (anonymous) {
+                            // Anonymity mode: NEVER announce on the prekey-bundle gossip topic from here. That
+                            // GossipSub envelope is signed with the node's libp2p host key and would link
+                            // identity, peer ID and IP for every mesh neighbour. The pool is only refilled
+                            // locally; the circuit publisher (AnonymousDirectoryPublisher) reads the store on
+                            // its next cycle and publishes the fresh bundle through a circuit.
+                            logger.info {
+                                "replenished one-time prekey pool in anonymity mode - generated $deficit fresh " +
+                                    "prekeys (was $currentCount, target $PREKEY_REPLENISH_TARGET_COUNT); " +
+                                    "no direct republish"
+                            }
+                        } else {
+                            val bundle = localPrekeyStore.publishBundle(localIdentity, notValidAfterEpochSecond)
+                            prekeyBundleGossip.announce(bundle)
+                            logger.info {
+                                "replenished one-time prekey pool for " +
+                                    "${localIdentity.secp256k1KeyPair.publicKey.fingerprint()} - generated $deficit " +
+                                    "fresh prekeys (was $currentCount, target $PREKEY_REPLENISH_TARGET_COUNT) and " +
+                                    "republished the prekey bundle"
+                            }
                         }
                     }
                 } catch (e: RuntimeException) {
@@ -1868,14 +2010,14 @@ class DmSessionManager private constructor(
             } catch (e: java.io.IOException) {
                 logger.warn(e) {
                     "failed to read X3DH_INITIAL ephemeral-key replay registry for " +
-                        "${peer.fingerprint()} at $target - treating as empty (fails open, not closed - " +
+                        "${who(peer)} at $target - treating as empty (fails open, not closed - " +
                         "see this function's own doc comment)"
                 }
                 return emptyList()
             }
         if (bytes.size % X3DH_INITIAL_EPHEMERAL_KEY_SIZE != 0) {
             logger.warn {
-                "X3DH_INITIAL ephemeral-key replay registry for ${peer.fingerprint()} at $target has an " +
+                "X3DH_INITIAL ephemeral-key replay registry for ${who(peer)} at $target has an " +
                     "unexpected size (${bytes.size}, not a multiple of $X3DH_INITIAL_EPHEMERAL_KEY_SIZE) - " +
                     "treating as empty"
             }
@@ -2005,14 +2147,14 @@ class DmSessionManager private constructor(
                 DoubleRatchetSessionCodec.decodeWithKey(bytes, cachedKey, random)
             } catch (e: CorruptedRatchetSessionException) {
                 logger.warn(e) {
-                    "persisted DM session file for ${peer.fingerprint()} at $target is structurally " +
+                    "persisted DM session file for ${who(peer)} at $target is structurally " +
                         "corrupt - treating as no persisted session; a fresh X3DH handshake will " +
                         "bootstrap a new one on the next send/inbound X3DH_INITIAL"
                 }
                 null
             } catch (e: KeystoreDecryptionException) {
                 logger.warn(e) {
-                    "persisted DM session file for ${peer.fingerprint()} at $target failed to " +
+                    "persisted DM session file for ${who(peer)} at $target failed to " +
                         "decrypt (wrong key or tampered ciphertext) - treating as no persisted " +
                         "session; a fresh X3DH handshake will bootstrap a new one on the next " +
                         "send/inbound X3DH_INITIAL"
@@ -2076,6 +2218,7 @@ class DmSessionManager private constructor(
         if (::dmProtocol.isInitialized) dmProtocol.stop()
         if (::mailboxPoller.isInitialized) mailboxPoller.stop()
         mailboxRedeliveryScheduler.stop()
+        anonymousTransport = null
         replenishmentExecutor.shutdownNow()
         cachedKeyLock.write { cachedKey.fill(0) }
     }
@@ -2165,6 +2308,12 @@ class DmSessionManager private constructor(
         /** V0.9.19 - cap on the reply-route registry; 4 x `CallManager.MAX_TRACKED_CALLS` (64). */
         const val MAX_CALL_REPLY_ROUTES = 256
 
+        /** V0.10.0-F1 - upper bound of one anonymity-mode online delivery attempt (assumption, confirmation required). */
+        val ANONYMOUS_SEND_DEADLINE: Duration = Duration.ofSeconds(30)
+
+        /** V0.10.0-F1 - offline lifetime of an anonymity-mode mailbox item: 48 hours, not 7 days. */
+        const val ANONYMOUS_OFFLINE_TTL_SECONDS = 48L * 3600L
+
         /** V0.9.19 - at most this many live routes per sender identity (distinct connections). */
         const val MAX_CALL_REPLY_ROUTES_PER_IDENTITY = 4
 
@@ -2195,7 +2344,8 @@ class DmSessionManager private constructor(
             node: LapisNode,
             peerDirectory: PeerDirectoryGossip,
             prekeyBundleGossip: PrekeyBundleGossip,
-            mailboxGossip: MailboxGossip,
+            // V0.10.0-F1: `null` only in anonymity mode, where the own direct mailbox topic must NOT be subscribed.
+            mailboxGossip: MailboxGossip?,
             nabuStorage: NabuStorage,
             pubsub: GossipPubSub,
             sessionStoreDirectory: Path,
@@ -2229,7 +2379,10 @@ class DmSessionManager private constructor(
             acceptedContacts: DmAcceptedContacts? = null,
             /** V0.9.14 - see the constructor property of the same name. */
             dhtOutbox: DhtOutbox? = null,
+            /** V0.10.0-F1 - anonymity mode; see the constructor property of the same name. */
+            anonymous: Boolean = false,
         ): DmSessionManager {
+            require(anonymous || mailboxGossip != null) { "a direct-mode manager needs a MailboxGossip" }
             Files.createDirectories(sessionStoreDirectory)
             if ("posix" in sessionStoreDirectory.fileSystem.supportedFileAttributeViews()) {
                 runCatching {
@@ -2289,11 +2442,17 @@ class DmSessionManager private constructor(
                     acceptance,
                     acceptedContacts,
                     dhtOutbox,
+                    anonymous,
                 )
+            if (anonymous) {
+                // No direct DM protocol, no poller, no direct mailbox pointers (see the constructor property).
+                manager.mailboxRedeliveryScheduler.stop()
+                return manager
+            }
             manager.dmProtocol = DmProtocol.attach(node, manager::handleInboundEnvelope)
             manager.mailboxPoller =
                 MailboxPoller.attach(
-                    mailboxGossip,
+                    checkNotNull(mailboxGossip),
                     nabuStorage,
                     peerDirectory,
                     manager::handleOfflineEnvelope,

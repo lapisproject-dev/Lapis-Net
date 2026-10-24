@@ -86,6 +86,12 @@ class AnonymityLoggingHygieneTest :
                     ra.maintenanceTick()
                     ra.publications() >= 1
                 } shouldBe true
+                // wave F1: the mailbox publisher and the mailbox role at the relay run under the same scanner
+                (
+                    ra
+                        .publishMailboxItems(listOf(ByteArray(5_728) { (it * 7).toByte() }))
+                        .get(120, java.util.concurrent.TimeUnit.SECONDS)
+                ) shouldBe true
                 ra.close()
 
                 val forbidden = ArrayList<String>()
