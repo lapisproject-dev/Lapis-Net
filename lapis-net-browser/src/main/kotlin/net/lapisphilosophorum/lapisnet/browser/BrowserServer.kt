@@ -12,6 +12,7 @@ import kotlinx.coroutines.runBlocking
 import net.lapisphilosophorum.lapisnet.call.CallConfig
 import net.lapisphilosophorum.lapisnet.call.CallManager
 import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
+import net.lapisphilosophorum.lapisnet.call.CallMediaPolicy
 import net.lapisphilosophorum.lapisnet.call.WebRtcCallMediaEngine
 import net.lapisphilosophorum.lapisnet.directory.AnonymousCapability
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordGossip
@@ -74,6 +75,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
 import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
@@ -96,6 +98,9 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toKotlinDuration
 
 private val logger = KotlinLogging.logger {}
+
+/** V0.10.0-G: connect timeout of a call with exposed media: the ACCEPT crosses a circuit first (assumption). */
+private val ANONYMOUS_CALL_CONNECT_TIMEOUT = java.time.Duration.ofSeconds(45)
 
 /** Grace period passed to [EmbeddedServer.stop] - how long Netty waits for in-flight requests to
  * finish before forcefully shutting down. */
@@ -364,6 +369,9 @@ class BrowserServer private constructor(
             // V0.9.15 - FIRST: the periodic jobs and the optional components (publisher, auto-relay, DHT fetcher,
             // Madli) use storage and the DM manager, which are torn down below. Bounded by per-component and
             // overall timeouts, never throws.
+            // V0.10.0-G: in anonymity mode the CallManager must stop BEFORE the circuit-based DM transport is closed by
+            // the supervisor, so no call signal is sent on a closed transport. stop() is idempotent.
+            if (anonymityRuntime != null) runCatching { callManager?.stop() }
             runCatching { supervisor.stopAll() }
             runCatching { httpEngine.stop(HTTP_STOP_GRACE_PERIOD_MILLIS, HTTP_STOP_TIMEOUT_MILLIS) }
             // Calls ride on the DM layer: stop the CallManager first, then close the media engine
@@ -780,6 +788,26 @@ class BrowserServer private constructor(
                 // In normal mode no OnionWire is built and no new gossip topic is subscribed (the revocation topic only
                 // for the one send, and only if the previous run was in anonymity mode).
                 val anonymous = wiring.anonymity == AnonymityMode.ON
+                // V0.10.0-G: signals follow the DM route (circuits in anonymity mode); media is direct, so calls are
+                // off unless --anonymity-allow-call-media=true. The connect timeout grows because the ACCEPT crosses a
+                // circuit (up to the 15 s signal deadline) before the media connection can even start.
+                val callMediaPolicy = CallMediaPolicy.of(anonymous, wiring.anonymityAllowCallMedia)
+                val anonymityWarning =
+                    if (callMediaPolicy == CallMediaPolicy.EXPOSED) {
+                        ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
+                    } else {
+                        ANONYMITY_INCOMPLETE_WARNING
+                    }
+                val effectiveCallConfig =
+                    callConfig.copy(
+                        mediaPolicy = callMediaPolicy,
+                        connectTimeout =
+                            if (callMediaPolicy == CallMediaPolicy.EXPOSED) {
+                                maxOf(callConfig.connectTimeout, ANONYMOUS_CALL_CONNECT_TIMEOUT)
+                            } else {
+                                callConfig.connectTimeout
+                            },
+                    )
                 val modeStore = FileDirectoryModeStore(dataDirectory.resolve(DIRECTORY_MODE_FILE))
                 val modeTransition = DirectoryModeTransition(identity, modeStore)
                 var sequenceSource: () -> Long = { System.currentTimeMillis() }
@@ -912,6 +940,7 @@ class BrowserServer private constructor(
                             },
                             supervisor = supervisor,
                             capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
+                            incompleteWarning = anonymityWarning,
                         )
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
@@ -987,7 +1016,7 @@ class BrowserServer private constructor(
                     }
                     cleanupOnFailure += stopMail
                     supervisor.register("anonymity-mail") { stopMail() }
-                    logger.warn { ANONYMITY_INCOMPLETE_WARNING }
+                    logger.warn { anonymityWarning }
                 }
 
                 if (acceptance.anyEnabled) {
@@ -1011,7 +1040,7 @@ class BrowserServer private constructor(
 
                 val callMediaEngine = callMediaEngineFactory?.invoke()
                 cleanupOnFailure += { runCatching { callMediaEngine?.close() } }
-                val callManager = callMediaEngine?.let { CallManager.attach(dmSessionManager, it, callConfig) }
+                val callManager = callMediaEngine?.let { CallManager.attach(dmSessionManager, it, effectiveCallConfig) }
                 // callManager.stop() must run BEFORE callMediaEngine.close() (registered above, so
                 // reversed cleanup order gives exactly that).
                 cleanupOnFailure += { runCatching { callManager?.stop() } }
@@ -1029,6 +1058,7 @@ class BrowserServer private constructor(
                         sessionToken = callToken,
                         expectedPort = { portRef.get() },
                         heartbeatInterval = callHeartbeatInterval,
+                        callMedia = callMediaPolicy,
                     )
 
                 val nodeStatus: () -> NodeStatusResponse = {
@@ -1062,6 +1092,7 @@ class BrowserServer private constructor(
                         lastAnonymityError = anonymityRuntime?.status()?.lastError?.wire ?: "none",
                         lastAnonymityErrorAgeSeconds = anonymityRuntime?.status()?.lastErrorAgeSeconds,
                         recipientUnreachableCount = anonymityRuntime?.status()?.recipientUnreachableCount ?: 0,
+                        callMedia = callMediaPolicy.wire,
                     )
                 }
                 val deps =

@@ -125,4 +125,20 @@ class AnonymityLoggingHygieneTest :
                 nodes.forEach { it.close() }
             }
         }
+
+        test("both warning texts (calls off, calls exposed) carry no address, port, identity or key material") {
+            val texts =
+                listOf(
+                    net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING,
+                    net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED,
+                )
+            val patterns = listOf("/ip4", "/ip6", "/tcp", "127.0.0.1", "localhost", "/p2p/", "12D3Koo", "Qm")
+            for (text in texts) {
+                for (p in patterns) (text.contains(p)) shouldBe false
+                (Regex("[0-9a-fA-F]{32,}").containsMatchIn(text)) shouldBe false
+                text.contains("IP address") shouldBe true
+            }
+            (texts[1].contains("--anonymity-allow-call-media=true")) shouldBe true
+            (texts[0].contains("calls are off")) shouldBe true
+        }
     })

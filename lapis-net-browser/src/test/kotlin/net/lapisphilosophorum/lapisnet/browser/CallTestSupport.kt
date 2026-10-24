@@ -14,6 +14,7 @@ import net.lapisphilosophorum.lapisnet.call.CallId
 import net.lapisphilosophorum.lapisnet.call.CallLogEntry
 import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
 import net.lapisphilosophorum.lapisnet.call.CallMediaObserver
+import net.lapisphilosophorum.lapisnet.call.CallMediaPolicy
 import net.lapisphilosophorum.lapisnet.call.CallMediaSession
 import net.lapisphilosophorum.lapisnet.call.CallSnapshot
 import net.lapisphilosophorum.lapisnet.call.CallState
@@ -91,13 +92,25 @@ internal class FakeCallRemote : CallRemote {
 
     val totalMutatingCalls: Int get() = placed.size + accepted.size + rejected.size + hungUp.size
 
-    override fun placeCall(peer: Secp256k1PublicKey): CallId {
+    /** Parallel to [placed]/[accepted]: the exposure confirmation each call carried. */
+    val placedConfirmed = CopyOnWriteArrayList<Boolean>()
+    val acceptedConfirmed = CopyOnWriteArrayList<Boolean>()
+
+    override fun placeCall(
+        peer: Secp256k1PublicKey,
+        mediaExposureConfirmed: Boolean,
+    ): CallId {
         placed.add(peer)
+        placedConfirmed.add(mediaExposureConfirmed)
         return CallId.random(random)
     }
 
-    override fun acceptCall(callId: CallId) {
+    override fun acceptCall(
+        callId: CallId,
+        mediaExposureConfirmed: Boolean,
+    ) {
         accepted.add(callId)
+        acceptedConfirmed.add(mediaExposureConfirmed)
     }
 
     override fun rejectCall(callId: CallId) {
@@ -146,12 +159,14 @@ internal fun testCallDeps(
     token: CallSessionToken = CallSessionToken.generate(),
     own: Secp256k1PublicKey = randomPeer(),
     port: Int = TEST_PORT,
+    callMedia: CallMediaPolicy = CallMediaPolicy.DIRECT,
 ) = CallApiDependencies(
     remote = remote,
     hub = hub,
     ownPublicKey = own,
     sessionToken = token,
     expectedPort = { port },
+    callMedia = callMedia,
 )
 
 /** Installs only the call routes, with the same ContentNegotiation + catch-all StatusPages the real

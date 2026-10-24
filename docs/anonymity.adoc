@@ -1,11 +1,13 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages and mail (waves V0.10.0-A to V0.10.0-F2)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages, mail and call signals (waves V0.10.0-A to V0.10.0-G)
 :toc:
 
 == Status
 
+*Wave G (call signals over circuits, unreleased) carries the signalling of a call (INVITE, ACCEPT, REJECT, HANGUP) over circuits for a node in anonymity mode, through the same rendezvous stream and the same Double Ratchet session as direct messages. The media path is NOT anonymised and can not be: WebRTC connects the two parties directly, so every call reveals your IP address to the other party and to network observers. Calls are therefore OFF in anonymity mode by default; `--anonymity-allow-call-media=true` turns them on, with a confirmation before every single call. Call signals are online only (never a mailbox), and both ends must be in anonymity mode.* See <<call-signals-over-circuits>>.
+
 *Wave F2 (mail over circuits, unreleased) carries mail over circuits for a node in anonymity mode. A mail with its attachments travels as one bundle over a rendezvous stream to the recipient's onion service; a small mail without attachments that cannot be delivered online is sealed to the recipient and announced on the same shared topic as offline direct messages. The node no longer subscribes to or publishes on a per-recipient inbox topic, leaves no DHT pointer and fetches nothing over Nabu/Bitswap for mail. Call media, GossipSub in general, the DHT and other content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode. Both ends must be in anonymity mode; there is no fallback to a direct connection.* See <<mail-over-circuits>>.
 
-*Wave F1 (direct messages over circuits, unreleased) carries direct messages, online and offline, over circuits for a node in anonymity mode. The sender reaches the recipient's onion service through a rendezvous point; an undeliverable message is sealed to the recipient and announced by relays on one shared topic. Mail, call media, GossipSub, the DHT and content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode (refused before any ratchet step). The recipient learns the sender's identity. Both sides must be in anonymity mode; there is no fallback to a direct connection and no attachments.* See <<dm-over-circuits>>.
+*Wave F1 (direct messages over circuits, unreleased) carries direct messages, online and offline, over circuits for a node in anonymity mode. The sender reaches the recipient's onion service through a rendezvous point; an undeliverable message is sealed to the recipient and announced by relays on one shared topic. Mail, call media, GossipSub, the DHT and content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode (refused before any ratchet step; superseded by wave G, see <<call-signals-over-circuits>>). The recipient learns the sender's identity. Both sides must be in anonymity mode; there is no fallback to a direct connection and no attachments.* See <<dm-over-circuits>>.
 
 *Wave E (path selection and policy, unreleased) adds the first thing a user can switch on: `--anonymity=on`. A node in that mode chooses relays with persistent guards and network diversity, builds circuits under a build policy, and publishes its directory entry only through those circuits. It does not make the node anonymous: direct messages, mail and call signalling still use direct connections and show the IP address, and the libp2p transport key is still the identity key. The option is experimental, off by default, and every start says so.* See <<path-policy>>.
 
@@ -70,7 +72,7 @@ These exist in the current release and must be closed before any anonymity claim
 . *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses. Directory side addressed in wave D (see <<directory-anonymity>>); the transport-level link between identity and IP remains until wave E.
 . *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F2). Wave F1 does not change mail; it removes the same leak for direct messages (a node in anonymity mode does not subscribe to its own direct-message mailbox topic). *Closed for a node in anonymity mode by wave F2:* it subscribes to no inbox topic, publishes on none, leaves no DHT pointer and fetches nothing over Nabu/Bitswap for mail (see <<mail-over-circuits>>); still present in the normal mode.
 . *Gossip timing.* Message publication times and mesh membership leak.
-. *WebRTC media.* ICE exposes IPs to the peer.
+. *WebRTC media.* ICE exposes IPs to the peer. Not closable by this design: since wave G calls are off in anonymity mode by default, and with `--anonymity-allow-call-media=true` the media connects directly and shows the IP address to the other party and to network observers (see <<call-signals-over-circuits>>).
 . *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom. Closed for direct messages in anonymity mode by wave F1 (no pointer, no Nabu blob, no IPNS value); closed for mail in anonymity mode by wave F2 as well; still present for nodes in the normal mode.
 . *Small anonymity set.* Few relays mean weak anonymity regardless of cryptography.
 . *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
@@ -650,7 +652,7 @@ NOTE: This section describes the state of wave F1. Wave F2 changed three things 
 
 *What it is.* A node in anonymity mode sends and receives direct messages only through circuits. The ratchet (X3DH and Double Ratchet) is unchanged and keeps protecting the content; what changes is the transport. A new module `lapis-net-dm-onion` is the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed item format and does not depend on any onion code) and `lapis-net-onion-wire` (which knows nothing about direct messages). `DmSessionManager` is attached with `anonymous = true`: it then registers no `/lapis/dm/1.1.0` protocol, starts no mailbox poller, publishes no pointer on any per-recipient topic and offers nothing to the DHT outbox. There is one inbound pipeline for both entrances (circuit stream and sealed item): `processInboundDmEnvelope`, with duplicate check, X3DH replay register, prekey rate limiter, ratchet decryption and acceptance policy. The sender of an incoming message is known only after decryption.
 
-*What it is not.* Mail and call media still use direct connections; call signalling is not available in anonymity mode (a call attempt is refused up front). GossipSub, the DHT and content fetches still show identity and IP. The recipient learns the sender's identity (it is in the envelope; the point is that the network does not learn who talks to whom, not that the peer is anonymous to the peer). Both sides must be in anonymity mode: a recipient in the normal mode, an unknown identity, a recipient without the DM service and a recipient without a prekey bundle all give the same refusal. There is no fallback to a direct connection, ever. A call invitation over this path is rejected (calls follow in wave G).
+*What it is not.* Mail and call media still use direct connections; call signalling is not available in anonymity mode (a call attempt is refused up front; superseded by wave G, see <<call-signals-over-circuits>>). GossipSub, the DHT and content fetches still show identity and IP. The recipient learns the sender's identity (it is in the envelope; the point is that the network does not learn who talks to whom, not that the peer is anonymous to the peer). Both sides must be in anonymity mode: a recipient in the normal mode, an unknown identity, a recipient without the DM service and a recipient without a prekey bundle all give the same refusal. There is no fallback to a direct connection, ever. A call invitation over this path is rejected (calls follow in wave G).
 
 At every start the node warned in wave F1 (log, CLI stderr, a notice in the browser that can not be dismissed; historical text, replaced in wave F2): _Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address._ The browser's status panel shows seven fixed lines (directory entries, direct messages, mail, call signalling, call media, mesh/DHT/fetches, and the guard and circuit counts) and the DM page shows a fixed notice above the input field and a disabled attachment button.
 
@@ -735,7 +737,7 @@ The refusal for the recipient happens before any session work, so a refused firs
 | new | the node's own direct-message mailbox topic | not subscribed; offline items arrive on the shared topic
 | new | the direct DM protocol `/lapis/dm/1.1.0` | not registered (a dial fails at protocol negotiation)
 | 13 | mail topic per recipient | unchanged until wave F2
-| call signalling | direct | not available in anonymity mode until wave G (refused up front, no ratchet step consumed); a call to a node in anonymity mode fails because no direct entry exists
+| call signalling | direct | not available in anonymity mode in wave F1 (superseded by wave G: over circuits, see <<call-signals-over-circuits>>)
 | call media | WebRTC | unchanged, not anonymisable by this design
 | 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged (transport key, wave J)
 |===
@@ -748,7 +750,7 @@ The refusal for the recipient happens before any session work, so a refused firs
 * No per-peer limit exists on the receiving side (the peer is anonymous); the global and per-stream limits are what protects the node.
 * Offline delivery needs the sender to keep announcing; the queue is lost on a restart. The sender cannot tell whether an item was delivered, so it announces until the lifetime ends.
 * An item is sealed to the long-term X25519 identity key: no forward secrecy for the sender and recipient metadata of the sealing layer.
-* A call invitation over this path is rejected; calls to a node in anonymity mode fail until wave G.
+* A call invitation over this path was rejected in wave F1; wave G accepts it over the circuit door only (the sealed mailbox door still rejects it).
 * One selector fix belongs to this wave: a remotely chosen last hop (an introduction point named by a descriptor) that equals the node's primary guard used to produce a path with the guard twice, which the circuit builder refuses. The circuit now enters through the backup guard in that case; without a backup the build reports "insufficient relays" and is retried later.
 * Not verified: real NATs and real networks (all tests use loopback nodes with an injected locator that gives each relay a synthetic /16), behaviour under load, an external cryptographic review of the sealing construction, and interoperability with v0.12.0 over the network.
 
@@ -760,7 +762,7 @@ The refusal for the recipient happens before any session work, so a refused firs
 * *Assumption, confirmation required:* the sealing key is the X25519 identity key of the prekey bundle, not the (rotating) signed prekey.
 * *Assumption, confirmation required:* constants: re-announcement every 10 minutes plus or minus 2 minutes, offline lifetime 48 hours (not 7 days), at most 4 items per circuit, at most 256 pending items and 32 per recipient, topic budgets 120 per minute in total and 10 per relay author, at most 2 cached streams with 60 seconds idle, 30 seconds for one online delivery attempt, relay limits 10 items per minute per link and 60 in total, 15 seconds to assemble an item.
 * *Assumption, confirmation required:* attachments are refused in anonymity mode in this wave; whether they travel over circuits later (waves F2 or J) is open.
-* *Assumption, confirmation required:* call signalling is refused in anonymity mode until wave G, so a call from or to a node in anonymity mode fails.
+* *Assumption, confirmation required:* call signalling is refused in anonymity mode until wave G, so a call from or to a node in anonymity mode fails. (Superseded by wave G.)
 * *Assumption, confirmation required:* the browser banner text (current text of `ANONYMITY_INCOMPLETE_WARNING`) and the seven fixed lines of the status panel were written for this wave from the facts above; the design team's wording was not available to the implementation and should replace them if it differs.
 * *Assumption, confirmation required:* the digest of the prekey bundle in the anonymous record is not compared with the bundle found in the directory (a legitimate bundle refresh would make such a comparison fail spuriously).
 
@@ -885,7 +887,7 @@ The API answers an accepted send the same way whether the bundle was delivered a
 | new | mail body and attachment fetch over Nabu/Bitswap | not performed: the DHT fetcher is not attached, the attachment route reads the local blockstore only
 | new | size of a bundle on the circuit | visible to the guard and the rendezvous point as a byte count; no padding before wave H
 | new | retry pattern | the 10-minute retry of a queued bundle (and of a re-announced item) is a timing pattern for an observer of the sender's circuits
-| call signalling | direct | not available (wave G)
+| call signalling | direct | wave F2: not available; since wave G over circuits (<<call-signals-over-circuits>>)
 | call media | WebRTC | unchanged, not anonymisable by this design
 | 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged (transport key, wave J)
 |===
@@ -914,13 +916,78 @@ The API answers an accepted send the same way whether the bundle was delivered a
 * *Assumption, confirmation required:* the `InboxIndex` replay-after-restart limit above is documented and not solved in this wave.
 * *Assumption, confirmation required:* the browser banner text, the mail line of the status panel and the mail page notice were written from the facts above; the design team's wording was not available to the implementation and should replace them if it differs.
 
+[[call-signals-over-circuits]]
+== Call signals over circuits (wave V0.10.0-G, unreleased)
+
+*What it is.* A call has two paths. The *signals* (INVITE, ACCEPT, REJECT, HANGUP; they carry the SDP) now travel over circuits for a node in anonymity mode. The *media* (the audio itself) is a direct WebRTC connection and can not be moved onto circuits: the two parties must learn each other's address to connect. This wave therefore moves the signals and is honest about the media. There is no second cryptographic layer: the Double Ratchet session between the two identities stays the only end-to-end layer, and the route is chosen inside `DmSessionManager` exactly like for direct messages. `CallManager` stays transport-independent and `lapis-net-call` still depends on `lapis-net-dm` only (the module graph is unchanged; the multi-node test uses the test fixtures of `lapis-net-dm-onion`).
+
+At every start in anonymity mode the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). With calls off (the default): _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ With `--anonymity-allow-call-media=true`: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ Both texts are the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, `ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED`, in `app.js` and here (a test compares them). The browser status panel says _Call signals: through circuits_ and, depending on the option, _Call media: off (would reveal your IP address)_ or _Call media: direct connection, your IP address is visible to the other party and to network observers_.
+
+=== Signal path
+
+* `DmSessionManager.sendCallSignal` in anonymity mode encrypts with the existing ratchet session (a call never begins a first contact: without a session the send fails as before) and hands the envelope to the rendezvous stream with a delivery deadline of 15 seconds.
+* *Online only.* A call signal is never deposited as a sealed mailbox item: if the recipient is not reachable (no service descriptor) the send fails before any ratchet step is consumed, with the fixed error `call-signal-path-lost`. The sealed mailbox door of the inbound sink still rejects `CALL_SIGNAL` before any decryption, exactly as the offline poller does on the direct path; only the circuit door accepts it.
+* A signal arriving through the circuit door goes through the same inbound pipeline as every other message: session requirement, authenticated decryption, replay suppression and the acceptance rules (`classifyQuarantinedSender`). There is no bypass and no new policy path. `marksAcceptance` is passed through unchanged.
+* *No reply route.* The V0.9.19 reply route (answering over the INVITE's open connection) is a direct-connection concept. In anonymity mode inbound signals carry no route and `sendCallSignal` refuses one.
+* *Size.* A call signal is capped well below the envelope limit of the circuit stream. It is NOT subject to the 5,668-byte limit of a sealed mailbox item, because it never uses one.
+* *Timing.* The 15 second signal deadline is at most the call dial timeout, so the 20 second media shutdown wait of `CallManager.stop()` stays valid. A lost path ends the call locally as `CIRCUIT_LOST`; this reason is local only: it is never encoded (`CallSignalCodec.encode` refuses it) and a wire value of 10 is rejected as malformed. There is no wire format change; older nodes are not affected.
+
+=== The media path and the default
+
+Calls are *off* in anonymity mode by default (`CallMediaPolicy.DISABLED`): `placeCall` throws before any hand-off, the HTTP API answers `409` with the code `CALL_MEDIA_DISABLED_IN_ANONYMITY_MODE` (no network traffic, no history entry), and an inbound INVITE is dropped silently (see below). `--anonymity-allow-call-media=true` (environment `LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA`, browser file key `anonymityAllowCallMedia`, only valid with `--anonymity=on`, restart required) selects `CallMediaPolicy.EXPOSED`.
+
+With the option, a call reveals your IP address to the other party *and to network observers*. Therefore the node enforces a confirmation for every call, both in the HTTP API (`409` with `MEDIA_EXPOSURE_CONFIRMATION_REQUIRED` unless the body says `confirmMediaExposure: true`) and in `CallManager` itself (`placeCall` and `acceptCall` throw without it). The browser asks with an alertdialog before each outgoing call and before accepting each incoming one; the confirmation is never stored, Enter and Escape never accept or reject a ringing call in this mode, and the desktop notification carries no peer information. A missing `callMedia` field in the status is treated like `exposed` (fail safe).
+
+*Reduced SDP, not anonymity.* With the option the SDP is reduced before it leaves the node and again when it arrives, as text only (the PeerConnection is untouched): only `typ host` UDP candidates with a public unicast address survive, at most one per component (IPv4 preferred); private (RFC 1918), loopback, link-local, CGNAT, ULA, multicast, IPv4-mapped and `.local` candidates are dropped, and the connection, RTCP and origin addresses are replaced with the placeholder `0.0.0.0`. No STUN, no TURN and no TCP is used. This keeps your LAN topology out of the signal and limits the exposure to one address per component; it does not hide that address.
+
+=== Refusals the user sees
+
+* `409 CALL_MEDIA_DISABLED_IN_ANONYMITY_MODE` (calls off) and `409 MEDIA_EXPOSURE_CONFIRMATION_REQUIRED`; the page shows fixed German texts and never the server's wording.
+* `CIRCUIT_LOST` ("Verbindung abgebrochen") when the signal path failed during setup. "Recipient not reachable anonymously" is deliberately shown the same way: the same answer can not be told apart.
+
+=== What the caller observes
+
+The transport acknowledgement of the circuit stream is constant and is sent before any processing. A recipient that blocks the caller (acceptance rule), has calls off, or simply does not answer produces the same observation at the caller: no reply at all, then `RING_TIMEOUT`. In particular an INVITE to a node with calls off is dropped *before* the BUSY check: no REJECT and no BUSY is sent. The capability bits published in the anonymous directory entry are unchanged (`DM`, `MAIL`), so the option is not fingerprintable there.
+
+=== Leak inventory after wave G
+
+[cols="1,3,3", options="header"]
+|===
+| # | Place | Status in anonymity mode
+| call signalling | INVITE / ACCEPT / REJECT / HANGUP | over circuits, online only, same ratchet session, no reply route
+| call media | WebRTC | direct; off by default; with the option the IP address is visible to the other party and to network observers
+| new | SDP content | inside the ratchet AEAD; reduced to one public host candidate per component with the option
+| new | call timing | signal and media start are correlatable by an observer of both; no padding before wave H
+| 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged
+|===
+
+=== Honest limits of wave G
+
+* A call is *not anonymous*: the media reveals the IP address. Only the signalling is hidden. If you need anonymity, do not turn the option on.
+* A small anonymity set, Sybil relays and a global passive observer are as in the threat model. Timing correlation between the signals and the start of the media is possible until wave H.
+* Without a public address on at least one side the call fails (no STUN, no TURN, no relayed media; on the same LAN it may fail as well, because private candidates are dropped).
+* The caller learns nothing about why a call was not answered; the callee learns the caller's identity. Both ends must be in anonymity mode, there is no fallback.
+* One global limit of 30 INVITEs per minute applies in anonymity mode in addition to the per-sender limit, because senders are cheap over circuits.
+* Calls share the rendezvous stream limits (per-minute envelope cap and receive queue) with direct messages; a call produces at most about four signals.
+* *Not verified:* real NATs and networks, real WebRTC media in anonymity mode (the filter drops loopback candidates, so this can not be tested on one host), behaviour under load, interoperability with v0.12.0 over the network, an external cryptographic review. The multi-node test runs on loopback with six relays, an injected locator with synthetic networks and a fake media engine.
+
+=== Assumptions awaiting confirmation (wave G)
+
+* *Assumption, confirmation required:* ICE candidates are reduced to public host candidates, not server-reflexive ones. The design paper asked for srflx only, but the code deliberately has no STUN ("no third party") and the SDP policy rejects srflx; a STUN server would be an additional observer. Alternative for a later wave: an operator-configured STUN server. The temporary-IPv6 rule can not be applied reliably on SDP text; the mitigation is "IPv6 only when no IPv4 candidate exists".
+* *Assumption, confirmation required:* the constants: signal delivery deadline 15 seconds, global limit 30 INVITEs per 60 seconds, connect timeout 45 seconds with the option.
+* *Assumption, confirmation required:* the capability bit for calls is not published, so the option is not visible in the directory and the "calls off" and "blocked" cases stay indistinguishable. A call to a node without the option simply rings out.
+* *Assumption, confirmation required:* the reason "recipient not reachable anonymously" is shown as `CIRCUIT_LOST` to the caller, because the answer must not differ.
+* *Assumption, confirmation required:* "at least four nodes and three relays" was read as four user nodes plus relays; the path policy needs more than three relays to build rendezvous paths, so the test uses six, as the F1 and F2 tests do.
+* *Assumption, confirmation required:* the observer test checks that each node is connected to relays only (not to the other party); a dedicated test hook for the guard identities was not added, so "only guards" is checked as "only relays".
+* *Assumption, confirmation required:* the browser wording (band, confirmation, labels) was written from the facts above; the design team's wording should replace it if it differs.
+
 == Incentives and operation
 
 Running a relay is opt-in per node and can be switched off. Relay reliability will be a Madli metric analogous to the existing relay-reliability metric. No payment in part 1; Lightning or Virtus incentives remain an open option. Operators need bandwidth and circuit limits; the foundation already bounds circuits, creation rate and cell rate (`OnionRelayLimits`).
 
 == Per-node switch
 
-`--anonymity=on|off` (environment `LAPISNET_ANONYMITY`, settings file key `anonymity` in the browser), default `off`, experimental. Only the exact lower-case words are accepted. It excludes `--hole-punching=auto|on` and `--onion-relay=true`; see <<path-policy>>. `--onion-relay=true|false` (default off) remains the separate switch that makes a node serve as an infrastructure relay and nothing else.
+`--anonymity=on|off` (environment `LAPISNET_ANONYMITY`, settings file key `anonymity` in the browser), default `off`, experimental. Only the exact lower-case words are accepted. It excludes `--hole-punching=auto|on` and `--onion-relay=true`; see <<path-policy>>. `--anonymity-allow-call-media=true|false` (environment `LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA`, browser file key `anonymityAllowCallMedia`, default `false`) is valid only together with `--anonymity=on`; see <<call-signals-over-circuits>>. `--onion-relay=true|false` (default off) remains the separate switch that makes a node serve as an infrastructure relay and nothing else.
 
 == Wire integration (wave V0.10.0-B)
 
@@ -1017,6 +1084,8 @@ Honest limits: zeroisation covers the arrays this code owns, not copies the JVM 
 
 Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServiceAddress`, `OnionServiceDescriptor` with its codec, the HPKE introduction, the end-to-end layer (`RendezvousEndToEnd`, `RendezvousHandshake`), the relay roles and splice inside `OnionRelay` (introduction table, rendezvous table, deferred cross-circuit work so that two circuit locks are never held at once) and the two pure state machines `OnionServiceStateMachine` and `RendezvousClientStateMachine`; to `lapis-net-directory`: `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip` and `OnionServiceDht`; to `lapis-net-onion-wire`: `OnionClientCircuit`/`OnionCircuitFactory`, `OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionPathProvider` and the `OnionWire` factories.
 
+Wave G adds no module: to `lapis-net-dm`: the anonymity mode of `DmSessionManager.sendCallSignal` and `DmCallSignalPathLostException`; to `lapis-net-call`: `CallMediaPolicy`, `CallSdpExposureFilter`, `CallEndReason.CIRCUIT_LOST` (local only), `CallEvent.IncomingSuppressed` and `CallSignalPathLostException`; to `lapis-net-networking`: the option `anonymity-allow-call-media`; to `lapis-net-browser`: the call media status, the 409 codes and the confirmation UI.
+
 Wave F2 adds the module `lapis-net-mail-onion` (`OnionMailTransport`, `OnionMailInboundHandler`, `OnionMailRetryQueue`, `AnonymousMailSubscriber`, `MailCircuitBundleCodec`); to `lapis-net-mail`: `AnonymousMailTransport`, `AnonymousMailInboundSink`, `AnonymousMailSizing`, `InboxAnonymousSink` and the anonymous modes of `MailSender` and `InboxGossip`; to `lapis-net-directory`: `SealedMailboxBox` and multiple consumers on `AnonymousMailboxGossip`; to `lapis-net-networking`: `GossipPubSub.subscribedTopics`.
 
 Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and `lapis-net-onion-wire`: `OnionDmTransport`, `DmCircuitFraming`, `OnionDmInboundHandler`, `AnonymousMailboxRedelivery`, `AnonymousMailboxSubscriber`); to `lapis-net-dm`: `AnonymousDmTransport`, `DmInboundSink`, `DmRoute`, `DmAnonymousFailure` and `SealedMailboxItemCodec`; to `lapis-net-onion`: the `MAILBOX_PUBLISH` relay role (`MailboxPublishBody`); to `lapis-net-directory`: `AnonymousMailboxGossip`; to `lapis-net-onion-wire`: `MailboxPublishSink`, `OnionMailboxPublisher`, `OnionServiceStreamRouter` and the `AnonymityRuntime` methods used by the adapter.
@@ -1032,7 +1101,7 @@ Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and
 | E | Done (unreleased): path selection (Madli weighting, diversity, persistent guards), the client circuit policy, and the experimental option `--anonymity=on|off` (DCUtR and Identify off, conflicts with `--hole-punching` and `--onion-relay`), wired into the CLI node and the browser. Only the directory publication and the path selection are active; no user traffic is anonymised and the transport key is still the identity key.
 | F1 | Done (unreleased): direct messages online and offline over circuits (rendezvous streams, sealed mailbox items announced by relays on one shared topic), new module `lapis-net-dm-onion`, new relay role `MAILBOX_PUBLISH`. No attachments, no fallback, mail and calls unchanged.
 | F2 | Done (unreleased): mail over circuits (rendezvous-stream bundles up to 1 MiB with attachments, small mail also as sealed items on the shared topic), off the per-recipient topic, no DHT pointer and no Nabu fetch; new module `lapis-net-mail-onion`, generic `SealedMailboxBox` with a kind byte, `MAIL` service application. Both ends must be in anonymity mode, no fallback. Calls unchanged.
-| G | Call signals over circuits, with an honest note on the media path.
+| G | Done (unreleased): call signals over circuits (online only, same ratchet session, no reply route); calls off in anonymity mode by default; `--anonymity-allow-call-media=true` allows them with a confirmation per call, media stays direct and reveals the IP address; reduced SDP candidates (public host only); `CIRCUIT_LOST`; no wire change.
 | H | Padding and timing protection (DROP cell schedule), circuit pre-building.
 | I | Multi-node tests, Sybil simulation, external cryptographic review recommended.
 | J (later) | GossipSub, DHT and content fetches.

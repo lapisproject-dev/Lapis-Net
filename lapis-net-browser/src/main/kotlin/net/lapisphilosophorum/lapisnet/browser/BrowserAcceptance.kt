@@ -29,6 +29,9 @@ enum class CallBlockReason {
 
     /** Any block that is not attributable to exactly one gate. */
     POLICY,
+
+    /** V0.10.0-G: calls are off in anonymity mode (the INVITE was dropped silently). Local display only. */
+    ANONYMITY_MODE,
 }
 
 /** Why a mail was discarded by the mail acceptance policy - counted locally, never sent anywhere. */

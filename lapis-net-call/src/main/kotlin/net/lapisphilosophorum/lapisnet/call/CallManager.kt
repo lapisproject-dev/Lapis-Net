@@ -4,6 +4,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
 import net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute
 import net.lapisphilosophorum.lapisnet.dm.DmInboundCallSignal
+import net.lapisphilosophorum.lapisnet.dm.DmRoute
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.security.SecureRandom
@@ -99,6 +100,48 @@ class CallManager private constructor(
     private val clock: () -> Instant,
 ) {
     private val listeners = CopyOnWriteArrayList<(CallEvent) -> Unit>()
+
+    /** Peer text for logs: the short fingerprint normally, nothing in anonymity mode (V0.10.0-G). */
+    private fun who(peer: Secp256k1PublicKey): String =
+        if (config.mediaPolicy.anonymity) "<peer>" else peer.fingerprint()
+
+    /** Logs [e] with its stack trace normally; in anonymity mode only its type (messages may carry addresses). */
+    private inline fun debugE(
+        e: Throwable,
+        crossinline message: () -> String,
+    ) {
+        if (config.mediaPolicy.anonymity) {
+            logger.debug { message() + " (${e.javaClass.simpleName})" }
+        } else {
+            logger.debug(e) { message() }
+        }
+    }
+
+    private inline fun warnE(
+        e: Throwable,
+        crossinline message: () -> String,
+    ) {
+        if (config.mediaPolicy.anonymity) {
+            logger.warn { message() + " (${e.javaClass.simpleName})" }
+        } else {
+            logger.warn(e) { message() }
+        }
+    }
+
+    private fun exposureFilteredLocal(sdp: String): String =
+        if (config.mediaPolicy == CallMediaPolicy.EXPOSED) CallSdpExposureFilter.filterLocal(sdp) else sdp
+
+    private fun exposureFilteredRemote(sdp: String): String =
+        if (config.mediaPolicy == CallMediaPolicy.EXPOSED) CallSdpExposureFilter.filterRemote(sdp) else sdp
+
+    private fun endReasonOfSendFailure(e: RuntimeException): CallEndReason =
+        if (e is CallSignalPathLostException) CallEndReason.CIRCUIT_LOST else CallEndReason.LOCAL_ERROR
+
+    /** V0.10.0-G: global INVITE limiter across all senders, used only in anonymity mode. */
+    private val globalInviteLimiter =
+        FixedWindowRateLimiter(config.maxGlobalInvitesPerWindow, config.globalInviteRateWindow) {
+            clock().toEpochMilli()
+        }
 
     /** Shares this manager's own injectable [clock] - see [CallLog]'s own constructor doc comment
      * for why an independent `Instant.now()` here would be inconsistent with every other
@@ -289,7 +332,16 @@ class CallManager private constructor(
      * default of 1 while another call is active): then a single [CallEvent.Ended] with
      * [CallEndReason.BUSY] is the ONLY event this [callId] ever gets, with no preceding
      * [CallEvent.OutgoingRinging] - see [placeCallOnStateThread]'s own early-return checks. */
-    fun placeCall(peer: Secp256k1PublicKey): CallId {
+    fun placeCall(
+        peer: Secp256k1PublicKey,
+        mediaExposureConfirmed: Boolean = false,
+    ): CallId {
+        // V0.10.0-G: refused synchronously, before any hand-off and any network traffic.
+        when (config.mediaPolicy) {
+            CallMediaPolicy.DISABLED -> throw CallMediaDisabledException()
+            CallMediaPolicy.EXPOSED -> if (!mediaExposureConfirmed) throw CallMediaExposureNotConfirmedException()
+            CallMediaPolicy.DIRECT -> Unit
+        }
         val callId = CallId.random(random)
         // Guarded like every internal stateExecutor hand-off - MEDIUM review-round finding (2026-09-02):
         // unlike every other stateExecutor.execute call site in this class, this was one of five PUBLIC
@@ -298,7 +350,7 @@ class CallManager private constructor(
         // API method instead of the same "safe to call after stop(), effectively a no-op" contract this
         // class's other query methods (activeCalls(), stop() itself) already document and provide. No
         // action needed on rejection: there is no ActiveCall to tear down, nothing was ever admitted.
-        executeOnStateThreadIfRunning("placing outgoing call to ${peer.fingerprint()}") {
+        executeOnStateThreadIfRunning("placing outgoing call to ${who(peer)}") {
             placeCallOnStateThread(callId, peer)
         }
         return callId
@@ -310,7 +362,16 @@ class CallManager private constructor(
      * transitions. Also a no-op (same discipline, same MEDIUM review-round finding, 2026-09-02) for a
      * caller racing this manager's own [stop] - see [placeCall]'s own doc comment on
      * [executeOnStateThreadIfRunning] for why an unguarded submission here used to throw instead. */
-    fun acceptCall(callId: CallId) {
+    fun acceptCall(
+        callId: CallId,
+        mediaExposureConfirmed: Boolean = false,
+    ) {
+        // V0.10.0-G: with DISABLED no call can ring, so this is a no-op; with EXPOSED it needs the confirmation.
+        when (config.mediaPolicy) {
+            CallMediaPolicy.DISABLED -> return
+            CallMediaPolicy.EXPOSED -> if (!mediaExposureConfirmed) throw CallMediaExposureNotConfirmedException()
+            CallMediaPolicy.DIRECT -> Unit
+        }
         executeOnStateThreadIfRunning("accepting call ${callId.fingerprint()}") { acceptCallOnStateThread(callId) }
     }
 
@@ -348,19 +409,19 @@ class CallManager private constructor(
                 future.complete(calls.values.map { CallSnapshot(it.callId, it.peer, it.state) })
             }
         } catch (e: RejectedExecutionException) {
-            logger.debug(e) { "activeCalls(): stateExecutor already shut down - returning empty list" }
+            debugE(e) { "activeCalls(): stateExecutor already shut down - returning empty list" }
             return emptyList()
         }
         return try {
             future.get(QUERY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
-            logger.debug(e) { "activeCalls(): interrupted while querying - returning empty list" }
+            debugE(e) { "activeCalls(): interrupted while querying - returning empty list" }
             emptyList()
         } catch (e: Exception) {
             // TimeoutException/ExecutionException - see stop()'s own identical catch for why a
             // RuntimeException catch here would never fire for either.
-            logger.debug(e) { "activeCalls(): timed out querying - returning empty list" }
+            debugE(e) { "activeCalls(): timed out querying - returning empty list" }
             emptyList()
         }
     }
@@ -400,7 +461,7 @@ class CallManager private constructor(
                 snapshot.get(QUERY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
-                logger.debug(e) { "stop(): interrupted while collecting active calls - shutting down anyway" }
+                debugE(e) { "stop(): interrupted while collecting active calls - shutting down anyway" }
                 emptyList()
             } catch (e: Exception) {
                 // TimeoutException (the state thread is stuck behind a slow listener - see emit()'s
@@ -409,7 +470,7 @@ class CallManager private constructor(
                 // is a RuntimeException - CompletableFuture.get(long, TimeUnit) declares exactly
                 // these three checked exceptions, so a `catch (e: RuntimeException)` here would never
                 // fire for the one failure mode this fallback exists to handle.
-                logger.debug(e) { "stop(): timed out collecting active calls - shutting down anyway" }
+                debugE(e) { "stop(): timed out collecting active calls - shutting down anyway" }
                 emptyList()
             }
         toClose.forEach { call -> call.timeoutTask?.cancel(false) }
@@ -497,13 +558,11 @@ class CallManager private constructor(
         // this manager's onInboundCallSignal stays registered there for the node's remaining lifetime.
         // No action needed on rejection: stop() is tearing this call down (or already has), so silently
         // dropping one more inbound signal changes nothing about this node's own state.
-        executeOnStateThreadIfRunning("handling inbound call signal from ${inbound.sender.fingerprint()}") {
+        executeOnStateThreadIfRunning("handling inbound call signal from ${who(inbound.sender)}") {
             try {
                 handleInboundCallSignalOnStateThread(inbound)
             } catch (e: RuntimeException) {
-                logger.warn(
-                    e,
-                ) { "unexpected exception handling inbound call signal from ${inbound.sender.fingerprint()}" }
+                warnE(e) { "unexpected exception handling inbound call signal from ${who(inbound.sender)}" }
             }
         }
     }
@@ -517,7 +576,7 @@ class CallManager private constructor(
             try {
                 listener(event)
             } catch (e: RuntimeException) {
-                logger.warn(e) { "call listener threw - other listeners still notified" }
+                warnE(e) { "call listener threw - other listeners still notified" }
             }
         }
     }
@@ -590,7 +649,7 @@ class CallManager private constructor(
             try {
                 mediaExecutor.execute { closeAndUntrack(session) }
             } catch (e: RejectedExecutionException) {
-                logger.debug(e) {
+                debugE(e) {
                     "mediaExecutor already shut down while closing an already-ended call's media " +
                         "session - closing inline instead"
                 }
@@ -620,7 +679,7 @@ class CallManager private constructor(
             stateExecutor.execute(action)
             true
         } catch (e: RejectedExecutionException) {
-            logger.debug(e) {
+            debugE(e) {
                 "stateExecutor already shut down while $description - ignoring, stop() is tearing " +
                     "this call down anyway"
             }
@@ -650,7 +709,7 @@ class CallManager private constructor(
             mediaExecutor.execute(action)
             true
         } catch (e: RejectedExecutionException) {
-            logger.debug(e) {
+            debugE(e) {
                 "mediaExecutor already shut down while $description - ignoring, stop() is tearing " +
                     "this call down anyway"
             }
@@ -697,7 +756,7 @@ class CallManager private constructor(
         try {
             scheduler.schedule(action, delay.toMillis(), TimeUnit.MILLISECONDS)
         } catch (e: RejectedExecutionException) {
-            logger.debug(e) {
+            debugE(e) {
                 "scheduler already shut down while $description - ignoring, stop() is tearing this " +
                     "call down anyway"
             }
@@ -774,9 +833,9 @@ class CallManager private constructor(
                 // (DmUnknownRecipientException). Only the type and fingerprints are logged.
                 logger.warn {
                     "failed to send ${signal.type} for call ${signal.callId.fingerprint()} to " +
-                        "${peer.fingerprint()}: ${e.javaClass.simpleName}"
+                        "${who(peer)}: ${e.javaClass.simpleName}"
                 }
-                logger.debug(e) { "details of the failed ${signal.type} send" }
+                debugE(e) { "details of the failed ${signal.type} send" }
             }
         }
     }
@@ -841,7 +900,7 @@ class CallManager private constructor(
         // handleInboundInvite's own ordering (MAX_TRACKED_CALLS before its BUSY/maxConcurrentCalls
         // check).
         if (calls.size >= MAX_TRACKED_CALLS) {
-            logger.debug { "refusing outgoing call to ${peer.fingerprint()} - too many tracked calls" }
+            logger.debug { "refusing outgoing call to ${who(peer)} - too many tracked calls" }
             val event = CallEvent.Ended(callId, peer, CallEndReason.BUSY)
             callLog.record(event)
             emit(event)
@@ -977,18 +1036,18 @@ class CallManager private constructor(
             try {
                 CallSignalCodec.decode(inbound.payload)
             } catch (e: MalformedCallSignalException) {
-                logger.debug(e) { "dropping malformed call signal from ${inbound.sender.fingerprint()}" }
+                debugE(e) { "dropping malformed call signal from ${who(inbound.sender)}" }
                 return
             }
         val now = nowMillis()
         if (signal.createdAtEpochMillis > now + config.maxClockSkew.toMillis()) {
             logger.debug {
-                "dropping call signal from ${inbound.sender.fingerprint()} - createdAt too far in the future"
+                "dropping call signal from ${who(inbound.sender)} - createdAt too far in the future"
             }
             return
         }
         if (signal.notValidAfterEpochMillis < now) {
-            logger.debug { "dropping expired call signal from ${inbound.sender.fingerprint()}" }
+            logger.debug { "dropping expired call signal from ${who(inbound.sender)}" }
             return
         }
         when (signal.type) {
@@ -1019,11 +1078,15 @@ class CallManager private constructor(
             return
         }
         if (!inviteRateLimiterFor(sender).tryAcquire()) {
-            logger.debug { "dropping INVITE from ${sender.fingerprint()} - invite rate limit exceeded" }
+            logger.debug { "dropping INVITE from ${who(sender)} - invite rate limit exceeded" }
+            return
+        }
+        if (config.mediaPolicy.anonymity && !globalInviteLimiter.tryAcquire()) {
+            logger.debug { "dropping INVITE - global invite rate limit exceeded" }
             return
         }
         if (calls.size >= MAX_TRACKED_CALLS) {
-            logger.debug { "dropping INVITE from ${sender.fingerprint()} - too many tracked calls" }
+            logger.debug { "dropping INVITE from ${who(sender)} - too many tracked calls" }
             return
         }
         if (quarantined && config.autoRejectQuarantined) {
@@ -1043,12 +1106,21 @@ class CallManager private constructor(
             if (alreadyEmitted) {
                 logger.debug {
                     "silently re-dropping retransmitted INVITE from quarantined sender " +
-                        "${sender.fingerprint()} - already emitted for this callId, no reply sent"
+                        "${who(sender)} - already emitted for this callId, no reply sent"
                 }
                 return
             }
-            logger.debug { "silently dropping INVITE from quarantined sender ${sender.fingerprint()} - no reply sent" }
+            logger.debug { "silently dropping INVITE from quarantined sender ${who(sender)} - no reply sent" }
             emit(CallEvent.IncomingCall(signal.callId, sender, quarantined = true))
+            return
+        }
+        if (config.mediaPolicy == CallMediaPolicy.DISABLED) {
+            // V0.10.0-G: calls are off in anonymity mode. Silent drop, exactly like a quarantined sender: a BUSY or
+            // REJECT would tell the caller the node is reachable and that calls are off. Deduplicated through the
+            // same LRU as the quarantine drop so a retransmit never re-emits.
+            if (quarantinedCallIds.put(signal.callId, true) == null) {
+                emit(CallEvent.IncomingSuppressed(signal.callId, sender, CallSuppressCause.ANONYMITY_MODE))
+            }
             return
         }
         // BUSY - checked AFTER the quarantine drop (a quarantined caller gets silence regardless of
@@ -1080,7 +1152,7 @@ class CallManager private constructor(
                 // INVITE - but handled explicitly rather than with a non-null assertion, consistent
                 // with this codebase's "never let an internal-consistency assumption surface as an
                 // NPE" discipline.
-                logger.warn { "INVITE from ${sender.fingerprint()} had a null sdp despite CallSignal's own invariant" }
+                logger.warn { "INVITE from ${who(sender)} had a null sdp despite CallSignal's own invariant" }
                 return
             }
         try {
@@ -1098,7 +1170,8 @@ class CallManager private constructor(
             return
         }
         val call = ActiveCall(signal.callId, sender, CallDirection.INCOMING)
-        call.remoteOfferSdp = sdp
+        call.remoteOfferSdp =
+            exposureFilteredRemote(sdp)
         call.replyRoute = replyRoute
         calls[signal.callId] = call
         scheduleTimeout(call, config.ringTimeout) { onRingTimeout(signal.callId) }
@@ -1143,6 +1216,14 @@ class CallManager private constructor(
             endCallOnStateThread(call, CallEndReason.LOCAL_ERROR)
             return
         }
+        val answerSdp =
+            if (config.mediaPolicy ==
+                CallMediaPolicy.EXPOSED
+            ) {
+                CallSdpExposureFilter.filterRemote(sdp)
+            } else {
+                sdp
+            }
         cancelTimeout(call)
         call.state = CallState.CONNECTING
         emit(CallEvent.Connecting(call.callId, call.peer))
@@ -1160,7 +1241,7 @@ class CallManager private constructor(
         // second, racing close of the same `RTCPeerConnection`.
         executeOnMediaThreadIfRunning("applying answer for call ${call.callId.fingerprint()}") {
             try {
-                session.applyAnswer(sdp)
+                session.applyAnswer(answerSdp)
             } catch (e: CallMediaException) {
                 closeAndUntrack(session)
                 // MINOR review-round finding (2026-09-02): this hand-off was overlooked when every
@@ -1246,7 +1327,11 @@ class CallManager private constructor(
         cause: String,
     ) {
         val call = calls[callId] ?: return
-        logger.debug { "media failed for call ${callId.fingerprint()}: $cause" }
+        if (config.mediaPolicy.anonymity) {
+            logger.debug { "media failed for call ${callId.fingerprint()}" } // the cause text may carry an address
+        } else {
+            logger.debug { "media failed for call ${callId.fingerprint()}: $cause" }
+        }
         val now = nowMillis()
         // marksAcceptance=false: an automatic media-failure reaction, never a local user decision
         // about this peer (see sendSignalAsync's own doc comment).
@@ -1288,7 +1373,7 @@ class CallManager private constructor(
             try {
                 mediaEngine.newSession(mediaObserverFor(callId, peer))
             } catch (e: RuntimeException) {
-                logger.debug(e) { "failed to create media session for outgoing call ${callId.fingerprint()}" }
+                debugE(e) { "failed to create media session for outgoing call ${callId.fingerprint()}" }
                 executeOnStateThreadIfRunning(
                     "ending outgoing call ${callId.fingerprint()} after a newSession failure",
                 ) {
@@ -1328,7 +1413,7 @@ class CallManager private constructor(
             try {
                 session.createOffer(config.iceGatheringTimeout)
             } catch (e: CallMediaException) {
-                logger.debug(e) { "failed to create offer for outgoing call ${callId.fingerprint()}" }
+                debugE(e) { "failed to create offer for outgoing call ${callId.fingerprint()}" }
                 closeAndUntrack(session)
                 executeOnStateThreadIfRunning(
                     "ending outgoing call ${callId.fingerprint()} after a createOffer failure",
@@ -1338,19 +1423,28 @@ class CallManager private constructor(
                 return
             }
         val now = nowMillis()
-        val signal = CallSignal.invite(callId, sdp, now, now + config.signalTtl.toMillis())
+        val offerSdp =
+            if (config.mediaPolicy ==
+                CallMediaPolicy.EXPOSED
+            ) {
+                CallSdpExposureFilter.filterLocal(sdp)
+            } else {
+                sdp
+            }
+        val signal = CallSignal.invite(callId, offerSdp, now, now + config.signalTtl.toMillis())
         try {
             // marksAcceptance=true: this INVITE only exists because the local user called placeCall()
             // - a real, deliberate decision to communicate with peer (see
             // CallSignalTransport.send's own doc comment, SECURITY round-11 review finding).
             transport.send(peer, CallSignalCodec.encode(signal), true, null)
         } catch (e: RuntimeException) {
-            logger.debug(e) { "failed to send INVITE for outgoing call ${callId.fingerprint()}" }
+            debugE(e) { "failed to send INVITE for outgoing call ${callId.fingerprint()}" }
             closeAndUntrack(session)
+            val endReason = endReasonOfSendFailure(e)
             executeOnStateThreadIfRunning(
                 "ending outgoing call ${callId.fingerprint()} after a failed INVITE send",
             ) {
-                calls[callId]?.let { endCallOnStateThread(it, CallEndReason.LOCAL_ERROR) }
+                calls[callId]?.let { endCallOnStateThread(it, endReason) }
             }
         }
     }
@@ -1371,7 +1465,7 @@ class CallManager private constructor(
             try {
                 mediaEngine.newSession(mediaObserverFor(callId, peer))
             } catch (e: RuntimeException) {
-                logger.debug(e) { "failed to create media session for incoming call ${callId.fingerprint()}" }
+                debugE(e) { "failed to create media session for incoming call ${callId.fingerprint()}" }
                 executeOnStateThreadIfRunning(
                     "ending incoming call ${callId.fingerprint()} after a newSession failure",
                 ) {
@@ -1400,7 +1494,7 @@ class CallManager private constructor(
             try {
                 session.acceptOfferAndCreateAnswer(remoteOfferSdp, config.iceGatheringTimeout)
             } catch (e: CallMediaException) {
-                logger.debug(e) { "failed to create answer for incoming call ${callId.fingerprint()}" }
+                debugE(e) { "failed to create answer for incoming call ${callId.fingerprint()}" }
                 closeAndUntrack(session)
                 executeOnStateThreadIfRunning(
                     "ending incoming call ${callId.fingerprint()} after an acceptOfferAndCreateAnswer failure",
@@ -1410,19 +1504,28 @@ class CallManager private constructor(
                 return
             }
         val now = nowMillis()
-        val signal = CallSignal.accept(callId, answerSdp, now, now + config.signalTtl.toMillis())
+        val localAnswer =
+            if (config.mediaPolicy ==
+                CallMediaPolicy.EXPOSED
+            ) {
+                CallSdpExposureFilter.filterLocal(answerSdp)
+            } else {
+                answerSdp
+            }
+        val signal = CallSignal.accept(callId, localAnswer, now, now + config.signalTtl.toMillis())
         try {
             // marksAcceptance=true: this ACCEPT only exists because the local user called
             // acceptCall() - a real, deliberate decision to communicate with peer (see
             // CallSignalTransport.send's own doc comment, SECURITY round-11 review finding).
             transport.send(peer, CallSignalCodec.encode(signal), true, replyRoute)
         } catch (e: RuntimeException) {
-            logger.debug(e) { "failed to send ACCEPT for incoming call ${callId.fingerprint()}" }
+            debugE(e) { "failed to send ACCEPT for incoming call ${callId.fingerprint()}" }
             closeAndUntrack(session)
+            val endReason = endReasonOfSendFailure(e)
             executeOnStateThreadIfRunning(
                 "ending incoming call ${callId.fingerprint()} after a failed ACCEPT send",
             ) {
-                calls[callId]?.let { endCallOnStateThread(it, CallEndReason.LOCAL_ERROR) }
+                calls[callId]?.let { endCallOnStateThread(it, endReason) }
             }
         }
     }
@@ -1472,6 +1575,10 @@ class CallManager private constructor(
             random: SecureRandom = SecureRandom(),
             clock: () -> Instant = Instant::now,
         ): CallManager {
+            // fail closed: the media policy must match the route of the DM layer (no mixed-up configuration)
+            require(config.mediaPolicy.anonymity == (dm.routeMode() == DmRoute.CIRCUIT)) {
+                "call media policy does not match the DM route"
+            }
             val manager = CallManager(DmCallSignalTransport(dm), mediaEngine, config, random, clock)
             dm.addCallSignalListener(manager::onInboundCallSignal)
             return manager

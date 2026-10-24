@@ -3,6 +3,9 @@
   --anonymity-warning-bg: #3d2f0a;
   --anonymity-warning-fg: #ffd98a;
   --anonymity-warning-border: #a87a1c;
+  --warn: #e0a526;
+  --warn-bg: #3d2f0a;
+  --warn-fg: #ffd98a;
   --bg: #0f1115;
   --panel-bg: #1a1d24;
   --border: #2a2e37;
@@ -474,6 +477,9 @@ input[type="checkbox"] {
     --anonymity-warning-bg: #fff4d6;
     --anonymity-warning-fg: #5a3d00;
     --anonymity-warning-border: #c98a00;
+    --warn: #c98a00;
+    --warn-bg: #fff4d6;
+    --warn-fg: #5a3d00;
     --bg: #f5f6f8;
     --panel-bg: #ffffff;
     --border: #dfe2e8;
@@ -532,3 +538,22 @@ button:disabled { opacity: 0.5; cursor: default; }
 
 .node-status-lines { margin: 0.2rem 0 0.2rem 1.1rem; padding: 0; font-weight: 600; }
 .node-status-lines li { margin: 0; }
+
+/* V0.10.0-G - calls in anonymity mode: amber (never red), a left rule of 4px, the eye as the sign of "visible". */
+.call-anonymity, .call-exposure {
+  display: flex;
+  gap: 0.7rem;
+  align-items: flex-start;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+.call-anonymity[hidden] { display: none; }
+.call-anonymity p, .call-exposure p { margin: 0.25rem 0 0; font-size: 0.9rem; }
+.call-anonymity-eye, .call-exposure-eye { flex: none; color: var(--warn); }
+.call-exposure { margin-top: 0.6rem; flex: 1 1 100%; }
+.call-exposure-actions { display: flex; gap: 0.5rem; margin-top: 0.6rem; flex-wrap: wrap; }
+.call-card { flex-wrap: wrap; }

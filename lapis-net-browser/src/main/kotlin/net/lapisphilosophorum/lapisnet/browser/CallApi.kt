@@ -26,6 +26,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import net.lapisphilosophorum.lapisnet.call.CallId
+import net.lapisphilosophorum.lapisnet.call.CallMediaDisabledException
+import net.lapisphilosophorum.lapisnet.call.CallMediaExposureNotConfirmedException
+import net.lapisphilosophorum.lapisnet.call.CallMediaPolicy
 import net.lapisphilosophorum.lapisnet.core.ratelimit.FixedWindowRateLimiter
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import java.time.Duration
@@ -48,12 +51,30 @@ data class CallSessionResponse(
 @Serializable
 data class CallPlaceRequest(
     val peer: String,
+    /** V0.10.0-G: set by the browser only from the click on the confirmation button; never stored. */
+    val confirmMediaExposure: Boolean = false,
 )
 
-/** Empty-but-present body of accept/reject/hangup - requiring a JSON body (together with the guard's
- * `Content-Type`/`Origin` checks) keeps these routes out of reach of plain cross-site form posts. */
+/** Body of accept/reject/hangup - requiring a JSON body (together with the guard's
+ * `Content-Type`/`Origin` checks) keeps these routes out of reach of plain cross-site form posts. `{}` stays valid. */
 @Serializable
-class CallActionRequest
+data class CallActionRequest(
+    val confirmMediaExposure: Boolean = false,
+)
+
+/** 409 body of the anonymity-mode refusals: a human text plus a stable machine code. */
+@Serializable
+data class CallErrorResponse(
+    val error: String,
+    val code: String,
+)
+
+internal const val CODE_CALL_MEDIA_DISABLED = "CALL_MEDIA_DISABLED_IN_ANONYMITY_MODE"
+internal const val CODE_EXPOSURE_CONFIRMATION_REQUIRED = "MEDIA_EXPOSURE_CONFIRMATION_REQUIRED"
+internal const val TEXT_CALL_MEDIA_DISABLED =
+    "Calls are not available in anonymity mode because call media reveals your IP address"
+internal const val TEXT_EXPOSURE_CONFIRMATION_REQUIRED =
+    "The exposure of your IP address through call media has not been confirmed"
 
 @Serializable
 data class CallPlaceResponse(
@@ -85,6 +106,10 @@ data class CallStatusResponse(
     val available: Boolean,
     val active: List<CallSnapshotDto>,
     val history: List<CallHistoryDto>,
+    /** V0.10.0-G: `"off"|"on"`; also reported when [available] is false. */
+    val anonymity: String = "off",
+    /** V0.10.0-G: `"direct"|"disabled"|"exposed"`; also reported when [available] is false. */
+    val callMedia: String = "direct",
 )
 
 /** One SSE message. [type] is `incoming|ringing|connecting|active|ended|blocked`; every string is
@@ -113,6 +138,8 @@ class CallApiDependencies(
     /** The port the HTTP engine really bound; `0` until known (the guard then answers `503`). */
     val expectedPort: () -> Int,
     val heartbeatInterval: kotlin.time.Duration = 15.seconds,
+    /** V0.10.0-G: DIRECT in normal mode; DISABLED/EXPOSED in anonymity mode. */
+    val callMedia: CallMediaPolicy = CallMediaPolicy.DIRECT,
 )
 
 private val sseJson = Json { encodeDefaults = true }
@@ -188,7 +215,15 @@ internal fun Route.installCallRoutes(deps: CallApiDependencies) {
             get("/status") {
                 val remote = deps.remote
                 if (remote == null) {
-                    call.respond(CallStatusResponse(available = false, active = emptyList(), history = emptyList()))
+                    call.respond(
+                        CallStatusResponse(
+                            available = false,
+                            active = emptyList(),
+                            history = emptyList(),
+                            anonymity = anonymityWire(deps.callMedia),
+                            callMedia = deps.callMedia.wire,
+                        ),
+                    )
                     return@get
                 }
                 val active =
@@ -227,24 +262,54 @@ internal fun Route.installCallRoutes(deps: CallApiDependencies) {
                     (ended + blocked)
                         .sortedByDescending { it.atEpochSecond }
                         .take(CALL_STATUS_HISTORY_LIMIT)
-                call.respond(CallStatusResponse(available = true, active = active, history = history))
+                call.respond(
+                    CallStatusResponse(
+                        available = true,
+                        active = active,
+                        history = history,
+                        anonymity = anonymityWire(deps.callMedia),
+                        callMedia = deps.callMedia.wire,
+                    ),
+                )
             }
 
             post("/place") {
                 val remote = deps.remote ?: return@post call.respondUnavailable()
                 val request = receiveOrBadRequest<CallPlaceRequest>() ?: return@post
+                // V0.10.0-G: refused before the peer check and before any remote call: no network, no history entry.
+                if (deps.callMedia == CallMediaPolicy.DISABLED) {
+                    call.respondMediaDisabled()
+                    return@post
+                }
+                if (deps.callMedia == CallMediaPolicy.EXPOSED && !request.confirmMediaExposure) {
+                    call.respondConfirmationRequired()
+                    return@post
+                }
                 val peer = parseHexPublicKeyOrNull(request.peer)
                 if (peer == null || peer.bytes.contentEquals(deps.ownPublicKey.bytes)) {
                     call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid peer"))
                     return@post
                 }
-                val callId = remote.placeCall(peer)
+                val callId =
+                    try {
+                        remote.placeCall(peer, request.confirmMediaExposure)
+                    } catch (_: CallMediaDisabledException) {
+                        call.respondMediaDisabled()
+                        return@post
+                    } catch (_: CallMediaExposureNotConfirmedException) {
+                        call.respondConfirmationRequired()
+                        return@post
+                    }
                 call.respond(HttpStatusCode.Accepted, CallPlaceResponse(callId.bytes.toHexString()))
             }
 
-            post("/{callId}/accept") { handleAction(deps) { remote, id -> remote.acceptCall(id) } }
-            post("/{callId}/reject") { handleAction(deps) { remote, id -> remote.rejectCall(id) } }
-            post("/{callId}/hangup") { handleAction(deps) { remote, id -> remote.hangUp(id) } }
+            post("/{callId}/accept") {
+                handleAction(deps, needsExposureConfirmation = true) { remote, id, confirmed ->
+                    remote.acceptCall(id, confirmed)
+                }
+            }
+            post("/{callId}/reject") { handleAction(deps) { remote, id, _ -> remote.rejectCall(id) } }
+            post("/{callId}/hangup") { handleAction(deps) { remote, id, _ -> remote.hangUp(id) } }
 
             get("/events") {
                 val hub = deps.hub
@@ -304,16 +369,30 @@ private suspend fun io.ktor.server.application.ApplicationCall.respondUnavailabl
     respond(HttpStatusCode.ServiceUnavailable, ErrorResponse("calls are not available on this node"))
 }
 
+private fun anonymityWire(policy: CallMediaPolicy): String = if (policy.anonymity) "on" else "off"
+
+private suspend fun io.ktor.server.application.ApplicationCall.respondMediaDisabled() {
+    respond(HttpStatusCode.Conflict, CallErrorResponse(TEXT_CALL_MEDIA_DISABLED, CODE_CALL_MEDIA_DISABLED))
+}
+
+private suspend fun io.ktor.server.application.ApplicationCall.respondConfirmationRequired() {
+    respond(
+        HttpStatusCode.Conflict,
+        CallErrorResponse(TEXT_EXPOSURE_CONFIRMATION_REQUIRED, CODE_EXPOSURE_CONFIRMATION_REQUIRED),
+    )
+}
+
 private suspend fun RoutingContext.handleAction(
     deps: CallApiDependencies,
-    action: (CallRemote, CallId) -> Unit,
+    needsExposureConfirmation: Boolean = false,
+    action: (CallRemote, CallId, Boolean) -> Unit,
 ) {
     val remote = deps.remote
     if (remote == null) {
         call.respondUnavailable()
         return
     }
-    receiveOrBadRequest<CallActionRequest>() ?: return
+    val body = receiveOrBadRequest<CallActionRequest>() ?: return
     val id = call.parameters["callId"]?.let(::parseCallIdOrNull)
     if (id == null) {
         call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid call id"))
@@ -329,7 +408,17 @@ private suspend fun RoutingContext.handleAction(
         call.respond(HttpStatusCode.NotFound, ErrorResponse("unknown call"))
         return
     }
+    // V0.10.0-G: checked AFTER the unknown/blocked 404s so the confirmation answer is no existence oracle.
+    if (needsExposureConfirmation && deps.callMedia == CallMediaPolicy.EXPOSED && !body.confirmMediaExposure) {
+        call.respondConfirmationRequired()
+        return
+    }
     // A race between the check above and this call is harmless: CallManager treats it as a no-op.
-    action(remote, id)
+    try {
+        action(remote, id, body.confirmMediaExposure)
+    } catch (_: CallMediaExposureNotConfirmedException) {
+        call.respondConfirmationRequired()
+        return
+    }
     call.respond(HttpStatusCode.Accepted)
 }

@@ -21,6 +21,21 @@ internal fun fakeAudioSdp(): String =
         "a=fingerprint:sha-256 " + (1..32).joinToString(":") { "AB" } + "\r\n" +
         "a=candidate:1 1 udp 2122260223 192.168.1.5 54321 typ host\r\n"
 
+/** Like [fakeAudioSdp] but with a PUBLIC (documentation range) host candidate plus private/loopback ones, so the
+ * V0.10.0-G exposure filter has something to keep and something to drop. */
+internal fun fakePublicAudioSdp(): String =
+    "v=0\r\n" +
+        "o=- 1 1 IN IP4 192.168.1.5\r\n" +
+        "s=-\r\n" +
+        "t=0 0\r\n" +
+        "m=audio 54321 UDP/TLS/RTP/SAVPF 111\r\n" +
+        "c=IN IP4 192.168.1.5\r\n" +
+        "a=rtcp:54321 IN IP4 192.168.1.5\r\n" +
+        "a=setup:actpass\r\n" +
+        "a=fingerprint:sha-256 " + (1..32).joinToString(":") { "AB" } + "\r\n" +
+        "a=candidate:1 1 udp 2122260223 192.168.1.5 54321 typ host\r\n" +
+        "a=candidate:2 1 udp 2122260222 198.51.100.7 54321 typ host\r\n"
+
 /** A test double for [CallMediaSession] - never touches `dev.onvoid.webrtc.*` or a real network
  * interface. [failCreateOrAccept]/[failApplyAnswer] simulate a media-layer failure;
  * [autoConnectOnAcceptSide]/[autoConnectOnApplyAnswer] control whether/when this session fires
@@ -45,9 +60,15 @@ internal class FakeCallMediaSession(
     var autoConnectOnAcceptSide = true
     var autoConnectOnApplyAnswer = true
 
+    /** The SDP this session returns as offer/answer. */
+    var sdp: () -> String = { fakeAudioSdp() }
+
+    /** Every remote SDP this session was handed (offer on the accept side, answer on the caller side). */
+    val remoteSdps = CopyOnWriteArrayList<String>()
+
     override fun createOffer(timeout: Duration): String {
         if (failCreateOrAccept) throw CallMediaException("simulated createOffer failure")
-        return fakeAudioSdp()
+        return sdp()
     }
 
     override fun acceptOfferAndCreateAnswer(
@@ -55,12 +76,14 @@ internal class FakeCallMediaSession(
         timeout: Duration,
     ): String {
         if (failCreateOrAccept) throw CallMediaException("simulated acceptOfferAndCreateAnswer failure")
+        remoteSdps.add(remoteSdp)
         if (autoConnectOnAcceptSide) observer.onMediaConnected()
-        return fakeAudioSdp()
+        return sdp()
     }
 
     override fun applyAnswer(remoteSdp: String) {
         if (failApplyAnswer) throw CallMediaException("simulated applyAnswer failure")
+        remoteSdps.add(remoteSdp)
         if (autoConnectOnApplyAnswer) observer.onMediaConnected()
     }
 
@@ -134,6 +157,10 @@ internal class FakeCallSignalTransport(
     private val network: FakeCallNetwork,
 ) : CallSignalTransport {
     var failSends = false
+
+    /** When set, [send] throws this instead of delivering (e.g. a circuit-loss failure). */
+    @Volatile
+    var failWith: RuntimeException? = null
     var quarantinedFromSelf = false
     val sentSignals = CopyOnWriteArrayList<CallSignal>()
 
@@ -165,6 +192,7 @@ internal class FakeCallSignalTransport(
         replyRoute: net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute?,
     ) {
         blockSendUntil?.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        failWith?.let { throw it }
         if (failSends) throw RuntimeException("simulated transport failure")
         sentSignals.add(CallSignalCodec.decode(payload))
         sentMarksAcceptance.add(marksAcceptance)

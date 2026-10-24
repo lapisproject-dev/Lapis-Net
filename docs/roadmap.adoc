@@ -2149,6 +2149,14 @@ _Unreleased. Internal wave identifier. Infrastructure, no anonymity offered._
 * *Open:* the libp2p transport key is still the identity key (largest remaining leak, wave E); no path selection; no DHT write path for anonymous entries; offline DM and mail through the DHT outbox unavailable in anonymity mode until wave F; an address published before the switch stays visible up to 24 hours (and in archives); the index has the wave C Sybil limit; nothing verified behind real NATs, against v0.12.0 over the network or by an external cryptographic review.
 * *Decisions pending:* see "Assumptions awaiting confirmation (wave D)" in `anonymity.adoc`.
 
+== V0.10.0-G — Traffic anonymisation, part 7: call signals over circuits
+
+_Unreleased. Internal wave identifier. Experimental option; call media is not anonymised and can not be._
+
+* *Done:* call signals (INVITE, ACCEPT, REJECT, HANGUP) over the rendezvous stream of a node in anonymity mode, online only, through the same Double Ratchet session (`DmSessionManager.sendCallSignal`, `DmCallSignalPathLostException`; the sealed mailbox door still rejects `CALL_SIGNAL`); `CallMediaPolicy` (`DIRECT`, `DISABLED`, `EXPOSED`) with calls off by default in anonymity mode; the option `--anonymity-allow-call-media` (environment `LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA`, browser file key `anonymityAllowCallMedia`); a confirmation before every call enforced in `CallApi` and in `CallManager`; silent drop of an INVITE while calls are off (`CallEvent.IncomingSuppressed`, no BUSY, no REJECT); the local-only end reason `CIRCUIT_LOST`; reduction of the SDP to public host candidates (`CallSdpExposureFilter`); a global INVITE limit in anonymity mode; log redaction of peers and SDP; the call page with the exposure band and the alertdialog; the 409 codes `CALL_MEDIA_DISABLED_IN_ANONYMITY_MODE` and `MEDIA_EXPOSURE_CONFIRMATION_REQUIRED`; a multi-node test with six relays and four nodes on loopback. No wire format change.
+* *Open:* the media path (a call reveals the IP address to the other party and to network observers), padding and timing protection (wave H), GossipSub, the DHT and content fetches (wave J), the transport key (largest remaining leak). A call needs a public address on at least one side (no STUN, no TURN). Not verified on real NATs and networks, with real WebRTC media in anonymity mode, under load, or by an external cryptographic review.
+* *Decisions pending:* see "Assumptions awaiting confirmation (wave G)" in `anonymity.adoc` (host-only candidates instead of srflx, constants, capability bit not published).
+
 == V0.10.0-F2 — Traffic anonymisation, part 6b: mail over circuits
 
 _Unreleased. Internal wave identifier. Experimental option, no anonymity of call media or the network layer offered._

@@ -76,4 +76,20 @@ class CallSignalCodecTest :
                 ).reason shouldBe
                 CallEndReason.NONE
         }
+
+        test("V0.10.0-G: CIRCUIT_LOST is local-only: never encoded, wire value 10 is malformed") {
+            val callId = CallId.random(random)
+            io.kotest.assertions.throwables.shouldThrow<IllegalArgumentException> {
+                CallSignalCodec.encode(CallSignal.hangUp(callId, CallEndReason.CIRCUIT_LOST, 1_000L, 61_000L))
+            }
+            val bytes = CallSignalCodec.encode(CallSignal.hangUp(callId, CallEndReason.LOCAL_HANGUP, 1_000L, 61_000L))
+            val tampered = bytes.copyOf()
+            tampered[CallSignalCodec.FIXED_PREFIX_SIZE - 3] = 10 // the reason byte
+            io.kotest.assertions.throwables.shouldThrow<MalformedCallSignalException> {
+                CallSignalCodec.decode(
+                    tampered,
+                )
+            }
+            CallEndReason.fromWireValue(10) shouldBe null
+        }
     })

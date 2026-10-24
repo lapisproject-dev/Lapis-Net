@@ -58,6 +58,12 @@ open class DmSessionException(
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
 
+/**
+ * V0.10.0-G - an anonymity-mode call signal could not be delivered over circuits (recipient not online anonymously,
+ * or the delivery attempt failed). Fixed text, no cause chain, no address and no circuit id.
+ */
+class DmCallSignalPathLostException : DmSessionException("call-signal-path-lost")
+
 /** Thrown by [DmSessionManager.send] when [PeerDirectoryGossip.lookup]/[PrekeyBundleGossip.lookup]
  * has no record for the recipient - a specific, catchable failure, never a crash or hang. Directory/
  * bundle propagation racing a genuinely reachable peer is the expected cause; [DmSessionManager]
@@ -291,7 +297,7 @@ class DmSessionManager private constructor(
             override fun acceptCircuitEnvelope(envelopeBytes: ByteArray) {
                 try {
                     val envelope = DmEnvelopeCodec.decode(envelopeBytes)
-                    dispatchAnonymousInbound(envelope, "circuit")
+                    dispatchAnonymousInbound(envelope, "circuit", AnonymousInboundDoor.CIRCUIT)
                 } catch (e: MalformedDmEnvelopeException) {
                     logger.debug { "rejected malformed DM envelope from a circuit" }
                 } catch (e: RuntimeException) {
@@ -305,7 +311,7 @@ class DmSessionManager private constructor(
                     privateKey = localPrekeyStore.x25519IdentityPrivateKey()
                     val envelope =
                         SealedMailboxItemCodec.open(itemBytes, privateKey, Instant.now().epochSecond) ?: return
-                    dispatchAnonymousInbound(envelope, "anonymous mailbox")
+                    dispatchAnonymousInbound(envelope, "anonymous mailbox", AnonymousInboundDoor.SEALED_MAILBOX)
                 } catch (e: RuntimeException) {
                     logger.warn {
                         "unexpected failure on the anonymous mailbox path - rejecting (${e::class.simpleName})"
@@ -321,13 +327,20 @@ class DmSessionManager private constructor(
     private fun dispatchAnonymousInbound(
         envelope: DmEnvelope,
         sourceDescription: String,
+        door: AnonymousInboundDoor,
     ) {
-        if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
-            logger.debug { "call signal arrived over the anonymity path - rejected (calls are not routed here yet)" }
+        // V0.10.0-G: a call signal is valid ONLY through the live circuit door (online-only, like the direct path);
+        // through the sealed mailbox it stays rejected (a ringing call hours late is a bug, and a metadata leak).
+        // Session requirement, AEAD and acceptance rules all run in processInboundDmEnvelope - no bypass.
+        if (envelope.messageType == DmMessageType.CALL_SIGNAL && door == AnonymousInboundDoor.SEALED_MAILBOX) {
+            logger.debug { "call signal arrived via the anonymous mailbox - rejected (calls are online-only)" }
             return
         }
         processInboundDmEnvelope(envelope, sourceDescription, null)
     }
+
+    /** V0.10.0-G: which anonymity-mode inbound door an envelope came through. */
+    private enum class AnonymousInboundDoor { CIRCUIT, SEALED_MAILBOX }
 
     /** Pre-session refusal checks of an anonymity-mode send; returns the resolved target. */
     private fun resolveAnonymousTarget(
@@ -358,6 +371,32 @@ class DmSessionManager private constructor(
         }
         transport.depositOffline(target, envelopeBytes, Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS)
         return DmSendOutcome.QUEUED_FOR_PICKUP
+    }
+
+    /**
+     * V0.10.0-G: anonymity-mode call signal. Every refusal happens BEFORE the ratchet step; never deposited offline.
+     * All "not reachable anonymously" outcomes (offline target, failed delivery) surface as the same fixed error.
+     */
+    private fun sendAnonymousCallSignalLocked(
+        recipient: Secp256k1PublicKey,
+        payload: ByteArray,
+        marksAcceptance: Boolean,
+    ) {
+        // The sealed-mailbox size ceiling does not apply: a call signal never touches a mailbox, only the live
+        // circuit stream, whose own ceiling is DmEnvelopeCodec.MAX_ENVELOPE_BYTES (payload is capped far below it).
+        val transport =
+            anonymousTransport ?: throw DmAnonymousDeliveryException(DmAnonymousFailure.ANONYMITY_NOT_READY)
+        val target = transport.resolve(recipient)
+        if (!target.online) throw DmCallSignalPathLostException()
+        val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
+        if (!transport.deliverOnline(
+                target,
+                DmEnvelopeCodec.encode(envelope),
+                Instant.now().plus(ANONYMOUS_CALL_SIGNAL_DEADLINE),
+            )
+        ) {
+            throw DmCallSignalPathLostException()
+        }
     }
 
     /** V0.8.5 - lateinit for the exact same reason as [dmProtocol]: [MailboxPoller.attach] needs a
@@ -974,6 +1013,10 @@ class DmSessionManager private constructor(
      * permanently bypassing every configured [DmAcceptancePolicy] gate for that peer's later DMs and
      * mailbox pickups.
      *
+     * **V0.10.0-G, anonymity mode:** the signal travels over the rendezvous circuit stream, ONLINE only (an offline
+     * target fails with [DmCallSignalPathLostException] before any ratchet step; it is never deposited in a mailbox),
+     * with [ANONYMOUS_CALL_SIGNAL_DEADLINE]. A [replyRoute] is refused. The same ratchet session is the only E2E layer.
+     *
      * @throws DmUnknownRecipientException if [recipient] has no [PeerDirectoryGossip] record.
      * @throws DmNoSessionException if no session with [recipient] exists yet.
      * @throws DmSessionException if [payload] exceeds [MAX_CALL_SIGNAL_PAYLOAD_BYTES], or for a
@@ -985,15 +1028,19 @@ class DmSessionManager private constructor(
         marksAcceptance: Boolean,
         replyRoute: DmCallReplyRoute? = null,
     ) {
-        // Anonymity mode has no direct DM protocol and no inbound call path: refuse BEFORE any
-        // ratchet step is consumed.
-        if (anonymous) {
-            throw DmSessionException("call signalling is not available in anonymity mode")
+        // V0.10.0-G: in anonymity mode a call signal travels over the rendezvous circuit, online only. A reply
+        // route (V0.9.19) is a direct-connection concept and never exists here: defence in depth.
+        if (anonymous && replyRoute != null) {
+            throw DmSessionException("call reply route is not available in anonymity mode")
         }
         if (payload.size > MAX_CALL_SIGNAL_PAYLOAD_BYTES) {
             throw DmSessionException(
                 "call signal payload (${payload.size} bytes) exceeds $MAX_CALL_SIGNAL_PAYLOAD_BYTES bytes",
             )
+        }
+        if (anonymous) {
+            withPeerLock(recipient) { sendAnonymousCallSignalLocked(recipient, payload, marksAcceptance) }
+            return
         }
         withPeerLock(recipient) {
             // V0.9.19: resolve the target BEFORE advancing the ratchet - an unsendable signal must
@@ -2310,6 +2357,12 @@ class DmSessionManager private constructor(
 
         /** V0.10.0-F1 - upper bound of one anonymity-mode online delivery attempt (assumption, confirmation required). */
         val ANONYMOUS_SEND_DEADLINE: Duration = Duration.ofSeconds(30)
+
+        /**
+         * V0.10.0-G - delivery deadline of an anonymity-mode call signal. Must stay <= the call dial timeout so the
+         * 20 s media shutdown wait in the call module remains valid (assumption, confirmation required).
+         */
+        val ANONYMOUS_CALL_SIGNAL_DEADLINE: Duration = Duration.ofSeconds(15)
 
         /** V0.10.0-F1 - offline lifetime of an anonymity-mode mailbox item: 48 hours, not 7 days. */
         const val ANONYMOUS_OFFLINE_TTL_SECONDS = 48L * 3600L

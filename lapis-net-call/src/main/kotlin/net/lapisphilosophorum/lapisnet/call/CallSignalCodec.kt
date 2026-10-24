@@ -76,6 +76,7 @@ object CallSignalCodec {
     const val MAX_CALL_SIGNAL_BYTES = FIXED_PREFIX_SIZE + MAX_SDP_BYTES
 
     fun encode(signal: CallSignal): ByteArray {
+        require(signal.reason != CallEndReason.CIRCUIT_LOST) { "CIRCUIT_LOST is a local-only end reason" }
         val sdpBytes = signal.sdp?.toByteArray(Charsets.US_ASCII) ?: ByteArray(0)
         require(sdpBytes.size <= MAX_SDP_BYTES) {
             "encoded sdp (${sdpBytes.size} bytes) exceeds $MAX_SDP_BYTES bytes"

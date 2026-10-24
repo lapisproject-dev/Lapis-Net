@@ -5,6 +5,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
 
 private fun resource(name: String): String =
     AnonymityStaticAssetsTest::class.java
@@ -31,11 +32,17 @@ class AnonymityStaticAssetsTest :
         }
 
         test("the warning text is character-identical in the Kotlin constant, app.js and docs/anonymity.adoc") {
-            warning shouldContain "direct messages and mail travel over circuits"
+            warning shouldContain "direct messages, mail and call signals travel over circuits"
             warning shouldNotContain "mail and call media"
+            val exposed = ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
+            exposed shouldContain "--anonymity-allow-call-media=true"
             resource("app.js") shouldContain warning
+            resource("app.js") shouldContain exposed
             val docs = java.io.File("../docs/anonymity.adoc")
-            if (docs.exists()) docs.readText() shouldContain warning
+            if (docs.exists()) {
+                docs.readText() shouldContain warning
+                docs.readText() shouldContain exposed
+            }
         }
 
         test("the status panel's mail line says mail travels over circuits and states the offline limit") {
@@ -99,8 +106,11 @@ class AnonymityStaticAssetsTest :
                     js.indexOf("const ANONYMITY_STATUS_LINES"),
                     js.indexOf("];", js.indexOf("const ANONYMITY_STATUS_LINES")),
                 )
-            // six fixed lines plus the seventh, built from two numbers
-            Regex("\"[A-Z][^\"]*\"").findAll(lines).count() shouldBe 6
+            // five fixed lines here, the call media line (two fixed variants) and the counts line built from two numbers
+            Regex("\"[A-Z][^\"]*\"").findAll(lines).count() shouldBe 5
+            js shouldContain "Call signals: through circuits"
+            js shouldContain "Call media: off (would reveal your IP address)"
+            js shouldContain "Call media: direct connection, your IP address is visible to the other party"
             val fn = js.substring(js.indexOf("function renderAnonymityStatus"), js.indexOf("// V0.9.15 status panel."))
             fn shouldContain "item.textContent"
             fn shouldNotContain "innerHTML"

@@ -1,6 +1,8 @@
 package net.lapisphilosophorum.lapisnet.call
 
+import net.lapisphilosophorum.lapisnet.dm.DmAnonymousDeliveryException
 import net.lapisphilosophorum.lapisnet.dm.DmCallReplyRoute
+import net.lapisphilosophorum.lapisnet.dm.DmCallSignalPathLostException
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 
@@ -22,7 +24,8 @@ fun interface CallSignalTransport {
      * either value.
      *
      * [replyRoute] is only an address fallback (V0.9.19); it never changes whether a signal is
-     * sent. `null` for an INVITE and whenever no inbound signal from [peer] supplied one.
+     * sent. `null` for an INVITE and whenever no inbound signal from [peer] supplied one; ALWAYS `null` in
+     * anonymity mode (V0.10.0-G).
      *
      * @throws RuntimeException on any send failure - `CallManager` catches this generically (it
      * never needs to distinguish transport failure modes, only that a send did or did not succeed)
@@ -35,6 +38,12 @@ fun interface CallSignalTransport {
         replyRoute: DmCallReplyRoute?,
     )
 }
+
+/**
+ * V0.10.0-G: the signal path over circuits failed (recipient not reachable anonymously, or the delivery attempt
+ * failed). Fixed text, no cause chain: it carries no address and no circuit id.
+ */
+class CallSignalPathLostException : RuntimeException("call-signal-path-lost")
 
 /** The production [CallSignalTransport] - a thin adapter over [DmSessionManager.sendCallSignal].
  * Deliberately this thin: all of [DmSessionManager]'s own `@throws` taxonomy
@@ -50,6 +59,12 @@ class DmCallSignalTransport(
         marksAcceptance: Boolean,
         replyRoute: DmCallReplyRoute?,
     ) {
-        dm.sendCallSignal(peer, payload, marksAcceptance, replyRoute)
+        try {
+            dm.sendCallSignal(peer, payload, marksAcceptance, replyRoute)
+        } catch (e: DmCallSignalPathLostException) {
+            throw CallSignalPathLostException()
+        } catch (e: DmAnonymousDeliveryException) {
+            throw CallSignalPathLostException()
+        }
     }
 }

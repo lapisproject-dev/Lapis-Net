@@ -267,6 +267,8 @@ data class NodeStatusResponse(
     val lastAnonymityErrorAgeSeconds: Long? = null,
     /** Sends that found no anonymous way to the recipient since start (wave V0.10.0-F1); a number, no target. */
     val recipientUnreachableCount: Long = 0,
+    /** V0.10.0-G: `"direct"|"disabled"|"exposed"` - what happens to call media (see `CallMediaPolicy`). */
+    val callMedia: String = "direct",
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */

@@ -98,4 +98,24 @@ class CallEventHubBlockReasonTest :
             drainAll(sub).size shouldBe 40
             (hub.listenerInvocationNanosMaxForTesting() / 1_000_000) shouldBeLessThan 50
         }
+
+        test("V0.10.0-G: IncomingSuppressed becomes a blocked UI event with ANONYMITY_MODE and is not actionable") {
+            val remote = FakeCallRemote()
+            val hub = CallEventHub(remote, autoRejectQuarantined = true)
+            val sub = hub.trySubscribe().shouldNotBeNull()
+            val id = randomCallId()
+            val peer = randomPeer()
+            remote.emit(
+                CallEvent.IncomingSuppressed(
+                    id,
+                    peer,
+                    net.lapisphilosophorum.lapisnet.call.CallSuppressCause.ANONYMITY_MODE,
+                ),
+            )
+            val event = drainAll(sub).single()
+            event.type shouldBe "blocked"
+            event.blockReason shouldBe "ANONYMITY_MODE"
+            hub.blockedAttempts().single().reason shouldBe CallBlockReason.ANONYMITY_MODE
+            hub.isBlocked(id) shouldBe true
+        }
     })

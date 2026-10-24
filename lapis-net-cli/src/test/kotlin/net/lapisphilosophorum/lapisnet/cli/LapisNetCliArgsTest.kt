@@ -205,6 +205,7 @@ class LapisNetCliArgsTest :
                 0
             help.outText shouldContain "--anonymity=on|off"
             help.outText shouldContain "experimental"
-            help.outText shouldContain "does NOT anonymise direct messages, mail or calls yet"
+            help.outText shouldContain "call media is direct"
+            help.outText shouldContain "--anonymity-allow-call-media=true|false"
         }
     })

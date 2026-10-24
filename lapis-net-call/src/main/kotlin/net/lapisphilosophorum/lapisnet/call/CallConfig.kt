@@ -38,4 +38,10 @@ data class CallConfig(
      * [CallEndReason.RING_TIMEOUT]. See `CallManager`'s own class doc comment for the metadata-
      * minimization reasoning ("no online-presence leak to a stranger") and its accepted UX cost. */
     val autoRejectQuarantined: Boolean = true,
+    /** V0.10.0-G: media policy; [CallMediaPolicy.DIRECT] (default) keeps every behaviour unchanged. */
+    val mediaPolicy: CallMediaPolicy = CallMediaPolicy.DIRECT,
+    /** V0.10.0-G: global INVITE limit across ALL senders, applied ONLY when [mediaPolicy] is not DIRECT (senders are
+     * cheap over circuits, a Sybil flood must not exceed this on top of the per-sender limit). */
+    val maxGlobalInvitesPerWindow: Int = 30,
+    val globalInviteRateWindow: Duration = Duration.ofSeconds(60),
 )

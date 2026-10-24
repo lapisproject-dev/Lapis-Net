@@ -26,13 +26,17 @@ dependencies {
     implementation(project(":lapis-net-core"))
     implementation(rootProject.libs.webrtc.java)
     runtimeOnly(variantOf(rootProject.libs.webrtc.java) { classifier(webrtcNativeClassifier()) })
-    testRuntimeOnly(rootProject.libs.logback.classic)
+    testImplementation(rootProject.libs.logback.classic)
     // testFixtures(lapis-net-dm): buildDmTestNode/connectAndConverge/DmTestNode -
     // TwoNodeCallIntegrationTest.kt's real two-node setup. Every type these helpers reference
     // (LapisNode, PeerDirectoryGossip, PrekeyStore, NabuStorage, GossipPubSub, DualKeyIdentity) is
     // already resolvable here via the api(lapis-net-dm) edge above (lapis-net-dm re-exports them as
     // api itself) - this edge only needs to bring the HELPER FUNCTIONS/CLASSES themselves.
     testImplementation(testFixtures(project(":lapis-net-dm")))
+    // V0.10.0-G: testFixtures(lapis-net-dm-onion) - DmOnionNode/RelayHost, the real multi-node circuit rig that
+    // MultiNodeCallSignalsOverCircuitsTest runs call signals over. Test scope only: lapis-net-call keeps depending on
+    // lapis-net-dm alone in main (the dependency graph is unchanged).
+    testImplementation(testFixtures(project(":lapis-net-dm-onion")))
 }
 
 // Host-platform classifier detection for webrtc-java's native binary - NOT all five platform

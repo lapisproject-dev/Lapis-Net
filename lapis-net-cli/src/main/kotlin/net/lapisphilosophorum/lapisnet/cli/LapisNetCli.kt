@@ -137,6 +137,11 @@ internal fun runCli(
         }
         if (options.anonymity == AnonymityMode.ON) {
             out.println("  anonymity: experimental and incomplete (see the warning on stderr)")
+            if (options.anonymityAllowCallMedia) {
+                out.println(
+                    "  anonymity-allow-call-media=true (the CLI has no calls; the switch only matters for the browser)",
+                )
+            }
             err.println("WARNING: $ANONYMITY_INCOMPLETE_WARNING")
         }
         out.println("Press Ctrl+C to stop.")

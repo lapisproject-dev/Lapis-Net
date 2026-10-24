@@ -254,6 +254,8 @@ class AnonymityRuntime private constructor(
             clock: Clock = Clock.systemUTC(),
             governor: CircuitBuildGovernor = CircuitBuildGovernor(clock),
             capabilities: Set<AnonymousCapability> = setOf(AnonymousCapability.DM),
+            /** V0.10.0-G: the warning logged at start; the browser passes the call-media-exposed variant when applicable. */
+            incompleteWarning: String = ANONYMITY_INCOMPLETE_WARNING,
         ): AnonymityRuntime {
             require(wire.directoryMode == DirectoryAnonymityMode.ON) { "the onion wire is not in anonymity mode" }
             val key = homeDir.toAbsolutePath().normalize()
@@ -408,7 +410,7 @@ class AnonymityRuntime private constructor(
                         initialDelay = 1.seconds,
                     ) { runtime.maintenanceTick() }
                 runtime.attachMaintenance(job)
-                logger.warn { ANONYMITY_INCOMPLETE_WARNING }
+                logger.warn { incompleteWarning }
                 return runtime
             } catch (e: Exception) {
                 closers.asReversed().forEach { runCatching(it) }

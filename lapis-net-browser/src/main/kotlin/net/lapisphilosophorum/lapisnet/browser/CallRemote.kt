@@ -17,10 +17,16 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
  */
 interface CallRemote {
     /** Places an outgoing call; returns the freshly minted [CallId] immediately. */
-    fun placeCall(peer: Secp256k1PublicKey): CallId
+    fun placeCall(
+        peer: Secp256k1PublicKey,
+        mediaExposureConfirmed: Boolean,
+    ): CallId
 
     /** Accepts a currently ringing incoming call (a no-op for an unknown/finished call). */
-    fun acceptCall(callId: CallId)
+    fun acceptCall(
+        callId: CallId,
+        mediaExposureConfirmed: Boolean,
+    )
 
     /** Rejects an incoming call with `DECLINED`. */
     fun rejectCall(callId: CallId)
@@ -43,9 +49,15 @@ interface CallRemote {
 class CallManagerRemote(
     private val manager: CallManager,
 ) : CallRemote {
-    override fun placeCall(peer: Secp256k1PublicKey): CallId = manager.placeCall(peer)
+    override fun placeCall(
+        peer: Secp256k1PublicKey,
+        mediaExposureConfirmed: Boolean,
+    ): CallId = manager.placeCall(peer, mediaExposureConfirmed)
 
-    override fun acceptCall(callId: CallId) = manager.acceptCall(callId)
+    override fun acceptCall(
+        callId: CallId,
+        mediaExposureConfirmed: Boolean,
+    ) = manager.acceptCall(callId, mediaExposureConfirmed)
 
     override fun rejectCall(callId: CallId) = manager.rejectCall(callId)
 

@@ -138,6 +138,12 @@ class CallEventHub(
                 } else {
                     CallUiEvent("incoming", id, peer, fp, unaccepted = event.quarantined)
                 }
+            is CallEvent.IncomingSuppressed -> {
+                // V0.10.0-G: calls are off in anonymity mode; recorded like a block so accept/reject answer 404.
+                val reason = CallBlockReason.ANONYMITY_MODE
+                recordBlocked(BlockedCallAttempt(event.callId, event.peer, clockSeconds(), reason))
+                CallUiEvent("blocked", id, peer, fp, blockReason = reason.name)
+            }
             is CallEvent.OutgoingRinging -> CallUiEvent("ringing", id, peer, fp)
             is CallEvent.Connecting -> CallUiEvent("connecting", id, peer, fp)
             is CallEvent.Active -> CallUiEvent("active", id, peer, fp)

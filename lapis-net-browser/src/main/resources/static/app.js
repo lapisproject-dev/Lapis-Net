@@ -132,7 +132,11 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages and mail travel over circuits, but call media still uses direct connections and reveals your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address.";
+// Used instead when calls are allowed (--anonymity-allow-call-media=true), and for an unknown/missing callMedia value
+// (fail safe: show the more alarming text).
+const ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED =
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -147,10 +151,14 @@ const ANONYMITY_STATUS_LINES = [
   "Directory entries: published through circuits",
   "Direct messages: over circuits (no attachments)",
   "Mail: over circuits (small mail also offline; up to 1 MiB with attachments only while both are online)",
-  "Call signalling: not available in anonymity mode",
-  "Call media: direct connection, your IP address is visible",
+  "Call signals: through circuits",
   "Network mesh, DHT and fetches: direct, identity and address are visible",
 ];
+
+// The call media line depends on the node's callMedia status (V0.10.0-G); fixed texts only, never server text.
+const ANONYMITY_CALL_MEDIA_LINE_DISABLED = "Call media: off (would reveal your IP address)";
+const ANONYMITY_CALL_MEDIA_LINE_EXPOSED =
+  "Call media: direct connection, your IP address is visible to the other party and to network observers";
 
 function renderAnonymityStatus(status) {
   const warning = document.getElementById("anonymity-warning");
@@ -158,10 +166,14 @@ function renderAnonymityStatus(status) {
   const errorLine = document.getElementById("node-status-anonymity-error");
   const on = status.anonymityMode === "on";
   warning.hidden = !on;
-  warning.textContent = on ? ANONYMITY_WARNING_TEXT : "";
+  const callMediaDisabled = status.callMedia === "disabled";
+  warning.textContent = on ? (callMediaDisabled ? ANONYMITY_WARNING_TEXT : ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED) : "";
   line.textContent = "";
   const lines = on
-    ? ANONYMITY_STATUS_LINES.concat([
+    ? ANONYMITY_STATUS_LINES.slice(0, 4)
+        .concat([callMediaDisabled ? ANONYMITY_CALL_MEDIA_LINE_DISABLED : ANONYMITY_CALL_MEDIA_LINE_EXPOSED])
+        .concat(ANONYMITY_STATUS_LINES.slice(4))
+        .concat([
         "On (experimental): " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)",
       ])
     : ["off"];

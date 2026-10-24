@@ -173,4 +173,39 @@ class BrowserServerAnonymityTest :
             while (System.nanoTime() < deadline && onionThreads().size > baseline) Thread.sleep(100)
             onionThreads().size shouldBe baseline
         }
+
+        test("V0.10.0-G: the node status reports the call media policy for off, on and on with the option").config(
+            timeout = 180.seconds,
+        ) {
+            val cases =
+                listOf(
+                    Triple(NodeWiringOptions(), "direct", false),
+                    Triple(
+                        NodeWiringOptions(anonymity = AnonymityMode.ON, holePunching = HolePunchMode.OFF),
+                        "disabled",
+                        true,
+                    ),
+                    Triple(
+                        NodeWiringOptions(
+                            anonymity = AnonymityMode.ON,
+                            holePunching = HolePunchMode.OFF,
+                            anonymityAllowCallMedia = true,
+                        ),
+                        "exposed",
+                        true,
+                    ),
+                )
+            for ((options, expected, anonymous) in cases) {
+                val server = startWiredTestServer(config = BrowserConfig(options))
+                try {
+                    val port = server.boundPort
+                    val (code, body) = rawHttp(port, "GET", "/api/node/status", mapOf("Host" to "127.0.0.1:$port"))
+                    code shouldBe 200
+                    json.decodeFromString<NodeStatusResponse>(body).callMedia shouldBe expected
+                    (server.anonymityRuntimeForTesting != null) shouldBe anonymous
+                } finally {
+                    server.stop()
+                }
+            }
+        }
     })

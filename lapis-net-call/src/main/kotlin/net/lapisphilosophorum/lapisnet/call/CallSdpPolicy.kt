@@ -96,7 +96,7 @@ object CallSdpPolicy {
      * resolve to loopback/a third party's address, exactly the SSRF/portscan shape this object's
      * own class doc comment says accepting a call must never enable. Rejecting anything that is not
      * already a numeric literal closes both at once, with zero network activity of its own. */
-    private fun isIpLiteral(address: String): Boolean {
+    internal fun isIpLiteral(address: String): Boolean {
         val withoutZone = address.substringBefore('%')
         return IPV4_LITERAL_REGEX.matches(withoutZone) || IPV6_LITERAL_REGEX.matches(withoutZone)
     }
@@ -121,7 +121,7 @@ object CallSdpPolicy {
      * :0001` and `::0:1` both parse to the same value as `::1`, and an IPv4-mapped IPv6 literal like
      * `::ffff:127.0.0.1` is returned as an [java.net.Inet4Address] for `127.0.0.1` (see that method's
      * own javadoc) - none of which the OLD prefix/suffix checks on the raw string ever recognized. */
-    private fun normalizedLiteralAddress(address: String): InetAddress =
+    internal fun normalizedLiteralAddress(address: String): InetAddress =
         InetAddress.getByName(address.substringBefore('%'))
 
     /** @throws CallSdpRejectedException if [sdp] fails any check. Never mutates or returns anything -

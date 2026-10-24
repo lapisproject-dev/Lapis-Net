@@ -2,6 +2,9 @@ package net.lapisphilosophorum.lapisnet.call
 
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 
+/** Why an inbound call was suppressed without any reply. */
+enum class CallSuppressCause { ANONYMITY_MODE, }
+
 /** The local state of one call, as observed by a [CallManager] listener - a simplified projection of
  * `CallManager`'s own internal per-call state machine, exposed for a future UI (V0.8.7b, not this
  * wave - see `docs/architecture.adoc`'s own "explicit, deliberate scope cuts" section) to render. */
@@ -39,6 +42,14 @@ sealed class CallEvent {
         override val callId: CallId,
         override val peer: Secp256k1PublicKey,
         val quarantined: Boolean,
+    ) : CallEvent()
+
+    /** V0.10.0-G: an inbound `INVITE` was dropped silently because calls are off in anonymity mode
+     * ([CallMediaPolicy.DISABLED]). Nothing was sent back, no media session exists; the ONLY event for [callId]. */
+    data class IncomingSuppressed(
+        override val callId: CallId,
+        override val peer: Secp256k1PublicKey,
+        val cause: CallSuppressCause,
     ) : CallEvent()
 
     /** [CallManager.placeCall] sent its `INVITE` and is now waiting for the peer to `ACCEPT`/

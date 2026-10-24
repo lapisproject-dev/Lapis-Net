@@ -93,7 +93,37 @@ class NodeWiringOptionsAnonymityTest :
         test("the help text names the option as experimental and says what it does not do") {
             NodeWiringOptions.HELP_TEXT shouldContain "--anonymity=on|off"
             NodeWiringOptions.HELP_TEXT shouldContain "(experimental, default off)"
-            NodeWiringOptions.HELP_TEXT shouldContain "does NOT anonymise direct messages, mail or calls yet"
+            NodeWiringOptions.HELP_TEXT shouldContain "call media is direct"
+            NodeWiringOptions.HELP_TEXT shouldContain "--anonymity-allow-call-media=true|false"
+        }
+
+        test("V0.10.0-G: anonymity-allow-call-media defaults to false and needs anonymity=on") {
+            resolve().anonymityAllowCallMedia shouldBe false
+            resolve("--anonymity=on").anonymityAllowCallMedia shouldBe false
+            resolve("--anonymity=on", "--anonymity-allow-call-media=true").anonymityAllowCallMedia shouldBe true
+            resolve("--anonymity-allow-call-media=false").anonymityAllowCallMedia shouldBe false
+            shouldThrow<InvalidWiringOptionException> { resolve("--anonymity-allow-call-media=true") }
+                .message shouldBe "--anonymity-allow-call-media requires --anonymity=on"
+            shouldThrow<InvalidWiringOptionException> {
+                resolve("--anonymity=off", "--anonymity-allow-call-media=true")
+            }
+            shouldThrow<InvalidWiringOptionException> { resolve("--anonymity=on", "--anonymity-allow-call-media=yes") }
+        }
+
+        test("V0.10.0-G: the environment variable and the known key exist, an invalid value fails in every source") {
+            NodeWiringOptions.envNameOf(NodeWiringOptions.KEY_ANONYMITY_ALLOW_CALL_MEDIA) shouldBe
+                "LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA"
+            (NodeWiringOptions.KEY_ANONYMITY_ALLOW_CALL_MEDIA in NodeWiringOptions.KNOWN_KEYS) shouldBe true
+            val raw =
+                NodeWiringOptions.fromEnvironment(
+                    mapOf("LAPISNET_ANONYMITY" to "on", "LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA" to "true"),
+                )
+            NodeWiringOptions.resolve(raw).anonymityAllowCallMedia shouldBe true
+            shouldThrow<InvalidWiringOptionException> {
+                NodeWiringOptions.validateValues(
+                    NodeWiringOptions.fromEnvironment(mapOf("LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA" to "maybe")),
+                )
+            }
         }
 
         test("the known keys contain anonymity") {

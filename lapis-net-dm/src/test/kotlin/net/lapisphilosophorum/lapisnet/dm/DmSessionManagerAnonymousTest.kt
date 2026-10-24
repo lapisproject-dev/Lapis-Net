@@ -56,8 +56,8 @@ private class FakeAnonymousTransport(
 
 class DmSessionManagerAnonymousTest :
     FunSpec({
-        fun nodePair(): Triple<DmTestNode, DmTestNode, FakeAnonymousTransport> {
-            val a = buildDmTestNode(anonymous = true)
+        fun nodePair(contacts: DmAcceptedContacts? = null): Triple<DmTestNode, DmTestNode, FakeAnonymousTransport> {
+            val a = buildDmTestNode(anonymous = true, acceptedContacts = contacts)
             val b = buildDmTestNode(anonymous = true)
             connectAndConverge(a, b)
             val transport =
@@ -168,14 +168,12 @@ class DmSessionManagerAnonymousTest :
             }
         }
 
-        test("circuit door delivers once, replay is deduplicated, a CALL_SIGNAL is rejected") {
+        test("circuit door delivers once and replay is deduplicated") {
             val (a, b, transport) = nodePair()
             try {
                 a.dmSessionManager.installAnonymousTransport(transport)
                 val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
                 b.dmSessionManager.addInboundListener { received.add(it) }
-                val calls = Collections.synchronizedList(mutableListOf<DmInboundCallSignal>())
-                b.dmSessionManager.addCallSignalListener { calls.add(it) }
                 val bPub = b.identity.secp256k1KeyPair.publicKey
 
                 a.dmSessionManager.sendAuto(bPub, DmContent(body = "online")) shouldBe DmSendOutcome.SENT_ONLINE
@@ -186,30 +184,63 @@ class DmSessionManagerAnonymousTest :
                 sink.acceptCircuitEnvelope(ByteArray(40))
                 received shouldHaveSize 1
                 received[0].content.body shouldBe "online"
-
-                // A CALL_SIGNAL envelope (structurally valid: same sender, ratchet message of the
-                // real envelope, no X3DH header) must be dropped at BOTH inbound doors before any
-                // decryption, and must never reach the call-signal listener or the message listener.
                 a.dmSessionManager.routeMode() shouldBe DmRoute.CIRCUIT
-                // The ratchet message must be FRESH (really encrypted under the A->B session, never
-                // delivered to B): a replayed one would be absorbed by the dedup check regardless of
-                // the CALL_SIGNAL rejection and the test would pass vacuously.
-                a.dmSessionManager.sendAuto(bPub, DmContent(body = "fresh")) shouldBe DmSendOutcome.SENT_ONLINE
-                transport.onlineBytes.size shouldBe 2
-                val real = DmEnvelopeCodec.decode(transport.onlineBytes[1])
-                val callBytes =
-                    DmEnvelopeCodec.encode(
-                        DmEnvelope(DmMessageType.CALL_SIGNAL, real.senderIdentity, null, real.ratchetMessage),
-                    )
-                sink.acceptCircuitEnvelope(callBytes)
-                val bPrivate = b.prekeyStore.x25519IdentityPrivateKey()
+            } finally {
+                a.stop()
+                b.stop()
+            }
+        }
+
+        test("V0.10.0-G: a call signal goes over the circuit door only; the sealed mailbox door rejects it") {
+            val (a, b, transport) = nodePair()
+            try {
+                a.dmSessionManager.installAnonymousTransport(transport)
+                val bPub = b.identity.secp256k1KeyPair.publicKey
+                val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                b.dmSessionManager.addInboundListener { received.add(it) }
+                val calls = Collections.synchronizedList(mutableListOf<DmInboundCallSignal>())
+                b.dmSessionManager.addCallSignalListener { calls.add(it) }
+                a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
+                val sink = b.dmSessionManager.inboundSink()
+                sink.acceptCircuitEnvelope(transport.onlineBytes[0])
+
+                // through the sealed mailbox: rejected before any ratchet access (fresh message, so no dedup masking)
+                a.dmSessionManager.sendCallSignal(bPub, "via-mailbox".toByteArray(), marksAcceptance = false)
+                val mailboxCallBytes = transport.onlineBytes[1]
                 val sealingKey = requireNotNull(a.prekeyBundleGossip.lookup(bPub)).x25519IdentityKey
                 sink.acceptSealedMailboxItem(
-                    SealedMailboxItemCodec.seal(callBytes, sealingKey, Instant.now().epochSecond + 3600),
+                    SealedMailboxItemCodec.seal(mailboxCallBytes, sealingKey, Instant.now().epochSecond + 3600),
                 )
-                bPrivate.destroy()
                 calls shouldHaveSize 0
+
+                // through the circuit door: delivered exactly once, replay deduplicated, route is null
+                sink.acceptCircuitEnvelope(mailboxCallBytes)
+                sink.acceptCircuitEnvelope(mailboxCallBytes)
+                calls shouldHaveSize 1
+                String(calls[0].payload) shouldBe "via-mailbox"
+                calls[0].replyRoute shouldBe null
                 received shouldHaveSize 1
+            } finally {
+                a.stop()
+                b.stop()
+            }
+        }
+
+        test("V0.10.0-G: a tampered call signal is rejected by the AEAD and never reaches the listener") {
+            val (a, b, transport) = nodePair()
+            try {
+                a.dmSessionManager.installAnonymousTransport(transport)
+                val bPub = b.identity.secp256k1KeyPair.publicKey
+                val calls = Collections.synchronizedList(mutableListOf<DmInboundCallSignal>())
+                b.dmSessionManager.addCallSignalListener { calls.add(it) }
+                a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
+                val sink = b.dmSessionManager.inboundSink()
+                sink.acceptCircuitEnvelope(transport.onlineBytes[0])
+                a.dmSessionManager.sendCallSignal(bPub, "payload".toByteArray(), marksAcceptance = false)
+                val tampered = transport.onlineBytes[1].copyOf()
+                tampered[tampered.size - 1] = (tampered[tampered.size - 1].toInt() xor 0x01).toByte()
+                sink.acceptCircuitEnvelope(tampered)
+                calls shouldHaveSize 0
             } finally {
                 a.stop()
                 b.stop()
@@ -246,18 +277,91 @@ class DmSessionManagerAnonymousTest :
             }
         }
 
-        test("sendCallSignal is refused up front in anonymity mode and consumes no ratchet step") {
+        test("V0.10.0-G: sendCallSignal goes online once and never to the mailbox") {
+            val contacts = DmAcceptedContacts()
+            val (a, b, transport) = nodePair(contacts)
+            try {
+                a.dmSessionManager.installAnonymousTransport(transport)
+                val bPub = b.identity.secp256k1KeyPair.publicKey
+                a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
+                a.dmSessionManager.sendCallSignal(bPub, ByteArray(4), marksAcceptance = false)
+                transport.onlineBytes shouldHaveSize 2
+                transport.depositedBytes shouldHaveSize 0
+                a.dmSessionManager.sendCallSignal(bPub, ByteArray(4), marksAcceptance = true)
+                transport.onlineBytes shouldHaveSize 3
+                // (sendAuto already accepted the contact; the marksAcceptance=false path is covered by the direct tests)
+                contacts.isAccepted(bPub) shouldBe true
+            } finally {
+                a.stop()
+                b.stop()
+            }
+        }
+
+        test(
+            "V0.10.0-G: an offline target or a failed delivery fails fixed, consumes no ratchet step, never deposits",
+        ) {
             val (a, b, transport) = nodePair()
             try {
                 a.dmSessionManager.installAnonymousTransport(transport)
                 val bPub = b.identity.secp256k1KeyPair.publicKey
                 a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
-                val e =
-                    shouldThrow<DmSessionException> {
-                        a.dmSessionManager.sendCallSignal(bPub, ByteArray(4), marksAcceptance = false)
+                transport.online = false
+                val e1 =
+                    shouldThrow<DmCallSignalPathLostException> {
+                        a.dmSessionManager.sendCallSignal(bPub, ByteArray(4), marksAcceptance = true)
                     }
-                e.message shouldBe "call signalling is not available in anonymity mode"
+                e1.message shouldBe "call-signal-path-lost"
+                e1.cause shouldBe null
+                transport.online = true
+                transport.onlineSucceeds = false
+                shouldThrow<DmCallSignalPathLostException> {
+                    a.dmSessionManager.sendCallSignal(bPub, ByteArray(4), marksAcceptance = true)
+                }
+                transport.depositedBytes shouldHaveSize 0
                 transport.onlineBytes shouldHaveSize 1
+            } finally {
+                a.stop()
+                b.stop()
+            }
+        }
+
+        test("V0.10.0-G: a reply route and an oversized payload are refused before any ratchet step") {
+            val (a, b, transport) = nodePair()
+            try {
+                a.dmSessionManager.installAnonymousTransport(transport)
+                val bPub = b.identity.secp256k1KeyPair.publicKey
+                a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
+                shouldThrow<DmSessionException> {
+                    a.dmSessionManager.sendCallSignal(
+                        bPub,
+                        ByteArray(4),
+                        marksAcceptance = false,
+                        replyRoute = DmCallReplyRoute(ByteArray(DmCallReplyRoute.TOKEN_SIZE)),
+                    )
+                }.message shouldBe "call reply route is not available in anonymity mode"
+                shouldThrow<DmSessionException> {
+                    a.dmSessionManager.sendCallSignal(
+                        bPub,
+                        ByteArray(DmSessionManager.MAX_CALL_SIGNAL_PAYLOAD_BYTES + 1),
+                        marksAcceptance = false,
+                    )
+                }
+                transport.onlineBytes shouldHaveSize 1
+            } finally {
+                a.stop()
+                b.stop()
+            }
+        }
+
+        test("V0.10.0-G: the largest valid call signal fits the circuit stream although it exceeds a sealed item") {
+            val (a, b, transport) = nodePair()
+            try {
+                a.dmSessionManager.installAnonymousTransport(transport)
+                val bPub = b.identity.secp256k1KeyPair.publicKey
+                a.dmSessionManager.sendAuto(bPub, DmContent(body = "hi")) shouldBe DmSendOutcome.SENT_ONLINE
+                a.dmSessionManager.sendCallSignal(bPub, ByteArray(16_427), marksAcceptance = false)
+                transport.onlineBytes shouldHaveSize 2
+                (transport.onlineBytes[1].size <= DmEnvelopeCodec.MAX_ENVELOPE_BYTES) shouldBe true
             } finally {
                 a.stop()
                 b.stop()

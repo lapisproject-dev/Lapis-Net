@@ -23,8 +23,9 @@ enum class DeclaredReachability {
 
 /**
  * Wave V0.10.0-E: `--anonymity=on|off`. Only the exact lower-case words are accepted. EXPERIMENTAL and incomplete: in
- * [ON] the node publishes its directory presence through onion circuits and chooses paths with persistent guards, but
- * direct messages, mail and call signalling still use direct connections.
+ * [ON] the node publishes its directory presence through onion circuits, chooses paths with persistent guards and
+ * carries direct messages, mail and call signals over circuits. Call media is NOT anonymised: calls are off unless
+ * `--anonymity-allow-call-media=true`, in which case call media connects directly and reveals the IP address.
  */
 enum class AnonymityMode {
     OFF,
@@ -72,6 +73,11 @@ data class NodeWiringOptions(
      * Excludes hole punching (forced off) and `--onion-relay` (the relay descriptor would bind identity and address).
      */
     val anonymity: AnonymityMode = AnonymityMode.OFF,
+    /**
+     * V0.10.0-G: allow calls in anonymity mode (`--anonymity-allow-call-media`). Only valid with `anonymity=on`.
+     * Call media then connects directly and reveals the IP address to the other party and to network observers.
+     */
+    val anonymityAllowCallMedia: Boolean = false,
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -114,6 +120,7 @@ data class NodeWiringOptions(
         const val KEY_HOLE_PUNCHING = "hole-punching"
         const val KEY_ONION_RELAY = "onion-relay"
         const val KEY_ANONYMITY = "anonymity"
+        const val KEY_ANONYMITY_ALLOW_CALL_MEDIA = "anonymity-allow-call-media"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
@@ -127,6 +134,7 @@ data class NodeWiringOptions(
                 KEY_HOLE_PUNCHING,
                 KEY_ONION_RELAY,
                 KEY_ANONYMITY,
+                KEY_ANONYMITY_ALLOW_CALL_MEDIA,
             )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
@@ -152,6 +160,11 @@ data class NodeWiringOptions(
             val holePunchingRaw = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) }
             val onionRelay = raw[KEY_ONION_RELAY]?.let { parseBoolean(KEY_ONION_RELAY, it) } ?: false
             val anonymity = raw[KEY_ANONYMITY]?.let { parseAnonymity(it) } ?: AnonymityMode.OFF
+            val allowCallMedia =
+                raw[KEY_ANONYMITY_ALLOW_CALL_MEDIA]?.let { parseBoolean(KEY_ANONYMITY_ALLOW_CALL_MEDIA, it) } ?: false
+            if (allowCallMedia && anonymity != AnonymityMode.ON) {
+                throw InvalidWiringOptionException("--anonymity-allow-call-media requires --anonymity=on")
+            }
             if (anonymity == AnonymityMode.ON) {
                 // an explicit auto/on is a conflict, never silently overridden; only a missing key resolves to off
                 if (holePunchingRaw != null && holePunchingRaw != HolePunchMode.OFF) {
@@ -163,7 +176,16 @@ data class NodeWiringOptions(
             }
             val holePunching =
                 if (anonymity == AnonymityMode.ON) HolePunchMode.OFF else holePunchingRaw ?: HolePunchMode.AUTO
-            return NodeWiringOptions(reachability, autoRelay, dhtFallback, publish, holePunching, onionRelay, anonymity)
+            return NodeWiringOptions(
+                reachability,
+                autoRelay,
+                dhtFallback,
+                publish,
+                holePunching,
+                onionRelay,
+                anonymity,
+                allowCallMedia,
+            )
         }
 
         /**
@@ -174,7 +196,12 @@ data class NodeWiringOptions(
             for ((key, value) in raw) {
                 when (key) {
                     KEY_REACHABILITY -> parseReachability(value)
-                    KEY_AUTO_RELAY, KEY_DHT_FALLBACK, KEY_PUBLISH_RELAY_RELIABILITY, KEY_ONION_RELAY ->
+                    KEY_AUTO_RELAY,
+                    KEY_DHT_FALLBACK,
+                    KEY_PUBLISH_RELAY_RELIABILITY,
+                    KEY_ONION_RELAY,
+                    KEY_ANONYMITY_ALLOW_CALL_MEDIA,
+                    ->
                         parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
                     KEY_ANONYMITY -> parseAnonymity(value)
@@ -262,10 +289,13 @@ data class NodeWiringOptions(
             |        relay descriptor (gossip, and the DHT value when --dht-fallback is on) and answers circuit
             |        CREATE/EXTEND cells. NO user traffic is routed over circuits yet and nothing is anonymised;
             |        the descriptor makes this node's identity and address publicly known as a relay.
-            |  --anonymity=on|off   (experimental, default off) anonymous directory publication over onion circuits; does NOT anonymise direct messages, mail or calls yet
+            |  --anonymity=on|off   (experimental, default off) anonymises directory, direct messages, mail and call signals; call media is direct
             |        With on: the directory entry is published only through circuits (persistent guards, diverse
             |        paths), hole punching is switched off, and the start is refused together with
             |        --hole-punching=auto|on or --onion-relay=true.
+            |  --anonymity-allow-call-media=true|false    [false]   (only with --anonymity=on)
+            |        Allow calls in anonymity mode. Call media then connects directly and reveals your IP
+            |        address to the other party and to network observers.
             """.trimMargin()
     }
 }

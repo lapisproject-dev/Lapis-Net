@@ -21,9 +21,17 @@ enum class CallEndReason(
     LOCAL_ERROR(7),
     REMOTE_HANGUP(8),
     LOCAL_HANGUP(9),
+
+    /**
+     * V0.10.0-G: the signal path over circuits was lost (anonymity mode). LOCAL ONLY: never encoded
+     * ([CallSignalCodec.encode] refuses it) and never decoded ([fromWireValue] does not know it).
+     */
+    CIRCUIT_LOST(10),
     ;
 
     companion object {
-        fun fromWireValue(value: Byte): CallEndReason? = entries.firstOrNull { it.wireValue == value }
+        /** Values that may appear on the wire; [CIRCUIT_LOST] is local-only and therefore excluded. */
+        fun fromWireValue(value: Byte): CallEndReason? =
+            entries.firstOrNull { it.wireValue == value && it != CIRCUIT_LOST }
     }
 }

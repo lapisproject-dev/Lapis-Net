@@ -270,4 +270,32 @@ class BrowserConfigTest :
                 ).wiring.anonymity shouldBe
                 AnonymityMode.ON
         }
+
+        test(
+            "V0.10.0-G: anonymityAllowCallMedia from the file, the environment and the arguments; invalid values abort",
+        ) {
+            val home = homeWith("anonymity=on\nanonymityAllowCallMedia=true\n")
+            BrowserConfig.load(emptyList(), emptyMap(), home).wiring.anonymityAllowCallMedia shouldBe true
+            BrowserConfig
+                .load(listOf("--anonymity-allow-call-media=false"), emptyMap(), home)
+                .wiring.anonymityAllowCallMedia shouldBe false
+            val env = mapOf("LAPISNET_ANONYMITY" to "on", "LAPISNET_ANONYMITY_ALLOW_CALL_MEDIA" to "true")
+            BrowserConfig.load(emptyList(), env, homeWith(null)).wiring.anonymityAllowCallMedia shouldBe true
+            BrowserConfig.DEFAULT.wiring.anonymityAllowCallMedia shouldBe false
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), emptyMap(), homeWith("anonymityAllowCallMedia=maybe\n"))
+            }
+            // an invalid file value aborts even if a higher source would override it
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(
+                    listOf("--anonymity=on", "--anonymity-allow-call-media=true"),
+                    emptyMap(),
+                    homeWith("anonymityAllowCallMedia=maybe\n"),
+                )
+            }
+            // true without anonymity=on is refused
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--anonymity-allow-call-media=true"), emptyMap(), homeWith(null))
+            }
+        }
     })
