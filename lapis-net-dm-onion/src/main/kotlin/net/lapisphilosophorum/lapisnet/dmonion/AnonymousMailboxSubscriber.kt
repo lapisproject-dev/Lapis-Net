@@ -25,6 +25,8 @@ class AnonymousMailboxSubscriber private constructor(
     private val sink: DmInboundSink,
     queueCapacity: Int,
 ) : AutoCloseable {
+    @Volatile
+    private var handle: AutoCloseable? = null
     private val dropped = AtomicLong(0)
     private val tried = AtomicLong(0)
     private val executor =
@@ -59,7 +61,7 @@ class AnonymousMailboxSubscriber private constructor(
     }
 
     override fun close() {
-        gossip.consumer = null
+        handle?.close()
         executor.shutdownNow()
     }
 
@@ -72,7 +74,7 @@ class AnonymousMailboxSubscriber private constructor(
             queueCapacity: Int = QUEUE_CAPACITY,
         ): AnonymousMailboxSubscriber {
             val subscriber = AnonymousMailboxSubscriber(gossip, sink, queueCapacity)
-            gossip.consumer = subscriber::offer
+            subscriber.handle = gossip.addConsumer(subscriber::offer)
             return subscriber
         }
     }

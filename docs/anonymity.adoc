@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy and direct messages (waves V0.10.0-A to V0.10.0-F1)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages and mail (waves V0.10.0-A to V0.10.0-F2)
 :toc:
 
 == Status
+
+*Wave F2 (mail over circuits, unreleased) carries mail over circuits for a node in anonymity mode. A mail with its attachments travels as one bundle over a rendezvous stream to the recipient's onion service; a small mail without attachments that cannot be delivered online is sealed to the recipient and announced on the same shared topic as offline direct messages. The node no longer subscribes to or publishes on a per-recipient inbox topic, leaves no DHT pointer and fetches nothing over Nabu/Bitswap for mail. Call media, GossipSub in general, the DHT and other content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode. Both ends must be in anonymity mode; there is no fallback to a direct connection.* See <<mail-over-circuits>>.
 
 *Wave F1 (direct messages over circuits, unreleased) carries direct messages, online and offline, over circuits for a node in anonymity mode. The sender reaches the recipient's onion service through a rendezvous point; an undeliverable message is sealed to the recipient and announced by relays on one shared topic. Mail, call media, GossipSub, the DHT and content fetches are unchanged: they still show identity and IP address, and the libp2p transport key is still the identity key. Call signalling is not available in anonymity mode (refused before any ratchet step). The recipient learns the sender's identity. Both sides must be in anonymity mode; there is no fallback to a direct connection and no attachments.* See <<dm-over-circuits>>.
 
@@ -66,10 +68,10 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 These exist in the current release and must be closed before any anonymity claim.
 
 . *`PeerRecord` publishes addresses.* The signed directory record binds an identity to its current network addresses. This is exactly the pseudonym-to-IP link to be hidden. In anonymity mode a node must publish introduction points, not addresses. Directory side addressed in wave D (see <<directory-anonymity>>); the transport-level link between identity and IP remains until wave E.
-. *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F2). Wave F1 does not change mail; it removes the same leak for direct messages (a node in anonymity mode does not subscribe to its own direct-message mailbox topic).
+. *Mail uses one GossipSub topic per recipient.* Subscribing to your own topic links your identity and IP for your mesh neighbours. Mail delivery has to move off the per-recipient topic: store and fetch through circuits (wave F2). Wave F1 does not change mail; it removes the same leak for direct messages (a node in anonymity mode does not subscribe to its own direct-message mailbox topic). *Closed for a node in anonymity mode by wave F2:* it subscribes to no inbox topic, publishes on none, leaves no DHT pointer and fetches nothing over Nabu/Bitswap for mail (see <<mail-over-circuits>>); still present in the normal mode.
 . *Gossip timing.* Message publication times and mesh membership leak.
 . *WebRTC media.* ICE exposes IPs to the peer.
-. *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom. Closed for direct messages in anonymity mode by wave F1 (no pointer, no Nabu blob, no IPNS value); still present for mail and for nodes in the normal mode.
+. *DHT provider records of the offline mailbox path* tell DHT peers who looks for whom. Closed for direct messages in anonymity mode by wave F1 (no pointer, no Nabu blob, no IPNS value); closed for mail in anonymity mode by wave F2 as well; still present for nodes in the normal mode.
 . *Small anonymity set.* Few relays mean weak anonymity regardless of cryptography.
 . *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
 . *Correlation by provoked teardown.* Any party on a path can destroy a circuit and correlate the effect elsewhere (DoS-based correlation). Not prevented.
@@ -644,15 +646,17 @@ The CLI start line shows `anonymity=on|off`; the browser status carries `anonymi
 [[dm-over-circuits]]
 == Direct messages over circuits (wave V0.10.0-F1, unreleased)
 
+NOTE: This section describes the state of wave F1. Wave F2 changed three things in it: mail now also travels over circuits (see <<mail-over-circuits>>, so every remark below that mail "is unchanged" or "uses direct connections" describes wave F1 only); the sealed item carries a kind byte inside its encrypted plaintext, which lowers the capacity of a direct-message item by one byte (5,668 bytes instead of 5,669); and the warning text below is historical, replaced by the text in <<mail-over-circuits>>.
+
 *What it is.* A node in anonymity mode sends and receives direct messages only through circuits. The ratchet (X3DH and Double Ratchet) is unchanged and keeps protecting the content; what changes is the transport. A new module `lapis-net-dm-onion` is the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed item format and does not depend on any onion code) and `lapis-net-onion-wire` (which knows nothing about direct messages). `DmSessionManager` is attached with `anonymous = true`: it then registers no `/lapis/dm/1.1.0` protocol, starts no mailbox poller, publishes no pointer on any per-recipient topic and offers nothing to the DHT outbox. There is one inbound pipeline for both entrances (circuit stream and sealed item): `processInboundDmEnvelope`, with duplicate check, X3DH replay register, prekey rate limiter, ratchet decryption and acceptance policy. The sender of an incoming message is known only after decryption.
 
 *What it is not.* Mail and call media still use direct connections; call signalling is not available in anonymity mode (a call attempt is refused up front). GossipSub, the DHT and content fetches still show identity and IP. The recipient learns the sender's identity (it is in the envelope; the point is that the network does not learn who talks to whom, not that the peer is anonymous to the peer). Both sides must be in anonymity mode: a recipient in the normal mode, an unknown identity, a recipient without the DM service and a recipient without a prekey bundle all give the same refusal. There is no fallback to a direct connection, ever. A call invitation over this path is rejected (calls follow in wave G).
 
-At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed): _Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address._ The browser's status panel shows seven fixed lines (directory entries, direct messages, mail, call signalling, call media, mesh/DHT/fetches, and the guard and circuit counts) and the DM page shows a fixed notice above the input field and a disabled attachment button.
+At every start the node warned in wave F1 (log, CLI stderr, a notice in the browser that can not be dismissed; historical text, replaced in wave F2): _Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address._ The browser's status panel shows seven fixed lines (directory entries, direct messages, mail, call signalling, call media, mesh/DHT/fetches, and the guard and circuit counts) and the DM page shows a fixed notice above the input field and a disabled attachment button.
 
 === Online path
 
-The sender looks the recipient up in the local directory only (`AnonymousDirectory`, built without a DHT: a DHT lookup would show the DHT neighbours the sender's interest together with its IP). With a service descriptor it opens a rendezvous stream (`AnonymityRuntime.connectToService`): the rendezvous point is a path-selector endpoint, the first frame is a HELLO naming the application (`"LNSV" | version | appId`, DM = 1), the service side dispatches by HELLO (`OnionServiceStreamRouter`; MAIL and CALL are reserved for later waves) and closes a stream without a valid HELLO after 10 seconds.
+The sender looks the recipient up in the local directory only (`AnonymousDirectory`, built without a DHT: a DHT lookup would show the DHT neighbours the sender's interest together with its IP). With a service descriptor it opens a rendezvous stream (`AnonymityRuntime.connectToService`): the rendezvous point is a path-selector endpoint, the first frame is a HELLO naming the application (`"LNSV" | version | appId`, DM = 1), the service side dispatches by HELLO (`OnionServiceStreamRouter`; MAIL joined in wave F2, CALL is reserved for a later wave) and closes a stream without a valid HELLO after 10 seconds.
 
 [kuml, dm-online-sequence, svg]
 ----
@@ -760,6 +764,156 @@ The refusal for the recipient happens before any session work, so a refused firs
 * *Assumption, confirmation required:* the browser banner text (current text of `ANONYMITY_INCOMPLETE_WARNING`) and the seven fixed lines of the status panel were written for this wave from the facts above; the design team's wording was not available to the implementation and should replace them if it differs.
 * *Assumption, confirmation required:* the digest of the prekey bundle in the anonymous record is not compared with the bundle found in the directory (a legitimate bundle refresh would make such a comparison fail spuriously).
 
+[[mail-over-circuits]]
+== Mail over circuits (wave V0.10.0-F2, unreleased)
+
+*What it is.* A node in anonymity mode sends and receives mail only through circuits. The mail itself is unchanged: a signed `MessageEnvelope` and a body that is hybrid-ECIES sealed (or, if the user chooses `NONE`, plain), exactly as on the direct path. What changes is the transport and the places a mail may touch. A new module `lapis-net-mail-onion` is the adapter between `lapis-net-mail` (which knows only the `AnonymousMailTransport` and `AnonymousMailInboundSink` interfaces and does not depend on onion code) and `lapis-net-onion-wire`. The browser attaches `MailSender` with `anonymous = true` and `InboxGossip` through `attachAnonymous`; both are built before the anonymity runtime exists, so the transport is installed afterwards and every send fails with `anonymity-not-ready` until then. There is no fallback to the direct path, ever.
+
+In anonymity mode, mail and its attachments no longer use:
+
+* the per-recipient inbox topic (`InboxTopics`): not subscribed, not published on (`attachAnonymous` registers no subscription, `MailSender` never calls `publish`);
+* the DHT outbox: `MailSender` is refused a `DhtOutbox` at construction (fail closed), so there are no pointers, no provider records (`MessagingRendezvous`) and no IPNS values for mail;
+* the DHT fetcher (`InboxDhtFetcher`): not attached; it would fetch envelope and body from the sender over Nabu/Bitswap, which dials the sender;
+* Nabu/Bitswap for attachments: `GET /api/mail/attachment/{cid}` reads the local blockstore only (`getLocal`; the ordinary `get` falls back to provider lookup and Bitswap on a miss), and the sender builds a bundle only from blobs it holds locally.
+
+*What it is not.* Call media still uses direct connections (WebRTC reveals IP addresses to the peer) and call signalling is not available; GossipSub in general, the DHT and other content fetches still show identity and IP address. The recipient learns the sender's identity (it is in the signed envelope). Both ends must be in anonymity mode: a recipient in the normal mode, an unknown identity, a revoked one, one without the MAIL service and one without a prekey bundle all give the same refusal.
+
+At every start the node warns (log, CLI stderr, a notice in the browser that can not be dismissed): _Anonymity mode is incomplete: direct messages and mail travel over circuits, but call media still uses direct connections and reveals your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address._ The text is the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, in `app.js` and here (a test compares the first two). The browser's status panel keeps its seven fixed lines; the mail line reads _Mail: over circuits (small mail also offline; up to 1 MiB with attachments only while both are online)_. The mail page shows a fixed notice above the compose form.
+
+=== Delivery: two size classes and a hard limit
+
+The class applies to the transport bundle: the signed mail frame plus all attachment blobs.
+
+[cols="1,2,2,2,3", options="header"]
+|===
+| Class | Limit | Online | Offline | Why
+| `INLINE` | frame at most 5,668 bytes (the capacity of a sealed item), no attachments | rendezvous stream `MAIL`, constant acknowledgement | a sealed item on the shared topic, announced again every 10 minutes (plus or minus 2) until 48 hours, by the same queue as offline direct messages | the infrastructure of wave F1 serves it unchanged; every item is exactly 5,728 bytes
+| `CIRCUIT` | bundle at most 1 MiB, at most 16 attachments | rendezvous stream `MAIL`, one bundle frame, attachments in band, constant acknowledgement | *no item.* The sender keeps the bundle in a bounded in-memory queue and tries the stream again every 10 minutes (plus or minus 2) for 48 hours | no relay stores content, no one dials the sender, integrity comes from self-certifying CIDs
+| too large | more than 1 MiB or more than 16 attachments | -- | -- | refused with `mail-too-large-anonymous` (413) before any network step; nothing is stored, built or sent
+|===
+
+[kuml, mail-online-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Mail over a rendezvous stream") {
+    val sender = lifeline(name = "Sender (anonymity mode)")
+    val circuits = lifeline(name = "Circuits and rendezvous point")
+    val receiver = lifeline(name = "Recipient (onion service)")
+
+    message(from = sender, to = sender, label = "pre-flight: directory (local), MAIL capability, prekey bundle, size class")
+    message(from = sender, to = sender, label = "sign envelope, seal body, store locally, build bundle (frame + blobs)")
+    message(from = sender, to = circuits, label = "INTRODUCE, rendezvous (a NEW circuit for every delivery)")
+    message(from = circuits, to = receiver, label = "rendezvous stream, HELLO(MAIL)")
+    message(from = sender, to = receiver, label = "BUNDLE frame (frame, count, blobs)")
+    reply(from = receiver, to = sender, label = "ACK (one constant byte, sent before any check)")
+    message(from = receiver, to = receiver, label = "InboxGossip.anonymousIngest, then the blobs the mail references")
+}
+----
+
+[kuml, mail-offline-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Small mail while the recipient is offline") {
+    val sender = lifeline(name = "Sender")
+    val relay = lifeline(name = "Relay (last hop, MAILBOX_PUBLISH)")
+    val topic = lifeline(name = "Shared topic")
+    val recipient = lifeline(name = "Recipient (anonymity mode)")
+
+    message(from = sender, to = sender, label = "online attempt fails: seal(MAIL, frame, recipient identity key)")
+    message(from = sender, to = relay, label = "8 fragments of 716 bytes through a circuit")
+    message(from = relay, to = topic, label = "announce (the relay is the author)")
+    message(from = topic, to = recipient, label = "every subscriber receives the item")
+    message(from = recipient, to = recipient, label = "open with the own key; kind MAIL goes to the mail sink, anything else is dropped")
+    message(from = sender, to = relay, label = "again after 10 minutes, sealed afresh (until 48 h)")
+}
+----
+
+*Why not the alternatives.*
+
+. _Blob storage at relays, reached over circuits._ This would be a new relay role that stores content. Relays would become storage targets and abuse magnets, and quota, deletion and liability would be open questions. It belongs, if anywhere, to a later wave (I or J).
+. _Chunking a bundle over many items._ A 44 KB bundle needs eight items from the topic's global budget (120 per minute for the whole network, shared with direct messages); a few mails would starve everybody else.
+. _Pulling from a hidden service of the sender._ The sender would have to run a service and a descriptor of its own for this; it offers nothing that pushing to the recipient's service does not.
+
+=== Keys and one item format for two kinds
+
+The sender looks the recipient up in the local anonymous directory only (no DHT). It needs the `MAIL` capability in the recipient's anonymous record and the recipient's prekey bundle; the sealing key is the X25519 identity key of the bundle, like for direct messages. The mail body stays hybrid-ECIES sealed to the recipient's secp256k1 key as before.
+
+Direct messages and mail share one sealed item format and one topic. The kind is inside the encrypted plaintext, not in a header, because any cleartext header field would tell every observer of the topic which items are mail:
+
+----
+version(1) | ephemeralX25519(32) | AEAD( notValidAfter(8) | kind(1) | len(2) | payload | zero padding ) | tag(16)
+----
+
+Always exactly 5,728 bytes; `kind` is 1 (DM) or 2 (MAIL); the payload capacity is 5,668 bytes (`SealedMailboxBox`, in `lapis-net-directory`; `SealedMailboxItemCodec` of `lapis-net-dm` is now a thin wrapper). The wire format of the unreleased wave F1 was changed in place; there is nothing to migrate. Two consumers (the direct-message subscriber and the mail subscriber) now listen on the shared topic (`AnonymousMailboxGossip.addConsumer`, at most 4); each opens an item with the same key, which is two key agreements per item at no more than 120 items per minute. An item of the other kind simply does not open.
+
+=== Bundle and stream
+
+A bundle is `version(1) = 1 | frameLen(4) | mailFrame | count(1) | { blobLen(4) | blob }*`. Every length is checked against the remaining bytes and the limits before anything is allocated; the sum is at most 1 MiB and `count` at most 16. CIDs are not transmitted: the receiver computes them from the blob bytes. The stream carries `type(1) | len(4) | bytes` frames as for direct messages, with a new type 3 (bundle) accepted by the receiver; the acknowledgement is the same constant frame (type 2).
+
+The sender opens a *new circuit for every delivery*; there is no stream cache, because mail is rare and this keeps deliveries unlinkable. A delivery runs on a small bounded executor (2 threads, queue 16; if that is full the online attempt is skipped and the mail is queued at once) so that the HTTP thread never waits for a circuit. Every failure path closes the circuit.
+
+The receiver (`OnionMailInboundHandler`) serves at most 4 mail streams at once (a fifth is closed immediately), one bundle per stream, 30 bundles and 8 MiB per minute over all streams, 10 seconds between the pieces of one frame, the complete 5-byte frame header within 15 seconds of the stream's creation, a body rate of at least 1 KiB/s on average (measured from the end of the header, after a 10-second grace period) and 120 seconds per stream. A body must also be able to finish within the stream's lifetime at the rate it has shown so far, so a stream that keeps its slot to the end of its lifetime has to complete its frame and thereby consume budget. The byte budget for the minute is reserved from the declared frame length in the header *before* the body buffer is allocated. A full work queue (8) closes the stream without an acknowledgement; the sender then keeps the mail and retries. The acknowledgement is sent as soon as the frame is complete and queued, never after the acceptance check, and a refused bundle does not end the stream early.
+
+* *Known limitation (slot exhaustion):* peers are anonymous and there is no per-peer limit. An attacker that sends a header declaring a large frame and then a body at just above the minimum rate (roughly 4 KiB/s of upstream for all four streams) keeps all 4 mail stream slots busy until the sweeper cuts them, and the budget reserved for the declared length (up to 4 MiB of the 8 MiB per minute) is held meanwhile. The reservation is returned when such a stream is cut, so the attack costs the attacker no budget, and honest senders retry (every 10 minutes, for 48 hours). The minimum rate and the completion projection make the attack far more expensive than a byte-per-interval trickle, but do not remove it. Planned mitigation: not returning the reservation of a stream cut for being slow, or a cost per stream (proof of work).
+
+=== One entrance, one policy
+
+Both anonymous paths (the stream and the sealed item) end in `InboxGossip.anonymousIngest`, which runs the very stages of the gossip validator: frame decode, `checkEnvelope` (addressing, signature, content binding, the live acceptance policy including the contact bypass, read per message) and `ingestChecked` with the `InboxIndex` duplicate suppression. A test feeds the same frames and gate configurations (Veritas path, Karma, contact bypass, none) through both entrances and compares the decisions. `updateAcceptanceCheck` changes both. Attachment blobs are looked at only *after* a mail was accepted, and only blobs whose own CID is referenced by the decrypted body are stored (everything else is discarded and counted); a refused mail stores nothing. Accepted mail (envelope, body and attachment blobs) is written with `NabuStorage.putUnserved` into a separate local blockstore (`<blockstore>-private`) that Bitswap and the DHT engine never see: a remote peer cannot probe acceptance or presence with WANT_HAVE or GET_PROVIDERS, so storage is no side channel. `get` and `getLocal` still read it locally. Mail that additionally arrives through the public gossip or DHT paths is stored in the served blockstore like any public mail.
+
+=== Refusals the user sees
+
+[cols="2,1,3", options="header"]
+|===
+| Code | HTTP | Meaning
+| `recipient-not-reachable-anonymously` | 503 | Unknown, not in anonymity mode, revoked, no MAIL service or no prekey bundle: one answer for all of them, checked for every recipient before anything is sent (all or nothing; it does not say which recipient).
+| `anonymity-not-ready` | 503 | No guards yet or the runtime is not up (also before the transport is installed at start). No fallback.
+| `mail-too-large-anonymous` | 413 | More than 1 MiB in total or more than 16 attachments. Checked before the base64 decoding in the API and again in the pre-flight, before any circuit is built.
+| `attachments-unavailable-anonymous` | 409 on send, 404 on download | An attachment blob is not held locally (for example a forwarded reference). Anonymity mode never fetches blobs from the network.
+|===
+
+The API answers an accepted send the same way whether the bundle was delivered at once or queued. The exception messages of other failures (which may name peers) are never passed on. An attachment is stored in the local blockstore before the pre-flight (that is a local operation); a refused send can therefore leave an orphan blob locally, which is as inert as any unreferenced blob.
+
+=== Leak inventory after wave F2
+
+[cols="1,3,3", options="header"]
+|===
+| # | Place | Status in anonymity mode
+| 13 | mail topic per recipient | not subscribed, not published on; mail arrives over a rendezvous stream or as a sealed item on the shared topic
+| 3, 4 (mail) | pointer in the DHT outbox, provider records, IPNS values | no pointer exists, `MailSender` has no outbox
+| new | mail body and attachment fetch over Nabu/Bitswap | not performed: the DHT fetcher is not attached, the attachment route reads the local blockstore only
+| new | size of a bundle on the circuit | visible to the guard and the rendezvous point as a byte count; no padding before wave H
+| new | retry pattern | the 10-minute retry of a queued bundle (and of a re-announced item) is a timing pattern for an observer of the sender's circuits
+| call signalling | direct | not available (wave G)
+| call media | WebRTC | unchanged, not anonymisable by this design
+| 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged (transport key, wave J)
+|===
+
+=== Honest limits of wave F2
+
+* A small anonymity set, Sybil relays and a global passive observer are as in the threat model. Timing and size correlation (including the retry pattern) is possible until wave H pads to the cell size.
+* A `CIRCUIT` mail (anything with attachments, or a frame above 5,668 bytes) is delivered only while sender and recipient are online at the same time within 48 hours; the retry queue is in memory and lost on restart (at most 32 entries, 4 per recipient, 16 MiB). A small mail is also delivered while the recipient is offline, but only while the sender keeps announcing, like a direct message.
+* The recipient learns the sender's identity; both ends must be in anonymity mode.
+* The shared topic's budget (120 items per minute for the whole network, 10 per relay) is one resource shared by direct messages and mail; a flood on it can delay both. A mail can displace a direct message from the sender's shared re-announcement queue (256 entries, 32 per recipient, common to both kinds).
+* No forward secrecy for the sealing layer (the long-term identity key is the recipient key); the mail content stays hybrid-ECIES protected. With `EncryptionMode.NONE` the body is plaintext at rest (only the transport is encrypted end to end).
+* The `InboxIndex` is in memory only. A sealed item (valid for 48 hours) or a mail frame that an attacker or a relay replays after the recipient restarted is accepted as new; within one run duplicates are suppressed. This is the same as on the direct path and is not solved in this wave.
+* No per-peer limit exists on the receiving side (the peer is anonymous); the global and per-stream limits protect the node.
+* Not verified: real NATs and real networks (all tests use loopback nodes with an injected locator that gives each relay a synthetic /16), behaviour under load, an external cryptographic review of the sealing construction, and interoperability with v0.12.0 over the network.
+
+=== Assumptions awaiting confirmation (wave F2)
+
+* *Assumption, confirmation required:* the size classes: `INLINE` at most 5,668 bytes (online and offline), `CIRCUIT` at most 1 MiB and 16 attachments (online only, 48-hour retry), larger is refused. Alternatives: relay blob storage (own wave), chunking over items; and whether the limit should rather be 256 KiB.
+* *Assumption, confirmation required:* with several recipients a single recipient that is not reachable anonymously rejects the whole send, without saying which.
+* *Assumption, confirmation required:* `EncryptionMode.NONE` stays allowed in anonymity mode (the transport is encrypted end to end anyway); the alternative is to allow only `HYBRID_ECIES`.
+* *Assumption, confirmation required:* direct messages and mail share one re-announcement queue and its caps (256 entries, 32 per recipient).
+* *Assumption, confirmation required:* a new circuit for every mail delivery instead of a stream cache (less linkability, more circuit builds under the governor).
+* *Assumption, confirmation required:* the in-place change of the unreleased F1 item format (the kind byte, direct-message capacity minus one byte, version stays 1).
+* *Assumption, confirmation required:* the attachment references of a sealed body are read by a callback that decrypts the body with the node's identity key inside the browser wiring; the sink itself never holds a private key.
+* *Assumption, confirmation required:* the constants: 4 concurrent mail streams, 30 bundles and 8 MiB per minute, 120 seconds per stream, 10 seconds idle, receive queue 8; retry queue 32 entries, 4 per recipient, 16 MiB, every 10 minutes plus or minus 2 minutes, lifetime 48 hours; send executor 2 threads and queue 16; 25 seconds to connect and 120 seconds for one delivery attempt.
+* *Assumption, confirmation required:* the `InboxIndex` replay-after-restart limit above is documented and not solved in this wave.
+* *Assumption, confirmation required:* the browser banner text, the mail line of the status panel and the mail page notice were written from the facts above; the design team's wording was not available to the implementation and should replace them if it differs.
+
 == Incentives and operation
 
 Running a relay is opt-in per node and can be switched off. Relay reliability will be a Madli metric analogous to the existing relay-reliability metric. No payment in part 1; Lightning or Virtus incentives remain an open option. Operators need bandwidth and circuit limits; the foundation already bounds circuits, creation rate and cell rate (`OnionRelayLimits`).
@@ -863,6 +1017,8 @@ Honest limits: zeroisation covers the arrays this code owns, not copies the JVM 
 
 Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServiceAddress`, `OnionServiceDescriptor` with its codec, the HPKE introduction, the end-to-end layer (`RendezvousEndToEnd`, `RendezvousHandshake`), the relay roles and splice inside `OnionRelay` (introduction table, rendezvous table, deferred cross-circuit work so that two circuit locks are never held at once) and the two pure state machines `OnionServiceStateMachine` and `RendezvousClientStateMachine`; to `lapis-net-directory`: `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip` and `OnionServiceDht`; to `lapis-net-onion-wire`: `OnionClientCircuit`/`OnionCircuitFactory`, `OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionPathProvider` and the `OnionWire` factories.
 
+Wave F2 adds the module `lapis-net-mail-onion` (`OnionMailTransport`, `OnionMailInboundHandler`, `OnionMailRetryQueue`, `AnonymousMailSubscriber`, `MailCircuitBundleCodec`); to `lapis-net-mail`: `AnonymousMailTransport`, `AnonymousMailInboundSink`, `AnonymousMailSizing`, `InboxAnonymousSink` and the anonymous modes of `MailSender` and `InboxGossip`; to `lapis-net-directory`: `SealedMailboxBox` and multiple consumers on `AnonymousMailboxGossip`; to `lapis-net-networking`: `GossipPubSub.subscribedTopics`.
+
 Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and `lapis-net-onion-wire`: `OnionDmTransport`, `DmCircuitFraming`, `OnionDmInboundHandler`, `AnonymousMailboxRedelivery`, `AnonymousMailboxSubscriber`); to `lapis-net-dm`: `AnonymousDmTransport`, `DmInboundSink`, `DmRoute`, `DmAnonymousFailure` and `SealedMailboxItemCodec`; to `lapis-net-onion`: the `MAILBOX_PUBLISH` relay role (`MailboxPublishBody`); to `lapis-net-directory`: `AnonymousMailboxGossip`; to `lapis-net-onion-wire`: `MailboxPublishSink`, `OnionMailboxPublisher`, `OnionServiceStreamRouter` and the `AnonymityRuntime` methods used by the adapter.
 
 == Wave plan
@@ -875,7 +1031,7 @@ Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and
 | D | Done (unreleased): directory anonymity: `AnonymousPeerRecord` (no address, no peer id, no binding) on its own gossip topic, `DirectoryAnonymityMode` with fail-closed suppression of every address-bearing publication, downgrade protection against replayed address records, mode-switch transition records, publication of the directory objects through a circuit (`DIRECTORY_PUBLISH`). No user traffic, no path selection, and the transport key is still bound to the identity (wave E).
 | E | Done (unreleased): path selection (Madli weighting, diversity, persistent guards), the client circuit policy, and the experimental option `--anonymity=on|off` (DCUtR and Identify off, conflicts with `--hole-punching` and `--onion-relay`), wired into the CLI node and the browser. Only the directory publication and the path selection are active; no user traffic is anonymised and the transport key is still the identity key.
 | F1 | Done (unreleased): direct messages online and offline over circuits (rendezvous streams, sealed mailbox items announced by relays on one shared topic), new module `lapis-net-dm-onion`, new relay role `MAILBOX_PUBLISH`. No attachments, no fallback, mail and calls unchanged.
-| F2 | Mail delivery over circuits and off the per-recipient topic.
+| F2 | Done (unreleased): mail over circuits (rendezvous-stream bundles up to 1 MiB with attachments, small mail also as sealed items on the shared topic), off the per-recipient topic, no DHT pointer and no Nabu fetch; new module `lapis-net-mail-onion`, generic `SealedMailboxBox` with a kind byte, `MAIL` service application. Both ends must be in anonymity mode, no fallback. Calls unchanged.
 | G | Call signals over circuits, with an honest note on the media path.
 | H | Padding and timing protection (DROP cell schedule), circuit pre-building.
 | I | Multi-node tests, Sybil simulation, external cryptographic review recommended.

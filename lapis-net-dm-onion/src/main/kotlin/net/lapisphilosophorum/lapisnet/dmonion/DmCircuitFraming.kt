@@ -54,6 +54,8 @@ class DmFrameReader(
     private val allowedType: Int,
     private val clockMillis: () -> Long,
     private val maxEnvelopeBytes: Int = DmEnvelopeCodec.MAX_ENVELOPE_BYTES,
+    /** Asked with the declared length BEFORE the body buffer is allocated; `false` ends the stream. */
+    private val admit: (length: Int) -> Boolean = { true },
 ) {
     private val header = ByteArray(DmCircuitFraming.HEADER_SIZE)
     private var headerFill = 0
@@ -67,6 +69,45 @@ class DmFrameReader(
     /** `true` while a frame has been started but not completed. */
     @Volatile var inFrame: Boolean = false
         private set
+
+    /** `true` once the header of the current frame has been read completely (its length is known). */
+    @Volatile var headerComplete: Boolean = false
+        private set
+
+    /** Time the body of the current frame started (header complete); meaningless while [headerComplete] is false. */
+    @Volatile var bodyStartMillis: Long = 0L
+        private set
+
+    /** Body bytes of the current frame received so far. */
+    @Volatile var bodyReceived: Int = 0
+        private set
+
+    /** Declared body length of the current frame; meaningless while [headerComplete] is false. */
+    @Volatile var bodyLength: Int = 0
+        private set
+
+    /**
+     * `true` if the body of the current frame is arriving slower than [minBytesPerSecond] on average, measured from the end of
+     * the header after a grace period of [graceMillis]. A trickle of single bytes inside the idle limit cannot hold a stream.
+     * With a [deadlineMillis] (absolute time) it is also `true` if, at the average rate so far, the body cannot complete before
+     * the deadline: a stream that holds its slot until the deadline must therefore finish its frame.
+     */
+    fun bodyTooSlow(
+        nowMillis: Long,
+        graceMillis: Long,
+        minBytesPerSecond: Long,
+        deadlineMillis: Long = Long.MAX_VALUE,
+    ): Boolean {
+        if (!headerComplete) return false
+        val elapsed = nowMillis - bodyStartMillis
+        if (elapsed < graceMillis || elapsed <= 0L) return false
+        val received = bodyReceived.toLong()
+        if (received * 1000L < (elapsed - graceMillis) * minBytesPerSecond) return true
+        if (deadlineMillis == Long.MAX_VALUE) return false
+        val timeLeft = deadlineMillis - nowMillis
+        if (timeLeft <= 0L) return false
+        return received + received * timeLeft / elapsed < bodyLength.toLong()
+    }
 
     /** Feeds one stream message; calls [onFrame] for every frame that completes. @throws DmFramingException */
     fun feed(
@@ -90,12 +131,18 @@ class DmFrameReader(
                 val valid =
                     if (type == DmCircuitFraming.TYPE_ACK) length == 1 else length in 1..maxEnvelopeBytes
                 if (!valid) throw DmFramingException("frame length out of range")
+                if (!admit(length)) throw DmFramingException("frame not admitted")
                 body = ByteArray(length)
                 bodyFill = 0
+                bodyReceived = 0
+                bodyLength = length
+                bodyStartMillis = clockMillis()
+                headerComplete = true
             } else {
                 val take = minOf(current.size - bodyFill, chunk.size - offset)
                 chunk.copyInto(current, bodyFill, offset, offset + take)
                 bodyFill += take
+                bodyReceived = bodyFill
                 offset += take
                 lastProgressMillis = clockMillis()
                 if (bodyFill == current.size) {
@@ -103,8 +150,11 @@ class DmFrameReader(
                     body = null
                     bodyFill = 0
                     headerFill = 0
-                    inFrame = false
                     onFrame(type, current)
+                    // reset only after the callback, so a sweeper never sees a completed frame as a silent stream
+                    inFrame = false
+                    headerComplete = false
+                    bodyReceived = 0
                 }
             }
         }

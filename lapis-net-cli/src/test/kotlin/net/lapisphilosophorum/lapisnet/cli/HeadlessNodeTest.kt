@@ -232,7 +232,7 @@ class HeadlessNodeTest :
                 ) shouldBe 0
                 out.toString() shouldContain "anonymity=on"
                 err.toString() shouldContain "Anonymity mode is incomplete"
-                err.toString() shouldContain "reveal your IP address"
+                err.toString() shouldContain "reveals your IP address"
             } finally {
                 node.stop()
             }

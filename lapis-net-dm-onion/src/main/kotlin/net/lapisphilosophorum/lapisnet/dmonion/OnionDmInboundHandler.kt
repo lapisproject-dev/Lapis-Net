@@ -18,8 +18,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 private val logger = KotlinLogging.logger {}
 
-/** Fixed-window counter: at most [limit] events per [windowMillis]. */
-internal class WindowLimiter(
+/** Fixed-window counter: at most [limit] units (events or bytes) per [windowMillis]. */
+class WindowLimiter(
     private val limit: Int,
     private val clock: Clock,
     private val windowMillis: Long = 60_000L,
@@ -28,15 +28,31 @@ internal class WindowLimiter(
     private var count = 0
 
     @Synchronized
-    fun tryAcquire(): Boolean {
+    fun tryAcquire(units: Int = 1): Boolean = acquireStamped(units) != null
+
+    /**
+     * Like [tryAcquire], but returns the start of the window the units were charged to (null when refused), so that
+     * [release] can give them back only if that window is still the current one.
+     */
+    @Synchronized
+    fun acquireStamped(units: Int = 1): Long? {
         val now = clock.millis()
         if (now - windowStart >= windowMillis || now < windowStart) {
             windowStart = now
             count = 0
         }
-        if (count >= limit) return false
-        count++
-        return true
+        if (units < 1 || units > limit - count) return null
+        count += units
+        return windowStart
+    }
+
+    /** Gives [units] back to the window identified by [stamp] (from [acquireStamped]); a window that has ended is left alone. */
+    @Synchronized
+    fun release(
+        units: Int,
+        stamp: Long,
+    ) {
+        if (stamp == windowStart) count = maxOf(0, count - units)
     }
 }
 

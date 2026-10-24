@@ -78,6 +78,34 @@ const composeReplyTargetEl = document.getElementById("compose-reply-target");
 const composeReplyClearButton = document.getElementById("compose-reply-clear");
 const composeStatusEl = document.getElementById("compose-status");
 
+// V0.10.0-F2 anonymity mode. Every text below is fixed in this file; nothing from the server response is ever shown
+// in this mode except through the code table (an unknown code becomes the generic text).
+const MAIL_ANONYMITY_NOTICE =
+  "Anonymity mode: mail travels over circuits. The recipient sees who you are. Only people who are in anonymity mode as well can be reached. A mail with attachments can be at most 1 MiB in total and is delivered only while you and the recipient are online at the same time. Smaller mail without attachments is also delivered while the recipient is offline.";
+const MAIL_ANONYMITY_ERROR_TEXTS = {
+  "recipient-not-reachable-anonymously": "At least one recipient cannot be reached anonymously. Nothing was sent.",
+  "anonymity-not-ready": "Anonymity mode is not ready yet. Nothing was sent, please try again shortly.",
+  "mail-too-large-anonymous": "This mail is too large for anonymity mode (at most 1 MiB including attachments). Nothing was sent.",
+  "attachments-unavailable-anonymous": "An attachment is not available on this node. Nothing was sent.",
+};
+let anonymousMode = false;
+
+function mailErrorText(error) {
+  if (!anonymousMode) return `failed: ${error.message}`;
+  return MAIL_ANONYMITY_ERROR_TEXTS[error.message] || "The mail could not be sent. Nothing was sent.";
+}
+
+function applyAnonymityMode() {
+  return fetchJson("/api/node/status")
+    .then((status) => {
+      anonymousMode = status.anonymityMode === "on";
+      const notice = document.getElementById("mail-anonymity-notice");
+      notice.hidden = !anonymousMode;
+      if (anonymousMode) setText(notice, MAIL_ANONYMITY_NOTICE);
+    })
+    .catch(() => {});
+}
+
 const folderInboxButton = document.getElementById("folder-inbox-button");
 const folderSentButton = document.getElementById("folder-sent-button");
 const mailRefreshButton = document.getElementById("mail-refresh-button");
@@ -319,9 +347,9 @@ composeForm.addEventListener("submit", (event) => {
       }
     })
     .catch((error) => {
-      composeStatusEl.textContent = `failed: ${error.message}`;
+      composeStatusEl.textContent = mailErrorText(error);
     });
 });
 
 loadIdentity();
-loadMailList();
+applyAnonymityMode().then(() => loadMailList());

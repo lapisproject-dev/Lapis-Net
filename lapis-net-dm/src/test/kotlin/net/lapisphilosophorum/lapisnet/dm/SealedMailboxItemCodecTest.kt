@@ -4,6 +4,8 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
+import net.lapisphilosophorum.lapisnet.directory.SealedMailboxBox
+import net.lapisphilosophorum.lapisnet.directory.SealedMailboxKind
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 
@@ -80,5 +82,17 @@ class SealedMailboxItemCodecTest :
         test("fragments tile the item exactly") {
             (SealedMailboxItemCodec.FRAGMENT_BYTES * SealedMailboxItemCodec.FRAGMENT_COUNT) shouldBe
                 SealedMailboxItemCodec.SEALED_ITEM_BYTES
+        }
+
+        test("capacity is 5,668 bytes since the kind byte moved into the sealed plaintext") {
+            SealedMailboxItemCodec.MAX_ENVELOPE_BYTES shouldBe 5_668
+        }
+
+        test("a DM item does not open as MAIL, and a MAIL item does not open as a DM") {
+            val dmItem = SealedMailboxItemCodec.seal(envelopeBytes(), recipient.publicKey, now + 100)
+            SealedMailboxBox.open(dmItem, recipient.privateKey, now, SealedMailboxKind.MAIL) shouldBe null
+            val mailItem =
+                SealedMailboxBox.seal(SealedMailboxKind.MAIL, envelopeBytes(), recipient.publicKey, now + 100)
+            SealedMailboxItemCodec.open(mailItem, recipient.privateKey, now) shouldBe null
         }
     })

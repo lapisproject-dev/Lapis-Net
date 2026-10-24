@@ -17,6 +17,7 @@ include(
     "lapis-net-policy",
     "lapis-net-dm",
     "lapis-net-dm-onion",
+    "lapis-net-mail-onion",
     "lapis-net-call",
     "lapis-net-cli",
     "lapis-net-browser",

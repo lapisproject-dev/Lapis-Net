@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.mail
 
+import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ipfs.cid.Cid
 import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
 import net.lapisphilosophorum.lapisnet.directory.OutboxEntry
@@ -8,6 +9,9 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import java.util.concurrent.atomic.AtomicReference
+
+private val logger = KotlinLogging.logger {}
 
 /** The result of a [MailSender.send] call: the signed envelope, the decoded body, the body's CID,
  * and the exact frame bytes that were published - kept around so [MailSender.republish] can
@@ -45,9 +49,56 @@ class MailSender(
      * published to the DHT by this class. */
     private val outbox: DhtOutbox? = null,
     private val dhtEntryTtlSeconds: Long = DEFAULT_DHT_ENTRY_TTL_SECONDS,
+    /**
+     * V0.10.0-F2: anonymity mode. When `true`, [send] never publishes to an inbox topic, never leaves a DHT pointer and
+     * hands the mail to the installed [AnonymousMailTransport] instead; there is no fallback to the direct path. Such a
+     * sender must not be given an [outbox] (fail closed).
+     */
+    private val anonymous: Boolean = false,
 ) {
+    private val anonymousTransport = AtomicReference<AnonymousMailTransport?>(null)
+
     init {
         require(dhtEntryTtlSeconds > 0) { "dhtEntryTtlSeconds must be positive" }
+        require(!(anonymous && outbox != null)) { "an anonymous mail sender must not have a DHT outbox" }
+    }
+
+    /**
+     * Installs the circuit transport (once). The sender is built before the anonymity runtime exists, so the transport
+     * arrives later; until then every anonymous send fails with [MailAnonymousFailure.ANONYMITY_NOT_READY].
+     */
+    fun installAnonymousTransport(transport: AnonymousMailTransport) {
+        check(anonymous) { "this mail sender is not in anonymity mode" }
+        check(anonymousTransport.compareAndSet(null, transport)) { "the anonymous mail transport is already installed" }
+    }
+
+    /**
+     * Anonymity mode: everything that can fail is checked BEFORE the first store, then the mail is stored locally and
+     * handed to circuits. No publish, no outbox offer, no blob fetch (attachments come from the local blockstore only).
+     */
+    private fun dispatchAnonymously(
+        recipients: List<Secp256k1PublicKey>,
+        attachments: List<AttachmentRef>,
+        bodyBytes: ByteArray,
+        envelopeBytes: ByteArray,
+        frame: ByteArray,
+    ) {
+        val transport =
+            anonymousTransport.get() ?: throw MailAnonymousDeliveryException(MailAnonymousFailure.ANONYMITY_NOT_READY)
+        if (attachments.size > AnonymousMailSizing.MAX_ATTACHMENTS) {
+            throw MailAnonymousDeliveryException(MailAnonymousFailure.MAIL_TOO_LARGE_ANONYMOUS)
+        }
+        val blobs = ArrayList<ByteArray>(attachments.size)
+        for (ref in attachments.distinctBy { it.cid }) {
+            blobs +=
+                storage.getLocal(ref.cid)
+                    ?: throw MailAnonymousDeliveryException(MailAnonymousFailure.ATTACHMENTS_UNAVAILABLE_ANONYMOUS)
+        }
+        val sizeClass = transport.preflight(recipients, frame.size, blobs.map { it.size })
+        storage.put(bodyBytes)
+        storage.put(envelopeBytes)
+        transport.deliver(recipients, frame, blobs, sizeClass)
+        logger.debug { "anonymous mail handed to circuits (${sizeClass.name.lowercase()})" }
     }
 
     private fun offerToOutbox(
@@ -133,7 +184,8 @@ class MailSender(
         sentAtEpochSecond: Long,
     ): SentMessage {
         val bodyBytes = MessageBodyCodec.encode(messageBody)
-        val bodyCid = storage.put(bodyBytes)
+        // In anonymity mode nothing is stored before the pre-flight checks passed; the CID is a pure function of the bytes.
+        val bodyCid = if (anonymous) MessageBodyCodec.cidFor(bodyBytes) else storage.put(bodyBytes)
 
         val envelope =
             MessageEnvelope.create(
@@ -146,6 +198,18 @@ class MailSender(
                 threadRoot = threadRoot,
             )
         val envelopeBytes = MessageEnvelopeCodec.encode(envelope)
+        if (anonymous) {
+            val frame = MailFrameCodec.encode(envelopeBytes, bodyBytes)
+            dispatchAnonymously(recipients, messageBody.attachments, bodyBytes, envelopeBytes, frame)
+            return SentMessage(
+                envelope,
+                messageBody,
+                bodyCid,
+                sealedBody = null,
+                frameBytes = frame,
+                envelopeCid = MessageBodyCodec.cidFor(envelopeBytes),
+            )
+        }
         val envelopeCid = storage.put(envelopeBytes)
 
         val frame = MailFrameCodec.encode(envelopeBytes, bodyBytes)
@@ -188,8 +252,8 @@ class MailSender(
             )
         val sealed = HybridEcies.seal(messageBody, localIdentity, context)
         // Body put FIRST - same load-bearing invariant as the plaintext path, applied to the
-        // sealed blob instead of the plaintext one.
-        storage.put(sealed.sealedBodyBytes)
+        // sealed blob instead of the plaintext one. (Anonymity mode puts both blobs only after the pre-flight.)
+        if (!anonymous) storage.put(sealed.sealedBodyBytes)
 
         val envelope =
             MessageEnvelope.create(
@@ -203,6 +267,18 @@ class MailSender(
                 wraps = sealed.wraps,
             )
         val envelopeBytes = MessageEnvelopeCodec.encode(envelope)
+        if (anonymous) {
+            val frame = MailFrameCodec.encode(envelopeBytes, sealed.sealedBodyBytes)
+            dispatchAnonymously(recipients, messageBody.attachments, sealed.sealedBodyBytes, envelopeBytes, frame)
+            return SentMessage(
+                envelope,
+                messageBody,
+                sealed.contentCid,
+                sealedBody = sealed.sealedBody,
+                frameBytes = frame,
+                envelopeCid = MessageBodyCodec.cidFor(envelopeBytes),
+            )
+        }
         val envelopeCid = storage.put(envelopeBytes)
 
         val frame = MailFrameCodec.encode(envelopeBytes, sealed.sealedBodyBytes)
@@ -230,6 +306,11 @@ class MailSender(
      * [InboxGossip]'s [InboxIndex] dedups by content id).
      */
     fun republish(sent: SentMessage) {
+        if (anonymous) {
+            // anonymity mode: nothing is ever published to a topic; redelivery is the transport's job
+            logger.debug { "republish ignored in anonymity mode" }
+            return
+        }
         sent.envelope.recipients.forEach { recipient ->
             pubsub.publish(InboxTopics.forRecipient(recipient), sent.frameBytes)
         }

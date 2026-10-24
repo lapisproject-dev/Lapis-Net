@@ -8,6 +8,7 @@ import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.time.Clock
+import java.util.concurrent.CopyOnWriteArrayList
 
 private val logger = KotlinLogging.logger {}
 
@@ -23,15 +24,34 @@ const val ANONYMOUS_MAILBOX_GOSSIP_TOPIC = "LapisNet:anonymous-mailbox:v1"
  * SHA-256 (IGNORE, and they do not use the budget), then the per-author and global rate budget (IGNORE on excess,
  * never REJECT). Nothing is logged except aggregate debug lines: no peer ids, no bytes.
  *
- * [consumer], when set, receives every item that passed validation (it runs on the gossip thread: the consumer
- * must hand work to a bounded executor and return at once).
+ * Consumers registered with [addConsumer] (at most [MAX_CONSUMERS]: the direct-message and the mail subscriber
+ * share this topic) receive every item that passed validation. They run on the gossip thread: each consumer must
+ * hand work to a bounded executor and return at once. A failing consumer does not affect the others.
  */
 class AnonymousMailboxGossip private constructor(
     private val pubsub: GossipPubSub,
     private val subscription: PubsubSubscription,
 ) {
-    @Volatile
-    var consumer: ((ByteArray) -> Unit)? = null
+    private val consumers = CopyOnWriteArrayList<(ByteArray) -> Unit>()
+
+    /** Registers [consumer]; closing the returned handle removes it again. */
+    fun addConsumer(consumer: (ByteArray) -> Unit): AutoCloseable {
+        synchronized(consumers) {
+            require(consumers.size < MAX_CONSUMERS) { "too many mailbox consumers" }
+            consumers.add(consumer)
+        }
+        return AutoCloseable { consumers.remove(consumer) }
+    }
+
+    internal fun dispatch(bytes: ByteArray) {
+        for (c in consumers) {
+            try {
+                c(bytes)
+            } catch (e: RuntimeException) {
+                logger.debug { "mailbox consumer failed (${e::class.simpleName})" }
+            }
+        }
+    }
 
     /** Announces [itemBytes] (a relay only). The size is re-checked; nothing else about the item is. */
     fun publish(itemBytes: ByteArray) {
@@ -40,13 +60,14 @@ class AnonymousMailboxGossip private constructor(
     }
 
     fun stop() {
-        consumer = null
+        consumers.clear()
         subscription.unsubscribe()
     }
 
     companion object {
-        /** Matches `SealedMailboxItemCodec.SEALED_ITEM_BYTES` in lapis-net-dm (asserted by a test in dm-onion). */
+        /** Equals [SealedMailboxBox.ITEM_BYTES] (asserted by a test). */
         const val ITEM_SIZE = 5_728
+        const val MAX_CONSUMERS = 4
         const val DEFAULT_PER_AUTHOR_PER_MINUTE = 10
         const val DEFAULT_GLOBAL_PER_MINUTE = 120
         const val MAX_TRACKED_AUTHOR_BUCKETS = 1024
@@ -65,11 +86,7 @@ class AnonymousMailboxGossip private constructor(
                 pubsub.subscribe(ANONYMOUS_MAILBOX_GOSSIP_TOPIC) { bytes, from ->
                     val result = validator.validate(bytes, from)
                     if (result == ValidationResult.Valid) {
-                        try {
-                            self?.consumer?.invoke(bytes)
-                        } catch (e: RuntimeException) {
-                            logger.debug { "mailbox consumer failed (${e::class.simpleName})" }
-                        }
+                        self?.dispatch(bytes)
                     }
                     result
                 }

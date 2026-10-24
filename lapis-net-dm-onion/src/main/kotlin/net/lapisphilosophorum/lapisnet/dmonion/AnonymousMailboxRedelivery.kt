@@ -1,7 +1,8 @@
 package net.lapisphilosophorum.lapisnet.dmonion
 
 import io.github.oshai.kotlinlogging.KotlinLogging
-import net.lapisphilosophorum.lapisnet.dm.SealedMailboxItemCodec
+import net.lapisphilosophorum.lapisnet.directory.SealedMailboxBox
+import net.lapisphilosophorum.lapisnet.directory.SealedMailboxKind
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519PublicKey
 import java.security.SecureRandom
@@ -23,7 +24,7 @@ private val logger = KotlinLogging.logger {}
  * Every announcement seals the envelope afresh (new ephemeral key), so announcements cannot be linked by their bytes;
  * the recipient's duplicate suppression absorbs the repeats. At most [itemsPerCircuit] items travel through one circuit.
  * The queue lives in memory only (lost on restart, documented) and is bounded: [maxEntries] in total and
- * [maxPerRecipient] per recipient; when full the oldest entry is dropped and counted.
+ * [maxPerRecipient] per recipient (shared by direct messages and mail, whose entries carry their [SealedMailboxKind]); when full the oldest entry is dropped and counted.
  *
  * Timing: first announcement at once, then every [intervalMillis] plus or minus up to [jitterMillis]; a failed
  * announcement is retried after [retryMillis]. Defaults (10 min, 2 min, 60 s) are assumptions awaiting confirmation.
@@ -42,6 +43,7 @@ class AnonymousMailboxRedelivery(
 ) : AutoCloseable {
     private class Entry(
         val seq: Long,
+        val kind: SealedMailboxKind,
         val recipient: Secp256k1PublicKey,
         val sealingKey: X25519PublicKey,
         val envelopeBytes: ByteArray,
@@ -80,10 +82,18 @@ class AnonymousMailboxRedelivery(
         sealingKey: X25519PublicKey,
         envelopeBytes: ByteArray,
         notValidAfterEpochSecond: Long,
+        kind: SealedMailboxKind = SealedMailboxKind.DM,
     ) {
         if (closed.get()) return
         synchronized(lock) {
-            if (entries.any { it.recipient == recipient && it.envelopeBytes.contentEquals(envelopeBytes) }) return
+            if (entries.any {
+                    it.kind == kind &&
+                        it.recipient == recipient &&
+                        it.envelopeBytes.contentEquals(envelopeBytes)
+                }
+            ) {
+                return
+            }
             val own = entries.filter { it.recipient == recipient }
             if (own.size >= maxPerRecipient) {
                 entries.remove(own.minBy { it.seq })
@@ -96,6 +106,7 @@ class AnonymousMailboxRedelivery(
             entries +=
                 Entry(
                     seq.incrementAndGet(),
+                    kind,
                     recipient,
                     sealingKey,
                     envelopeBytes.copyOf(),
@@ -127,7 +138,8 @@ class AnonymousMailboxRedelivery(
         val sealedFor = ArrayList<Entry>(due.size)
         for (e in due) {
             try {
-                items += SealedMailboxItemCodec.seal(e.envelopeBytes, e.sealingKey, e.notValidAfterEpochSecond, random)
+                items +=
+                    SealedMailboxBox.seal(e.kind, e.envelopeBytes, e.sealingKey, e.notValidAfterEpochSecond, random)
                 sealedFor += e
             } catch (ex: RuntimeException) {
                 logger.debug { "dropping an unsealable mailbox entry (${ex.javaClass.simpleName})" }

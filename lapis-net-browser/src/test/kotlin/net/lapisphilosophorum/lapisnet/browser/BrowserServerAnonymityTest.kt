@@ -54,6 +54,9 @@ class BrowserServerAnonymityTest :
                 // normal mode: the direct DM path with the own mailbox topic, exactly as before
                 server.mailboxGossipOrNullForTesting.shouldNotBeNull()
                 server.dmSessionManagerForTesting.routeMode() shouldBe DmRoute.DIRECT
+                // normal mode keeps the per-recipient inbox topic exactly as before
+                server.mailInboxForTesting.subscribed shouldBe true
+                (server.mailInboxForTesting.topic in server.pubsubForTesting.subscribedTopics()) shouldBe true
                 server.anonymityStatus().mode shouldBe "off"
                 onionThreads() shouldBe emptyList()
                 FileDirectoryModeStore(dir.resolve("directory-mode.state")).load().shouldNotBeNull().mode shouldBe
@@ -111,6 +114,31 @@ class BrowserServerAnonymityTest :
                         )
                     }
                 refused.failure shouldBe DmAnonymousFailure.ANONYMITY_NOT_READY
+                // mail (wave F2): no per-recipient inbox subscription, no DHT fetcher, no DHT outbox pointers, MAIL advertised
+                server.mailInboxForTesting.subscribed shouldBe false
+                server.inboxDhtFetcherForTesting.shouldBeNull()
+                (server.mailInboxForTesting.topic in server.pubsubForTesting.subscribedTopics()) shouldBe false
+                (
+                    net.lapisphilosophorum.lapisnet.directory.ANONYMOUS_MAILBOX_GOSSIP_TOPIC in
+                        server.pubsubForTesting.subscribedTopics()
+                ) shouldBe true
+                // a mail send is refused up front while no route exists (no fallback to the direct path)
+                val mailPort = port
+                val someone =
+                    DualKeyIdentity
+                        .generate()
+                        .secp256k1KeyPair.publicKey.bytes
+                        .joinToString("") { "%02x".format(it) }
+                val mailRefusal =
+                    rawHttp(
+                        mailPort,
+                        "POST",
+                        "/api/mail",
+                        mapOf("Host" to "127.0.0.1:$mailPort", "Content-Type" to "application/json"),
+                        """{"recipientsHex":["$someone"],"subject":"s","body":"b"}""",
+                    )
+                mailRefusal.first shouldBe 503
+                mailRefusal.second shouldContain "anonymity-not-ready"
                 // the periodic maintenance runs once after a second; loopback has no relay at all
                 var parsed: NodeStatusResponse
                 var body: String

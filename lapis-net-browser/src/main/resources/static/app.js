@@ -132,7 +132,7 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media still use direct connections and reveal your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address.";
+  "Anonymity mode is incomplete: direct messages and mail travel over circuits, but call media still uses direct connections and reveals your IP address, call signalling is not available, and the network mesh, DHT lookups and fetches still show your identity and address.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -146,7 +146,7 @@ const ANONYMITY_ERROR_LABELS = {
 const ANONYMITY_STATUS_LINES = [
   "Directory entries: published through circuits",
   "Direct messages: over circuits (no attachments)",
-  "Mail: direct connection, your IP address is visible",
+  "Mail: over circuits (small mail also offline; up to 1 MiB with attachments only while both are online)",
   "Call signalling: not available in anonymity mode",
   "Call media: direct connection, your IP address is visible",
   "Network mesh, DHT and fetches: direct, identity and address are visible",

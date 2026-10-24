@@ -10,11 +10,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
 
-/** The applications that share the one onion service of a node (wave V0.10.0-F1). MAIL and CALL are reserved for later waves. */
+/** The applications that share the one onion service of a node (wave V0.10.0-F1). MAIL joined in wave V0.10.0-F2; CALL is reserved for a later wave. */
 enum class OnionServiceApp(
     val id: Byte,
 ) {
     DM(1),
+    MAIL(2),
     ;
 
     companion object {

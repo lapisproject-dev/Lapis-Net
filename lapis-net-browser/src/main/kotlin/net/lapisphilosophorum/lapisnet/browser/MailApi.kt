@@ -14,12 +14,15 @@ import io.ktor.server.routing.post
 import kotlinx.serialization.Serializable
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
+import net.lapisphilosophorum.lapisnet.mail.AnonymousMailSizing
 import net.lapisphilosophorum.lapisnet.mail.AttachmentRef
 import net.lapisphilosophorum.lapisnet.mail.EncryptedAttachmentBlobCodec
 import net.lapisphilosophorum.lapisnet.mail.EncryptionMode
 import net.lapisphilosophorum.lapisnet.mail.HybridEcies
 import net.lapisphilosophorum.lapisnet.mail.InboxMessage
 import net.lapisphilosophorum.lapisnet.mail.InboxPayload
+import net.lapisphilosophorum.lapisnet.mail.MailAnonymousDeliveryException
+import net.lapisphilosophorum.lapisnet.mail.MailAnonymousFailure
 import net.lapisphilosophorum.lapisnet.mail.MailAttachmentCipher
 import net.lapisphilosophorum.lapisnet.mail.MessageBodyCodec
 import net.lapisphilosophorum.lapisnet.mail.ThreadBuilder
@@ -324,6 +327,22 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
             }
         }
 
+        // Anonymity mode: the whole transport bundle is capped at 1 MiB; refused here, before any decoding or storing,
+        // with the same stable code the sender's pre-flight uses.
+        if (deps.anonymityActive &&
+            (
+                request.attachments.size > AnonymousMailSizing.MAX_ATTACHMENTS ||
+                    request.attachments.sumOf { (it.contentBase64.length.toLong() * 3) / 4 } >
+                    AnonymousMailSizing.MAX_CIRCUIT_BUNDLE_BYTES
+            )
+        ) {
+            call.respond(
+                HttpStatusCode.PayloadTooLarge,
+                ErrorResponse(MailAnonymousFailure.MAIL_TOO_LARGE_ANONYMOUS.wire),
+            )
+            return@post
+        }
+
         val decodedAttachments =
             request.attachments.map { attachment ->
                 val rawBytes =
@@ -381,6 +400,18 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
                     threadRoot = threadRoot,
                     encryption = encryptionMode,
                 )
+            } catch (e: MailAnonymousDeliveryException) {
+                // stable, content-free codes only; the message names no recipient, peer or address
+                val status =
+                    when (e.failure) {
+                        MailAnonymousFailure.RECIPIENT_NOT_REACHABLE_ANONYMOUSLY,
+                        MailAnonymousFailure.ANONYMITY_NOT_READY,
+                        -> HttpStatusCode.ServiceUnavailable
+                        MailAnonymousFailure.MAIL_TOO_LARGE_ANONYMOUS -> HttpStatusCode.PayloadTooLarge
+                        MailAnonymousFailure.ATTACHMENTS_UNAVAILABLE_ANONYMOUS -> HttpStatusCode.Conflict
+                    }
+                call.respond(status, ErrorResponse(e.failure.wire))
+                return@post
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.BadRequest, ErrorResponse("invalid mail request: ${e.message}"))
                 return@post
@@ -446,7 +477,21 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
         // retrieve an attachment blob it already has locally (the sender's own node, or a node
         // that fetched it some other way). Documented here, not silently swallowed - see
         // NabuStorage.get's doc comment for the underlying provider-discovery gap.
-        val blobBytes = runCatching { deps.storage.get(found.cid) }.getOrNull()
+        // Anonymity mode: the local blockstore only. storage.get would fall back to provider lookup and Bitswap on a
+        // miss, i.e. dial other peers; attachments arrive in-band with the mail or not at all.
+        val blobBytes =
+            if (deps.anonymityActive) {
+                runCatching { deps.storage.getLocal(found.cid) }.getOrNull()
+            } else {
+                runCatching { deps.storage.get(found.cid) }.getOrNull()
+            }
+        if (blobBytes == null && deps.anonymityActive) {
+            call.respond(
+                HttpStatusCode.NotFound,
+                ErrorResponse(MailAnonymousFailure.ATTACHMENTS_UNAVAILABLE_ANONYMOUS.wire),
+            )
+            return@get
+        }
         if (blobBytes == null) {
             call.respond(
                 HttpStatusCode.NotFound,

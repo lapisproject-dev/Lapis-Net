@@ -39,6 +39,8 @@
   .mail-attachments { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.4rem; }
   .mail-attachment-item { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; }
   .mail-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  #mail-anonymity-notice { margin: 0; padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; }
+  #mail-anonymity-notice[hidden] { display: none; }
   .mail-decryption-failed { color: var(--badge-low-text); font-style: italic; }
   #thread-view { display: none; flex-direction: column; gap: 0.5rem; }
   #thread-view.visible { display: flex; }
@@ -66,6 +68,7 @@
 <main id="mail-main">
   <section class="mail-panel" id="compose-panel">
     <h2>Compose</h2>
+    <p id="mail-anonymity-notice" role="status" hidden></p>
     <form id="compose-form">
       <div>
         <label for="compose-recipients">Recipients (comma or newline separated hex public keys)</label>

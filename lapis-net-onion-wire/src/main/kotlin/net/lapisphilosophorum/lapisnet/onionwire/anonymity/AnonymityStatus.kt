@@ -20,7 +20,7 @@ enum class AnonymityErrorCode(
 data class AnonymityStatus(
     /** `"off"` or `"on"`. */
     val mode: String,
-    /** `true` whenever the mode is on: direct messages, mail and calls are not anonymised yet. */
+    /** `true` whenever the mode is on: calls and the network mesh are not anonymised yet. */
     val incomplete: Boolean,
     val guards: Int,
     val activeCircuits: Int,
@@ -36,6 +36,6 @@ data class AnonymityStatus(
 
 /** Logged once at start and shown in the CLI and the browser whenever anonymity mode is on. */
 const val ANONYMITY_INCOMPLETE_WARNING: String =
-    "Anonymity mode is incomplete: direct messages travel over circuits, but mail and call media " +
-        "still use direct connections and reveal your IP address, call signalling is not available, " +
+    "Anonymity mode is incomplete: direct messages and mail travel over circuits, but call media " +
+        "still uses direct connections and reveals your IP address, call signalling is not available, " +
         "and the network mesh, DHT lookups and fetches still show your identity and address."

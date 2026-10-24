@@ -130,8 +130,29 @@ class GossipPubSub private constructor(
                 val from = PeerId(checkNotNull(message.from) { "gossip message has no from peer id" })
                 CompletableFuture.completedFuture(handler(bytes, from))
             }
-        return gossip.subscribe(validator, Topic(topic))
+        val subscription = gossip.subscribe(validator, Topic(topic))
+        synchronized(subscribed) { subscribed.merge(topic, 1, Int::plus) }
+        return object : PubsubSubscription {
+            private val released =
+                java.util.concurrent.atomic
+                    .AtomicBoolean(false)
+
+            override fun unsubscribe() {
+                subscription.unsubscribe()
+                if (released.compareAndSet(false, true)) {
+                    synchronized(subscribed) {
+                        val left = (subscribed[topic] ?: 1) - 1
+                        if (left <= 0) subscribed.remove(topic) else subscribed[topic] = left
+                    }
+                }
+            }
+        }
     }
+
+    private val subscribed = HashMap<String, Int>()
+
+    /** A snapshot of the topics registered through [subscribe] and not yet unsubscribed (tests, status; read-only). */
+    fun subscribedTopics(): Set<String> = synchronized(subscribed) { subscribed.keys.toSet() }
 
     /**
      * Test seam (wave V0.10.0-D): sees `(topic, bytes)` of every message THIS node publishes itself (not the ones it

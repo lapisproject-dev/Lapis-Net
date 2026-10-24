@@ -105,6 +105,8 @@ private fun daemonThreads(prefix: String): ThreadFactory {
 class NabuStorage private constructor(
     private val host: Host,
     private val blockstore: Blockstore,
+    /** Blocks received over anonymous paths: never handed to Bitswap or the DHT engine, see [putUnserved]. */
+    private val privateBlockstore: Blockstore,
     private val bitswap: Bitswap,
     private val bitswapEngine: RefreshableBitswapEngine,
     private val kademlia: Kademlia,
@@ -198,6 +200,29 @@ class NabuStorage private constructor(
     }
 
     /**
+     * Stores [bytes] in a local blockstore that is NOT served: neither Bitswap (WANT_HAVE and WANT_BLOCK) nor the DHT
+     * engine can see it, so a remote peer cannot probe whether (or when) this node accepted something received over an
+     * anonymous path. [get] and [getLocal] still return it locally. The private store lives next to the public one.
+     */
+    fun putUnserved(
+        bytes: ByteArray,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): Cid {
+        val cid = awaitOrWrap("put private block", timeout) { privateBlockstore.put(bytes, Cid.Codec.Raw) }
+        logger.debug { "stored unserved block $cid (${bytes.size} bytes)" }
+        return cid
+    }
+
+    private fun localLookup(
+        cid: Cid,
+        timeout: Duration,
+    ): java.util.Optional<ByteArray> {
+        val pub = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
+        if (pub.isPresent) return pub
+        return awaitOrWrap("check private blockstore", timeout) { privateBlockstore.get(cid) }
+    }
+
+    /**
      * Returns the bytes for [cid] from the LOCAL blockstore only - guaranteed no network I/O and
      * no [findProviders] call, unlike [get]. `null` if [cid] is not held locally.
      *
@@ -214,7 +239,7 @@ class NabuStorage private constructor(
         cid: Cid,
         timeout: Duration = DEFAULT_TIMEOUT,
     ): ByteArray? {
-        val local = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
+        val local = localLookup(cid, timeout)
         return if (local.isPresent) local.get() else null
     }
 
@@ -262,7 +287,7 @@ class NabuStorage private constructor(
         val start = System.nanoTime()
         requirePositive(timeout)
         val deadline = start + timeout.toNanos()
-        val local = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
+        val local = localLookup(cid, timeout)
         if (local.isPresent) return local.get()
         if (stopped.get()) return null
 
@@ -911,6 +936,10 @@ class NabuStorage private constructor(
         ): NabuStorage {
             val host = node.host
             val blockstore = FileBlockstore(blockstoreDir)
+            val privateDir = blockstoreDir.resolveSibling(blockstoreDir.fileName.toString() + "-private")
+            java.nio.file.Files
+                .createDirectories(privateDir)
+            val privateBlockstore = FileBlockstore(privateDir)
 
             val bitswapEngine = RefreshableBitswapEngine(blockstore, allowAllReads, Bitswap.MAX_MESSAGE_SIZE, clock)
             val bitswap = Bitswap(bitswapEngine)
@@ -964,6 +993,7 @@ class NabuStorage private constructor(
             return NabuStorage(
                 host,
                 blockstore,
+                privateBlockstore,
                 bitswap,
                 bitswapEngine,
                 kademlia,

@@ -72,12 +72,18 @@ class InboxGossip private constructor(
     private val storage: NabuStorage,
     private val localIdentity: Secp256k1PublicKey,
     private val index: InboxIndex,
-    private val subscription: PubsubSubscription,
+    private val subscription: PubsubSubscription?,
     private val acceptanceRef: AcceptanceRef,
 ) {
     /** The GossipSub topic this instance is subscribed to - [InboxTopics.forRecipient] applied to
      * the identity this instance was [attach]ed for. */
     val topic: String = InboxTopics.forRecipient(localIdentity)
+
+    /**
+     * `false` for an instance built by [attachAnonymous]: it holds the same acceptance policy and index but never
+     * subscribed to the per-recipient inbox topic, so nothing about it is visible on the gossip network.
+     */
+    val subscribed: Boolean get() = subscription != null
 
     /** All tracked inbox messages, oldest first. */
     fun messages(): List<InboxMessage> = index.latest()
@@ -116,7 +122,47 @@ class InboxGossip private constructor(
     /** Unsubscribes from the inbox topic. No other sub-resources to release - mirrors
      * `net.lapisphilosophorum.lapisnet.trust.VeritasGossip.stop` exactly. */
     fun stop() {
-        subscription.unsubscribe()
+        subscription?.unsubscribe()
+    }
+
+    /**
+     * V0.10.0-F2: the single entrance of mail that arrived over circuits (rendezvous stream or sealed item). It runs
+     * exactly the stages of the gossip validator: frame decode (the caller bounds the size), [checkEnvelope] with the
+     * live acceptance policy (read per message) and [ingestChecked], with the same contact bypass and the same
+     * [InboxIndex] duplicate suppression. Never throws; the outcome is for the caller's counters only and must not be
+     * reported to the sender.
+     */
+    internal fun anonymousIngest(frameBytes: ByteArray): InboxIngestOutcome = anonymousIngestMessage(frameBytes).first
+
+    /** [anonymousIngest] that also returns the indexed message when the mail was accepted. */
+    internal fun anonymousIngestMessage(frameBytes: ByteArray): Pair<InboxIngestOutcome, InboxMessage?> {
+        val frame =
+            try {
+                MailFrameCodec.decode(frameBytes)
+            } catch (e: MalformedMailFrameException) {
+                logger.debug { "rejected structurally malformed mail frame from a circuit" }
+                return InboxIngestOutcome.INVALID to null
+            }
+        val check = checkEnvelope(frame.envelopeBytes, localIdentity, acceptanceRef.value, frame.bodyBytes, "a circuit")
+        val envelope =
+            when (check) {
+                is EnvelopeCheck.Passed -> check.envelope
+                is EnvelopeCheck.Failed -> return InboxIngestOutcome.INVALID to null
+            }
+        val outcome =
+            ingestChecked(
+                envelope,
+                frame.envelopeBytes,
+                frame.bodyBytes,
+                storage,
+                index,
+                "a circuit",
+                true,
+                serveable = false,
+            )
+        val message =
+            if (outcome == InboxIngestOutcome.ACCEPTED) index.latest().lastOrNull { it.envelope == envelope } else null
+        return outcome to message
     }
 
     companion object {
@@ -142,6 +188,19 @@ class InboxGossip private constructor(
                 }
             return InboxGossip(pubsub, storage, localIdentity, index, subscription, acceptanceRef)
         }
+
+        /**
+         * V0.10.0-F2: anonymity mode. Same instance shape as [attach] (same index, same live acceptance policy, same
+         * [checkEnvelope]/[ingestChecked]) but it does NOT subscribe to the per-recipient inbox topic: a topic named
+         * after the recipient's key would tie the node's network position to its mail identity. Mail arrives only via
+         * [anonymousIngest].
+         */
+        fun attachAnonymous(
+            pubsub: GossipPubSub,
+            storage: NabuStorage,
+            localIdentity: Secp256k1PublicKey,
+            acceptance: MailAcceptanceCheck? = null,
+        ): InboxGossip = InboxGossip(pubsub, storage, localIdentity, InboxIndex(), null, AcceptanceRef(acceptance))
 
         /**
          * The GossipSub validator: decode -> addressing check -> signature -> CID binding -> dedup
@@ -323,6 +382,7 @@ class InboxGossip private constructor(
             index: InboxIndex,
             source: String,
             cidChecked: Boolean = false,
+            serveable: Boolean = true,
         ): InboxIngestOutcome {
             if (!cidChecked && MessageBodyCodec.cidFor(bodyBytes) != envelope.contentCid) {
                 logger.debug { "rejected envelope from $source whose contentCid does not match the body" }
@@ -355,8 +415,14 @@ class InboxGossip private constructor(
                 try {
                     // Body first, then envelope: a crash between the two never leaves a persisted
                     // envelope pointing at a body this node does not have.
-                    storage.put(bodyBytes)
-                    storage.put(envelopeBytes)
+                    // mail received over a circuit is kept in the unserved store: Bitswap must not reveal acceptance
+                    if (serveable) {
+                        storage.put(bodyBytes)
+                        storage.put(envelopeBytes)
+                    } else {
+                        storage.putUnserved(bodyBytes)
+                        storage.putUnserved(envelopeBytes)
+                    }
                 } catch (e: NabuStorageException) {
                     // Backported from MailboxGossip's identical fix (V0.8.5 security audit
                     // finding): release the reservation on failure - tryReservePersistence already

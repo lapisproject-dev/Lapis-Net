@@ -30,6 +30,46 @@ class AnonymityStaticAssetsTest :
             fn shouldNotContain "status.anonymityWarning"
         }
 
+        test("the warning text is character-identical in the Kotlin constant, app.js and docs/anonymity.adoc") {
+            warning shouldContain "direct messages and mail travel over circuits"
+            warning shouldNotContain "mail and call media"
+            resource("app.js") shouldContain warning
+            val docs = java.io.File("../docs/anonymity.adoc")
+            if (docs.exists()) docs.readText() shouldContain warning
+        }
+
+        test("the status panel's mail line says mail travels over circuits and states the offline limit") {
+            val js = resource("app.js")
+            js shouldContain
+                "Mail: over circuits (small mail also offline; up to 1 MiB with attachments only while both are online)"
+            js shouldNotContain "Mail: direct connection"
+        }
+
+        test("mail.js maps the anonymity error codes to fixed texts and shows a fixed, undismissable notice") {
+            val js = resource("mail.js")
+            for (
+            code in
+            listOf(
+                "recipient-not-reachable-anonymously",
+                "anonymity-not-ready",
+                "mail-too-large-anonymous",
+                "attachments-unavailable-anonymous",
+            )
+            ) {
+                js shouldContain "\"$code\""
+            }
+            js shouldContain "mailErrorText(error)"
+            js shouldContain "MAIL_ANONYMITY_NOTICE"
+            js
+                .lines()
+                .filterNot { it.trimStart().let { l -> l.startsWith("//") || l.startsWith("/*") || l.startsWith("*") } }
+                .joinToString("\n") shouldNotContain "innerHTML"
+            val html = resource("mail.html")
+            html shouldContain "id=\"mail-anonymity-notice\" role=\"status\""
+            html shouldNotContain "mail-anonymity-notice-close"
+            (html.indexOf("id=\"mail-anonymity-notice\"") < html.indexOf("id=\"compose-recipients\"")) shouldBe true
+        }
+
         test("the warning card is a status region above the node status list and can not be dismissed") {
             val html = resource("index.html")
             html shouldContain "id=\"anonymity-warning\" role=\"status\""

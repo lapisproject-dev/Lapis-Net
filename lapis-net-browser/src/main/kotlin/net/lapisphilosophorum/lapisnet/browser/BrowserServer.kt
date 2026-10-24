@@ -13,6 +13,7 @@ import net.lapisphilosophorum.lapisnet.call.CallConfig
 import net.lapisphilosophorum.lapisnet.call.CallManager
 import net.lapisphilosophorum.lapisnet.call.CallMediaEngine
 import net.lapisphilosophorum.lapisnet.call.WebRtcCallMediaEngine
+import net.lapisphilosophorum.lapisnet.directory.AnonymousCapability
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordGossip
 import net.lapisphilosophorum.lapisnet.directory.DhtOutbox
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
@@ -49,10 +50,18 @@ import net.lapisphilosophorum.lapisnet.madli.DailyRelayReliabilityPublication
 import net.lapisphilosophorum.lapisnet.madli.MadliGossip
 import net.lapisphilosophorum.lapisnet.madli.MadliRelayRanker
 import net.lapisphilosophorum.lapisnet.madli.MadliRelayReliabilityPublisher
+import net.lapisphilosophorum.lapisnet.mail.HybridEcies
+import net.lapisphilosophorum.lapisnet.mail.InboxAnonymousSink
 import net.lapisphilosophorum.lapisnet.mail.InboxDhtFetcher
 import net.lapisphilosophorum.lapisnet.mail.InboxGossip
+import net.lapisphilosophorum.lapisnet.mail.InboxPayload
 import net.lapisphilosophorum.lapisnet.mail.MailSender
 import net.lapisphilosophorum.lapisnet.mail.SentFolder
+import net.lapisphilosophorum.lapisnet.mailonion.AnonymityRuntimeMailPort
+import net.lapisphilosophorum.lapisnet.mailonion.AnonymousMailSubscriber
+import net.lapisphilosophorum.lapisnet.mailonion.OnionMailInboundHandler
+import net.lapisphilosophorum.lapisnet.mailonion.OnionMailRetryQueue
+import net.lapisphilosophorum.lapisnet.mailonion.OnionMailTransport
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
@@ -563,12 +572,30 @@ class BrowserServer private constructor(
                     )
                 val acceptanceChecks = acceptance.buildChecks()
                 val acceptanceCheck = acceptanceChecks.dm
+                // Anonymity mode (wave V0.10.0-F2): mail is neither published to a per-recipient topic nor announced
+                // in the DHT, so the inbox does not subscribe, the sender gets no outbox and no DHT fetcher exists.
+                val anonymousMail = wiring.anonymity == AnonymityMode.ON
                 val mailInbox =
-                    InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey, acceptanceChecks.mail)
+                    if (anonymousMail) {
+                        InboxGossip.attachAnonymous(
+                            pubsub,
+                            storage,
+                            identity.secp256k1KeyPair.publicKey,
+                            acceptanceChecks.mail,
+                        )
+                    } else {
+                        InboxGossip.attach(pubsub, storage, identity.secp256k1KeyPair.publicKey, acceptanceChecks.mail)
+                    }
                 cleanupOnFailure += { runCatching { mailInbox.stop() } }
                 // V0.9.15 - the outbox through which mail and DM pointers reach the DHT (no outbox = gossip only).
                 val dhtOutbox = if (wiring.dhtFallback) DhtOutbox() else null
-                val mailSender = MailSender(pubsub, storage, outbox = dhtOutbox)
+                val mailSender =
+                    MailSender(
+                        pubsub,
+                        storage,
+                        outbox = if (anonymousMail) null else dhtOutbox,
+                        anonymous = anonymousMail,
+                    )
                 val sentFolder = SentFolder()
 
                 // V0.8.6b - DM browser wiring. Mirrors DmTestNode/buildDmTestNode's established
@@ -720,9 +747,13 @@ class BrowserServer private constructor(
                             it.dhtConsumer(),
                         )
                     }
-                    val fetcher = InboxDhtFetcher.attach(mailInbox, storage, peerDirectory, dht, ownPublicKey)
-                    inboxDhtFetcher = fetcher
-                    supervisor.register("inbox-dht-fetcher") { fetcher.stop() }
+                    // Anonymity mode: the fetcher would pull envelope and body from the sender over Nabu/Bitswap, which
+                    // dials the sender; no mail pointer exists in this mode, so there is nothing to fetch either.
+                    if (!anonymousMail) {
+                        val fetcher = InboxDhtFetcher.attach(mailInbox, storage, peerDirectory, dht, ownPublicKey)
+                        inboxDhtFetcher = fetcher
+                        supervisor.register("inbox-dht-fetcher") { fetcher.stop() }
+                    }
                     supervisor.launchPeriodic(
                         "dht-maintenance",
                         interval = dhtMaintenanceInterval,
@@ -880,6 +911,7 @@ class BrowserServer private constructor(
                                 directoryDht?.publishTombstone(identity, tombstone)
                             },
                             supervisor = supervisor,
+                            capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
                         )
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
@@ -910,6 +942,51 @@ class BrowserServer private constructor(
                     }
                     cleanupOnFailure += stopDm
                     supervisor.register("anonymity-dm") { stopDm() }
+                    // Mail over circuits (wave V0.10.0-F2), registered after the DM parts so the supervisor stops it
+                    // first. One shared redelivery queue (direct messages and mail), one inbound sink for both of the
+                    // mail paths (rendezvous stream and sealed item).
+                    val mailRetryQueue = OnionMailRetryQueue()
+                    val mailTransport =
+                        OnionMailTransport(
+                            AnonymityRuntimeMailPort(started),
+                            ownPublicKey,
+                            { id -> prekeyBundleGossip.lookup(id) },
+                            redelivery,
+                            mailRetryQueue,
+                        )
+                    mailSender.installAnonymousTransport(mailTransport)
+                    val mailSink =
+                        InboxAnonymousSink(mailInbox, storage) { message ->
+                            // decrypting needs the identity key; it stays inside this lambda, never in the sink
+                            val sealed = (message.payload as? InboxPayload.Sealed)?.sealedBody
+                            if (sealed == null) {
+                                null
+                            } else {
+                                runCatching {
+                                    HybridEcies
+                                        .open(message.envelope, sealed, identity.secp256k1KeyPair)
+                                        .attachments
+                                        .map { it.cid }
+                                        .toSet()
+                                }.getOrNull()
+                            }
+                        }
+                    val mailInboundHandler = OnionMailInboundHandler(mailSink)
+                    started.serviceRouter().register(OnionServiceApp.MAIL, mailInboundHandler::handle)
+                    val anonymousMailSubscriber =
+                        AnonymousMailSubscriber.attach(
+                            checkNotNull(started.mailboxGossip()),
+                            { prekeyStore.x25519IdentityPrivateKey() },
+                            mailSink,
+                        )
+                    val stopMail = {
+                        runCatching { anonymousMailSubscriber.close() }
+                        runCatching { mailInboundHandler.close() }
+                        runCatching { mailTransport.close() }
+                        Unit
+                    }
+                    cleanupOnFailure += stopMail
+                    supervisor.register("anonymity-mail") { stopMail() }
                     logger.warn { ANONYMITY_INCOMPLETE_WARNING }
                 }
 

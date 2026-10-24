@@ -49,6 +49,7 @@ dependencies {
     implementation(project(":lapis-net-onion"))
     // V0.10.0-F1 - direct messages over circuits (adapter between lapis-net-dm and lapis-net-onion-wire).
     implementation(project(":lapis-net-dm-onion"))
+    implementation(project(":lapis-net-mail-onion"))
 
     implementation(rootProject.libs.ktor.server.core)
     implementation(rootProject.libs.ktor.server.netty)

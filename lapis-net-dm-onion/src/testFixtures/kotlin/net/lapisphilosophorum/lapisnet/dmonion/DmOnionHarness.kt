@@ -153,6 +153,9 @@ class DmOnionNode(
     val identity: DualKeyIdentity = DualKeyIdentity.generate(),
     val dir: Path = Files.createTempDirectory("dm-onion-node"),
     private val redeliveryIntervalMillis: Long = 3_000L,
+    /** The capabilities the node advertises (F2 adds MAIL). */
+    private val capabilities: Set<net.lapisphilosophorum.lapisnet.directory.AnonymousCapability> =
+        setOf(net.lapisphilosophorum.lapisnet.directory.AnonymousCapability.DM),
 ) {
     val key: Secp256k1PublicKey get() = identity.secp256k1KeyPair.publicKey
     val serviceKey: Ed25519KeyPair = Ed25519KeyPair.generate()
@@ -244,6 +247,7 @@ class DmOnionNode(
                 { t -> peerDirectory.announce(t) },
                 supervisor,
                 governor = CircuitBuildGovernor(Clock.systemUTC(), ratePerMinute = 600, burst = 100),
+                capabilities = capabilities,
             )
         port = RecordingPort(AnonymityRuntimePort(runtime))
         redelivery =
@@ -259,8 +263,13 @@ class DmOnionNode(
         handler = OnionDmInboundHandler(dm.inboundSink())
         runtime.serviceRouter().register(OnionServiceApp.DM, handler::handle)
         subscriber = AnonymousMailboxSubscriber.attach(checkNotNull(runtime.mailboxGossip()), dm.inboundSink())
+        onStarted(this)
         running = true
     }
+
+    /** Hooks for rigs that add services on top of the DM stack (after the DM stack is up / before it is stopped). */
+    var onStarted: (DmOnionNode) -> Unit = {}
+    var onStopping: (DmOnionNode) -> Unit = {}
 
     /** Ticks the maintenance until the node published its presence and the service host is up. */
     fun awaitPublished(timeout: Duration = Duration.ofSeconds(200)): Boolean =
@@ -272,6 +281,7 @@ class DmOnionNode(
     fun stop() {
         if (!running) return
         running = false
+        runCatching { onStopping(this) }
         runCatching { transport.close() }
         runCatching { subscriber.close() }
         runCatching { handler.close() }
