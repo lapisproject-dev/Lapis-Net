@@ -126,7 +126,14 @@ class OnionDmInboundHandler(
             channel.close()
             return
         }
-        val conn = Conn(channel, DmFrameReader(DmCircuitFraming.TYPE_ENVELOPE, clock::millis), clock.millis())
+        val reader =
+            DmFrameReader(
+                setOf(DmCircuitFraming.TYPE_ENVELOPE, DmCircuitFraming.TYPE_ENVELOPE_PADDED),
+                clock::millis,
+                maxPayload = channel.maxPayload,
+                paddedTypes = mapOf(DmCircuitFraming.TYPE_ENVELOPE_PADDED to DmCircuitFraming.TYPE_ENVELOPE),
+            )
+        val conn = Conn(channel, reader, clock.millis())
         conns += conn
         channel.onClose { conns -= conn }
         channel.onReceive { chunk ->

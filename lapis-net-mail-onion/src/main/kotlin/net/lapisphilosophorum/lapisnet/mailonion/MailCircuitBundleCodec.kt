@@ -80,12 +80,21 @@ object MailCircuitBundleCodec {
  */
 object MailCircuitFraming {
     const val TYPE_MAIL_BUNDLE = 3
+
+    /** A bundle frame padded with zero bytes to a size class (wave V0.10.0-H); reported to handlers as [TYPE_MAIL_BUNDLE]. */
+    const val TYPE_MAIL_BUNDLE_PADDED = 5
     const val TYPE_ACK = DmCircuitFraming.TYPE_ACK
 
     /** Largest declared frame length a receiver accepts (the bundle limit plus the framing's own slack). */
     const val MAX_FRAME_BYTES = AnonymousMailSizing.MAX_CIRCUIT_BUNDLE_BYTES + 16
 
     fun bundleFrame(bundle: ByteArray): ByteArray = DmCircuitFraming.frame(TYPE_MAIL_BUNDLE, bundle)
+
+    /** A bundle frame padded to its size class: an exact multiple of [maxPayload] ([FrameSizeClasses]). */
+    fun paddedBundleFrame(
+        bundle: ByteArray,
+        maxPayload: Int,
+    ): ByteArray = DmCircuitFraming.paddedFrame(TYPE_MAIL_BUNDLE_PADDED, bundle, maxPayload, MAX_FRAME_BYTES)
 
     fun ackFrame(): ByteArray = DmCircuitFraming.ackFrame()
 
@@ -97,8 +106,17 @@ object MailCircuitFraming {
     /** A receiver-side reader; [admit] sees the declared length before the body buffer is allocated. */
     fun bundleReader(
         clockMillis: () -> Long,
+        maxPayload: Int = DmCircuitFraming.DEFAULT_MAX_PAYLOAD,
         admit: (Int) -> Boolean,
-    ): DmFrameReader = DmFrameReader(TYPE_MAIL_BUNDLE, clockMillis, MAX_FRAME_BYTES, admit)
+    ): DmFrameReader =
+        DmFrameReader(
+            setOf(TYPE_MAIL_BUNDLE, TYPE_MAIL_BUNDLE_PADDED),
+            clockMillis,
+            MAX_FRAME_BYTES,
+            admit,
+            maxPayload,
+            mapOf(TYPE_MAIL_BUNDLE_PADDED to TYPE_MAIL_BUNDLE),
+        )
 
     /** A sender-side reader that accepts only the acknowledgement. */
     fun ackReader(clockMillis: () -> Long): DmFrameReader = DmFrameReader(TYPE_ACK, clockMillis)

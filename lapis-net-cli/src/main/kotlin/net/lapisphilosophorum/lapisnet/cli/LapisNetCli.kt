@@ -15,11 +15,12 @@ import net.lapisphilosophorum.lapisnet.networking.BootstrapConfig
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
 import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
-import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.anonymityIncompleteWarning
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.trust.TrustGraph
 import net.lapisphilosophorum.lapisnet.trust.TrustPath
@@ -125,6 +126,7 @@ internal fun runCli(
                 "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability} " +
                 "hole-punching=${options.holePunching.name.lowercase()} onion-relay=${options.onionRelay} " +
                 "anonymity=${options.anonymity.name.lowercase()}" +
+                (if (options.anonymity == AnonymityMode.ON) " padding=${options.anonymityPadding.wire}" else "") +
                 if (headless.node.holePunching != null) " (active)" else "",
         )
         if (options.dhtFallback) {
@@ -142,7 +144,13 @@ internal fun runCli(
                     "  anonymity-allow-call-media=true (the CLI has no calls; the switch only matters for the browser)",
                 )
             }
-            err.println("WARNING: $ANONYMITY_INCOMPLETE_WARNING")
+            if (options.anonymityPadding == AnonymityPaddingMode.OFF) {
+                out.println("  padding: off - message sizes and timing are visible to an observer of your connection")
+            }
+            err.println(
+                // the CLI has no calls, so the call-media exposure text never applies (as before wave H)
+                "WARNING: ${anonymityIncompleteWarning(false, options.anonymityPadding)}",
+            )
         }
         out.println("Press Ctrl+C to stop.")
         awaitShutdown(headless::stop)

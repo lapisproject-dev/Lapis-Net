@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages, mail and call signals (waves V0.10.0-A to V0.10.0-G)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages, mail, call signals, padding and timing (waves V0.10.0-A to V0.10.0-H)
 :toc:
 
 == Status
+
+*Wave H (padding and timing protection, unreleased) makes the traffic of a node in anonymity mode harder to read for a local observer of its guard connection: message sizes are padded to size classes, cover cells are sent towards the guard on a randomised schedule, outgoing cells leave in time slices, and circuits are built in advance. It makes observation by a local observer or a single relay harder; it is NOT protection against a global passive observer, and it does not hide that and roughly when the node is active.* See <<padding-and-timing>>.
 
 *Wave G (call signals over circuits, unreleased) carries the signalling of a call (INVITE, ACCEPT, REJECT, HANGUP) over circuits for a node in anonymity mode, through the same rendezvous stream and the same Double Ratchet session as direct messages. The media path is NOT anonymised and can not be: WebRTC connects the two parties directly, so every call reveals your IP address to the other party and to network observers. Calls are therefore OFF in anonymity mode by default; `--anonymity-allow-call-media=true` turns them on, with a confirmation before every single call. Call signals are online only (never a mailbox), and both ends must be in anonymity mode.* See <<call-signals-over-circuits>>.
 
@@ -46,7 +48,7 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 
 | Local observer (ISP, shared network)
 | Sees only encrypted 1024-byte cells to a guard (link encryption: wave B). Cannot see destination identity or content.
-| Sees that the user runs the protocol and when it is active. No padding schedule yet (wave H), so volume and timing leak.
+| Sees that the user runs the protocol and roughly when it is active. Since wave H (default `--anonymity-padding=standard`) the length of a message is hidden inside its size class, the exact timing of sends is hidden in 50 ms slices with cover cells, and a circuit build is not tied to the first send of a message. The size class, coarse activity periods, the return direction and the number of mailbox items still leak (see <<padding-and-timing>>). With `--anonymity-padding=off` none of this applies.
 
 | A single malicious relay
 | Learns at most its two neighbours and its own position (hop index). Cannot read or undetectably alter cell content.
@@ -178,7 +180,7 @@ sequenceDiagram(name = "Cell layering and filler regeneration") {
 
 === Lifetime, rotation, padding
 
-A circuit lives at most 10 minutes (relay-enforced by a sweep) or 2^32 cells per direction, whichever comes first; new destinations get new circuits (policy, wave E). Part 1 has a fixed cell size and a `DROP` relay message. A padding schedule against timing analysis is *open* (wave H).
+A circuit lives at most 10 minutes (relay-enforced by a sweep) or 2^32 cells per direction, whichever comes first; new destinations get new circuits (policy, wave E). Part 1 has a fixed cell size and a `DROP` relay message. Padding and timing protection against a local observer is wave H (<<padding-and-timing>>); an observer who sees both ends of a circuit is not defended. A warm circuit (pre-built, wave H) serves exactly one use; there is still no circuit reuse anywhere.
 
 === Link encryption
 
@@ -921,7 +923,7 @@ The API answers an accepted send the same way whether the bundle was delivered a
 
 *What it is.* A call has two paths. The *signals* (INVITE, ACCEPT, REJECT, HANGUP; they carry the SDP) now travel over circuits for a node in anonymity mode. The *media* (the audio itself) is a direct WebRTC connection and can not be moved onto circuits: the two parties must learn each other's address to connect. This wave therefore moves the signals and is honest about the media. There is no second cryptographic layer: the Double Ratchet session between the two identities stays the only end-to-end layer, and the route is chosen inside `DmSessionManager` exactly like for direct messages. `CallManager` stays transport-independent and `lapis-net-call` still depends on `lapis-net-dm` only (the module graph is unchanged; the multi-node test uses the test fixtures of `lapis-net-dm-onion`).
 
-At every start in anonymity mode the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). With calls off (the default): _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ With `--anonymity-allow-call-media=true`: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ Both texts are the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, `ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED`, in `app.js` and here (a test compares them). The browser status panel says _Call signals: through circuits_ and, depending on the option, _Call media: off (would reveal your IP address)_ or _Call media: direct connection, your IP address is visible to the other party and to network observers_.
+At every start in anonymity mode the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). Since wave H there are four fixed texts, chosen by the call-media option and by `--anonymity-padding`. Calls off, padding standard (the default): _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ Calls allowed with `--anonymity-allow-call-media=true`, padding standard: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ Calls off, `--anonymity-padding=off`: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ Calls allowed, padding off: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ The four texts are the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, `ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF_CALL_MEDIA_EXPOSED` (selected by `anonymityIncompleteWarning`), in `app.js` and here (a test compares them). The browser status panel says _Call signals: through circuits_ and, depending on the option, _Call media: off (would reveal your IP address)_ or _Call media: direct connection, your IP address is visible to the other party and to network observers_, and, since wave H, an eighth line about padding.
 
 === Signal path
 
@@ -980,6 +982,77 @@ The transport acknowledgement of the circuit stream is constant and is sent befo
 * *Assumption, confirmation required:* "at least four nodes and three relays" was read as four user nodes plus relays; the path policy needs more than three relays to build rendezvous paths, so the test uses six, as the F1 and F2 tests do.
 * *Assumption, confirmation required:* the observer test checks that each node is connected to relays only (not to the other party); a dedicated test hook for the guard identities was not added, so "only guards" is checked as "only relays".
 * *Assumption, confirmation required:* the browser wording (band, confirmation, labels) was written from the facts above; the design team's wording should replace it if it differs.
+
+[[padding-and-timing]]
+== Padding and timing protection (wave V0.10.0-H, unreleased)
+
+*What it is.* Four measures against a LOCAL observer of the connection between a node in anonymity mode and its guard (an ISP, a shared network, the guard itself), controlled by `--anonymity-padding=standard|off` (default `standard`, also `LAPISNET_ANONYMITY_PADDING` and `anonymityPadding` in `browser.properties`; valid but without effect while `--anonymity=off`). *It is not protection against a global passive observer* who sees both ends of a circuit: end-to-end correlation of timing and volume stays out of scope. *Compatibility:* both ends of a stream must run wave H. With the default `--anonymity-padding=standard` a sender always uses the padded frame types 4 (`ENVELOPE_PADDED`) and 5 (`MAIL_BUNDLE_PADDED`). A receiver on master or any earlier release (including v0.10.0-G) does not know them and closes the stream on the first header ("unexpected frame type"); the sender gets no acknowledgement, so direct messages, call signals and online mail on the circuit path from a wave H node to such a node fail without a diagnostic (mail then falls back to the mailbox or retry path). Nothing negotiates a capability: there is no version field in the service descriptor or the link handshake. Until both nodes run wave H, a wave H node that talks to older nodes must use `--anonymity-padding=off` (unpadded frames, which every build accepts). A receiver of wave H still accepts the unpadded types.
+
+=== Size classes
+
+On a rendezvous stream every message is one 1024-byte cell (929 byte end-to-end blob, at most 910 bytes of data). The length of a direct message, call signal or mail bundle therefore shows only as the NUMBER of cells. The sender pads the frame with zero bytes, inside the end-to-end encrypted stream, up to the next class: the smallest power of two of cells that holds it, capped at the cell count of the largest legal frame. Padded frames carry their own type (`ENVELOPE_PADDED` = 4, `MAIL_BUNDLE_PADDED` = 5); the receiver still accepts the unpadded types (a sender with padding off).
+
+[cols="2,5", options="header"]
+|===
+| Kind | Classes (cells)
+| Direct message and call signal (frame up to 65,715 bytes)
+| 1, 2, 4, 8, 16, 32, 64, 73
+| Mail bundle (frame up to 1 MiB + 16)
+| 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1153
+|===
+
+A frame of `n` bytes needs `ceil((5 + n) / 910)` cells. A normal text message stays at one cell and costs nothing; the overhead is below a factor of two. The padding is derived deterministically from the authenticated length, so a peer cannot choose it. The receiver counts and discards the padding bytes and never inspects them (no padding oracle). The acknowledgement is sent only after the LAST padding byte, so its timing does not reveal the real length; a sender that stops short of its class is never acknowledged and the idle sweep closes the stream. The memory quota sees the real length; the rate check (`bodyTooSlow`) counts the whole class.
+
+Fixed already before this wave (checked by tests): the directory publish message (one cell, answer one cell), the mailbox item (always 5,728 bytes = 8 fragments), the introduce and rendezvous handshake, and the acknowledgements.
+
+=== Cover cells
+
+A node sends a cover cell on a randomised schedule: the next one follows after `U(0.5, 1.5)` times 4 s. The cover cell is a relay `DROP` addressed to hop 2 (the middle relay) of a randomly chosen own, already built circuit, never to the guard (the guard would recognise it and could drop it). A relay discards a `DROP` without any answer, keeps no state for it and does not tear down a circuit that has a role (introduction, rendezvous, publish); a `DROP` counts against the per-circuit cell limit (2,000 per second) and the per-link limit, like every cell. No relay code was added; tests pin this. Relays never create cover, so cover cannot amplify. A cover cell is skipped when no circuit is open: cover is never a reason to build one. A token bucket caps cover at 1 KiB per second (burst 16 cells); real traffic never draws from it and is never delayed by it. Cover is sent in one direction only (client to relay); the return direction stays unpadded.
+
+=== Time slices
+
+Outgoing cells are not written when they are produced but at the next boundary of a 50 ms slice (per link, in order), at most as many per boundary as the link's write queue holds. A slice with real cells is followed by at least three slices with one cover cell each, so the end of a burst is not visible at slice resolution. A single timer entry exists only while cells or a tail are pending; an idle node runs no steady timer, and no thread is added (the existing timer thread of the link manager is used). Only an anonymity-mode node installs the shaper, and such a node never relays for others (the modes exclude each other), so only its own cells are shaped.
+
+Latency budget: at most one slice (50 ms) per send step at the own guard link. A direct message or call signal with its acknowledgement: up to about 100 ms more (sender and receiver each shape once). Establishing a rendezvous: about six own send steps, up to about 300 ms. A large mail is paced by the write queue (at least about 5 MiB per second) and is not slower than 1153 cells divided by the queue.
+
+=== Warm circuit pool
+
+Up to two circuits (half of the governor pool of four) are built in advance, one at a time, only when the governor admits a build at once (the rate limit and the backoff of failed builds apply; one token is always left for real builds). The 30-second maintenance round starts at most one such build, so there is no dial storm. A warm circuit is handed out once, for a rendezvous (the circuit's last hop becomes the rendezvous point), a mailbox publish or a directory publish; the governor slot moves to the new purpose and the circuit keeps its age. An idle warm circuit older than six minutes is closed (relays sweep at ten minutes). A real build that finds the pool full closes an idle warm circuit first, so the pool never makes a real build fail. Introduction circuits are not pre-built (their last hop is chosen by the service). This replaces the sentence "every build goes to a new circuit" by: a warm circuit serves exactly one use; there is still no reuse.
+
+=== Bandwidth budget
+
+Expected cover: about 0.25 cells per second, i.e. about 256 B/s at the guard link (about 21 MiB per day), plus burst tails (three cells after each active slice). The cap is 1 KiB/s (about 84 MiB per day). The relay side pays about twice that, because the middle relay receives each cover cell too. Real traffic is not capped. There is no mobile or battery mode in the repository; whoever needs one uses `--anonymity-padding=off`.
+
+=== Leak inventory after wave H
+
+Closed or weakened: the length of a message inside its size class; the exact timing of sends at the guard link (hidden in a 50 ms slice, with a cover tail); the build of a circuit at the moment of a rendezvous or publish (warm pool).
+
+Still open:
+
+* the size class itself (a long message against a short one), and coarse periods of activity;
+* the return direction (relay to client) has no cover and no slicing;
+* the number of mailbox items per circuit (one to four) and the one acknowledgement per item;
+* the build of the introduction circuit of a rendezvous (not pre-built);
+* GossipSub, DHT lookups and fetches (wave J) and WebRTC media;
+* a global passive observer, a small anonymity set, correlation by provoked teardown.
+
+=== Honest limits of wave H
+
+* The measures are verified on loopback and with a manual clock, not on real networks, NATs, under load, or against a real observer on the wire. No external cryptographic or traffic-analysis review has taken place.
+* The guard itself sees the cover cells it forwards and can tell cover from payload by the cell count it relays beyond hop 1 only if it colludes with hop 2.
+* A node that sends nothing for a long time still shows cover at a low rate; a node with padding off shows its real pattern.
+
+=== Assumptions awaiting confirmation (wave H)
+
+* *Assumption, confirmation required:* cover defaults: mean 4 s with plus or minus 50 % jitter, burst tail of three slices, cap 1 KiB/s with a burst of 16 cells, slice 50 ms (about 21 MiB per day expected, about 84 MiB per day at most at the guard link, twice that in the network).
+* *Assumption, confirmation required:* the cover cell is addressed to hop 2, so the guard cannot recognise it. Alternatives: the last hop (more relay cost) or link-level padding (cheap, but visible to the guard).
+* *Assumption, confirmation required:* no cover or padding in the return direction; a balance would need negotiated padding through the guard and per-circuit relay state, which contradicts "a DROP keeps no state".
+* *Assumption, confirmation required:* mailbox items are not padded to a fixed count; dummy items would use up the relay rate limits (10 per minute per link).
+* *Assumption, confirmation required:* the introduction circuit is not pre-built.
+* *Assumption, confirmation required:* the warm pool stays on with `--anonymity-padding=off` (it is not padding and its cost is low).
+* *Assumption, confirmation required:* size classes are powers of two (overhead below 2x); powers of four would give fewer classes and up to 4x overhead.
+* *Assumption, confirmation required:* `--anonymity-padding` offers only `standard` and `off`; the cover budget is fixed in the code.
+* *Assumption, confirmation required:* the eighth status line of the browser panel and its wording were written by the implementation; the design team's review of the wording is outstanding.
 
 == Incentives and operation
 
@@ -1084,6 +1157,8 @@ Honest limits: zeroisation covers the arrays this code owns, not copies the JVM 
 
 Wave C adds to `lapis-net-onion`: the hidden-service message codecs, `OnionServiceAddress`, `OnionServiceDescriptor` with its codec, the HPKE introduction, the end-to-end layer (`RendezvousEndToEnd`, `RendezvousHandshake`), the relay roles and splice inside `OnionRelay` (introduction table, rendezvous table, deferred cross-circuit work so that two circuit locks are never held at once) and the two pure state machines `OnionServiceStateMachine` and `RendezvousClientStateMachine`; to `lapis-net-directory`: `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip` and `OnionServiceDht`; to `lapis-net-onion-wire`: `OnionClientCircuit`/`OnionCircuitFactory`, `OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionPathProvider` and the `OnionWire` factories.
 
+Wave H adds no module: to `lapis-net-dm-onion`: `FrameSizeClasses`, the padded frame types and the padding phase of `DmFrameReader`; to `lapis-net-mail-onion`: the padded bundle frame; to `lapis-net-onion-wire`: `EgressShaper` (hooked into `OnionLinkManager`), `OnionClientCircuit.sendDrop`, `TrafficPaddingConfig`, `CoverTrafficScheduler` with `CoverBudget`, `WarmCircuitPool`, `CircuitBuildGovernor.tryAdmitNow`/`retag` and the padding fields of `AnonymityStatus`; to `lapis-net-networking`: the option `anonymity-padding`; to `lapis-net-browser`: the padding status fields and the eighth status line. `lapis-net-onion` (the relay) is unchanged.
+
 Wave G adds no module: to `lapis-net-dm`: the anonymity mode of `DmSessionManager.sendCallSignal` and `DmCallSignalPathLostException`; to `lapis-net-call`: `CallMediaPolicy`, `CallSdpExposureFilter`, `CallEndReason.CIRCUIT_LOST` (local only), `CallEvent.IncomingSuppressed` and `CallSignalPathLostException`; to `lapis-net-networking`: the option `anonymity-allow-call-media`; to `lapis-net-browser`: the call media status, the 409 codes and the confirmation UI.
 
 Wave F2 adds the module `lapis-net-mail-onion` (`OnionMailTransport`, `OnionMailInboundHandler`, `OnionMailRetryQueue`, `AnonymousMailSubscriber`, `MailCircuitBundleCodec`); to `lapis-net-mail`: `AnonymousMailTransport`, `AnonymousMailInboundSink`, `AnonymousMailSizing`, `InboxAnonymousSink` and the anonymous modes of `MailSender` and `InboxGossip`; to `lapis-net-directory`: `SealedMailboxBox` and multiple consumers on `AnonymousMailboxGossip`; to `lapis-net-networking`: `GossipPubSub.subscribedTopics`.
@@ -1102,7 +1177,7 @@ Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and
 | F1 | Done (unreleased): direct messages online and offline over circuits (rendezvous streams, sealed mailbox items announced by relays on one shared topic), new module `lapis-net-dm-onion`, new relay role `MAILBOX_PUBLISH`. No attachments, no fallback, mail and calls unchanged.
 | F2 | Done (unreleased): mail over circuits (rendezvous-stream bundles up to 1 MiB with attachments, small mail also as sealed items on the shared topic), off the per-recipient topic, no DHT pointer and no Nabu fetch; new module `lapis-net-mail-onion`, generic `SealedMailboxBox` with a kind byte, `MAIL` service application. Both ends must be in anonymity mode, no fallback. Calls unchanged.
 | G | Done (unreleased): call signals over circuits (online only, same ratchet session, no reply route); calls off in anonymity mode by default; `--anonymity-allow-call-media=true` allows them with a confirmation per call, media stays direct and reveals the IP address; reduced SDP candidates (public host only); `CIRCUIT_LOST`; no wire change.
-| H | Padding and timing protection (DROP cell schedule), circuit pre-building.
+| H | Done (unreleased): padding and timing protection against a local observer: size classes inside the end-to-end layer (frame types 4 and 5), cover `DROP` cells to hop 2 on a randomised schedule with a budget, 50 ms egress slices with a burst tail, a warm circuit pool (one use each), `--anonymity-padding=standard|off`. Not protection against a global passive observer; the return direction, mailbox item counts and the introduction circuit stay open. See <<padding-and-timing>>.
 | I | Multi-node tests, Sybil simulation, external cryptographic review recommended.
 | J (later) | GossipSub, DHT and content fetches.
 |===

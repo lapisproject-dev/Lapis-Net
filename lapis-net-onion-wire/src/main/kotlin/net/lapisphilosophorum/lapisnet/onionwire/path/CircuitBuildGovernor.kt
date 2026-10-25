@@ -16,7 +16,8 @@ import kotlin.time.Duration.Companion.seconds
  * exponential backoff after failed builds (5 s up to 5 min), a pool of at most [maxOpenClientCircuits] outgoing client
  * circuits (directory publication and rendezvous client; the long-lived introduction circuits of a hosted service are
  * bounded by the host's intro count and only pay the rate), a maximum circuit age of [lifetime], and a [lockdown] after
- * which nothing new is built. Every new target gets a new circuit: there is no circuit reuse anywhere.
+ * which nothing new is built. Every new target gets a new circuit: a warm circuit (wave V0.10.0-H) is built in advance
+ * and then serves exactly one use; there is no circuit reuse anywhere.
  *
  * The handle of a circuit is an opaque object; nothing here logs or exposes targets.
  */
@@ -54,8 +55,8 @@ class CircuitBuildGovernor(
 
     private class Open(
         val handle: Any,
-        val purpose: CircuitPurpose?,
-        val targetKey: String,
+        var purpose: CircuitPurpose?,
+        var targetKey: String,
         val builtAtMillis: Long,
     )
 
@@ -133,6 +134,39 @@ class CircuitBuildGovernor(
             Admission.Granted
         }
 
+    /**
+     * Like [admit], but for a speculative build (the warm pool of wave V0.10.0-H): `true` only if the build is granted
+     * RIGHT NOW (same bucket, backoff and pool bounds). Never delays, never queues. A `true` must be answered by
+     * [onBuilt] or [onFailed], exactly like a `Granted`.
+     */
+    fun tryAdmitNow(
+        purpose: CircuitPurpose?,
+        targetKey: String,
+    ): Boolean =
+        synchronized(lock) {
+            // a speculative build leaves at least one token for a real one
+            if (!locked) {
+                refill(clock.millis())
+                if (tokens < 1.0 + WARM_TOKEN_RESERVE) return false
+            }
+            admit(purpose, targetKey) == Admission.Granted
+        }
+
+    /**
+     * Changes the purpose and target of an open circuit (a warm circuit is handed to its one use). The slot is kept and
+     * the age is NOT reset: the lifetime runs from the build. A purpose change inside the pool does not change the count.
+     */
+    fun retag(
+        handle: Any,
+        purpose: CircuitPurpose?,
+        targetKey: String,
+    ) = synchronized(lock) {
+        open.firstOrNull { it.handle === handle }?.let {
+            it.purpose = purpose
+            it.targetKey = targetKey
+        }
+    }
+
     /** The circuit [handle] was built. Not registered if it is already [closed]. */
     fun onBuilt(
         handle: Any,
@@ -184,6 +218,7 @@ class CircuitBuildGovernor(
     fun poolOpenCount(): Int = synchronized(lock) { open.count { isPool(it.purpose) } }
 
     private companion object {
+        const val WARM_TOKEN_RESERVE = 1.0
         const val MAX_SHIFT = 20
         const val MAX_FAILURES = 64
     }

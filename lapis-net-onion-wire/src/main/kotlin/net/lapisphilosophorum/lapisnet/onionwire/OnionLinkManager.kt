@@ -347,8 +347,39 @@ internal class OnionLinkManager(
 
     // ---- outbound ----------------------------------------------------------------------------------
 
-    /** Writes [cell]; `false` if the link is gone, not ready or its write queue overflowed (the link is then closed). */
+    /**
+     * The egress shaper of anonymity mode (wave V0.10.0-H), or `null` (normal mode, relay nodes, padding off): then every
+     * cell is written at once. Installed and removed by `OnionWire`.
+     */
+    @Volatile internal var egress: EgressShaper? = null
+
+    /** Test seam (null in production): sees every cell as it is handed to the link, with the time. */
+    @Volatile internal var egressTapForTest: ((LinkId, Cell) -> Unit)? = null
+
+    internal fun maxQueuedCells(): Int = config.maxQueuedCellsPerLink
+
+    /** Cells written to [linkId] and not yet flushed by Netty. */
+    internal fun pendingCells(linkId: LinkId): Int = links[linkId.value]?.pending?.get() ?: 0
+
+    /**
+     * Sends [cell]: through the egress shaper if one is installed (the cell then leaves at the next slice boundary),
+     * otherwise written at once. `false` if the link is gone, not ready or a write queue overflowed (the link is then closed).
+     */
     fun send(
+        linkId: LinkId,
+        cell: Cell,
+    ): Boolean {
+        val link = links[linkId.value] ?: return false
+        if (link.ctx == null || link.ended.get()) return false
+        val shaper = egress ?: return writeNow(linkId, cell)
+        if (shaper.enqueue(linkId, cell)) return true
+        logger.debug { "onion link closed: egress queue overflow" }
+        close(linkId)
+        return false
+    }
+
+    /** Writes [cell]; `false` if the link is gone, not ready or its write queue overflowed (the link is then closed). */
+    internal fun writeNow(
         linkId: LinkId,
         cell: Cell,
     ): Boolean {
@@ -361,6 +392,7 @@ internal class OnionLinkManager(
             close(linkId)
             return false
         }
+        egressTapForTest?.invoke(linkId, cell)
         ctx
             .writeAndFlush(Unpooled.wrappedBuffer(CellCodec.encode(cell)))
             .addListener {
@@ -389,6 +421,7 @@ internal class OnionLinkManager(
     /** Idempotent cleanup of all bookkeeping of [link] and notification of the relay. */
     fun linkEnded(link: OnionLink) {
         if (!link.ended.compareAndSet(false, true)) return
+        egress?.linkClosed(link.id)
         links.remove(link.id.value, link)
         slots.decrementAndGet()
         if (link.inbound) {
@@ -534,6 +567,7 @@ internal class OnionLinkManager(
 
     override fun close() {
         if (!closedFlag.compareAndSet(false, true)) return
+        runCatching { egress?.closeAndFlush() }
         for (link in links.values.toList()) close(link.id)
         dials.values.forEach { it.completeExceptionally(IllegalStateException("closed")) }
         dials.clear()

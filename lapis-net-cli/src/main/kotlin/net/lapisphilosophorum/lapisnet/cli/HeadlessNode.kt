@@ -36,6 +36,8 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.anonymityIncompleteWarning
 import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
@@ -294,6 +296,9 @@ internal class HeadlessNode private constructor(
                             },
                             supervisor = supervisor,
                             capabilities = emptySet(),
+                            // the headless node has no calls: the call-media exposure text never applies
+                            incompleteWarning = anonymityIncompleteWarning(false, options.anonymityPadding),
+                            padding = TrafficPaddingConfig.of(options.anonymityPadding),
                         )
                     val started = anonymity
                     rollback += { started.close() }

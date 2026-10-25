@@ -109,6 +109,7 @@ data class BrowserConfig(
                 "holePunching" to NodeWiringOptions.KEY_HOLE_PUNCHING,
                 "anonymity" to NodeWiringOptions.KEY_ANONYMITY,
                 "anonymityAllowCallMedia" to NodeWiringOptions.KEY_ANONYMITY_ALLOW_CALL_MEDIA,
+                "anonymityPadding" to NodeWiringOptions.KEY_ANONYMITY_PADDING,
                 "dmAcceptance.veritasGate" to KEY_VERITAS_GATE,
                 "dmAcceptance.karmaMinScore" to KEY_KARMA_MIN,
                 "dmAcceptance.minDepositMsat" to KEY_MIN_DEPOSIT,

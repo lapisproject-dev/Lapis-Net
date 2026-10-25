@@ -45,6 +45,11 @@ class OnionMailboxPublisher internal constructor(
     private val maxAttempts: Int = 3,
     private val clock: Clock = Clock.systemUTC(),
     private val random: SecureRandom = SecureRandom(),
+    /** A pre-built circuit for the purpose, if any (the warm pool of wave V0.10.0-H); used once, then the usual path. */
+    private val prebuilt: (
+        (CircuitPurpose) -> net.lapisphilosophorum.lapisnet.onionwire.anonymity.WarmCircuitPool.Prebuilt?
+    )? =
+        null,
 ) : AutoCloseable {
     private enum class Outcome { OK, RETRY }
 
@@ -76,6 +81,28 @@ class OnionMailboxPublisher internal constructor(
         ) {
             return CompletableFuture.completedFuture(false)
         }
+        val warm = runCatching { prebuilt?.invoke(CircuitPurpose.MAILBOX_PUBLISH) }.getOrNull()
+        if (warm == null || warm.circuit.isClosed) {
+            warm?.let { runCatching { it.circuit.close() } }
+            return publishRegular(items)
+        }
+        return exchange(warm.circuit, items)
+            .exceptionally { Outcome.RETRY }
+            .thenCompose { outcome ->
+                when (outcome) {
+                    Outcome.OK -> {
+                        publications.incrementAndGet()
+                        CompletableFuture.completedFuture(true)
+                    }
+                    Outcome.RETRY -> {
+                        penalise(warm.lastHop.identity)
+                        publishRegular(items)
+                    }
+                }
+            }.exceptionally { false }
+    }
+
+    private fun publishRegular(items: List<ByteArray>): CompletableFuture<Boolean> {
         val now = clock.millis()
         val usable =
             try {

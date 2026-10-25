@@ -156,6 +156,9 @@ class DmOnionNode(
     /** The capabilities the node advertises (F2 adds MAIL). */
     private val capabilities: Set<net.lapisphilosophorum.lapisnet.directory.AnonymousCapability> =
         setOf(net.lapisphilosophorum.lapisnet.directory.AnonymousCapability.DM),
+    /** V0.10.0-H: padding of this node's anonymity runtime. */
+    private val padding: net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig =
+        net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig.STANDARD,
 ) {
     val key: Secp256k1PublicKey get() = identity.secp256k1KeyPair.publicKey
     val serviceKey: Ed25519KeyPair = Ed25519KeyPair.generate()
@@ -248,6 +251,7 @@ class DmOnionNode(
                 supervisor,
                 governor = CircuitBuildGovernor(Clock.systemUTC(), ratePerMinute = 600, burst = 100),
                 capabilities = capabilities,
+                padding = padding,
             )
         port = RecordingPort(AnonymityRuntimePort(runtime))
         redelivery =

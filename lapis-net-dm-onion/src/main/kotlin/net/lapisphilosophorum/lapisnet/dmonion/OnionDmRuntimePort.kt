@@ -27,6 +27,9 @@ interface FrameChannel : AutoCloseable {
 
 /** The narrow view of the anonymity runtime that the DM adapter uses; a seam so the adapter can be tested with fakes. */
 interface OnionDmRuntimePort {
+    /** `true` if frames are padded to size classes (wave V0.10.0-H); the receiver accepts both forms. */
+    val paddingEnabled: Boolean get() = false
+
     fun ready(): Boolean
 
     fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability
@@ -63,6 +66,8 @@ class StreamFrameChannel(
 class AnonymityRuntimePort(
     private val runtime: AnonymityRuntime,
 ) : OnionDmRuntimePort {
+    override val paddingEnabled: Boolean get() = runtime.padding.sizeClasses
+
     override fun ready(): Boolean = runtime.ready()
 
     override fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability =

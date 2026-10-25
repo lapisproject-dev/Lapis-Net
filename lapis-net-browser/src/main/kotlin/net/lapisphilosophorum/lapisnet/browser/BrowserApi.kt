@@ -269,6 +269,14 @@ data class NodeStatusResponse(
     val recipientUnreachableCount: Long = 0,
     /** V0.10.0-G: `"direct"|"disabled"|"exposed"` - what happens to call media (see `CallMediaPolicy`). */
     val callMedia: String = "direct",
+    /** V0.10.0-H: `"standard"|"off"` (padding and timing protection; `"off"` while anonymity mode is off). */
+    val anonymityPadding: String = "off",
+    /** Warm circuits waiting for their one use (a number). */
+    val anonymityWarmCircuits: Int = 0,
+    /** Cover cells sent since start (a number). */
+    val anonymityCoverSent: Long = 0,
+    /** Cover cells suppressed because the cover budget was spent (a number). */
+    val anonymityCoverBudgetExhausted: Long = 0,
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */

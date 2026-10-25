@@ -54,6 +54,11 @@ class OnionDirectoryPublisher internal constructor(
     private val maxAttempts: Int = 3,
     private val clock: Clock = Clock.systemUTC(),
     private val random: SecureRandom = SecureRandom(),
+    /** A pre-built circuit for the purpose, if any (the warm pool of wave V0.10.0-H); used once, then the usual path. */
+    private val prebuilt: (
+        (CircuitPurpose) -> net.lapisphilosophorum.lapisnet.onionwire.anonymity.WarmCircuitPool.Prebuilt?
+    )? =
+        null,
 ) : DirectoryPublicationChannel,
     AutoCloseable {
     private enum class Outcome { OK, REJECTED, RETRY }
@@ -93,6 +98,30 @@ class OnionDirectoryPublisher internal constructor(
             logger.debug { "directory object of type $type does not fit one publish message" }
             return CompletableFuture.completedFuture(false)
         }
+        val warm = runCatching { prebuilt?.invoke(CircuitPurpose.DIRECTORY_PUBLISH) }.getOrNull()
+        if (warm == null || warm.circuit.isClosed) {
+            warm?.let { runCatching { it.circuit.close() } }
+            return publishRegular(type, bytes)
+        }
+        // the warm circuit's last hop is the publish relay; on a retry-able failure the usual candidates follow
+        return exchange(warm.circuit, type, bytes)
+            .exceptionally { Outcome.RETRY }
+            .thenCompose { outcome ->
+                when (outcome) {
+                    Outcome.OK -> CompletableFuture.completedFuture(true)
+                    Outcome.REJECTED -> CompletableFuture.completedFuture(false)
+                    Outcome.RETRY -> {
+                        penalise(warm.lastHop.identity)
+                        publishRegular(type, bytes)
+                    }
+                }
+            }.exceptionally { false }
+    }
+
+    private fun publishRegular(
+        type: DirectoryObjectType,
+        bytes: ByteArray,
+    ): CompletableFuture<Boolean> {
         val now = clock.millis()
         val usable =
             publishRelays()

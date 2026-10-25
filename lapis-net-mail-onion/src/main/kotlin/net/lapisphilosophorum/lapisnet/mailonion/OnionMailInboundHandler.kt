@@ -117,7 +117,7 @@ class OnionMailInboundHandler(
         }
         val conn = Conn(channel, clock.millis())
         conn.reader =
-            MailCircuitFraming.bundleReader(clock::millis) { length ->
+            MailCircuitFraming.bundleReader(clock::millis, channel.maxPayload) { length ->
                 // one bundle per stream; the budgets are reserved BEFORE the body buffer is allocated
                 admit(conn, length)
             }

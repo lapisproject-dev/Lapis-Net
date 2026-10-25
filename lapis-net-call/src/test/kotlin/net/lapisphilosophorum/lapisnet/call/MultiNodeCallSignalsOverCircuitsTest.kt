@@ -338,7 +338,11 @@ class MultiNodeCallSignalsOverCircuitsTest :
                 ((System.currentTimeMillis() - t0) < 45_000) shouldBe true
                 b.endedReasons() shouldBe listOf(CallEndReason.CIRCUIT_LOST)
                 awaitCondition(Duration.ofSeconds(60)) { a.events.any { it is CallEvent.Ended } } shouldBe true
-                a.endedReasons() shouldBe listOf(CallEndReason.RING_TIMEOUT)
+                // Since wave H a cover cell written to a dead link can reveal the loss before the ring timeout; the call
+                // then ends as CIRCUIT_LOST (with A on padding off it rings out as before, verified once by running the test that way).
+                a.endedReasons().size shouldBe 1
+                (a.endedReasons().single() in listOf(CallEndReason.RING_TIMEOUT, CallEndReason.CIRCUIT_LOST)) shouldBe
+                    true
                 // generous: under the load of a full parallel build the close tasks queue behind slow media-thread work
                 withClue(
                     "live sessions A=${a.manager.liveMediaSessionCountForTesting()} B=${b.manager.liveMediaSessionCountForTesting()}",

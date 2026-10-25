@@ -132,11 +132,16 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address.";
 // Used instead when calls are allowed (--anonymity-allow-call-media=true), and for an unknown/missing callMedia value
 // (fail safe: show the more alarming text).
 const ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address.";
+// V0.10.0-H: the same two texts for --anonymity-padding=off (also the fail-safe for an unknown/missing padding value).
+const ANONYMITY_WARNING_TEXT_PADDING_OFF =
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address.";
+const ANONYMITY_WARNING_TEXT_PADDING_OFF_CALL_MEDIA_EXPOSED =
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -160,6 +165,26 @@ const ANONYMITY_CALL_MEDIA_LINE_DISABLED = "Call media: off (would reveal your I
 const ANONYMITY_CALL_MEDIA_LINE_EXPOSED =
   "Call media: direct connection, your IP address is visible to the other party and to network observers";
 
+// The four warning texts, selected by two fixed switches; nothing of the text comes from the server.
+function anonymityWarningText(callMediaDisabled, paddingStandard) {
+  if (paddingStandard) {
+    return callMediaDisabled ? ANONYMITY_WARNING_TEXT : ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED;
+  }
+  return callMediaDisabled ? ANONYMITY_WARNING_TEXT_PADDING_OFF : ANONYMITY_WARNING_TEXT_PADDING_OFF_CALL_MEDIA_EXPOSED;
+}
+
+// The eighth fixed line (V0.10.0-H): fixed text plus three numbers.
+const ANONYMITY_PADDING_LINE_STANDARD = "Padding: standard (sizes padded to classes, cover cells, 50 ms time slices)";
+const ANONYMITY_PADDING_LINE_OFF = "Padding: off (message sizes and timing are visible to an observer of your connection)";
+
+function anonymityPaddingLine(status) {
+  if (status.anonymityPadding !== "standard") return ANONYMITY_PADDING_LINE_OFF;
+  return (
+    ANONYMITY_PADDING_LINE_STANDARD + ": " + status.anonymityWarmCircuits + " warm circuit(s), " +
+    status.anonymityCoverSent + " cover cell(s) sent, budget spent " + status.anonymityCoverBudgetExhausted + " time(s)"
+  );
+}
+
 function renderAnonymityStatus(status) {
   const warning = document.getElementById("anonymity-warning");
   const line = document.getElementById("node-status-anonymity");
@@ -167,7 +192,8 @@ function renderAnonymityStatus(status) {
   const on = status.anonymityMode === "on";
   warning.hidden = !on;
   const callMediaDisabled = status.callMedia === "disabled";
-  warning.textContent = on ? (callMediaDisabled ? ANONYMITY_WARNING_TEXT : ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED) : "";
+  const paddingStandard = status.anonymityPadding === "standard";
+  warning.textContent = on ? anonymityWarningText(callMediaDisabled, paddingStandard) : "";
   line.textContent = "";
   const lines = on
     ? ANONYMITY_STATUS_LINES.slice(0, 4)
@@ -175,6 +201,7 @@ function renderAnonymityStatus(status) {
         .concat(ANONYMITY_STATUS_LINES.slice(4))
         .concat([
         "On (experimental): " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)",
+        anonymityPaddingLine(status),
       ])
     : ["off"];
   for (const text of lines) {

@@ -6,6 +6,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchConfig
@@ -128,5 +129,22 @@ class NodeWiringOptionsAnonymityTest :
 
         test("the known keys contain anonymity") {
             (NodeWiringOptions.KEY_ANONYMITY in NodeWiringOptions.KNOWN_KEYS) shouldBe true
+        }
+
+        test(
+            "V0.10.0-H: anonymity-padding defaults to standard, accepts exactly standard|off, also with anonymity off",
+        ) {
+            resolve().anonymityPadding shouldBe AnonymityPaddingMode.STANDARD
+            resolve("--anonymity=on", "--anonymity-padding=off").anonymityPadding shouldBe AnonymityPaddingMode.OFF
+            resolve("--anonymity=on", "--anonymity-padding=standard").anonymityPadding shouldBe
+                AnonymityPaddingMode.STANDARD
+            resolve("--anonymity-padding=off").anonymityPadding shouldBe AnonymityPaddingMode.OFF
+            for (bad in listOf("STANDARD", "Off", "on", "", " off", "true")) {
+                shouldThrow<InvalidWiringOptionException> { resolve("--anonymity-padding=$bad") }
+                    .message shouldBe "--anonymity-padding must be standard|off"
+            }
+            NodeWiringOptions.envNameOf(NodeWiringOptions.KEY_ANONYMITY_PADDING) shouldBe "LAPISNET_ANONYMITY_PADDING"
+            (NodeWiringOptions.KEY_ANONYMITY_PADDING in NodeWiringOptions.KNOWN_KEYS) shouldBe true
+            NodeWiringOptions.HELP_TEXT shouldContain "--anonymity-padding=standard|off"
         }
     })

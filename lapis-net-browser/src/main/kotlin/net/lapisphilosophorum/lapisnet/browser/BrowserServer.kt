@@ -74,10 +74,10 @@ import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWireConfig
-import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
-import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.anonymityIncompleteWarning
 import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
@@ -793,11 +793,7 @@ class BrowserServer private constructor(
                 // circuit (up to the 15 s signal deadline) before the media connection can even start.
                 val callMediaPolicy = CallMediaPolicy.of(anonymous, wiring.anonymityAllowCallMedia)
                 val anonymityWarning =
-                    if (callMediaPolicy == CallMediaPolicy.EXPOSED) {
-                        ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
-                    } else {
-                        ANONYMITY_INCOMPLETE_WARNING
-                    }
+                    anonymityIncompleteWarning(callMediaPolicy == CallMediaPolicy.EXPOSED, wiring.anonymityPadding)
                 val effectiveCallConfig =
                     callConfig.copy(
                         mediaPolicy = callMediaPolicy,
@@ -941,6 +937,7 @@ class BrowserServer private constructor(
                             supervisor = supervisor,
                             capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
                             incompleteWarning = anonymityWarning,
+                            padding = TrafficPaddingConfig.of(wiring.anonymityPadding),
                         )
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
@@ -1092,6 +1089,10 @@ class BrowserServer private constructor(
                         lastAnonymityError = anonymityRuntime?.status()?.lastError?.wire ?: "none",
                         lastAnonymityErrorAgeSeconds = anonymityRuntime?.status()?.lastErrorAgeSeconds,
                         recipientUnreachableCount = anonymityRuntime?.status()?.recipientUnreachableCount ?: 0,
+                        anonymityPadding = anonymityRuntime?.status()?.padding ?: "off",
+                        anonymityWarmCircuits = anonymityRuntime?.status()?.warmCircuits ?: 0,
+                        anonymityCoverSent = anonymityRuntime?.status()?.coverCellsSent ?: 0,
+                        anonymityCoverBudgetExhausted = anonymityRuntime?.status()?.coverBudgetExhausted ?: 0,
                         callMedia = callMediaPolicy.wire,
                     )
                 }

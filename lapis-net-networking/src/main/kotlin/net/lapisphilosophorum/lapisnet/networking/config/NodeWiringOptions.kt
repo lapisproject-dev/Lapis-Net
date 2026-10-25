@@ -42,6 +42,24 @@ enum class AnonymityMode {
     }
 }
 
+/**
+ * Wave V0.10.0-H: `--anonymity-padding=standard|off`. Only the exact lower-case words are accepted. `standard` (the
+ * default) pads message sizes to size classes, sends cover cells towards the guard and shapes outgoing cells into time
+ * slices; `off` sends exactly what is needed, so an observer of the connection sees message sizes and timing. Without
+ * effect (but valid) while `--anonymity=off`.
+ */
+enum class AnonymityPaddingMode(
+    val wire: String,
+) {
+    STANDARD("standard"),
+    OFF("off"),
+    ;
+
+    companion object {
+        fun parse(raw: String): AnonymityPaddingMode? = entries.firstOrNull { it.wire == raw }
+    }
+}
+
 /** Thrown for any invalid operator-supplied wiring value. Never swallowed into a default: the process must not start. */
 class InvalidWiringOptionException(
     message: String,
@@ -78,6 +96,8 @@ data class NodeWiringOptions(
      * Call media then connects directly and reveals the IP address to the other party and to network observers.
      */
     val anonymityAllowCallMedia: Boolean = false,
+    /** V0.10.0-H: padding and timing protection in anonymity mode (`--anonymity-padding`). Without effect while anonymity is off. */
+    val anonymityPadding: AnonymityPaddingMode = AnonymityPaddingMode.STANDARD,
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -121,6 +141,7 @@ data class NodeWiringOptions(
         const val KEY_ONION_RELAY = "onion-relay"
         const val KEY_ANONYMITY = "anonymity"
         const val KEY_ANONYMITY_ALLOW_CALL_MEDIA = "anonymity-allow-call-media"
+        const val KEY_ANONYMITY_PADDING = "anonymity-padding"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
@@ -135,6 +156,7 @@ data class NodeWiringOptions(
                 KEY_ONION_RELAY,
                 KEY_ANONYMITY,
                 KEY_ANONYMITY_ALLOW_CALL_MEDIA,
+                KEY_ANONYMITY_PADDING,
             )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
@@ -162,6 +184,8 @@ data class NodeWiringOptions(
             val anonymity = raw[KEY_ANONYMITY]?.let { parseAnonymity(it) } ?: AnonymityMode.OFF
             val allowCallMedia =
                 raw[KEY_ANONYMITY_ALLOW_CALL_MEDIA]?.let { parseBoolean(KEY_ANONYMITY_ALLOW_CALL_MEDIA, it) } ?: false
+            val anonymityPadding =
+                raw[KEY_ANONYMITY_PADDING]?.let { parseAnonymityPadding(it) } ?: AnonymityPaddingMode.STANDARD
             if (allowCallMedia && anonymity != AnonymityMode.ON) {
                 throw InvalidWiringOptionException("--anonymity-allow-call-media requires --anonymity=on")
             }
@@ -185,6 +209,7 @@ data class NodeWiringOptions(
                 onionRelay,
                 anonymity,
                 allowCallMedia,
+                anonymityPadding,
             )
         }
 
@@ -205,6 +230,7 @@ data class NodeWiringOptions(
                         parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
                     KEY_ANONYMITY -> parseAnonymity(value)
+                    KEY_ANONYMITY_PADDING -> parseAnonymityPadding(value)
                     else -> throw InvalidWiringOptionException("unknown option --$key")
                 }
             }
@@ -247,6 +273,10 @@ data class NodeWiringOptions(
 
         private fun parseAnonymity(raw: String): AnonymityMode =
             AnonymityMode.parse(raw) ?: throw InvalidWiringOptionException("--anonymity must be on|off")
+
+        private fun parseAnonymityPadding(raw: String): AnonymityPaddingMode =
+            AnonymityPaddingMode.parse(raw)
+                ?: throw InvalidWiringOptionException("--anonymity-padding must be standard|off")
 
         private fun parseHolePunching(raw: String): HolePunchMode =
             HolePunchMode.parse(raw) ?: throw InvalidWiringOptionException("--hole-punching must be auto|on|off")
@@ -296,6 +326,11 @@ data class NodeWiringOptions(
             |  --anonymity-allow-call-media=true|false    [false]   (only with --anonymity=on)
             |        Allow calls in anonymity mode. Call media then connects directly and reveals your IP
             |        address to the other party and to network observers.
+            |  --anonymity-padding=standard|off           [standard]   (only effective with --anonymity=on)
+            |        standard: message sizes are padded to size classes, cover cells are sent towards the guard
+            |        and outgoing cells leave in time slices of 50 ms. Costs a little traffic (about 21 MiB per
+            |        day on average, at most about 84 MiB per day on your guard link) and up to 50 ms latency per
+            |        send. off: no padding; an observer of your connection sees message sizes and timing.
             """.trimMargin()
     }
 }

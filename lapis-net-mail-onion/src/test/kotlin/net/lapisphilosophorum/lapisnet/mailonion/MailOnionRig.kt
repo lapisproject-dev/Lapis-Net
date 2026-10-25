@@ -128,8 +128,16 @@ class MailStack(
 class MailOnionNode(
     relays: List<RelayHost>,
     locator: SyntheticLocator,
+    padding: net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig =
+        net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig.STANDARD,
 ) {
-    val n = DmOnionNode(relays, locator, capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL))
+    val n =
+        DmOnionNode(
+            relays,
+            locator,
+            capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
+            padding = padding,
+        )
 
     @Volatile lateinit var mail: MailStack
 

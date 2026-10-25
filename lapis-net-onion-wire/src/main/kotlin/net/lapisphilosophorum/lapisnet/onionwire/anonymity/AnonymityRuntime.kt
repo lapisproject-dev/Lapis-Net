@@ -17,12 +17,14 @@ import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
+import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceConfig
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onionwire.AnonymousDirectoryPublisher
 import net.lapisphilosophorum.lapisnet.onionwire.CircuitAdmissionException
 import net.lapisphilosophorum.lapisnet.onionwire.CircuitPolicy
+import net.lapisphilosophorum.lapisnet.onionwire.EgressShaper
 import net.lapisphilosophorum.lapisnet.onionwire.OnionClientCircuit
 import net.lapisphilosophorum.lapisnet.onionwire.OnionDirectoryPublisher
 import net.lapisphilosophorum.lapisnet.onionwire.OnionMailboxPublisher
@@ -33,6 +35,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceHello
 import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceHost
 import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceStreamRouter
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
+import net.lapisphilosophorum.lapisnet.onionwire.SliceTimer
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
 import net.lapisphilosophorum.lapisnet.onionwire.path.EncryptedFileGuardStateStore
 import net.lapisphilosophorum.lapisnet.onionwire.path.GuardManager
@@ -91,6 +94,11 @@ class AnonymityRuntime private constructor(
     private val rendezvousClient: OnionRendezvousClient,
     private val mailboxPublisher: OnionMailboxPublisher,
     private val router: OnionServiceStreamRouter,
+    /** Padding and timing protection of this run (wave V0.10.0-H). */
+    val padding: TrafficPaddingConfig,
+    private val warm: WarmCircuitPool,
+    private val cover: CoverTrafficScheduler?,
+    private val shaper: EgressShaper?,
 ) : AutoCloseable {
     private val lifecycle = Any()
 
@@ -104,6 +112,12 @@ class AnonymityRuntime private constructor(
 
     /** Runs one maintenance round now (the supervisor does this every 30 s); safe to call from any thread. */
     fun maintainNow() = maintenanceTick()
+
+    internal fun warmPoolForTest(): WarmCircuitPool = warm
+
+    internal fun coverForTest(): CoverTrafficScheduler? = cover
+
+    internal fun shaperForTest(): EgressShaper? = shaper
 
     internal fun attachMaintenance(job: NodeServiceSupervisor.PeriodicJob) {
         maintenance = job
@@ -122,6 +136,10 @@ class AnonymityRuntime private constructor(
             lastError = e?.first ?: AnonymityErrorCode.NONE,
             lastErrorAgeSeconds = e?.let { ((clock.millis() - it.second) / 1000).coerceAtLeast(0) },
             recipientUnreachableCount = recipientUnreachable.get(),
+            padding = padding.wireMode,
+            warmCircuits = warm.size(),
+            coverCellsSent = cover?.sentCount() ?: 0L,
+            coverBudgetExhausted = cover?.suppressedCount() ?: 0L,
         )
     }
 
@@ -157,8 +175,10 @@ class AnonymityRuntime private constructor(
         timeout: Duration,
     ): CompletableFuture<OnionRendezvousStream> {
         if (!ready()) return CompletableFuture.failedFuture(InsufficientRelaysException())
+        // a warm circuit (wave V0.10.0-H) already ends at a suitable rendezvous point: its one use is this one
+        val prebuilt = warm.take(CircuitPurpose.RENDEZVOUS_SENDER)
+        var endpoint: OnionRelayDescriptor? = prebuilt?.lastHop
         val exclude = HashSet<Secp256k1PublicKey>()
-        var endpoint: OnionRelayDescriptor? = null
         repeat(RENDEZVOUS_ENDPOINT_TRIES) {
             if (endpoint != null) return@repeat
             val candidate = selector.selectEndpoint(exclude) ?: return@repeat
@@ -169,9 +189,13 @@ class AnonymityRuntime private constructor(
                 exclude += candidate.identity
             }
         }
-        val rendezvousPoint = endpoint ?: return CompletableFuture.failedFuture(InsufficientRelaysException())
+        val rendezvousPoint =
+            endpoint ?: run {
+                prebuilt?.let { runCatching { it.circuit.close() } }
+                return CompletableFuture.failedFuture(InsufficientRelaysException())
+            }
         return rendezvousClient
-            .connect(descriptor.address(), paths, rendezvousPoint, descriptor, timeout)
+            .connectWith(descriptor.address(), paths, rendezvousPoint, descriptor, timeout, prebuilt?.circuit)
             .thenCompose { stream ->
                 if (stream.send(OnionServiceHello.encode(app))) {
                     CompletableFuture.completedFuture(stream)
@@ -207,6 +231,8 @@ class AnonymityRuntime private constructor(
         try {
             governor.lockdown()
             maintenance?.cancel()
+            runCatching { cover?.close() }
+            runCatching { warm.close() }
             runCatching { router.close() }
             runCatching { rendezvousClient.close() }
             runCatching { mailboxPublisher.close() }
@@ -217,6 +243,9 @@ class AnonymityRuntime private constructor(
                 runCatching { (h as OnionClientCircuit).close() }
                 governor.onClosed(h)
             }
+            // every DESTROY above is queued in the shaper: flush it, then stop shaping
+            runCatching { shaper?.closeAndFlush() }
+            if (shaper != null) runCatching { wire.uninstallEgressShaper() }
             runCatching { guardStore.close() }
         } finally {
             synchronized(lifecycle) { state = State.STOPPED }
@@ -256,6 +285,8 @@ class AnonymityRuntime private constructor(
             capabilities: Set<AnonymousCapability> = setOf(AnonymousCapability.DM),
             /** V0.10.0-G: the warning logged at start; the browser passes the call-media-exposed variant when applicable. */
             incompleteWarning: String = ANONYMITY_INCOMPLETE_WARNING,
+            /** V0.10.0-H: padding and timing protection; [TrafficPaddingConfig.OFF] switches the whole wave off. */
+            padding: TrafficPaddingConfig = TrafficPaddingConfig.STANDARD,
         ): AnonymityRuntime {
             require(wire.directoryMode == DirectoryAnonymityMode.ON) { "the onion wire is not in anonymity mode" }
             val key = homeDir.toAbsolutePath().normalize()
@@ -300,9 +331,19 @@ class AnonymityRuntime private constructor(
                         clock = clock,
                     )
                 val paths = SelectingOnionPathProvider(selector) { record(AnonymityErrorCode.INSUFFICIENT_RELAYS) }
+                val warm =
+                    WarmCircuitPool(
+                        governor,
+                        wire.circuitFactory(),
+                        selector,
+                        clock,
+                        target = minOf(WarmCircuitPool.WARM_TARGET, governor.maxOpenClientCircuits / 2),
+                    )
+                closers += { warm.close() }
                 wire.installCircuitPolicy(
                     CircuitPolicy(
                         governor,
+                        evictIdle = warm::evictOne,
                         firstHopResult = { id, ok ->
                             // a shutdown in progress must neither count failures against a guard nor touch its state file
                             if (!governor.isLocked()) {
@@ -324,7 +365,8 @@ class AnonymityRuntime private constructor(
                     if (picked.size < count) record(AnonymityErrorCode.INSUFFICIENT_RELAYS)
                     return picked
                 }
-                val publisher = wire.experimentalDirectoryPublisher(paths) { endpoints(PUBLISH_CANDIDATES) }
+                val publisher =
+                    wire.directoryPublisher(paths, { endpoints(PUBLISH_CANDIDATES) }, prebuilt = warm::take)
                 closers += { publisher.close() }
                 val recording = RecordingChannel(publisher) { record(AnonymityErrorCode.PUBLISH_FAILED) }
                 val host =
@@ -340,7 +382,8 @@ class AnonymityRuntime private constructor(
                 host.onConnection = router::route
                 val rendezvousClient = wire.experimentalRendezvousClient()
                 closers += { rendezvousClient.close() }
-                val mailboxPublisher = wire.experimentalMailboxPublisher(paths) { endpoints(PUBLISH_CANDIDATES) }
+                val mailboxPublisher =
+                    wire.mailboxPublisher(paths, { endpoints(PUBLISH_CANDIDATES) }, prebuilt = warm::take)
                 closers += { mailboxPublisher.close() }
                 val anonymousPublisher =
                     AnonymousDirectoryPublisher(
@@ -354,6 +397,27 @@ class AnonymityRuntime private constructor(
                         tombstonePublisher = tombstonePublisher,
                     )
                 closers += { anonymousPublisher.close() }
+                // padding and timing (V0.10.0-H): the cover scheduler and the egress shaper, both bounded and timer-driven
+                val cover =
+                    if (padding.cover) {
+                        CoverTrafficScheduler(
+                            padding,
+                            { governor.allHandles().filterIsInstance<OnionClientCircuit>() },
+                            SliceTimer.of(wire.linkManager()),
+                            CoverBudget(padding.coverBudgetBytesPerSecond, padding.coverBudgetBurstCells, clock),
+                            random,
+                        )
+                    } else {
+                        null
+                    }
+                cover?.let { c -> closers += { c.close() } }
+                val shaper =
+                    if (padding.slicing) {
+                        wire.installEgressShaper(padding) { link, n -> cover?.tailCover(link, n) }
+                    } else {
+                        null
+                    }
+                if (shaper != null) closers += { wire.uninstallEgressShaper() }
                 val runtime =
                     AnonymityRuntime(
                         key,
@@ -371,6 +435,10 @@ class AnonymityRuntime private constructor(
                         rendezvousClient,
                         mailboxPublisher,
                         router,
+                        padding,
+                        warm,
+                        cover,
+                        shaper,
                     )
 
                 var publisherStarted = false
@@ -395,6 +463,8 @@ class AnonymityRuntime private constructor(
                             anonymousPublisher.start()
                             publisherStarted = true
                         }
+                        // the warm pool only starts once the node's own circuits are under way (it must not take their tokens)
+                        if (runtime.hostStarted) warm.maintain()
                         val p = anonymousPublisher.publications
                         if (p > lastPublications) {
                             lastPublications = p
@@ -410,6 +480,7 @@ class AnonymityRuntime private constructor(
                         initialDelay = 1.seconds,
                     ) { runtime.maintenanceTick() }
                 runtime.attachMaintenance(job)
+                cover?.start()
                 logger.warn { incompleteWarning }
                 return runtime
             } catch (e: Exception) {

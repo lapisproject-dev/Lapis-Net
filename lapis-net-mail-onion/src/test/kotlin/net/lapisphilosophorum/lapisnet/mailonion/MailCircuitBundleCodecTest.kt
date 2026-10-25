@@ -4,6 +4,7 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import net.lapisphilosophorum.lapisnet.dmonion.DmFramingException
+import net.lapisphilosophorum.lapisnet.dmonion.FrameSizeClasses
 import net.lapisphilosophorum.lapisnet.mail.AnonymousMailSizing
 import java.nio.ByteBuffer
 
@@ -107,5 +108,40 @@ class MailCircuitBundleCodecTest :
                 ) { _, _ -> }
             }
             asked shouldBe 1234
+        }
+
+        test(
+            "V0.10.0-H: a padded bundle frame is a multiple of the cell payload, in its class, and reads back as a bundle",
+        ) {
+            for (len in listOf(1, 905, 906, 20_000, 28_000, 200_000)) {
+                val bundle = ByteArray(len) { (it * 3).toByte() }
+                val frame = MailCircuitFraming.paddedBundleFrame(bundle, 910)
+                (frame.size % 910) shouldBe 0
+                val chunks = MailCircuitFraming.chunks(frame, 910)
+                chunks.size shouldBe
+                    FrameSizeClasses.classChunks(
+                        FrameSizeClasses.realChunks(len, 910),
+                        FrameSizeClasses.maxChunks(MailCircuitFraming.MAX_FRAME_BYTES, 910),
+                    )
+                val reader = MailCircuitFraming.bundleReader({ 0L }) { true }
+                var got: Pair<Int, ByteArray>? = null
+                chunks.forEach { reader.feed(it) { t, p -> got = t to p } }
+                got!!.first shouldBe MailCircuitFraming.TYPE_MAIL_BUNDLE
+                got!!.second.contentEquals(bundle) shouldBe true
+            }
+            // 20 KB and 28 KB share one class (32 chunks)
+            MailCircuitFraming.chunks(MailCircuitFraming.paddedBundleFrame(ByteArray(20_000), 910), 910).size shouldBe
+                MailCircuitFraming.chunks(MailCircuitFraming.paddedBundleFrame(ByteArray(28_000), 910), 910).size
+        }
+
+        test("V0.10.0-H: the largest legal bundle needs 1153 chunks and an oversized one is refused when built") {
+            MailCircuitFraming
+                .chunks(
+                    MailCircuitFraming.paddedBundleFrame(ByteArray(MailCircuitFraming.MAX_FRAME_BYTES), 910),
+                    910,
+                ).size shouldBe 1153
+            shouldThrow<IllegalArgumentException> {
+                MailCircuitFraming.paddedBundleFrame(ByteArray(MailCircuitFraming.MAX_FRAME_BYTES + 1), 910)
+            }
         }
     })

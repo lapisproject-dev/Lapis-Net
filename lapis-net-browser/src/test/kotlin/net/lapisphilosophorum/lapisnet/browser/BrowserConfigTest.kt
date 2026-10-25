@@ -237,6 +237,37 @@ class BrowserConfigTest :
                 AnonymityMode.OFF
         }
 
+        test("anonymity padding: default standard, file key, environment over file, arguments over environment") {
+            fun padding(
+                args: List<String>,
+                env: Map<String, String>,
+                home: java.nio.file.Path,
+            ) = BrowserConfig.load(args, env, home).wiring.anonymityPadding
+            padding(emptyList(), emptyMap(), homeWith(null)) shouldBe
+                net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode.STANDARD
+            val home = homeWith("anonymity=on\nanonymityPadding=off\n")
+            val off = net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode.OFF
+            val standard = net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode.STANDARD
+            padding(emptyList(), emptyMap(), home) shouldBe off
+            padding(emptyList(), mapOf("LAPISNET_ANONYMITY_PADDING" to "standard"), home) shouldBe standard
+            padding(listOf("--anonymity-padding=off"), mapOf("LAPISNET_ANONYMITY_PADDING" to "standard"), home) shouldBe
+                off
+            // valid but without effect while anonymity is off
+            padding(listOf("--anonymity-padding=off"), emptyMap(), homeWith(null)) shouldBe off
+            for (bad in listOf("STANDARD", "on", "", "Off")) {
+                shouldThrow<InvalidWiringOptionException> {
+                    BrowserConfig.load(listOf("--anonymity-padding=$bad"), emptyMap(), homeWith(null))
+                }.message shouldBe "--anonymity-padding must be standard|off"
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(
+                    listOf("--anonymity-padding=off"),
+                    mapOf("LAPISNET_ANONYMITY_PADDING" to "1"),
+                    homeWith(null),
+                )
+            }
+        }
+
         test("anonymity: an invalid value in ANY source aborts, even where a higher-priority source overrides it") {
             val bad = homeWith("anonymity=maybe\n")
             shouldThrow<InvalidWiringOptionException> { BrowserConfig.load(emptyList(), emptyMap(), bad) }

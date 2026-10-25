@@ -16,6 +16,9 @@ import kotlin.time.toKotlinDuration
 
 /** The narrow view of the anonymity runtime that the mail adapter uses; a seam so the adapter can be tested with fakes. */
 interface OnionMailRuntimePort {
+    /** `true` if bundle frames are padded to size classes (wave V0.10.0-H); the receiver accepts both forms. */
+    val paddingEnabled: Boolean get() = false
+
     fun ready(): Boolean
 
     fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability
@@ -32,6 +35,8 @@ interface OnionMailRuntimePort {
 class AnonymityRuntimeMailPort(
     private val runtime: AnonymityRuntime,
 ) : OnionMailRuntimePort {
+    override val paddingEnabled: Boolean get() = runtime.padding.sizeClasses
+
     override fun ready(): Boolean = runtime.ready()
 
     override fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability =

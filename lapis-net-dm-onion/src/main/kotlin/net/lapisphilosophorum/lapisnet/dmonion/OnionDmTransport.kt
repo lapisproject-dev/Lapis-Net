@@ -226,10 +226,15 @@ class OnionDmTransport(
         if (entry.dead || entry.channel.isClosed) return false
         val ack = CompletableFuture<Boolean>()
         entry.pendingAck = ack
-        for (chunk in DmCircuitFraming.chunks(
-            DmCircuitFraming.envelopeFrame(envelopeBytes),
-            entry.channel.maxPayload,
-        )) {
+        val maxPayload = entry.channel.maxPayload
+        val frame =
+            if (port.paddingEnabled) {
+                if (envelopeBytes.size > DmEnvelopeCodec.MAX_ENVELOPE_BYTES) return false
+                DmCircuitFraming.paddedEnvelopeFrame(envelopeBytes, maxPayload)
+            } else {
+                DmCircuitFraming.envelopeFrame(envelopeBytes)
+            }
+        for (chunk in DmCircuitFraming.chunks(frame, maxPayload)) {
             if (!entry.channel.send(chunk)) return false
         }
         val remaining = Duration.between(clock.instant(), deadline).toMillis()

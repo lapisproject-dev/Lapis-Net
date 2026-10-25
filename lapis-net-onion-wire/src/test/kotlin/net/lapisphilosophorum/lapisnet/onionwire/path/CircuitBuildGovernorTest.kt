@@ -163,4 +163,43 @@ class CircuitBuildGovernorTest :
             g.onBuilt(Any(), CircuitPurpose.RENDEZVOUS_RECEIVER, "y", closed = true)
             g.admit(CircuitPurpose.INTRO, "i").shouldBeInstanceOf<CircuitBuildGovernor.Admission.Delayed>()
         }
+
+        test("tryAdmitNow grants at once or says no, never delays, and keeps one token for a real build") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, ratePerMinute = 6, burst = 3)
+            g.tryAdmitNow(null, "w1") shouldBe true // 3 tokens -> 2
+            g.tryAdmitNow(null, "w2") shouldBe true // 2 -> 1
+            g.tryAdmitNow(null, "w3") shouldBe false // would take the last token
+            g.admit(purpose, "real") shouldBe granted // the real build still gets it
+        }
+
+        test("tryAdmitNow respects the backoff, the pool bound and the lockdown") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, maxOpenClientCircuits = 2, ratePerMinute = 600, burst = 100)
+            g.tryAdmitNow(null, "a") shouldBe true
+            g.onFailed(null) // backoff of 5 s
+            g.tryAdmitNow(null, "b") shouldBe false
+            clock.advanceSeconds(6)
+            g.tryAdmitNow(null, "b") shouldBe true
+            g.onBuilt(Any(), null, "b")
+            g.tryAdmitNow(null, "c") shouldBe true
+            g.onBuilt(Any(), null, "c")
+            g.tryAdmitNow(null, "d") shouldBe false // pool of 2 is full
+            g.lockdown()
+            g.tryAdmitNow(null, "e") shouldBe false
+        }
+
+        test("retag changes purpose and target of an open circuit, keeps the slot and does not reset its age") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, ratePerMinute = 600, burst = 100)
+            val h = Any()
+            g.tryAdmitNow(null, "w") shouldBe true
+            g.onBuilt(h, null, "w")
+            clock.advanceSeconds(9 * 60)
+            g.retag(h, CircuitPurpose.MAILBOX_PUBLISH, "relay")
+            g.poolOpenCount() shouldBe 1
+            clock.advanceSeconds(90)
+            // the lifetime runs from the build: 10.5 minutes after it the circuit has expired although it was retagged late
+            g.expired(clock.instant()) shouldBe listOf(h)
+        }
     })

@@ -4,8 +4,11 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.ANONYMITY_PADDING_OFF_SENTENCE
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.anonymityIncompleteWarning
 
 private fun resource(name: String): String =
     AnonymityStaticAssetsTest::class.java
@@ -27,7 +30,8 @@ class AnonymityStaticAssetsTest :
             fn shouldNotContain "innerHTML"
             fn shouldNotContain "insertAdjacentHTML"
             // the warning text is a constant, never taken from the server response
-            fn shouldContain "ANONYMITY_WARNING_TEXT"
+            fn shouldContain "anonymityWarningText("
+            js shouldContain "ANONYMITY_WARNING_TEXT"
             fn shouldNotContain "status.anonymityWarning"
         }
 
@@ -43,6 +47,32 @@ class AnonymityStaticAssetsTest :
                 docs.readText() shouldContain warning
                 docs.readText() shouldContain exposed
             }
+        }
+
+        test("all four warning texts (calls x padding) are character-identical in Kotlin, app.js and the docs") {
+            val js = resource("app.js")
+            val docs = java.io.File("../docs/anonymity.adoc")
+            for (calls in listOf(false, true)) {
+                for (padding in AnonymityPaddingMode.entries) {
+                    val text = anonymityIncompleteWarning(calls, padding)
+                    js shouldContain text
+                    if (docs.exists()) docs.readText() shouldContain text
+                }
+            }
+            anonymityIncompleteWarning(false, AnonymityPaddingMode.OFF) shouldContain ANONYMITY_PADDING_OFF_SENTENCE
+            anonymityIncompleteWarning(false, AnonymityPaddingMode.STANDARD) shouldNotContain "padding is off"
+        }
+
+        test("the eighth status line shows padding with fixed texts and numbers only") {
+            val js = resource("app.js")
+            js shouldContain "anonymityPaddingLine(status)"
+            js shouldContain "Padding: off (message sizes and timing are visible to an observer of your connection)"
+            val fn =
+                js.substring(
+                    js.indexOf("function anonymityPaddingLine"),
+                    js.indexOf("function renderAnonymityStatus"),
+                )
+            fn shouldNotContain "innerHTML"
         }
 
         test("the status panel's mail line says mail travels over circuits and states the offline limit") {

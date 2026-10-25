@@ -17,6 +17,7 @@ import net.lapisphilosophorum.lapisnet.onion.DestroyReason
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
 import net.lapisphilosophorum.lapisnet.onion.OnionIntegrityException
+import net.lapisphilosophorum.lapisnet.onion.RelayCommand
 import net.lapisphilosophorum.lapisnet.onion.RelayMessage
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
 import net.lapisphilosophorum.lapisnet.onionwire.path.PathPolicy
@@ -30,6 +31,16 @@ import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
 
+/** What cover traffic needs of a circuit (a seam so the schedule can be tested without real circuits). */
+internal interface CoverCircuit {
+    val isClosed: Boolean
+    val linkId: LinkId
+
+    fun hopCount(): Int
+
+    fun sendDrop(targetHop: Int): Boolean
+}
+
 /**
  * One client-side circuit that can carry ANY relay message in both directions (hidden-service wave V0.10.0-C);
  * the diagnostic [ClientRoute] only knows DATA. Lock discipline: the internal lock is NEVER held while a callback
@@ -42,7 +53,7 @@ internal class OnionClientCircuit(
     private val builder: ClientCircuitBuilder,
     private val random: SecureRandom,
     private val onDone: (OnionClientCircuit) -> Unit,
-) {
+) : CoverCircuit {
     private enum class State { BUILDING, BUILT, CLOSED }
 
     private val lock = Any()
@@ -64,12 +75,12 @@ internal class OnionClientCircuit(
         private set
 
     val circuitId: Int get() = builder.firstLinkCircuitId
-    val linkId: LinkId get() = link
-    val isClosed: Boolean get() = synchronized(lock) { state == State.CLOSED }
+    override val linkId: LinkId get() = link
+    override val isClosed: Boolean get() = synchronized(lock) { state == State.CLOSED }
 
     fun armTimeout(handle: ScheduledFuture<*>?) = synchronized(lock) { timeout = handle }
 
-    fun hopCount(): Int = synchronized(lock) { circuit?.hopCount ?: 0 }
+    override fun hopCount(): Int = synchronized(lock) { circuit?.hopCount ?: 0 }
 
     fun onCell(cell: Cell) {
         val post = ArrayList<() -> Unit>(2)
@@ -138,6 +149,34 @@ internal class OnionClientCircuit(
                 val body =
                     try {
                         c.wrapForward(msg, c.hopCount)
+                    } catch (e: RuntimeException) {
+                        destroy(DestroyReason.INTERNAL, post)
+                        return@synchronized false
+                    }
+                if (!links.send(link, Cell(circuitId, CellCommand.RELAY, body))) {
+                    finish(IllegalStateException("link lost"), post)
+                    return@synchronized false
+                }
+                true
+            }
+        post.forEach { it() }
+        return ok
+    }
+
+    /**
+     * Sends a cover cell (wave V0.10.0-H): a relay DROP addressed to [targetHop], which discards it without any answer.
+     * Under the same lock as [send], so the order of the layer counters is kept. Logs nothing per cell. `false` if the
+     * circuit is not usable, shorter than [targetHop], or the link refused.
+     */
+    override fun sendDrop(targetHop: Int): Boolean {
+        val post = ArrayList<() -> Unit>(1)
+        val ok =
+            synchronized(lock) {
+                val c = circuit
+                if (state != State.BUILT || c == null || targetHop !in 1..c.hopCount) return@synchronized false
+                val body =
+                    try {
+                        c.wrapForward(RelayMessage(RelayCommand.DROP, 0, ByteArray(0)), targetHop)
                     } catch (e: RuntimeException) {
                         destroy(DestroyReason.INTERNAL, post)
                         return@synchronized false
@@ -225,6 +264,11 @@ internal class CircuitPolicy(
     /** Outcome of the FIRST hop of a build: `true` = it answered the CREATE, `false` = link or CREATE failure. */
     val firstHopResult: (Secp256k1PublicKey, Boolean) -> Unit = { _, _ -> },
     val onError: (Throwable) -> Unit = {},
+    /**
+     * Closes one idle warm circuit to free a pool slot (wave V0.10.0-H); `true` if one was closed. A real build that finds
+     * the pool full asks once, so the speculative warm pool never makes a real build fail.
+     */
+    val evictIdle: () -> Boolean = { false },
     /** A rate-limit delay longer than this fails the build instead of waiting. */
     val maxDefer: Duration = 30.seconds,
 )
@@ -280,6 +324,7 @@ internal class OnionCircuitFactory(
         timeout: Duration,
         purpose: CircuitPurpose?,
         waitedMillis: Long,
+        evicted: Boolean = false,
     ): CompletableFuture<OnionClientCircuit> {
         if (closed) return CompletableFuture.failedFuture(IllegalStateException("closed"))
         // the target key only separates circuits inside the governor; it is never logged
@@ -296,7 +341,12 @@ internal class OnionCircuitFactory(
         }
         return when (val a = p.governor.admit(purpose, target)) {
             CircuitBuildGovernor.Admission.Granted -> buildNow(path, timeout, p, purpose, target)
-            CircuitBuildGovernor.Admission.PoolFull -> refuse(CircuitAdmissionException.Kind.POOL_FULL)
+            CircuitBuildGovernor.Admission.PoolFull ->
+                if (!evicted && p.evictIdle()) {
+                    admitted(p, path, timeout, purpose, waitedMillis, evicted = true)
+                } else {
+                    refuse(CircuitAdmissionException.Kind.POOL_FULL)
+                }
             CircuitBuildGovernor.Admission.Locked -> refuse(CircuitAdmissionException.Kind.LOCKED)
             CircuitBuildGovernor.Admission.Dropped -> refuse(CircuitAdmissionException.Kind.RATE_LIMITED)
             is CircuitBuildGovernor.Admission.Delayed -> {
@@ -319,6 +369,27 @@ internal class OnionCircuitFactory(
                 result
             }
         }
+    }
+
+    /**
+     * Builds a circuit whose admission was already granted by [CircuitBuildGovernor.tryAdmitNow] (the warm pool). The
+     * granted slot is answered by the usual `onBuilt`/`onFailed`.
+     */
+    fun buildGranted(
+        path: List<OnionRelayDescriptor>,
+        timeout: Duration,
+    ): CompletableFuture<OnionClientCircuit> {
+        val p = policy ?: return CompletableFuture.failedFuture(IllegalStateException("no policy"))
+        if (closed) {
+            p.governor.onFailed(null)
+            return CompletableFuture.failedFuture(IllegalStateException("closed"))
+        }
+        val target =
+            path
+                .last()
+                .identity.bytes
+                .joinToString("") { "%02x".format(it) }
+        return buildNow(path, timeout, p, null, target)
     }
 
     private fun buildNow(

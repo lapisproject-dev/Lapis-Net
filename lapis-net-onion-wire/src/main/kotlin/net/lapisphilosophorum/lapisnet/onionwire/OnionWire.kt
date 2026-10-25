@@ -19,9 +19,12 @@ import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
+import net.lapisphilosophorum.lapisnet.onion.LinkId
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceConfig
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onion.RendezvousClientConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig
+import net.lapisphilosophorum.lapisnet.onionwire.anonymity.WarmCircuitPool
 import java.nio.file.Path
 import java.time.Clock
 import java.util.concurrent.CopyOnWriteArrayList
@@ -146,6 +149,7 @@ class OnionWire private constructor(
         publishRelays: () -> List<OnionRelayDescriptor> = { descriptors.snapshot(clock.millis() / 1000) },
         ackTimeout: Duration = 15.seconds,
         maxAttempts: Int = 3,
+        prebuilt: ((net.lapisphilosophorum.lapisnet.onion.CircuitPurpose) -> WarmCircuitPool.Prebuilt?)? = null,
     ): OnionDirectoryPublisher {
         check(!closed.get()) { "closed" }
         val publisher =
@@ -156,6 +160,7 @@ class OnionWire private constructor(
                 ackTimeout = ackTimeout,
                 maxAttempts = maxAttempts,
                 clock = clock,
+                prebuilt = prebuilt,
             )
         hidden += publisher
         publisher.onClosed = { hidden.remove(publisher) }
@@ -179,6 +184,7 @@ class OnionWire private constructor(
         publishRelays: () -> List<OnionRelayDescriptor>,
         ackTimeout: Duration = 15.seconds,
         maxAttempts: Int = 3,
+        prebuilt: ((net.lapisphilosophorum.lapisnet.onion.CircuitPurpose) -> WarmCircuitPool.Prebuilt?)? = null,
     ): OnionMailboxPublisher {
         check(!closed.get()) { "closed" }
         val publisher =
@@ -189,6 +195,7 @@ class OnionWire private constructor(
                 ackTimeout = ackTimeout,
                 maxAttempts = maxAttempts,
                 clock = clock,
+                prebuilt = prebuilt,
             )
         hidden += publisher
         publisher.onClosed = { hidden.remove(publisher) }
@@ -219,11 +226,48 @@ class OnionWire private constructor(
         factory.policy = policy
     }
 
+    /**
+     * Installs the egress shaper of anonymity mode (wave V0.10.0-H): from now on every cell this node sends leaves at a
+     * slice boundary. Refused for a relay node (it would delay other parties' traffic). Replaces a previous shaper.
+     */
+    internal fun installEgressShaper(
+        config: TrafficPaddingConfig,
+        onTail: (LinkId, Int) -> Unit,
+    ): EgressShaper {
+        check(!closed.get()) { "closed" }
+        check(relayService == null) { "a relay node never shapes egress" }
+        val shaper =
+            EgressShaper(
+                config,
+                links::writeNow,
+                links::pendingCells,
+                SliceTimer.of(links),
+                clock,
+                maxQueuedNetty = links.maxQueuedCells(),
+            )
+        shaper.tailSink = onTail
+        links.egress?.closeAndFlush()
+        links.egress = shaper
+        return shaper
+    }
+
+    /** Removes the egress shaper (after flushing it); later cells are written at once. */
+    internal fun uninstallEgressShaper() {
+        val shaper = links.egress ?: return
+        shaper.closeAndFlush()
+        links.egress = null
+    }
+
     /** Circuits currently open through the hidden-service factory (leak checks). */
     internal fun hiddenServiceRoutes(): Int = factory.openRoutes()
 
     /** Hosts and clients still referenced by this facade (leak checks). */
     internal fun hiddenCount(): Int = hidden.size
+
+    /** The warm-pool and cover scheduler need the factory and the links; the runtime builds them from these. */
+    internal fun circuitFactory(): OnionCircuitFactory = factory
+
+    internal fun linkManager(): OnionLinkManager = links
 
     /** Idempotent. Order: hosts and clients, relay service, descriptor gossip, link manager. */
     override fun close() {

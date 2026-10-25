@@ -60,14 +60,43 @@ class OnionRendezvousClient internal constructor(
         rendezvousPoint: OnionRelayDescriptor,
         descriptor: OnionServiceDescriptor? = null,
         timeout: Duration = config.overallTimeout,
+    ): CompletableFuture<OnionRendezvousStream> =
+        connectWith(address, paths, rendezvousPoint, descriptor, timeout, null)
+
+    /**
+     * Like [connect] with [prebuiltRendezvous]: a built circuit that ends at [rendezvousPoint] (a warm circuit, wave
+     * V0.10.0-H) is used as the rendezvous circuit instead of building one. Closed again if the attempt does not use it.
+     */
+    internal fun connectWith(
+        address: OnionServiceAddress,
+        paths: OnionPathProvider,
+        rendezvousPoint: OnionRelayDescriptor,
+        descriptor: OnionServiceDescriptor?,
+        timeout: Duration,
+        prebuiltRendezvous: OnionClientCircuit?,
     ): CompletableFuture<OnionRendezvousStream> {
-        if (closed) return CompletableFuture.failedFuture(IllegalStateException("closed"))
+        if (closed) {
+            prebuiltRendezvous?.let { runCatching { it.close() } }
+            return CompletableFuture.failedFuture(IllegalStateException("closed"))
+        }
         val now = clock.millis() / 1000
         val found =
             descriptor ?: services.current(address.serviceKey, now) ?: runCatching { dht?.resolve(address) }.getOrNull()
-        if (found == null) return CompletableFuture.failedFuture(IllegalStateException("no descriptor for the address"))
+        if (found == null) {
+            prebuiltRendezvous?.let { runCatching { it.close() } }
+            return CompletableFuture.failedFuture(IllegalStateException("no descriptor for the address"))
+        }
         val result = CompletableFuture<OnionRendezvousStream>()
-        val session = Session(address, found, rendezvousPoint, paths, result, config.copy(overallTimeout = timeout))
+        val session =
+            Session(
+                address,
+                found,
+                rendezvousPoint,
+                paths,
+                result,
+                config.copy(overallTimeout = timeout),
+                prebuiltRendezvous,
+            )
         sessions += session
         result.whenComplete { stream, _ ->
             sessions.remove(session)
@@ -98,6 +127,7 @@ class OnionRendezvousClient internal constructor(
         private val paths: OnionPathProvider,
         private val result: CompletableFuture<OnionRendezvousStream>,
         sessionConfig: RendezvousClientConfig,
+        private var prebuilt: OnionClientCircuit?,
     ) {
         private val lock = Any()
         private val machine =
@@ -147,7 +177,9 @@ class OnionRendezvousClient internal constructor(
                 timer?.cancel(false)
                 queue.clear()
                 s = stream
-                toClose = circuits.values.toList().also { circuits.clear() }
+                toClose =
+                    circuits.values.toList().also { circuits.clear() } +
+                    listOfNotNull(prebuilt.also { prebuilt = null })
             }
             s?.close()
             toClose.forEach { runCatching { it.close() } }
@@ -188,7 +220,25 @@ class OnionRendezvousClient internal constructor(
             }
         }
 
+        /** Uses the warm circuit as the rendezvous circuit; `false` if there is none or it has died meanwhile. */
+        private fun usePrebuilt(c: ClientCommand.BuildCircuit): Boolean {
+            if (c.purpose != net.lapisphilosophorum.lapisnet.onion.CircuitPurpose.RENDEZVOUS_SENDER) return false
+            val circuit = prebuilt ?: return false
+            prebuilt = null
+            if (circuit.isClosed) return false
+            circuits[c.ref] = circuit
+            circuit.onInbound = { msg -> inbound(c.ref, msg) }
+            circuit.onClosed = { closedByNetwork(c.ref) }
+            if (circuit.isClosed) {
+                circuits.remove(c.ref)
+                return false
+            }
+            enqueue(HsEvent.CircuitBuilt(c.ref))
+            return true
+        }
+
         private fun build(c: ClientCommand.BuildCircuit) {
+            if (usePrebuilt(c)) return
             val endpoint =
                 if (c.purpose == net.lapisphilosophorum.lapisnet.onion.CircuitPurpose.RENDEZVOUS_SENDER) {
                     rendezvousPoint
@@ -272,7 +322,7 @@ class OnionRendezvousClient internal constructor(
         private fun failed(c: ClientCommand.Failed) {
             finished = true
             timer?.cancel(false)
-            val toClose = circuits.values.toList()
+            val toClose = circuits.values.toList() + listOfNotNull(prebuilt.also { prebuilt = null })
             circuits.clear()
             toClose.forEach { runCatching { it.close() } }
             logger.debug { "rendezvous attempt failed: ${c.reason}" }

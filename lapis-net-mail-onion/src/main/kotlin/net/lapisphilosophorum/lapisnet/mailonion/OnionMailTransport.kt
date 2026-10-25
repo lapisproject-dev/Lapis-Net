@@ -273,7 +273,14 @@ class OnionMailTransport(
                 }
             }
             opened.onClose { ack.complete(false) }
-            for (chunk in MailCircuitFraming.chunks(MailCircuitFraming.bundleFrame(bundle), opened.maxPayload)) {
+            val frame =
+                if (port.paddingEnabled) {
+                    if (bundle.size > MailCircuitFraming.MAX_FRAME_BYTES) return false
+                    MailCircuitFraming.paddedBundleFrame(bundle, opened.maxPayload)
+                } else {
+                    MailCircuitFraming.bundleFrame(bundle)
+                }
+            for (chunk in MailCircuitFraming.chunks(frame, opened.maxPayload)) {
                 if (!opened.send(chunk)) return false
             }
             return ack.get(deliveryTimeout.toMillis(), TimeUnit.MILLISECONDS)

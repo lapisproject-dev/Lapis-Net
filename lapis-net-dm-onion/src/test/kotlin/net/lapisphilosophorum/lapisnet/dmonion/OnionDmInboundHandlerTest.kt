@@ -84,6 +84,54 @@ class OnionDmInboundHandlerTest :
             }
         }
 
+        test("a padded envelope is acknowledged only after the whole size class, and the sink gets the exact bytes") {
+            val sink = RecordingSink()
+            val handler = OnionDmInboundHandler(sink)
+            try {
+                val (client, server) = FakeChannel.pair()
+                handler.handleChannel(server)
+                val envelope = ByteArray(3_000) { (it * 7).toByte() }
+                val chunks =
+                    DmCircuitFraming.chunks(
+                        DmCircuitFraming.paddedEnvelopeFrame(envelope, client.maxPayload),
+                        client.maxPayload,
+                    )
+                chunks.size shouldBe 4
+                chunks.dropLast(1).forEach { client.send(it) }
+                Thread.sleep(100)
+                acks(client) shouldBe 0
+                sink.envelopes.size shouldBe 0
+                client.send(chunks.last())
+                waitFor { acks(client) == 1 } shouldBe true
+                waitFor { sink.envelopes.size == 1 } shouldBe true
+                sink.envelopes[0].contentEquals(envelope) shouldBe true
+            } finally {
+                handler.close()
+            }
+        }
+
+        test(
+            "a padded frame that stops short of its class is never acknowledged and the idle sweep closes the stream",
+        ) {
+            val sink = RecordingSink()
+            val handler = OnionDmInboundHandler(sink, idleMillis = 300, sweepMillis = 50)
+            try {
+                val (client, server) = FakeChannel.pair()
+                handler.handleChannel(server)
+                val chunks =
+                    DmCircuitFraming.chunks(
+                        DmCircuitFraming.paddedEnvelopeFrame(ByteArray(3_000), client.maxPayload),
+                        client.maxPayload,
+                    )
+                chunks.dropLast(1).forEach { client.send(it) }
+                waitFor { server.isClosed } shouldBe true
+                acks(client) shouldBe 0
+                sink.envelopes.size shouldBe 0
+            } finally {
+                handler.close()
+            }
+        }
+
         test("an oversize length closes the stream and nothing reaches the sink") {
             val sink = RecordingSink()
             val handler = OnionDmInboundHandler(sink)
