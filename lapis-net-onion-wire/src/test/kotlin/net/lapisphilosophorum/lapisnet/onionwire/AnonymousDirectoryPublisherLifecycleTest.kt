@@ -103,7 +103,44 @@ class AnonymousDirectoryPublisherLifecycleTest :
             publisherThreads() shouldBe before
         }
 
+        test("close while a publication is blocked returns at once, interrupts the worker and leaves no thread") {
+            val before = publisherThreads()
+            val started = java.util.concurrent.CountDownLatch(1)
+            val blocking =
+                object : DirectoryPublicationChannel {
+                    override val exposesOrigin = false
+
+                    override fun publishAnonymousPeerRecord(record: AnonymousPeerRecord): CompletableFuture<Boolean> {
+                        started.countDown()
+                        return CompletableFuture() // never completes
+                    }
+
+                    override fun publishPrekeyBundle(bundle: PrekeyBundle) = CompletableFuture.completedFuture(true)
+
+                    override fun publishServiceDescriptor(descriptor: OnionServiceDescriptor) =
+                        CompletableFuture.completedFuture(true)
+                }
+            val p =
+                AnonymousDirectoryPublisher(
+                    a.identity,
+                    Ed25519KeyPair.generate(),
+                    prekeys,
+                    blocking,
+                    InMemoryDirectoryModeStore(),
+                )
+            p.start()
+            p.start()
+            started.await(20, java.util.concurrent.TimeUnit.SECONDS) shouldBe true
+            val t0 = System.nanoTime()
+            p.close()
+            p.close()
+            ((System.nanoTime() - t0) < 5_000_000_000L) shouldBe true
+            awaitTrue(java.time.Duration.ofSeconds(20)) { publisherThreads() == before } shouldBe true
+            p.publications shouldBe 0
+        }
+
         test("a failed publication is retried and does not mark the entry as current") {
+            var now = System.currentTimeMillis()
             val failing =
                 object : DirectoryPublicationChannel {
                     var succeed = false
@@ -124,10 +161,14 @@ class AnonymousDirectoryPublisherLifecycleTest :
                     prekeys,
                     failing,
                     InMemoryDirectoryModeStore(),
+                    clockMillis = { now },
                 )
             p.tick() shouldBe false
             p.publications shouldBe 0
             failing.succeed = true
+            p.tick() shouldBe false // still inside the 5 s backoff: no retry storm
+            p.publications shouldBe 0
+            now += 6_000
             p.tick() shouldBe true
             p.publications shouldBe 1
             p.close()

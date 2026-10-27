@@ -94,17 +94,21 @@ class OnionWire private constructor(
         require(directoryMode == DirectoryAnonymityMode.OFF || (publication != null && !publication.exposesOrigin)) {
             "anonymity mode requires a publication channel that does not expose the origin"
         }
+        var republisher: ServiceDescriptorRepublisher? = null
         val publisher: (OnionServiceDescriptor) -> Unit =
             if (publication == null) {
                 { serviceGossip.announce(it) }
             } else {
-                { d ->
-                    // never blocks: this callback runs under the host's session lock. A failed publication is retried
-                    // with the host's next descriptor (republication on every change and before expiry).
-                    publication.publishServiceDescriptor(d).whenComplete { ok, error ->
-                        if (error != null || ok != true) logger.debug { "service descriptor publication failed" }
-                    }
-                }
+                // never blocks: this callback runs under the host's session lock. A lost or too early publication is
+                // repeated on the early republication schedule (see ServiceDescriptorRepublisher).
+                val r =
+                    ServiceDescriptorRepublisher(
+                        publication,
+                        { delay, task -> links.schedule(delay) { task() } },
+                        clock::millis,
+                    )
+                republisher = r
+                r::submit
             }
         val host =
             OnionServiceHost(
@@ -118,7 +122,10 @@ class OnionWire private constructor(
                 clock,
             )
         hidden += host
-        host.onClosed = { hidden.remove(host) }
+        host.onClosed = {
+            hidden.remove(host)
+            republisher?.close()
+        }
         return host
     }
 

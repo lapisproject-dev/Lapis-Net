@@ -2189,3 +2189,9 @@ _Unreleased. Internal wave identifier. Experimental option; no protection agains
 * *Open:* the return direction, the number of mailbox items per circuit, the introduction circuit, GossipSub/DHT/fetches (wave J), media, a global passive observer; nothing verified on real networks, under load, against a real observer or by an external review; the browser status line wording awaits the design team's review.
 * *Decisions pending:* see "Assumptions awaiting confirmation (wave H)" in `anonymity.adoc`.
 
+== Fix — late visibility in the anonymous directory (early republication)
+
+_Unreleased. Maintenance fix on top of V0.10.0-H._
+
+* *Done:* after the first successful publication the anonymous record and the prekey bundle are republished as new versions on a short schedule (5 s to 5 min, jittered, at most 4 versions per minute), and the service descriptor is retried and repeated unchanged (`DirectoryRepublishSchedule`, `PublicationRateGuard`, `AnonymousDirectoryPublisher`, `ServiceDescriptorRepublisher`). A node that subscribes after the publisher's first publication now sees the anonymous record and the prekey bundle within minutes instead of up to an hour; the service descriptor reaches only the direct neighbours of the announcing relay within minutes (see "Known limit of the descriptor repeat" in `anonymity.adoc`). See "Early republication" in `anonymity.adoc`.
+* *Open:* the service descriptor is not forwarded beyond the first hop by the repeat, so a late subscriber behind a node that already holds the descriptor can still resolve `HiddenDescriptorMissing` for up to 1 h. A node that subscribes later than about 5 minutes after the publisher's start still waits for the hourly republication (no catch-up path); the early publications are not verified on real networks or under adversarial load.

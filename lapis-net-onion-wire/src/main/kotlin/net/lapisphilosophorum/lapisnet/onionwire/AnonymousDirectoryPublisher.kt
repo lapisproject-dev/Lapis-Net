@@ -4,18 +4,22 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.core.crypto.domainSeparatedDigest
 import net.lapisphilosophorum.lapisnet.directory.AnonymousCapability
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord
+import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordGossip
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeStore
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition
 import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
+import net.lapisphilosophorum.lapisnet.directory.DirectoryRepublishSchedule
 import net.lapisphilosophorum.lapisnet.directory.DirectoryTransitionPlan
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
+import net.lapisphilosophorum.lapisnet.directory.PublicationRateGuard
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishBody
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundleCodec
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -45,6 +49,14 @@ private val logger = KotlinLogging.logger {}
  * is set (tests only). No fallback to a more revealing channel exists: a failed publication is retried on the next
  * tick. [start], [tick] and [close] are idempotent and thread-safe; after [close] nothing is published and no timer
  * thread remains.
+ *
+ * Early republication: GossipSub gives late subscribers no history, so an object published before a receiver
+ * subscribed would stay invisible to it until the hourly republication. After the FIRST successful publication the
+ * publisher therefore republishes on the short [earlySchedule]. Every republication is a complete NEW version (new
+ * bundle sequence, new record sequence): a byte-identical bundle would be declined by receivers and scored against the
+ * relaying peer. The number of versions per minute stays below the receivers' per-author rate. Slots that fell due
+ * while the process was suspended are merged into one publication. A failed publication is retried along
+ * [failureBackoff] and then every [retryInterval].
  */
 class AnonymousDirectoryPublisher(
     private val identity: DualKeyIdentity,
@@ -60,12 +72,18 @@ class AnonymousDirectoryPublisher(
     private val tombstonePublisher: (PeerRecord) -> Unit = {},
     allowDirectChannel: Boolean = false,
     private val publishTimeout: Duration = 60.seconds,
+    private val earlySchedule: DirectoryRepublishSchedule = DirectoryRepublishSchedule(),
+    maxVersionsPerMinute: Int = 4,
+    private val failureBackoff: List<Duration> = listOf(5.seconds, 15.seconds, 45.seconds),
 ) : AutoCloseable {
     init {
         require(allowDirectChannel || !channel.exposesOrigin) {
             "anonymity mode requires a publication channel that does not expose the origin"
         }
         require(recordTtlSeconds in 1..AnonymousPeerRecord.MAX_TTL_WINDOW_SECONDS) { "invalid record ttl" }
+        require(maxVersionsPerMinute in 1 until AnonymousPeerRecordGossip.DEFAULT_PER_AUTHOR_PER_MINUTE) {
+            "version rate must stay below the receivers' per-author rate"
+        }
     }
 
     private val transition = DirectoryModeTransition(identity, modeStore, clockMillis)
@@ -73,14 +91,31 @@ class AnonymousDirectoryPublisher(
     private val started = AtomicBoolean(false)
     private var transitionDone = false
     private var lastPublishedAtMillis: Long? = null
-    private var timer: ScheduledThreadPoolExecutor? = null
-    private var job: ScheduledFuture<*>? = null
+
+    @Volatile private var timer: ScheduledThreadPoolExecutor? = null
+
+    @Volatile private var job: ScheduledFuture<*>? = null
+    private val versionGuard = PublicationRateGuard(maxVersionsPerMinute, 60_000L, clockMillis)
+    private val pendingEarly = ArrayDeque<Long>()
+    private var consecutiveFailures = 0
+    private var backoffUntilMillis = 0L
 
     /** Number of anonymous records handed to the channel successfully (tests). */
     @Volatile var publications: Int = 0
         private set
 
-    /** Starts the periodic tick (every [retryInterval]; a tick only publishes when due). Idempotent. */
+    /** Number of early (staggered) republications that succeeded (tests). */
+    @Volatile var earlyRepublications: Int = 0
+        private set
+
+    /** Number of publication attempts, successful or not (tests). */
+    @Volatile var attempts: Int = 0
+        private set
+
+    /**
+     * Starts the tick, scheduled dynamically by [nextDelayMillis] (from 1 s up to [retryInterval], depending on what is
+     * due next; a tick only publishes when due). Idempotent.
+     */
     @Synchronized
     fun start() {
         if (closed.get() || !started.compareAndSet(false, true)) return
@@ -92,19 +127,40 @@ class AnonymousDirectoryPublisher(
             }
         executor.removeOnCancelPolicy = true
         timer = executor
-        job =
-            executor.scheduleWithFixedDelay(
-                {
-                    try {
-                        tick()
-                    } catch (e: RuntimeException) {
-                        logger.debug { "anonymous directory tick failed: ${e.javaClass.simpleName}" }
-                    }
-                },
-                0,
-                retryInterval.inWholeMilliseconds,
-                TimeUnit.MILLISECONDS,
-            )
+        job = executor.schedule(::runTick, 0, TimeUnit.MILLISECONDS)
+    }
+
+    private fun runTick() {
+        try {
+            tick()
+        } catch (e: RuntimeException) {
+            logger.debug { "anonymous directory tick failed: ${e.javaClass.simpleName}" }
+        }
+        reschedule()
+    }
+
+    @Synchronized
+    private fun reschedule() {
+        if (closed.get()) return
+        val executor = timer ?: return
+        try {
+            job = executor.schedule(::runTick, nextDelayMillis(), TimeUnit.MILLISECONDS)
+        } catch (e: RejectedExecutionException) {
+            return // closed concurrently: no zombie timer
+        }
+        if (closed.get()) job?.cancel(false)
+    }
+
+    /** Delay until the next tick is worth running, within [1 s (or [retryInterval]), [retryInterval]]. */
+    @Synchronized
+    internal fun nextDelayMillis(): Long {
+        val now = clockMillis()
+        val last = lastPublishedAtMillis
+        var due = if (last == null) now else last + republishInterval.inWholeMilliseconds
+        pendingEarly.firstOrNull()?.let { due = minOf(due, it) }
+        due = maxOf(due, backoffUntilMillis, versionGuard.nextAllowedAtMillis())
+        val cap = retryInterval.inWholeMilliseconds
+        return (due - now).coerceIn(minOf(1_000L, cap), cap)
     }
 
     /**
@@ -113,7 +169,10 @@ class AnonymousDirectoryPublisher(
      */
     @Synchronized
     fun tick(): Boolean {
-        if (closed.get()) return false
+        if (closed.get()) {
+            pendingEarly.clear()
+            return false
+        }
         val now = clockMillis()
         if (!transitionDone) {
             when (val plan = transition.prepare(DirectoryAnonymityMode.ON)) {
@@ -124,7 +183,11 @@ class AnonymousDirectoryPublisher(
             transitionDone = true
         }
         val last = lastPublishedAtMillis
-        if (last != null && now - last < republishInterval.inWholeMilliseconds) return true
+        val republishDue = last == null || now - last >= republishInterval.inWholeMilliseconds
+        val earlyDue = pendingEarly.firstOrNull()?.let { now >= it } == true
+        if (!republishDue && !earlyDue) return true
+        // a failed publication is retried along the backoff, never in a storm; a rate-limited tick is deferred
+        if (now < backoffUntilMillis || !versionGuard.tryAcquire()) return !republishDue
 
         val nowSeconds = now / 1000
         val notValidAfter = nowSeconds + recordTtlSeconds
@@ -150,12 +213,28 @@ class AnonymousDirectoryPublisher(
         val bundleOk = bundle == null || await(channel.publishPrekeyBundle(bundle))
         if (closed.get()) return false
         val recordOk = await(channel.publishAnonymousPeerRecord(record))
+        attempts++
         if (bundleOk && recordOk) {
+            if (last == null) pendingEarly.addAll(earlySchedule.plan(now).toList())
+            if (earlyDue) {
+                // merge every slot that is due by now (suspend, clock jump): one publication serves all of them
+                while (pendingEarly.isNotEmpty() && pendingEarly.first() <= now) pendingEarly.removeFirst()
+                earlyRepublications++
+                logger.debug {
+                    "anonymous directory early republish $earlyRepublications/${earlySchedule.offsets.size}"
+                }
+            }
+            consecutiveFailures = 0
+            backoffUntilMillis = 0L
             lastPublishedAtMillis = now
             publications++
             return true
         }
-        return false
+        consecutiveFailures++
+        val delay =
+            if (consecutiveFailures <= failureBackoff.size) failureBackoff[consecutiveFailures - 1] else retryInterval
+        backoffUntilMillis = now + delay.inWholeMilliseconds
+        return !republishDue
     }
 
     private fun await(future: java.util.concurrent.CompletableFuture<Boolean>): Boolean =

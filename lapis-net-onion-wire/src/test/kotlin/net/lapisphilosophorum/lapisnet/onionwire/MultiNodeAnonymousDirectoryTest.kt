@@ -153,6 +153,24 @@ class MultiNodeAnonymousDirectoryTest :
             host.close()
         }
 
+        test("a service descriptor whose first publication fails still arrives, without any change of the host").config(
+            timeout = 180.seconds,
+        ) {
+            val key = Ed25519KeyPair.generate()
+            val failFirst = FailFirstDescriptorChannel(directoryPublisher)
+            val host = a.wire.experimentalServiceHost(key, OnionServiceConfig(), provider, failFirst)
+            try {
+                host.start(descriptors.take(3)).get(90, TimeUnit.SECONDS)
+                // the host publishes only on change and hourly: the retry comes from the early republication
+                awaitTrue(java.time.Duration.ofSeconds(60)) {
+                    b.wire.serviceDescriptors.current(key.publicKey, now()) != null
+                } shouldBe true
+                (failFirst.calls.get() >= 2) shouldBe true
+            } finally {
+                host.close()
+            }
+        }
+
         test("the leak scanner finds NOTHING of A's addresses or transport identity (positive control included)") {
             val toldTombstone = tombstone.shouldNotBeNull()
             val tombstoneBytes = PeerRecordCodec.encode(toldTombstone)
@@ -324,3 +342,23 @@ class MultiNodeAnonymousDirectoryTest :
             watchers.forEach { (it.peerDirectory.lookup(c.key)?.sequenceNumber ?: 0L) shouldBe back.sequenceNumber }
         }
     })
+
+/** Fails the first service descriptor publication (acknowledged as not published), delegates everything else. */
+@OptIn(ExperimentalOnionApi::class)
+private class FailFirstDescriptorChannel(
+    private val delegate: net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel,
+) : net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel by delegate {
+    val calls =
+        java.util.concurrent.atomic
+            .AtomicInteger()
+
+    override fun publishServiceDescriptor(
+        descriptor: net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor,
+    ): java.util.concurrent.CompletableFuture<Boolean> =
+        if (calls.getAndIncrement() == 0) {
+            java.util.concurrent.CompletableFuture
+                .completedFuture(false)
+        } else {
+            delegate.publishServiceDescriptor(descriptor)
+        }
+}

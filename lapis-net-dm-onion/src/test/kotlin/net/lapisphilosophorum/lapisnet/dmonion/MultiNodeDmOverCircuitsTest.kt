@@ -132,31 +132,16 @@ class MultiNodeDmOverCircuitsTest :
                     "A sees B: ${seesHidden(a, b)}, B sees A: ${seesHidden(b, a)}, " +
                         "A->B ${a.runtime.resolveIdentity(b.key)::class.simpleName}, " +
                         "B->A ${b.runtime.resolveIdentity(a.key)::class.simpleName}"
-                var converged = false
-                // A directory object that is published while the gossip mesh is still forming is only repeated hourly
-                // (as designed); on a loaded machine that can happen. The test then republishes the way a user would:
-                // it restarts the node that the other one cannot see (before any listener is registered).
-                for (attempt in 1..4) {
-                    converged =
-                        awaitCondition(Duration.ofSeconds(75)) {
-                            if (System.currentTimeMillis() - lastPublish > 3_000) {
-                                c.publishSelf()
-                                lastPublish = System.currentTimeMillis()
-                            }
-                            seesHidden(a, b) && seesHidden(b, a)
+                // A directory object that is published while the gossip mesh is still forming is repeated on the early
+                // republication schedule (5 s to 5 min after the first publication), so no restart is needed.
+                val converged =
+                    awaitCondition(Duration.ofSeconds(360)) {
+                        if (System.currentTimeMillis() - lastPublish > 3_000) {
+                            c.publishSelf()
+                            lastPublish = System.currentTimeMillis()
                         }
-                    if (converged) break
-                    if (!seesHidden(b, a)) {
-                        a.stop()
-                        a.start()
-                        a.awaitPublished() shouldBe true
+                        seesHidden(a, b) && seesHidden(b, a)
                     }
-                    if (!seesHidden(a, b)) {
-                        b.stop()
-                        b.start()
-                        b.awaitPublished() shouldBe true
-                    }
-                }
                 withClue(status()) { converged shouldBe true }
                 a.dm.addInboundListener { aReceived += it }
                 listenOnB()
