@@ -540,6 +540,40 @@ class HiddenServiceFlowTest :
             w.service.stop()
         }
 
+        test("refreshDescriptor re-signs the same content as a strictly newer version and keeps the hourly clock") {
+            val w = World()
+            // not started: nothing to refresh
+            w.service.refreshDescriptor() shouldBe emptyList()
+            w.startService()
+            val first = w.flow.published.single()
+            w.clock.advanceMillis(7_000)
+            val commands = w.service.refreshDescriptor()
+            commands.size shouldBe 1
+            val fresh = (commands.single() as ServiceCommand.Publish).descriptor
+            (fresh.sequenceNumber > first.sequenceNumber) shouldBe true
+            fresh.introPoints shouldBe first.introPoints
+            fresh.encKey shouldBe first.encKey
+            fresh.serviceKey shouldBe first.serviceKey
+            OnionServiceDescriptor.verify(fresh, w.clock.millis() / 1000) shouldBe true
+            fresh.signature.contentEquals(first.signature) shouldBe false
+            // again: still strictly increasing
+            val third = (w.service.refreshDescriptor().single() as ServiceCommand.Publish).descriptor
+            (third.sequenceNumber > fresh.sequenceNumber) shouldBe true
+            // the regular tick does not publish because of a refresh (the hourly clock was not reset by it either way)
+            w.flow.runService(w.service.on(HsEvent.Tick))
+            w.flow.published.size shouldBe 1
+            w.flow.runService(w.service.stop())
+            w.service.refreshDescriptor() shouldBe emptyList()
+        }
+
+        test("refreshDescriptor returns nothing while an introduction point is not established") {
+            val w = World()
+            w.flow.runService(w.service.start(w.relays.take(w.config.introPoints).map { it.binding }))
+            // circuits were requested, but nothing settled yet
+            w.service.refreshDescriptor() shouldBe emptyList()
+            w.flow.runService(w.service.stop())
+        }
+
         test("configs are validated") {
             listOf(
                 { OnionServiceConfig(introPoints = 0) },

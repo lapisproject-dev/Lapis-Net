@@ -19,6 +19,7 @@ import net.lapisphilosophorum.lapisnet.dm.buildDmTestNode
 import net.lapisphilosophorum.lapisnet.dmonion.RelayHost
 import net.lapisphilosophorum.lapisnet.dmonion.SyntheticLocator
 import net.lapisphilosophorum.lapisnet.dmonion.awaitCondition
+import net.lapisphilosophorum.lapisnet.dmonion.isSeenBehindService
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.mail.AnonymousMailSizing
 import net.lapisphilosophorum.lapisnet.mail.AttachmentRef
@@ -448,6 +449,47 @@ class MultiNodeMailOverCircuitsTest :
             ) shouldBe
                 true
             (a.mail.retry.pendingCount() <= OnionMailRetryQueue.MAX_ENTRIES) shouldBe true
+        }
+
+        test(
+            "restart with a NEW onion address: A's next small mail and a CIRCUIT mail with attachment reach B exactly once, over the new descriptor",
+        ).config(timeout = 900.seconds) {
+            b.n.freshServiceKeyPerStart = true
+            val oldService = b.n.serviceKey.publicKey
+            b.n.stop()
+            b.n.start()
+            (b.n.serviceKey.publicKey == oldService) shouldBe false
+            b.n.awaitPublished() shouldBe true
+            val newService = b.n.serviceKey.publicKey
+            var lastTick = 0L
+            // A must learn B's NEW record and descriptor before the CIRCUIT mail (which needs a rendezvous stream)
+            withClue("A does not see B behind the new service") {
+                awaitCondition(Duration.ofSeconds(360)) {
+                    if (System.currentTimeMillis() - lastTick > 3_000) {
+                        a.n.runtime.maintainNow()
+                        b.n.runtime.maintainNow()
+                        lastTick = System.currentTimeMillis()
+                    }
+                    b.n.isSeenBehindService(a.n, newService)
+                } shouldBe true
+            }
+            val failuresBefore = a.n.port.connectFailures.size
+            sendUntilReceived(a, b, "mailtest after restart 8", "small after restart")
+            val blob = ByteArray(120_000) { (it % 241).toByte() }
+            val cid = a.n.storage.put(blob)
+            val ref = AttachmentRef(cid, "after-restart.bin", "application/octet-stream", blob.size.toLong())
+            val body = "y".repeat(20_000)
+            sendUntilReceived(a, b, "mailtest after restart 9", body, listOf(ref))
+            awaitCondition(Duration.ofSeconds(30)) { b.n.storage.getLocal(cid) != null } shouldBe true
+            b.n.storage
+                .getLocal(cid)!!
+                .contentEquals(blob) shouldBe true
+            b.mail.subjects().count { it == "mailtest after restart 8" } shouldBe 1
+            b.mail.subjects().count { it == "mailtest after restart 9" } shouldBe 1
+            // A never built a circuit to the introduction points of the old descriptor once the new one was known
+            withClue("connect failures of A: ${a.n.port.connectFailures.drop(failuresBefore)}") {
+                a.n.port.connectFailures.size shouldBe failuresBefore
+            }
         }
 
         test("start and stop leave nothing behind: no stream, no thread; a second start works")

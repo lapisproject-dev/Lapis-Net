@@ -13,6 +13,7 @@ import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorGossip
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorIndex
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
+import net.lapisphilosophorum.lapisnet.directory.PublicationRateGuard
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
@@ -95,6 +96,7 @@ class OnionWire private constructor(
             "anonymity mode requires a publication channel that does not expose the origin"
         }
         var republisher: ServiceDescriptorRepublisher? = null
+        var hostRef: OnionServiceHost? = null
         val publisher: (OnionServiceDescriptor) -> Unit =
             if (publication == null) {
                 { serviceGossip.announce(it) }
@@ -106,6 +108,9 @@ class OnionWire private constructor(
                         publication,
                         { delay, task -> links.schedule(delay) { task() } },
                         clock::millis,
+                        // fresh signed versions at the repeat slots, below the receivers' 6 per minute per author
+                        refresh = { hostRef?.refreshDescriptor() ?: false },
+                        versionGuard = PublicationRateGuard(DESCRIPTOR_VERSIONS_PER_MINUTE, 60_000L, clock::millis),
                     )
                 republisher = r
                 r::submit
@@ -121,6 +126,7 @@ class OnionWire private constructor(
                 publisher,
                 clock,
             )
+        hostRef = host
         hidden += host
         host.onClosed = {
             hidden.remove(host)
@@ -290,6 +296,9 @@ class OnionWire private constructor(
     }
 
     companion object {
+        /** Sender limit for signed versions of one service descriptor; receivers accept 6 per minute per author. */
+        private const val DESCRIPTOR_VERSIONS_PER_MINUTE = 4
+
         fun attach(
             node: LapisNode,
             identity: DualKeyIdentity,

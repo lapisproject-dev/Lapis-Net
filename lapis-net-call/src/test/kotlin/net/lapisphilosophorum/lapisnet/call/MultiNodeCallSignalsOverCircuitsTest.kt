@@ -19,6 +19,7 @@ import net.lapisphilosophorum.lapisnet.dmonion.DmOnionNode
 import net.lapisphilosophorum.lapisnet.dmonion.RelayHost
 import net.lapisphilosophorum.lapisnet.dmonion.SyntheticLocator
 import net.lapisphilosophorum.lapisnet.dmonion.awaitCondition
+import net.lapisphilosophorum.lapisnet.dmonion.isSeenBehindService
 import net.lapisphilosophorum.lapisnet.policy.AcceptanceGate
 import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.trust.TrustGraph
@@ -321,6 +322,89 @@ class MultiNodeCallSignalsOverCircuitsTest :
                 a.attachCalls()
                 b.attachCalls()
             }
+
+        test(
+            "B restarts with a NEW onion address: A's call reaches the new descriptor, INVITE, ACCEPT and HANGUP over circuits, no session leaks",
+        ).config(timeout = 900.seconds) {
+            fun restart(n: CallNode) {
+                n.manager.stop()
+                n.rig.stop()
+                n.rig.freshServiceKeyPerStart = true
+                n.rig.start()
+                n.rig.dm.addInboundListener { received.getValue(n) += it }
+                n.rig.dm.addCallSignalListener { n.signals += it }
+                n.attachCalls()
+                n.rig.awaitPublished() shouldBe true
+            }
+            val oldService = b.rig.serviceKey.publicKey
+            restart(b)
+            (b.rig.serviceKey.publicKey == oldService) shouldBe false
+            val newService = b.rig.serviceKey.publicKey
+            var lastTick = 0L
+
+            fun tick() {
+                if (System.currentTimeMillis() - lastTick > 3_000) {
+                    a.rig.runtime.maintainNow()
+                    b.rig.runtime.maintainNow()
+                    lastTick = System.currentTimeMillis()
+                }
+            }
+            // A restarted node is a late subscriber and gets no catch-up: it only sees the long-running A after A's next
+            // publication (hourly, by design). Like the other multi-node tests, the node that is not seen is restarted too.
+            val bSeesA =
+                awaitCondition(Duration.ofSeconds(25)) {
+                    tick()
+                    sees(b, a)
+                }
+            if (!bSeesA) {
+                println("TIMELINE call-restart: B did not see A after its restart; A restarts as well")
+                restart(a)
+            }
+            withClue("A does not see B behind the new service, or B does not see A") {
+                awaitCondition(Duration.ofSeconds(360)) {
+                    tick()
+                    b.rig.isSeenBehindService(a.rig, newService) && sees(a, b) && sees(b, a)
+                } shouldBe true
+            }
+            a.events.clear()
+            val failuresBefore = a.rig.port.connectFailures.size
+            val framesBefore = b.rig.port.frames.size
+            val callId = a.manager.placeCall(b.rig.key, mediaExposureConfirmed = true)
+            withClue(
+                "B events: ${b.events}, A events: ${a.events}, A connect failures: ${a.rig.port.connectFailures}",
+            ) {
+                awaitCondition(Duration.ofSeconds(90)) { b.events.any { it is CallEvent.IncomingCall } } shouldBe true
+            }
+            b.manager.acceptCall(callId, mediaExposureConfirmed = true)
+            withClue("A: ${a.shape()}, B: ${b.shape()}") {
+                awaitCondition(Duration.ofSeconds(60)) {
+                    a.events.any { it is CallEvent.Active } && b.events.any { it is CallEvent.Active }
+                } shouldBe true
+            }
+            (b.rig.port.frames.size > framesBefore) shouldBe true // B's ACCEPT went over a circuit
+            // observers see only relays
+            val relayIds = relays.map { it.node.peerId }.toSet()
+            (a.rig.connectedPeers.contains(b.rig.node.peerId)) shouldBe false
+            (b.rig.connectedPeers.contains(a.rig.node.peerId)) shouldBe false
+            a.rig.connectedPeers.all { it in relayIds } shouldBe true
+            b.rig.connectedPeers.all { it in relayIds } shouldBe true
+            a.manager.hangUp(callId)
+            awaitCondition(Duration.ofSeconds(60)) {
+                a.events.any { it is CallEvent.Ended } && b.events.any { it is CallEvent.Ended }
+            } shouldBe true
+            a.endedReasons() shouldBe listOf(CallEndReason.LOCAL_HANGUP)
+            b.endedReasons() shouldBe listOf(CallEndReason.REMOTE_HANGUP)
+            // A never failed to connect to anything of B's old descriptor, and nothing is left running
+            a.rig.port.connectFailures.size shouldBe failuresBefore
+            awaitCondition(Duration.ofSeconds(60)) {
+                a.manager.liveMediaSessionCountForTesting() == 0 && b.manager.liveMediaSessionCountForTesting() == 0
+            } shouldBe true
+            a.manager.activeCalls() shouldBe emptyList()
+            b.manager.activeCalls() shouldBe emptyList()
+            // the next test reads the events from a clean slate
+            a.events.clear()
+            b.events.clear()
+        }
 
         test("the circuits die while B is ringing: B ends with CIRCUIT_LOST, A rings out, no session leaks")
             .config(timeout = 600.seconds) {

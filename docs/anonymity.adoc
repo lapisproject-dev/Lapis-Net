@@ -1,7 +1,9 @@
-= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages, mail, call signals, padding and timing (waves V0.10.0-A to V0.10.0-H)
+= Traffic anonymisation: design, foundation, wire integration, receiver side, directory, path policy, direct messages, mail, call signals, padding and timing (waves V0.10.0-A to V0.10.0-I)
 :toc:
 
 == Status
+
+*Wave I (multi-node tests, Sybil simulation, review package, unreleased) adds no feature for the user. It tests more of what exists on real loopback nodes (a late subscriber behind a node that already holds a service descriptor, failure of the primary guard, a mode switch by restart, mail and call signals after a restart with a new onion address), simulates the real path selection against an adversary that controls part of the relays, and prepares the external review in link:external-review.adoc[external-review.adoc]. It fixed one defect that the new test found: the repeat slots of the early republication sent the service descriptor byte-identically, which a node that already holds it ignores and does not forward; they now send a fresh signed version (see <<early-republication>>). The external review itself has not taken place.* See <<wave-i>>.
 
 *Wave H (padding and timing protection, unreleased) makes the traffic of a node in anonymity mode harder to read for a local observer of its guard connection: message sizes are padded to size classes, cover cells are sent towards the guard on a randomised schedule, outgoing cells leave in time slices, and circuits are built in advance. It makes observation by a local observer or a single relay harder; it is NOT protection against a global passive observer, and it does not hide that and roughly when the node is active.* See <<padding-and-timing>>.
 
@@ -40,6 +42,7 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 * GossipSub, the DHT and content fetches in part 1 (wave J, later).
 * Tor equivalence. This is a small, purpose-built onion design for a small network, with a much smaller anonymity set than Tor.
 
+[[threat-model]]
 == Threat model
 
 [cols="2,3,3", options="header"]
@@ -67,6 +70,7 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 | End-to-end timing and volume correlation is out of scope.
 |===
 
+[[known-leaks]]
 == Known leaks today
 
 These exist in the current release and must be closed before any anonymity claim.
@@ -506,6 +510,7 @@ A node that gossips an entry itself shows its IP and peer ID to its mesh neighbo
 
 `OnionDirectoryPublisher` builds the circuit over a path from the injected `OnionPathProvider`, sends one message, waits up to 15 s for the acknowledgement and closes the circuit. A failing relay is put on an exponential backoff and another relay is tried; there is *no fallback to publishing from the own node*. `AnonymousDirectoryPublisher` publishes the anonymous record and the reduced prekey bundle every 60 minutes (record TTL 3 h) and detects the mode switch. `AnonymousDirectory.resolve` answers `Hidden`, `HiddenDescriptorMissing`, `Direct`, `Revoked` or `Unknown`; no DM, mail or call code calls it yet. Resolving the descriptor from the DHT shows the DHT the sender's interest.
 
+[[early-republication]]
 === Early republication
 
 GossipSub hands no history to late subscribers, and there is no catch-up path for anonymous records, prekey bundles or service descriptors (in anonymity mode the lookup deliberately goes without the DHT). A directory object that is published before a receiver subscribed to its topic is therefore invisible to that receiver until the next republication, which used to be an hour away. Seen in practice: node A published, node B started afterwards, and B resolved A as `HiddenDescriptorMissing` (record known, service descriptor missing) for minutes.
@@ -514,8 +519,8 @@ After the *first successful* publication the objects are therefore republished o
 
 * *Why not a "mesh ready" signal:* a readiness signal measures only the publisher's own neighbourhood (the relays, which are subscribed at once), never the receivers two hops away, and those are the ones that may subscribe late.
 * *Record and prekey bundle go out as new versions* (new sequence numbers). A byte-identical bundle is declined by receivers (`DECLINED` becomes `Invalid`, a score penalty for the relaying peer), so a bundle is never repeated; because the record carries the bundle digest, it is a new version too. The publisher keeps at most 4 versions per minute, below the receivers' per-author rate of 6 per minute (`PublicationRateGuard`; a conformance test drives the real validators along the worst-case timeline).
-* *The service descriptor is repeated unchanged:* for receivers an identical repetition is free (the validator's pre-check ignores it before any rate budget is touched) and the relay announces it again. At most 12 retries and repeats per hour, of which 4 are reserved for retries of a failed first send (repeats stop at 8); an expired descriptor is never sent.
-* *Known limit of the descriptor repeat:* a node that already holds the descriptor answers a byte-identical repeat with `Ignore`, and an ignored message is not forwarded. A repeat therefore reaches only peers that are direct gossip neighbours of the relay that announces it; a late subscriber that is meshed only with nodes that already hold the descriptor does not receive it and keeps resolving `HiddenDescriptorMissing` until the host's next new descriptor (up to one hour). Record and prekey bundle are not affected, because they go out as new versions. Sending the descriptor as a new sequence number would close the gap, but each new version is a visible publication and counts against the per-author rate; this is left for a later wave. The tests (`MultiNodeEarlyRepublishVisibilityTest`, `MultiNodeAnonymousDirectoryTest`) connect the late node to all relays and do not cover the multi-hop case.
+* *The service descriptor goes out as a fresh version at the repeat slots (wave I):* a byte-identical repetition is free for receivers (the validator's pre-check ignores it before any rate budget is touched), but for the same reason it is not forwarded: a node that already holds the descriptor answers `Ignore`, and GossipSub forwards neither an ignored message nor puts it into its message cache. A repeat therefore reached only direct gossip neighbours of the announcing relay; a late subscriber that is meshed only with nodes that already hold the descriptor never received it and kept resolving `HiddenDescriptorMissing` until the host's next new descriptor (up to one hour). This was found by `MultiNodeDescriptorMultiHopVisibilityTest` (six relays, a holder `M`, a late node `L` meshed only with `M`; on the code before wave I `L` did not see the descriptor within two minutes). At each slot the host now signs the same content again with a higher sequence number (`OnionServiceStateMachine.refreshDescriptor`: same introduction points, authentication keys and encryption key; sequence number, `notValidAfter` and signature are new). Such a version passes every receiver's pre-check, is `Valid` and is forwarded over several hops. The senders limit the refresh versions of one service to 4 per minute (`PublicationRateGuard`, the token is taken only for a version that was really produced), below the receivers' per-author rate of 6 per minute; genuine descriptors are always sent and count against the same budget, so many genuine changes within one minute can exceed 6 (refreshes are skipped meanwhile, a receiver may drop the surplus version); the receiver limits and the acceptance policy are unchanged, and `ServiceDescriptorRefreshConformanceTest` drives the real validator with its default limits along the worst timeline (lowest and highest jitter, failed first attempts, a change of the introduction points in the first minute). If the guard is empty, the host has nothing to refresh (an introduction point is not established) or no refresh is configured, the same descriptor is repeated as before. A genuine new descriptor (change, hourly) is always sent. At most 12 retries and repeats per hour, of which 4 are reserved for retries of a failed first send; an expired descriptor is never sent. The host's session lock is taken before the republisher's monitor; the republisher never calls the host while holding its own monitor (`ServiceDescriptorRepublisherTest`, 1000 rounds against a simulated host lock).
+* *What the fresh versions show:* up to six signed versions of one service descriptor in the first five minutes after a start instead of one version plus identical repetitions. They carry no new field and are linkable through the service key anyway; the pattern marks a freshly started host, as the record, the prekey bundle and the millisecond sequence numbers already do. This is one of the questions in link:external-review.adoc[external-review.adoc].
 * *Circuit budget:* each publication builds its own circuit under the existing circuit-build governor, which is not bypassed; at most about three objects times six publications plus retries within the first six minutes after a start; later descriptors of the same run add one send each plus failure retries, without a new burst.
 * *Honest limit:* a node that subscribes later than about 5 minutes after the publisher's start still sees the entry only at the hourly republication. A catch-up (index sync or relay-side replay) would be a separate wave.
 
@@ -1068,6 +1073,128 @@ Still open:
 * *Assumption, confirmation required:* `--anonymity-padding` offers only `standard` and `off`; the cover budget is fixed in the code.
 * *Assumption, confirmation required:* the eighth status line of the browser panel and its wording were written by the implementation; the design team's review of the wording is outstanding.
 
+[[wave-i]]
+== Multi-node tests, Sybil simulation and review package (wave V0.10.0-I, unreleased)
+
+*What it is.* Tests on real loopback nodes for situations that earlier waves did not cover, a simulation of the real path selection against a Sybil adversary, and the document that prepares an external review. No wire format, persistence format or option changed. *The only change in production code* is the fresh descriptor version described under <<early-republication>>.
+
+[[multi-node-tests]]
+=== Multi-node tests
+
+All of them run real nodes on `127.0.0.1` with an injected locator that gives each relay a synthetic /16 network. *They verify the logic on loopback, not behaviour over real networks, behind NATs or under load.*
+
+[cols="3,3,2", options="header"]
+|===
+| Scenario | What is asserted | Test class
+| A late node `L`, meshed only with a node `M` that already holds A's service descriptor
+| `L` receives the descriptor without any restart of A; `L` was connected to `M` only (the test fails if `L` ever dialled a relay); on the code before wave I this test is red
+| `MultiNodeDescriptorMultiHopVisibilityTest`
+| The primary guard `P` of A goes down (seven relays, relay descriptor TTL 40 s)
+| Builds fail at the first hop and are counted; the persisted primary stays `P` and no rotation happens (a single outage must not rotate the guard); nothing is announced from A's own node; once `P`'s descriptor has expired the backup is the first hop, A publishes a new service descriptor and a peer connects and exchanges ten messages. The 72-hour and 24-hour rotation rules are covered by `GuardManagerTest`
+| `MultiNodeGuardFailoverTest`
+| Mode switch by restart: ON, then NORMAL, then ON again with the same data directory
+| In NORMAL mode the peer resolves A as direct and is refused with `recipient-not-reachable-anonymously`, without any circuit; back in ON mode the guard is the same, the onion address is new, and a message is delivered. The test does not assert whether the Double Ratchet session is continued across the restart
+| `MultiNodeDmModeSwitchRestartTest`
+| Mail after a restart with a new onion address
+| A small mail and a circuit mail with an attachment arrive exactly once; the sender builds no failing connection towards the old descriptor
+| `MultiNodeMailOverCircuitsTest`
+| Call signals after a restart with a new onion address
+| INVITE, ACCEPT and HANGUP over circuits to the new descriptor; no media session remains; observers see only relays
+| `MultiNodeCallSignalsOverCircuitsTest`
+|===
+
+*Found by the tests, not fixed here.* A restarted node is a late subscriber without catch-up: it does not see the long-running peers until their next publication (hourly). A call that the restarted node has to answer needs the caller's record; `MultiNodeCallSignalsOverCircuitsTest` therefore restarts the caller as well when the restarted node does not see it within 25 seconds, the way the other multi-node tests restart the unseen node. A catch-up path is a separate wave.
+
+[[sybil-simulation]]
+=== Sybil simulation
+
+*What it is.* `SybilPathSimulation` (test sources of `lapis-net-onion-wire`) drives the real `OnionPathSelector`, `GuardManager` and path policy, without any network and without a mock, over a synthetic population of 100 relays in which an adversary controls a share `f` of the relays. Per client, a fresh guard manager chooses a guard; the client then builds 20 circuits. Measured: the chance that the guard is adversarial (`P(G)`), that the drawn last hop is adversarial (`P(E)`), that both are (`P(G and E)`), that at least one of the 20 circuits has both, and that the guards of two independent clients (the two ends of a conversation) are both adversarial. Each cell reports the proportion with its 95 % Wilson score interval. `f^2` is shown for comparison only (what a uniform choice without any policy would give).
+
+*Model assumptions (assumptions, not facts).*
+
+* 100 relays; the adversary controls 5, 10, 20 or 33 percent.
+* Honest relays: reputation spread evenly over 0.5 to 0.95, every tenth without history; each in its own /16 network (a second variant puts them into 20 shared /16 networks).
+* The addresses are self-declared (see <<path-policy>>), so the adversary can claim any network: `DISTINCT_V4_16` (every adversarial relay in its own /16) is the realistic attack; `SAME_V4_16`, `SAME_V6_48` and `NO_ADDRESS` show what the diversity rule alone achieves.
+* The adversary's reputation is either none (`NEW`) or the maximum (`MAXIMAL`). Madli is a weight and never a gate.
+* Seed `20261027`; the run is deterministic.
+
+*Hard guarantees of the policy (asserted by `SybilPathSimulationTest` in `check`).* If the adversary's relays share one /16, one /48 or have no address, no circuit has an adversarial guard and an adversarial last hop at the same time: two relays of one network never share a path, and at most one relay of unknown network is allowed. With distinct declared addresses there is no such guarantee.
+
+*Not modelled.* A global observer; timing correlation beyond the guard-and-exit pair; circuits with a prescribed last hop (introduction and rendezvous circuits); churn; the guard lifetime over time (the adversary's chance to be chosen at some point in 30 to 60 days); an adversary that also manipulates the honest relays' reputation.
+
+*Honest framing.* The figures are a simulation of this code under these assumptions, not a guarantee and not a measurement of a real network. They are an input for the external review (see link:external-review.adoc[external-review.adoc]), not its result.
+
+*Result of the full run* (20,000 clients per cell, 20 circuits per client, seed `20261027`, generated by `./gradlew clean :lapis-net-onion-wire:test --tests '*SybilPathSimulationTest*' -PlapisSybilFull=true`; the output is `lapis-net-onion-wire/build/sybil-simulation/table.adoc`). Columns: `f` share of adversarial relays; `P(G)` guard adversarial; `P(E)` drawn last hop adversarial; `P(G and E)` both, first circuit; `P(any G and E ...)` at least one of 20 circuits; `P(both ends G)` the guards of two independent clients both adversarial; `f^2` the uniform comparison. Values are percent with the 95 % Wilson interval.
+
+[cols="1.2,2.2,2.2,2.2,1", options="header"]
+|===
+| f | Placement | Reputation | P(G) | P(E) | P(G and E) | P(any G and E in 20 circuits) | P(both ends G) | f^2
+| 5% | DISTINCT_V4_16 | NEW | 0.47% (0.38-0.57) | 0.36% (0.28-0.45) | 0.00% (0.00-0.02) | 0.02% (0.01-0.04) | 0.00% (0.00-0.02) | 0.25%
+| 5% | DISTINCT_V4_16 | MAXIMAL | 7.34% (6.99-7.71) | 7.63% (7.27-8.01) | 0.43% (0.35-0.53) | 5.10% (4.80-5.41) | 0.50% (0.41-0.61) | 0.25%
+| 5% | SAME_V4_16 | NEW | 0.47% (0.38-0.57) | 0.36% (0.28-0.45) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.25%
+| 5% | SAME_V4_16 | MAXIMAL | 7.34% (6.99-7.71) | 6.76% (6.42-7.11) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.50% (0.41-0.61) | 0.25%
+| 5% | SAME_V6_48 | NEW | 0.47% (0.38-0.57) | 0.36% (0.28-0.45) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.25%
+| 5% | SAME_V6_48 | MAXIMAL | 7.34% (6.99-7.71) | 6.76% (6.42-7.11) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.50% (0.41-0.61) | 0.25%
+| 5% | NO_ADDRESS | NEW | 0.47% (0.38-0.57) | 0.36% (0.28-0.45) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.25%
+| 5% | NO_ADDRESS | MAXIMAL | 7.34% (6.99-7.71) | 6.76% (6.42-7.11) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.50% (0.41-0.61) | 0.25%
+| 10% | DISTINCT_V4_16 | NEW | 0.90% (0.78-1.04) | 0.82% (0.70-0.95) | 0.01% (0.00-0.03) | 0.13% (0.09-0.19) | 0.00% (0.00-0.02) | 1.00%
+| 10% | DISTINCT_V4_16 | MAXIMAL | 14.25% (13.77-14.74) | 14.75% (14.27-15.25) | 1.98% (1.80-2.19) | 13.41% (12.94-13.89) | 1.90% (1.72-2.10) | 1.00%
+| 10% | SAME_V4_16 | NEW | 0.90% (0.78-1.04) | 0.81% (0.69-0.94) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 1.00%
+| 10% | SAME_V4_16 | MAXIMAL | 10.02% (9.61-10.44) | 8.45% (8.07-8.84) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.90% (0.78-1.04) | 1.00%
+| 10% | SAME_V6_48 | NEW | 0.90% (0.78-1.04) | 0.81% (0.69-0.94) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 1.00%
+| 10% | SAME_V6_48 | MAXIMAL | 10.02% (9.61-10.44) | 8.45% (8.07-8.84) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.90% (0.78-1.04) | 1.00%
+| 10% | NO_ADDRESS | NEW | 0.90% (0.78-1.04) | 0.81% (0.69-0.94) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 1.00%
+| 10% | NO_ADDRESS | MAXIMAL | 10.02% (9.61-10.44) | 8.45% (8.07-8.84) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.90% (0.78-1.04) | 1.00%
+| 20% | DISTINCT_V4_16 | NEW | 1.85% (1.67-2.05) | 1.88% (1.70-2.08) | 0.02% (0.01-0.05) | 0.53% (0.44-0.65) | 0.01% (0.00-0.04) | 4.00%
+| 20% | DISTINCT_V4_16 | MAXIMAL | 27.36% (26.74-27.98) | 27.31% (26.69-27.93) | 7.07% (6.73-7.44) | 27.31% (26.69-27.93) | 7.40% (7.05-7.77) | 4.00%
+| 20% | SAME_V4_16 | NEW | 1.85% (1.67-2.05) | 1.83% (1.65-2.03) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.01% (0.00-0.04) | 4.00%
+| 20% | SAME_V4_16 | MAXIMAL | 9.99% (9.58-10.41) | 8.04% (7.67-8.42) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.96% (0.83-1.10) | 4.00%
+| 20% | SAME_V6_48 | NEW | 1.85% (1.67-2.05) | 1.83% (1.65-2.03) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.01% (0.00-0.04) | 4.00%
+| 20% | SAME_V6_48 | MAXIMAL | 9.99% (9.58-10.41) | 8.04% (7.67-8.42) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.96% (0.83-1.10) | 4.00%
+| 20% | NO_ADDRESS | NEW | 1.85% (1.67-2.05) | 1.83% (1.65-2.03) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.01% (0.00-0.04) | 4.00%
+| 20% | NO_ADDRESS | MAXIMAL | 9.99% (9.58-10.41) | 8.04% (7.67-8.42) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.96% (0.83-1.10) | 4.00%
+| 33% | DISTINCT_V4_16 | NEW | 3.65% (3.39-3.91) | 3.74% (3.49-4.01) | 0.16% (0.11-0.22) | 1.81% (1.63-2.00) | 0.12% (0.08-0.18) | 10.89%
+| 33% | DISTINCT_V4_16 | MAXIMAL | 43.09% (42.41-43.78) | 42.99% (42.31-43.68) | 18.24% (17.71-18.78) | 43.09% (42.41-43.78) | 18.37% (17.84-18.91) | 10.89%
+| 33% | SAME_V4_16 | NEW | 3.65% (3.39-3.91) | 3.43% (3.18-3.69) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.12% (0.08-0.18) | 10.89%
+| 33% | SAME_V4_16 | MAXIMAL | 9.76% (9.36-10.18) | 7.78% (7.41-8.15) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.98% (0.85-1.12) | 10.89%
+| 33% | SAME_V6_48 | NEW | 3.65% (3.39-3.91) | 3.43% (3.18-3.69) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.12% (0.08-0.18) | 10.89%
+| 33% | SAME_V6_48 | MAXIMAL | 9.76% (9.36-10.18) | 7.78% (7.41-8.15) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.98% (0.85-1.12) | 10.89%
+| 33% | NO_ADDRESS | NEW | 3.65% (3.39-3.91) | 3.43% (3.18-3.69) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.12% (0.08-0.18) | 10.89%
+| 33% | NO_ADDRESS | MAXIMAL | 9.76% (9.36-10.18) | 7.78% (7.41-8.15) | 0.00% (0.00-0.02) | 0.00% (0.00-0.02) | 0.98% (0.85-1.12) | 10.89%
+| 5% | DISTINCT_V4_16 (honest in 20 /16) | NEW | 0.47% (0.38-0.57) | 0.46% (0.38-0.56) | 0.00% (0.00-0.02) | 0.03% (0.01-0.07) | 0.00% (0.00-0.02) | 0.25%
+| 5% | DISTINCT_V4_16 (honest in 20 /16) | MAXIMAL | 7.34% (6.99-7.71) | 7.98% (7.61-8.36) | 0.40% (0.32-0.50) | 5.32% (5.01-5.63) | 0.50% (0.41-0.61) | 0.25%
+| 10% | DISTINCT_V4_16 (honest in 20 /16) | NEW | 0.90% (0.78-1.04) | 0.90% (0.77-1.04) | 0.02% (0.01-0.04) | 0.16% (0.11-0.23) | 0.00% (0.00-0.02) | 1.00%
+| 10% | DISTINCT_V4_16 (honest in 20 /16) | MAXIMAL | 14.25% (13.77-14.74) | 15.55% (15.05-16.05) | 2.02% (1.83-2.22) | 13.42% (12.95-13.90) | 1.90% (1.72-2.10) | 1.00%
+| 20% | DISTINCT_V4_16 (honest in 20 /16) | NEW | 1.85% (1.67-2.05) | 2.15% (1.96-2.36) | 0.03% (0.01-0.07) | 0.60% (0.50-0.71) | 0.01% (0.00-0.04) | 4.00%
+| 20% | DISTINCT_V4_16 (honest in 20 /16) | MAXIMAL | 27.36% (26.74-27.98) | 28.48% (27.85-29.10) | 7.30% (6.95-7.67) | 27.28% (26.67-27.91) | 7.40% (7.05-7.77) | 4.00%
+| 33% | DISTINCT_V4_16 (honest in 20 /16) | NEW | 3.65% (3.39-3.91) | 3.98% (3.72-4.26) | 0.14% (0.10-0.20) | 1.91% (1.73-2.11) | 0.12% (0.08-0.18) | 10.89%
+| 33% | DISTINCT_V4_16 (honest in 20 /16) | MAXIMAL | 43.09% (42.41-43.78) | 43.99% (43.30-44.67) | 18.28% (17.75-18.82) | 43.09% (42.41-43.78) | 18.37% (17.84-18.91) | 10.89%
+|===
+
+Clients per cell: 20000. Circuits that ended as "insufficient relays" over all cells: 0.
+
+*Reading the table.*
+
+* With every adversarial relay in one /16, one /48 or without an address, `P(G and E)` is zero in all cells: the diversity rule works as designed. But the adversary does not have to cooperate with it: addresses are self-declared, so the realistic row is `DISTINCT_V4_16`.
+* With distinct declared addresses and no history (`NEW`), the adversary stays far below `f`: the cap for relays without history holds (at 33 % of the relays, `P(G)` is 3.65 %).
+* With distinct declared addresses and the maximal reputation, the adversary is chosen far more often than its share: at 33 % of the relays `P(G)` is 43 % and `P(G and E)` 18 %, against 10.9 % for a uniform choice; at 20 % it is 27 % and 7 %. Madli is a weight, so a Sybil adversary that obtains a high reputation turns the weighting to its advantage. The simulation takes the reputation as given; how expensive it is to obtain, and whether the reputation of honest relays can be inflated or deflated, is not modelled.
+* The guard is chosen once and kept for 30 to 60 days, so `P(any G and E ...)` is close to `P(G)` in the rows with a maximal reputation: once the guard is adversarial, an adversarial last hop appears within 20 circuits almost surely (43.09 % against 43.09 % at 33 %). The longer a guard is kept, the more this applies.
+* Spreading the honest relays over only 20 /16 networks changes the figures little.
+* No circuit ended as "insufficient relays".
+
+
+=== The review package
+
+link:external-review.adoc[external-review.adoc] describes scope, protocols, known limits, reviewer questions and how to reproduce the tests. *No external cryptographic or anonymity review has taken place.*
+
+=== Honest limits of wave I
+
+* Everything was verified on loopback with an injected locator; the Sybil figures come from a model.
+* The fresh-version republication changes what a network observer sees of a freshly started host (up to six signed versions in five minutes); the question is open in the review package.
+* The late-subscriber limit for records and bundles remains: a node that restarts sees long-running peers only after their next publication.
+* The mode-switch test does not assert that the ratchet session survives a restart.
+* No external cryptographic or anonymity review has taken place; the transport key is still the identity key.
+
 == Incentives and operation
 
 Running a relay is opt-in per node and can be switched off. Relay reliability will be a Madli metric analogous to the existing relay-reliability metric. No payment in part 1; Lightning or Virtus incentives remain an open option. Operators need bandwidth and circuit limits; the foundation already bounds circuits, creation rate and cell rate (`OnionRelayLimits`).
@@ -1192,6 +1319,6 @@ Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and
 | F2 | Done (unreleased): mail over circuits (rendezvous-stream bundles up to 1 MiB with attachments, small mail also as sealed items on the shared topic), off the per-recipient topic, no DHT pointer and no Nabu fetch; new module `lapis-net-mail-onion`, generic `SealedMailboxBox` with a kind byte, `MAIL` service application. Both ends must be in anonymity mode, no fallback. Calls unchanged.
 | G | Done (unreleased): call signals over circuits (online only, same ratchet session, no reply route); calls off in anonymity mode by default; `--anonymity-allow-call-media=true` allows them with a confirmation per call, media stays direct and reveals the IP address; reduced SDP candidates (public host only); `CIRCUIT_LOST`; no wire change.
 | H | Done (unreleased): padding and timing protection against a local observer: size classes inside the end-to-end layer (frame types 4 and 5), cover `DROP` cells to hop 2 on a randomised schedule with a budget, 50 ms egress slices with a burst tail, a warm circuit pool (one use each), `--anonymity-padding=standard|off`. Not protection against a global passive observer; the return direction, mailbox item counts and the introduction circuit stay open. See <<padding-and-timing>>.
-| I | Multi-node tests, Sybil simulation, external cryptographic review recommended.
+| I | Done (unreleased): multi-node tests (late subscriber behind a holder, guard failover, mode switch by restart, mail and call signals after a restart with a new onion address), Sybil simulation of the real path selection, fresh signed service descriptor versions at the repeat slots (found by the multi-node test), and the review package link:external-review.adoc[external-review.adoc]. The external review itself has not taken place. See <<wave-i>>.
 | J (later) | GossipSub, DHT and content fetches.
 |===

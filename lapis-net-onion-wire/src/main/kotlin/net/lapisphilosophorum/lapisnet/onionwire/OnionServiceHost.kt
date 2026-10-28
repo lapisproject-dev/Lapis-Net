@@ -90,6 +90,23 @@ class OnionServiceHost internal constructor(
         return firstPublish
     }
 
+    /**
+     * Re-signs the current descriptor content as a fresh version and hands it to the publisher (early republication,
+     * see [ServiceDescriptorRepublisher]). Takes the session lock; must therefore never be called while holding the
+     * republisher's monitor.
+     *
+     * @return `true` if a new version was produced, `false` if the host is stopped or not all introduction points are
+     * established yet
+     */
+    internal fun refreshDescriptor(): Boolean =
+        locked {
+            if (stopped) return@locked false
+            val commands = machine.refreshDescriptor()
+            if (commands.isEmpty()) return@locked false
+            drain { execute(commands) }
+            true
+        }
+
     /** Runs [block] under the session lock, then the deferred application callbacks OUTSIDE of it. */
     private fun <T> locked(block: () -> T): T {
         val r = synchronized(lock) { block() }

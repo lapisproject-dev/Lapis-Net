@@ -41,7 +41,8 @@ and Farcaster have millions of users and mature client ecosystems; Lapis Net doe
   off in anonymity mode unless `--anonymity-allow-call-media=true`; the rest of the network layer still shows your IP
   address to peers. Since unreleased wave V0.10.0-H message sizes and timing are padded against a local observer
   (`--anonymity-padding=standard|off`), which is not protection against an observer of both ends.
-  See link:docs/anonymity.adoc[docs/anonymity.adoc].
+  See link:docs/anonymity.adoc[docs/anonymity.adoc]. No external cryptographic or anonymity review has taken place;
+  link:docs/external-review.adoc[docs/external-review.adoc] prepares one.
 * There is no embedded Lightning node (proof verification only), no group calls, no video and no
   multi-device messaging.
 

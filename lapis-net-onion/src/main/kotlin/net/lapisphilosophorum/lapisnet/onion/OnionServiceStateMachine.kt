@@ -529,6 +529,29 @@ class OnionServiceStateMachine(
         }
     }
 
+    /**
+     * Re-signs the current descriptor content as a NEW version (higher sequence number) if all introduction slots are
+     * ready: same introduction points, authentication keys and encryption key; only the sequence number, the
+     * `notValidAfter` and the signature change. Used by the early republication: a byte-identical repeat is ignored
+     * (not forwarded) by every node that already holds it, a fresh version is forwarded over several hops.
+     * Does not touch the hourly publication clock.
+     *
+     * @return the [ServiceCommand.Publish], or an empty list if not all slots are ready (nothing to refresh) or the
+     * service is stopped
+     */
+    @Synchronized
+    fun refreshDescriptor(): List<ServiceCommand> {
+        if (stopped || !started || !slots.all { it.ref != null }) return emptyList()
+        val out = ArrayList<ServiceCommand>(1)
+        val before = lastPublishMillis
+        val wasDirty = dirty
+        publish(out)
+        // the hourly clock and a pending change publication stay as they were
+        lastPublishMillis = before
+        dirty = wasDirty
+        return out
+    }
+
     private fun publish(out: MutableList<ServiceCommand>) {
         val nowSec = now() / 1000
         val entries = slots.map { IntroPointEntry(checkNotNull(it.relay), checkNotNull(it.authKey).publicKey) }

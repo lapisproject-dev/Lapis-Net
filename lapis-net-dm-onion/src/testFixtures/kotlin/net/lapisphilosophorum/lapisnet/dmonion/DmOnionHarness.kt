@@ -6,13 +6,19 @@ import io.libp2p.core.ConnectionHandler
 import io.libp2p.core.PeerId
 import io.libp2p.core.PeerInfo
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeRetirement
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeState
+import net.lapisphilosophorum.lapisnet.directory.DirectoryModeTransition
+import net.lapisphilosophorum.lapisnet.directory.DirectoryReachability
 import net.lapisphilosophorum.lapisnet.directory.InMemoryDirectoryModeStore
+import net.lapisphilosophorum.lapisnet.directory.PeerCapability
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
+import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
+import net.lapisphilosophorum.lapisnet.identity.Ed25519PublicKey
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
@@ -161,7 +167,11 @@ class DmOnionNode(
         net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig.STANDARD,
 ) {
     val key: Secp256k1PublicKey get() = identity.secp256k1KeyPair.publicKey
-    val serviceKey: Ed25519KeyPair = Ed25519KeyPair.generate()
+    var serviceKey: Ed25519KeyPair = Ed25519KeyPair.generate()
+        private set
+
+    /** Wave I: `true` makes every [start] generate a NEW service key, i.e. a new onion address (as a real restart does). */
+    var freshServiceKeyPerStart: Boolean = false
     val prekeys: PrekeyStore = PrekeyStore.create(dir.resolve("prekeys"), identity, oneTimePrekeyCount = 30)
     private val modeStore =
         InMemoryDirectoryModeStore(
@@ -191,6 +201,7 @@ class DmOnionNode(
     var running = false
 
     fun start() {
+        if (freshServiceKeyPerStart) serviceKey = Ed25519KeyPair.generate()
         node = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
         node.addConnectionHandler(
             ConnectionHandler { conn -> connectedPeers += conn.secureSession().remoteId },
@@ -271,6 +282,73 @@ class DmOnionNode(
         running = true
     }
 
+    var normalRunning = false
+        private set
+
+    /**
+     * Wave I: starts this identity in NORMAL mode (anonymity mode OFF) on the same data directory and mode store, the
+     * way a restart without `--anonymity` does it: the anonymous record of the earlier run is retired by a revocation,
+     * then an address-bearing peer record is announced. No DM stack and no anonymity runtime. Call [stopNormalMode]
+     * before the next [start].
+     */
+    fun startNormalMode() {
+        check(!running && !normalRunning) { "already running" }
+        node = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
+        storage = NabuStorage.attach(node, dir.resolve("storage").also { Files.createDirectories(it) })
+        pubsub = GossipPubSub.attach(node)
+        peerDirectory = PeerDirectoryGossip.attach(pubsub, storage)
+        bundleGossip = PrekeyBundleGossip.attach(pubsub, storage)
+        supervisor = NodeServiceSupervisor("dm-onion-node-normal")
+        wire =
+            OnionWire.attach(
+                node,
+                identity,
+                fastConfig(false),
+                pubsub,
+                peerDirectory,
+                supervisor,
+                dir.resolve("relay.onionkeys"),
+                null,
+                Clock.systemUTC(),
+                DirectoryAnonymityMode.OFF,
+                null,
+                bundleGossip,
+            )
+        relays.forEach { node.connect(PeerInfo(it.node.peerId, it.node.listenAddresses())) }
+        val descriptors = relays.map { it.wire.currentDescriptor()!! }
+        check(
+            awaitCondition(Duration.ofSeconds(90)) {
+                descriptors.all { wire.descriptors.current(it.identity, Clock.systemUTC().millis() / 1000) != null }
+            },
+        ) { "relay descriptors did not converge" }
+        val transition = DirectoryModeTransition(identity, modeStore)
+        check(DirectoryModeRetirement.onNormalStart(transition) { wire.announceRevocation(it) }) {
+            "the revocation could not be sent"
+        }
+        peerDirectory.announce(
+            PeerRecord.create(
+                identity,
+                node.listenAddresses(),
+                setOf(PeerCapability.DM),
+                transition.nextSequence(DirectoryAnonymityMode.OFF),
+                Clock.systemUTC().millis() / 1000 + 600,
+            ),
+        )
+        normalRunning = true
+    }
+
+    fun stopNormalMode() {
+        if (!normalRunning) return
+        normalRunning = false
+        runCatching { supervisor.stopAll() }
+        runCatching { wire.close() }
+        runCatching { peerDirectory.stop() }
+        runCatching { bundleGossip.stop() }
+        runCatching { pubsub.stop() }
+        runCatching { storage.stop() }
+        runCatching { node.stop() }
+    }
+
     /** Hooks for rigs that add services on top of the DM stack (after the DM stack is up / before it is stopped). */
     var onStarted: (DmOnionNode) -> Unit = {}
     var onStopping: (DmOnionNode) -> Unit = {}
@@ -300,3 +378,10 @@ class DmOnionNode(
         runCatching { node.stop() }
     }
 }
+
+/** Wave I: whether [viewer] resolves this node as hidden behind exactly the onion service [serviceKey]. */
+fun DmOnionNode.isSeenBehindService(
+    viewer: DmOnionNode,
+    serviceKey: Ed25519PublicKey,
+): Boolean =
+    (viewer.runtime.resolveIdentity(key) as? DirectoryReachability.Hidden)?.descriptor?.serviceKey == serviceKey

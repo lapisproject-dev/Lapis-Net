@@ -1,0 +1,230 @@
+= Preparing an external cryptographic and anonymity review (wave V0.10.0-I)
+:toc:
+
+Back to the link:../README.adoc[README]. Normative design source: link:anonymity.adoc[anonymity.adoc].
+
+== Status and purpose
+
+*No external cryptographic or anonymity review has taken place. This document prepares one; it does not report one.*
+
+The traffic anonymisation arc (waves V0.10.0-A to V0.10.0-I) is unreleased. No release tag contains it; the wave identifiers are not release numbers. Everything below describes the code as it stands at the commit the maintainers hand over (see <<what-a-review-needs>>). The experimental option `--anonymity=on` is off by default and every start warns that it is incomplete.
+
+The purpose of this document is to let a reviewer start work without a guided tour: what is in scope, what the claims are, where each protocol lives, what is already known to be weak, which questions the authors cannot answer themselves, and how to run the tests that pin the behaviour. Statements about security properties here are claims of the authors, checked by their own tests, not findings of an independent party.
+
+== Scope
+
+*In scope*
+
+* `lapis-net-onion`: cell format, ntor-style handshake, onion layers, relay state machine, introduction and rendezvous roles, onion addresses, service descriptors, HPKE introduction, end-to-end layer, hidden-service state machines. No network code.
+* `lapis-net-onion-wire`, including the packages `path` (path selection, guards, circuit governor) and `anonymity` (`AnonymityRuntime`, padding, cover traffic, warm circuit pool): link protocol, key persistence, relay descriptors, publication of directory objects through circuits, republication of service descriptors.
+* `lapis-net-dm-onion`, `lapis-net-mail-onion` and the call-signal path in `lapis-net-call`: how direct messages, mail and call signals travel over rendezvous streams, and the sealed mailbox items of the offline path.
+* The parts of `lapis-net-directory` that concern anonymous peer records, service descriptors, their indices and gossip validators, and the publication objects.
+* The embedding of X3DH and the Double Ratchet (`lapis-net-ratchet`, `lapis-net-dm`) into this transport: frame types, size classes, what the sealed item adds.
+
+*Out of scope*
+
+* Decoupling the libp2p transport key from the identity key. This is open and is the largest remaining leak (see <<known-limits>>).
+* Wave J: GossipSub, the DHT and content fetches in anonymity mode.
+* WebRTC call media. It is not anonymised and cannot be.
+* Trust (Veritas), Karma, Madli internals beyond their use as a path weight, LTR and the economy.
+* The browser UI.
+
+== Threat model
+
+The full table is in xref:anonymity.adoc#threat-model[the threat model of anonymity.adoc]. In short: a local observer, a single malicious relay, colluding relays and Sybil identities, a malicious receiver and a global passive observer are considered. *A global passive observer is not defended*, and neither is an observer who sees both ends of a circuit. Call media, the libp2p mesh, DHT lookups and content fetches still show identity and IP address. The recipient of a message learns the sender's identity; only the network is blinded.
+
+== Module map
+
+[kuml, external-review-modules, svg]
+----
+import dev.kuml.c4.dsl.c4Model
+
+c4Model(name = "OnionStackModules") {
+    lateinit var onion: dev.kuml.c4.model.C4Container
+    lateinit var wire: dev.kuml.c4.model.C4Container
+    lateinit var directory: dev.kuml.c4.model.C4Container
+    lateinit var dm: dev.kuml.c4.model.C4Container
+    lateinit var mail: dev.kuml.c4.model.C4Container
+    val stack = softwareSystem(name = "Anonymity stack under review") {
+        onion = container(name = "lapis-net-onion") {
+            technology = "Kotlin, no network code"
+        }
+        wire = container(name = "lapis-net-onion-wire") {
+            technology = "Kotlin, libp2p stream /lapis/onion/1.0.0"
+        }
+        directory = container(name = "lapis-net-directory") {
+            technology = "Kotlin, GossipSub validators and indices"
+        }
+        dm = container(name = "lapis-net-dm-onion") {
+            technology = "Kotlin, X3DH and Double Ratchet over rendezvous streams"
+        }
+        mail = container(name = "lapis-net-mail-onion") {
+            technology = "Kotlin, mail bundles over rendezvous streams"
+        }
+    }
+    relationship(source = wire, target = onion) { technology = "cells, handshake, layers" }
+    relationship(source = wire, target = directory) { technology = "descriptor gossip" }
+    relationship(source = dm, target = wire) { technology = "AnonymityRuntime" }
+    relationship(source = mail, target = dm) { technology = "stream framing" }
+    containerDiagram(name = "Module map") {
+        system = stack
+    }
+}
+----
+
+[cols="2,3,3", options="header"]
+|===
+| Module | Responsibility | Core classes
+| `lapis-net-onion` | Cells, handshake, onion layers, relay behaviour and limits, hidden-service protocol and state machines | `NtorHandshake`, `HopCipher`, `OnionRelay`, `OnionServiceDescriptor`, `OnionServiceStateMachine`, `RendezvousClientStateMachine`
+| `lapis-net-onion-wire` | Links, onion keys, relay and service descriptors on the wire, circuits, path selection, guards, publication, padding | `OnionLinkManager`, `OnionRelayService`, `OnionServiceHost`, `ServiceDescriptorRepublisher`, `OnionPathSelector`, `GuardManager`, `CircuitBuildGovernor`, `AnonymityRuntime`, `EgressShaper`, `CoverTrafficScheduler`, `WarmCircuitPool`
+| `lapis-net-directory` | Anonymous peer records, service descriptor index and gossip, relay descriptor index and gossip, mode transitions | `AnonymousPeerRecord`, `OnionServiceDescriptorIndex`, `OnionServiceDescriptorGossip`, `DirectoryModeTransition`, `PublicationRateGuard`
+| `lapis-net-dm-onion` | Direct messages over rendezvous streams, sealed mailbox items, re-announcement | `OnionDmTransport`, `OnionDmInboundHandler`, `AnonymousMailboxRedelivery`, `AnonymousMailboxSubscriber`, `FrameSizeClasses`
+| `lapis-net-mail-onion` | Mail bundles over rendezvous streams, retry queue | `OnionMailTransport`, `OnionMailRetryQueue`
+|===
+
+== Protocols
+
+Each protocol lists the facts a reviewer needs, where the authoritative description is, and which test pins it. The facts were taken from `anonymity.adoc` and the code at the handover commit; where the two ever disagree, the code is authoritative and the disagreement is a finding.
+
+=== Cell format and codec
+
+Every cell is exactly 1024 bytes: `circuitId(4) | command(1) | body(1019)`. Commands: PADDING (circuit id 0 only), CREATE, CREATED, RELAY, DESTROY. The parser has no length field and compares the input size to 1024 before copying. Unused body space is random. Description: xref:anonymity.adoc[anonymity.adoc], "Cell format". Tests: `CellCodecTest` (module `lapis-net-onion`), `CellFrameDecoderTest` (module `lapis-net-onion-wire`).
+
+=== Circuit handshake (ntor-style over X25519)
+
+The construction follows the published ntor description and is reimplemented, not copied. Protocol id `LapisNet:ntor-x25519-sha256:v1`. `KEY_SEED` and `AUTH` are HMAC-SHA256 over the secret input, the keys come from HKDF-SHA256 (64 bytes, forward and backward key). CREATE and EXTEND carry a `hopIndex` byte that selects the layer size and is bound into every AEAD's associated data. The pinned test vector is a self-generated regression vector, *not* an external known-answer test.
+
+[kuml, external-review-rendezvous, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Rendezvous with an onion service") {
+    val service = lifeline(name = "Service")
+    val intro = lifeline(name = "Introduction point")
+    val client = lifeline(name = "Client")
+    val rdv = lifeline(name = "Rendezvous point")
+
+    message(from = service, to = intro, label = "ESTABLISH_INTRO (signed with a fresh auth key)")
+    message(from = client, to = rdv, label = "ESTABLISH_RENDEZVOUS (cookie)")
+    message(from = client, to = intro, label = "INTRODUCE1 (HPKE to the service encryption key)")
+    message(from = intro, to = service, label = "INTRODUCE2 (same 273 bytes)")
+    message(from = service, to = rdv, label = "RENDEZVOUS1 (cookie, Y, AUTH)")
+    message(from = rdv, to = client, label = "RENDEZVOUS2 (Y, AUTH)")
+    message(from = client, to = service, label = "RENDEZVOUS_DATA, 929-byte end-to-end blobs, spliced")
+}
+----
+
+The circuit-build sequence (CREATE, EXTEND, CREATED, EXTENDED) is drawn in xref:anonymity.adoc[anonymity.adoc], section "Handshake (ntor over X25519)". Tests: `NtorHandshakeTest` (regression vector), `OnionKdfTest`, `ForwardSecrecyTest`, `ClientCircuitBuilderFailureTest`.
+
+=== Onion layers and the anti-tagging rule
+
+A layer for hop `i` has size `1019 - (i-1)*17` (16 tag bytes plus one type byte). ChaCha20-Poly1305 (RFC 8439) with an implicit nonce `directionTag(4) | counter(8)`; the counter is never transmitted, there is no replay window, and a failed open poisons the cipher. Every byte not covered by the receiving hop's tag is discarded and regenerated with fresh randomness (anti-tagging). Maximum 5 hops, production path length 3. A circuit lives at most 10 minutes or 2^32 cells per direction. Description: "Onion layers and the anti-tagging rule". Tests: `HopCipherTest`, `OnionLayerCryptoTest`, `ZeroizationTest`.
+
+=== Link encryption
+
+Cells travel over the dedicated libp2p stream `/lapis/onion/1.0.0`, which sits inside the libp2p Noise session. The Noise session protects the link only; the onion layers are independent of it. Description: "Link encryption" and "Stream protocol `/lapis/onion/1.0.0`". Tests: `OnionLinkManagerTest`, `OnionLinkProtocolAbuseTest`.
+
+=== Rendezvous and introduction
+
+Ten relay commands (codes 6 to 15), fixed body lengths with no length field. The introduction uses HPKE (RFC 9180, base mode, `DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, ChaCha20-Poly1305) to the service's X25519 encryption key; `info` binds the service id and the auth key. The end-to-end handshake reuses the ntor construction with the protocol id `LapisNet:hs-ntor-x25519-sha256:v1`; end-to-end blobs are exactly 929 bytes (910 bytes of data). The same X25519 key serves HPKE and the end-to-end ntor handshake, separated by labels. *There is no Tor-style key blinding* (rejected: it needs point arithmetic the crypto provider does not expose); onion addresses and introduction points are enumerable and descriptors of one service are linkable over time. Description: xref:anonymity.adoc#receiver-side[Receiver side and rendezvous]. Tests: `HiddenServiceCryptoTest`, `HiddenServiceFlowTest`, `MultiNodeRendezvousTest`.
+
+=== Service descriptor and publication through circuits
+
+A service descriptor is `ver(1) | serviceKey(32) | seq(8) | notValidAfter(8) | encKey(32) | count(1) | count x [relay onion key binding(137) | authKey(32)] | signature(64)`, at most 653 bytes, one to three introduction points. Objects reach the network through a circuit: relay command `DIRECTORY_PUBLISH` with a body of exactly 720 bytes (`type(1) | length(2) | object(<= 717) | random padding`), acknowledged with a status byte. The relay validates the object with the same functions as the gossip validators and announces it; the mesh sees the relay as publisher. Receivers apply per-author (6/min), per-peer (12/min) and global (60/min) limits after a cheap pre-check that ignores duplicates and stale versions without spending budget.
+
+*Changed in wave I:* the repeat slots of the early republication no longer send a byte-identical copy. The host signs a fresh version of the same content with a higher sequence number (`OnionServiceStateMachine.refreshDescriptor`), at most four versions per minute per service (`PublicationRateGuard`), below the receivers' limit. A byte-identical repeat is ignored by every node that already holds the descriptor and is therefore not forwarded; a late subscriber that is meshed only with such nodes never received it. The old behaviour is reproduced by `MultiNodeDescriptorMultiHopVisibilityTest` on the code before this wave (the late node did not receive the descriptor within two minutes); the new behaviour passes it.
+
+[kuml, external-review-refresh, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "Service descriptor: first publication and fresh versions") {
+    val host = lifeline(name = "OnionServiceHost")
+    val republisher = lifeline(name = "ServiceDescriptorRepublisher")
+    val relay = lifeline(name = "Publish relay (last hop)")
+    val holder = lifeline(name = "Node that holds the descriptor")
+    val late = lifeline(name = "Late subscriber behind the holder")
+
+    message(from = host, to = republisher, label = "submit(version n), under the host lock")
+    message(from = republisher, to = relay, label = "DIRECTORY_PUBLISH through a circuit")
+    message(from = relay, to = holder, label = "announce (valid, forwarded)")
+    message(from = republisher, to = host, label = "slot due: refresh() outside the republisher monitor")
+    message(from = host, to = republisher, label = "submit(version n+1): same content, new signature")
+    message(from = republisher, to = relay, label = "DIRECTORY_PUBLISH (at most 4 versions per minute)")
+    message(from = relay, to = holder, label = "announce (pre-check passes: higher sequence)")
+    message(from = holder, to = late, label = "forward (a byte-identical repeat would be ignored here)")
+}
+----
+
+Tests: `ServiceDescriptorRepublisherTest`, `ServiceDescriptorRefreshConformanceTest` (the real validator with default limits along the worst timeline), `HiddenServiceFlowTest` (`refreshDescriptor`), `MultiNodeDescriptorMultiHopVisibilityTest`.
+
+=== Mailbox items (offline path)
+
+An offline message or small mail is sealed to the recipient's long-term X25519 identity key: exactly 5,728 bytes, `version(1) | ephemeralX25519(32) | AEAD(...) | tag(16)`, key `HKDF-SHA256(X25519(ephemeral, recipient), salt = ephemeral || recipient, info = "LapisNet:anonymous-mailbox-item:v1")`, ChaCha20-Poly1305 with a zero nonce, one key per item. There is no sender signature; the ratchet decryption inside is the only proof of the sender. There is *no forward secrecy for the sealing layer*. A relay (role `MAILBOX_PUBLISH`, body exactly 720 bytes in eight fragments) announces the item on one shared GossipSub topic; every anonymity-mode node tries to open every item. The sender re-announces every 10 minutes (plus or minus 2) for up to 48 hours. Description: xref:anonymity.adoc#dm-over-circuits[Direct messages over circuits], "Offline path". Tests: `SealedMailboxItemCodecTest` (module `lapis-net-dm`), `SealedMailboxBoxTest` (module `lapis-net-directory`), `OnionRelayMailboxPublishTest`, `MultiNodeDmOverCircuitsTest`, `MultiNodeMailOverCircuitsTest`.
+
+=== X3DH and Double Ratchet embedded in the stream
+
+The ratchet is unchanged; what changes is the transport. A rendezvous stream starts with a HELLO frame (`"LNSV" | version | appId`) and then carries `type(1) | len(4) | bytes` frames split into messages of at most 910 bytes. The acknowledgement is one constant byte, sent as soon as the frame is complete and queued, never after processing, so its timing is no oracle for decryption or acceptance policy. A reply does not use the incoming stream; the answering node builds its own circuit. Description: "Online path". Tests: `MultiNodeDmOverCircuitsTest`, `MultiNodeDmModeSwitchRestartTest`, `MultiNodeCallSignalsOverCircuitsTest`.
+
+=== Padding and timing
+
+Size classes inside the end-to-end layer (frame types 4 and 5: a power of two of cells, capped at the largest legal frame), cover `DROP` cells to hop 2 on a `U(0.5, 1.5) x 4 s` schedule with a token bucket (1 KiB/s, burst 16 cells), 50 ms egress slices with a three-slice cover tail, and a warm pool of up to two pre-built circuits, each used once. Protects against a *local* observer of the guard connection only. Description: xref:anonymity.adoc#padding-and-timing[Padding and timing protection]. Tests: `EgressShaperTest`, `CoverTrafficSchedulerTest`, `WarmCircuitUsageTest`, `MultiNodeTrafficPaddingTest`.
+
+=== Path selection, guards and Sybil resistance
+
+Hop 1 is a persistent primary guard (two guards, lifetime 30 to 60 days, state encrypted at rest in `onion/guards.bin`). Hard diversity: no relay twice, no two relays in the same IPv4 /16 or IPv6 /48, at most one relay of unknown network, optionally no family. Soft weights from the Madli reliability (floor 0.02, 0.05 without history), relays without history capped at 15 % of the weight, one network bucket capped at `max(0.10, 1/buckets)`. The addresses are *self-declared and unverified*. Description: xref:anonymity.adoc#path-policy[Path selection and policy]. The behaviour under a Sybil adversary is simulated in xref:anonymity.adoc#sybil-simulation[Sybil simulation (wave I)]; the model, its assumptions and the numbers are there. Tests: `OnionPathSelectorTest`, `OnionPathSelectorWeightingTest`, `GuardManagerTest`, `SybilPathSimulationTest`, `MultiNodeGuardFailoverTest`.
+
+[[known-limits]]
+== Known limits and leak inventory
+
+* Leak inventory: xref:anonymity.adoc#known-leaks[Known leaks today] and the per-wave inventories ("Leak inventory after wave F1", "F2", "G", "H").
+* Honest limits per wave: the sections "Honest limits of wave B", "C", "D", "E", "F1", "F2", "G", "H" and the multi-node section of wave I in `anonymity.adoc`.
+* The libp2p transport key is the identity key; every direct connection of the node (mesh, DHT, Bitswap, Identify) shows identity and IP address.
+* The handshake test vector is generated by the authors (one cross-check against an independent script); there is no external known-answer test.
+* Zeroisation of key material on the JVM is best effort: the garbage collector may have copied arrays before they are overwritten.
+* The service descriptor index and gossip have a documented Sybil limit: a valid descriptor costs nothing, and about 61 per minute exhaust the global budget. The fresh-version republication of wave I does not change any receiver limit.
+* A node that subscribes later than about five minutes after a publisher's start sees that publisher only at the hourly republication (no catch-up path). Observed in the wave I multi-node tests: a restarted node does not see long-running peers until their next publication.
+* Everything was verified on loopback with an injected locator that gives each relay a synthetic /16, not over real networks, behind NATs or under load.
+
+== Questions for reviewers
+
+. Is the ntor variant, including the transcript binding of `ID`, `B`, `X`, `Y` and `PROTOID` and the added `hopIndex` byte, secure as a circuit handshake?
+. Does the anti-tagging rule (regenerating every byte outside the receiving hop's tag) suffice against tagging by colluding non-adjacent relays, including tagging through teardown behaviour?
+. Does the HPKE introduction (info and aad binding, one X25519 key shared with the end-to-end ntor handshake) have replay or key-compromise-impersonation weaknesses beyond the stated absence of forward secrecy?
+. The onion address scheme has no key blinding. What does the linkability of descriptors over time cost in practice, and is a cheaper mitigation than blinding available?
+. Does the sealing construction of the mailbox items (long-term recipient key, zero nonce with a fresh key per item, no sender signature) leak anything about sender, recipient or content to a subscriber who cannot open the item, or to the relay that announces it?
+. Are the size classes (powers of two of cells) and the fixed 5,728-byte item a sufficient length-hiding choice for the traffic this system carries?
+. Are the guard parameters (two guards, 30 to 60 days, replacement after three first-hop failures over 24 hours or 72 hours without a descriptor, at most one failure rotation per 24 hours) and the /16 and /48 diversity rule appropriate when addresses are self-declared?
+. Is the methodology of the Sybil simulation sound (model, sample size, the choice to measure guard, exit and guard-and-exit on the real selector), and which adversary placements or reputations does it miss?
+. Is the republication of the service descriptor as fresh signed versions (new in wave I: up to six signed versions in the first five minutes) a fingerprint for a freshly started host, beyond what the record, the prekey bundle and the millisecond sequence number already show?
+. Is the denial-of-service surface of the service descriptor index (global budget of 60 per minute, capacity 4096, no eviction of valid entries) acceptable, and does the additional signature verification caused by fresh versions open a new amplification path?
+
+[[reproducing]]
+== Reproducing the tests
+
+* Toolchain: JDK 25, Gradle wrapper in the repository, Linux or macOS.
+* Full build with all tests: `./gradlew clean check`. Expect roughly 55 to 60 minutes on a developer laptop. `ktlint` is part of `check`.
+* One spec: `./gradlew clean :lapis-net-onion-wire:test --tests '*MultiNodeGuardFailoverTest*'`.
+* Sybil simulation, small sample (part of `check`): `--tests '*SybilPathSimulationTest*'`. Full run for the published table: `./gradlew clean :lapis-net-onion-wire:test --tests '*SybilPathSimulationTest*' -PlapisSybilFull=true`; the output is `lapis-net-onion-wire/build/sybil-simulation/table.adoc`.
+* Timing-sensitive multi-node specs depend on the speed of the machine. To reproduce a failure on a slow machine pin the build to few CPUs (Linux): `taskset -c 0,1 ./gradlew ...`, see `CONTRIBUTING.adoc`.
+* Known flake: `MultiNodeHolePunchTest` (module `lapis-net-networking`) can fail once with `PunchDialLost`; it is unrelated to the anonymity stack.
+
+[cols="3,2", options="header"]
+|===
+| Scenario | Test class
+| Late subscriber behind a node that already holds a service descriptor | `MultiNodeDescriptorMultiHopVisibilityTest`
+| Failure of the primary guard, failover to the backup | `MultiNodeGuardFailoverTest`
+| Direct messages, mode switch ON to OFF to ON by restart | `MultiNodeDmModeSwitchRestartTest`
+| Mail after a restart with a new onion address | `MultiNodeMailOverCircuitsTest`
+| Call signals after a restart with a new onion address | `MultiNodeCallSignalsOverCircuitsTest`
+| Descriptor republication, unit and conformance | `ServiceDescriptorRepublisherTest`, `ServiceDescriptorRefreshConformanceTest`
+| Path selection under a Sybil adversary | `SybilPathSimulationTest`
+|===
+
+[[what-a-review-needs]]
+== What a review would need from the maintainers
+
+* The commit hash of the state to be reviewed: _to be entered by the maintainers at handover_.
+* A contact for questions: _to be entered by the maintainers_.
+* Agreement on how findings are reported and whether the authors may publish them.
+* Optionally a test network of relays; all current verification uses loopback nodes.

@@ -28,3 +28,10 @@ dependencies {
     // Test-only SLF4J backend: OnionWireLoggingHygieneTest captures log output.
     testImplementation(rootProject.libs.logback.classic)
 }
+
+// Wave I: the Sybil simulation has a small sample that runs in `check` and a full run (20,000 clients per cell, minutes)
+// that produces the table in docs/anonymity.adoc. It is switched on with -PlapisSybilFull=true and never runs in `check`.
+// providers.gradleProperty keeps the task configuration-cache compatible.
+tasks.test {
+    systemProperty("lapis.sybil.full", providers.gradleProperty("lapisSybilFull").getOrElse("false"))
+}

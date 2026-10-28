@@ -1,10 +1,12 @@
 package net.lapisphilosophorum.lapisnet.onionwire
 
+import io.kotest.assertions.fail
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord
 import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
 import net.lapisphilosophorum.lapisnet.directory.DirectoryRepublishSchedule
+import net.lapisphilosophorum.lapisnet.directory.PublicationRateGuard
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
@@ -14,7 +16,11 @@ import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptorCodec
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 
 /** A scheduler with a due list and a manual clock; cancelled entries never run. */
@@ -265,6 +271,216 @@ class ServiceDescriptorRepublisherTest :
                 runCatching { r.submit(descriptor(1, s.now)) }
                 s.advanceBy(5.seconds.inWholeMilliseconds + 1_000)
                 calls.size shouldBe 2
+            }
+        }
+
+        /** Simulates the host: every refresh re-signs the content as a version with the next sequence number. */
+        class RefreshingHost(
+            private val s: ManualScheduler,
+            startSeq: Long = 1,
+        ) {
+            var seq = startSeq
+            var calls = 0
+            var produce = true
+            lateinit var republisher: ServiceDescriptorRepublisher
+
+            fun refresh(): Boolean {
+                calls++
+                if (!produce) return false
+                seq++
+                republisher.submit(descriptor(seq, s.now))
+                return true
+            }
+        }
+
+        fun refreshing(
+            scheduler: ManualScheduler,
+            channel: DirectoryPublicationChannel,
+            host: RefreshingHost,
+            guard: PublicationRateGuard? = PublicationRateGuard(4, 60_000L) { scheduler.now },
+            maxPerHour: Int = 12,
+        ) = ServiceDescriptorRepublisher(
+            channel,
+            scheduler::schedule,
+            { scheduler.now },
+            noJitter,
+            maxEarlySendsPerHour = maxPerHour,
+            retryReserve = 0,
+            refresh = host::refresh,
+            versionGuard = guard,
+        ).also { host.republisher = it }
+
+        test("at the slots a fresh version is sent: strictly rising sequence numbers, no byte-identical repeat") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            val host = RefreshingHost(s)
+            refreshing(s, channel, host).use { r ->
+                r.submit(descriptor(1, s.now))
+                s.advanceBy(10 * 60_000L)
+                channel.sent.size shouldBe 6 // the first send and one fresh version per slot
+                host.calls shouldBe 5
+                channel.sent.map { it.sequenceNumber } shouldBe (1L..6L).toList()
+                channel.sent
+                    .map { OnionServiceDescriptorCodec.encode(it).toList() }
+                    .distinct()
+                    .size shouldBe 6
+                channel.maxInFlight shouldBe 1
+                s.pending() shouldBe 0 // the schedule runs to its end
+            }
+        }
+
+        test("an empty version guard falls back to the identical repeat and asks the host for nothing") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            val host = RefreshingHost(s)
+            val exhausted = PublicationRateGuard(1, 3_600_000L) { s.now }
+            exhausted.tryAcquire() shouldBe true
+            refreshing(s, channel, host, guard = exhausted).use { r ->
+                val d = descriptor(1, s.now)
+                r.submit(d)
+                s.advanceBy(10 * 60_000L)
+                host.calls shouldBe 0
+                channel.sent.size shouldBe 6
+                channel.sent.all { it == d } shouldBe true
+            }
+        }
+
+        test("a host that has nothing to refresh leads to the identical repeat") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            val host = RefreshingHost(s).also { it.produce = false }
+            refreshing(s, channel, host).use { r ->
+                val d = descriptor(1, s.now)
+                r.submit(d)
+                s.advanceBy(10 * 60_000L)
+                host.calls shouldBe 5
+                channel.sent.size shouldBe 6
+                channel.sent.all { it == d } shouldBe true
+            }
+        }
+
+        test("a host that produced nothing does not consume version guard tokens") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            val host = RefreshingHost(s).also { it.produce = false }
+            val guard = PublicationRateGuard(4, 3_600_000L) { s.now }
+            refreshing(s, channel, host, guard = guard).use { r ->
+                r.submit(descriptor(1, s.now))
+                s.advanceBy(10 * 60_000L)
+                host.calls shouldBe 5
+            }
+            // only the genuine first send took a token; the 5 unproductive refresh attempts took none: 3 remain
+            List(3) { guard.tryAcquire() }.all { it } shouldBe true
+            guard.tryAcquire() shouldBe false
+        }
+
+        test("a refresh version whose send fails does not stop the remaining slots") {
+            val s = ManualScheduler()
+            val channel =
+                DescriptorChannel { CompletableFuture.completedFuture(it != 1) } // the first fresh version fails
+            val host = RefreshingHost(s)
+            refreshing(s, channel, host).use { r ->
+                r.submit(descriptor(1, s.now))
+                s.advanceBy(10 * 60_000L)
+                channel.sent.size shouldBe 6
+                host.calls shouldBe 5
+                s.pending() shouldBe 0
+            }
+        }
+
+        test("the hourly cap of early sends still applies to fresh versions") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            val host = RefreshingHost(s)
+            refreshing(s, channel, host, maxPerHour = 3).use { r ->
+                r.submit(descriptor(1, s.now))
+                s.advanceBy(10 * 60_000L)
+                channel.sent.size shouldBe 4 // the first send and three capped early sends
+            }
+        }
+
+        test("the version guard keeps the sends of one descriptor lifetime at four per minute") {
+            val s = ManualScheduler()
+            val host = RefreshingHost(s)
+            val times = ArrayList<Long>()
+            val channel =
+                DescriptorChannel {
+                    times += s.now
+                    CompletableFuture.completedFuture(true)
+                }
+            refreshing(s, channel, host).use { r ->
+                r.submit(descriptor(1, s.now))
+                s.advanceBy(10 * 60_000L)
+            }
+            (times.size >= 6) shouldBe true
+            for (t in times) (times.count { it in t until t + 60_000L } <= 4) shouldBe true
+        }
+
+        test("close during a running refresh leaves nothing behind") {
+            val s = ManualScheduler()
+            val channel = DescriptorChannel()
+            lateinit var r: ServiceDescriptorRepublisher
+            var seq = 1L
+            r =
+                ServiceDescriptorRepublisher(
+                    channel,
+                    s::schedule,
+                    { s.now },
+                    noJitter,
+                    retryReserve = 0,
+                    refresh = {
+                        r.close()
+                        seq++
+                        r.submit(descriptor(seq, s.now))
+                        true
+                    },
+                    versionGuard = PublicationRateGuard(4, 60_000L) { s.now },
+                )
+            r.submit(descriptor(1, s.now))
+            s.advanceBy(10 * 60_000L)
+            channel.sent.size shouldBe 1
+            s.pending() shouldBe 0
+        }
+
+        test("refresh never runs under the republisher monitor: no deadlock against submit under a host lock") {
+            val pool = List(64) { descriptor(it + 1L, System.currentTimeMillis()) }
+            val hostLock = Any()
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                repeat(1000) { iteration ->
+                    val next = AtomicInteger(0)
+                    lateinit var r: ServiceDescriptorRepublisher
+                    r =
+                        ServiceDescriptorRepublisher(
+                            DescriptorChannel(),
+                            { _, task -> executor.submit(Runnable { task() }) }, // slots fire at once, on a pool thread
+                            System::currentTimeMillis,
+                            DirectoryRepublishSchedule(jitterFraction = 0.0),
+                            retryReserve = 0,
+                            // like the real host: takes its session lock, then calls submit
+                            refresh = {
+                                synchronized(hostLock) { r.submit(pool[next.incrementAndGet()]) }
+                                true
+                            },
+                            versionGuard = PublicationRateGuard(1_000, 60_000L, System::currentTimeMillis),
+                        )
+                    val genuine =
+                        executor.submit {
+                            repeat(10) {
+                                // the host publishes under its session lock and calls submit inside
+                                synchronized(hostLock) { r.submit(pool[next.incrementAndGet()]) }
+                            }
+                        }
+                    try {
+                        genuine.get(20, TimeUnit.SECONDS)
+                    } catch (e: TimeoutException) {
+                        fail("deadlock between the host lock and the republisher monitor (iteration $iteration)")
+                    } finally {
+                        r.close()
+                    }
+                }
+            } finally {
+                executor.shutdownNow()
             }
         }
     })
