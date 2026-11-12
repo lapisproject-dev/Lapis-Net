@@ -119,8 +119,20 @@ class MultiNodeCallSignalsOverCircuitsTest :
             var attempts = 0
             while (received.getValue(to).none { it.sender == from.rig.key } && attempts < 6) {
                 attempts++
-                runCatching { from.rig.dm.sendAuto(to.rig.key, DmContent(body = "hello")) }
-                awaitCondition(Duration.ofSeconds(30)) { received.getValue(to).any { it.sender == from.rig.key } }
+                val t0 = System.currentTimeMillis()
+                val outcome =
+                    runCatching { from.rig.dm.sendAuto(to.rig.key, DmContent(body = "hello")) }
+                        .fold({ it.toString() }, { "threw ${it.javaClass.simpleName}" })
+                val got =
+                    awaitCondition(Duration.ofSeconds(30)) { received.getValue(to).any { it.sender == from.rig.key } }
+                println(
+                    "TIMELINE call: session attempt $attempts ${if (got) "OK" else "FAILED"} " +
+                        "after ${System.currentTimeMillis() - t0} ms, send outcome $outcome",
+                )
+                if (!got) {
+                    println("TIMELINE call: sender ${from.rig.diagnosticsLine()}")
+                    println("TIMELINE call: receiver ${to.rig.diagnosticsLine()}")
+                }
             }
             withClue("DM session ${from.rig.key.fingerprint()} -> ${to.rig.key.fingerprint()}") {
                 received.getValue(to).any { it.sender == from.rig.key } shouldBe true
@@ -137,6 +149,7 @@ class MultiNodeCallSignalsOverCircuitsTest :
                 for (attempt in 1..4) {
                     val converged = awaitCondition(Duration.ofSeconds(75)) { pairs.all { (v, o) -> sees(v, o) } }
                     if (converged) break
+                    println("TIMELINE call: restart branch entered (attempt $attempt)")
                     pairs.filter { (v, o) -> !sees(v, o) }.map { it.second }.distinct().forEach {
                         it.rig.stop()
                         it.rig.start()

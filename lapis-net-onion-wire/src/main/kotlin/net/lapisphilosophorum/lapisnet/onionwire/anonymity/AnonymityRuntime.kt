@@ -143,6 +143,29 @@ class AnonymityRuntime private constructor(
         )
     }
 
+    /**
+     * Coarse counters for load diagnostics (tests, bug reports): governor admissions per purpose, rendezvous client
+     * failures and service-side drops. Contains no targets, addresses or fingerprints.
+     */
+    fun diagnostics(): AnonymityDiagnostics {
+        val st = host.serviceStats()
+        return AnonymityDiagnostics(
+            admissions =
+                governor.admissionStats().entries.associate { (p, c) ->
+                    (p?.name ?: "WARM") to
+                        "granted=${c.granted} delayed=${c.delayed} poolFull=${c.poolFull} dropped=${c.dropped} " +
+                        "locked=${c.locked} failed=${c.failed}"
+                },
+            maxConsecutiveFailures = governor.maxConsecutiveFailuresSeen(),
+            rendezvousFailures = rendezvousClient.failureStats().mapKeys { it.key.name },
+            rendezvousFailureStates = rendezvousClient.failureStateStats().mapKeys { it.key.name },
+            serviceStats =
+                "accepted=${st.accepted} rateLimited=${st.rateLimited} concurrencyLimited=${st.concurrencyLimited} " +
+                    "malformed=${st.malformed} replays=${st.replays} cacheFull=${st.cacheFull} " +
+                    "unknownRendezvousPoint=${st.unknownRendezvousPoint}",
+        )
+    }
+
     /** The router that dispatches the streams reaching this node's onion service by application (wave V0.10.0-F1). */
     fun serviceRouter(): OnionServiceStreamRouter = router
 
@@ -531,3 +554,12 @@ private class RecordingChannel(
     override fun publishServiceDescriptor(descriptor: OnionServiceDescriptor) =
         watch(delegate.publishServiceDescriptor(descriptor))
 }
+
+/** Diagnostic snapshot of an [AnonymityRuntime] (see [AnonymityRuntime.diagnostics]). */
+data class AnonymityDiagnostics(
+    val admissions: Map<String, String>,
+    val maxConsecutiveFailures: Int,
+    val rendezvousFailures: Map<String, Long>,
+    val rendezvousFailureStates: Map<String, Long>,
+    val serviceStats: String,
+)

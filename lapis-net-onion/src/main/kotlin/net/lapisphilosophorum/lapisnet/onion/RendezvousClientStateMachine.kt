@@ -67,8 +67,11 @@ sealed interface ClientCommand {
         val e2e: RendezvousEndToEnd,
     ) : ClientCommand
 
+    /** The attempt failed with [reason] while in [atState], after [introAttempts] introduction points were tried (diagnostics only). */
     class Failed(
         val reason: RendezvousFailure,
+        val atState: RendezvousClientState = RendezvousClientState.FAILED,
+        val introAttempts: Int = 0,
     ) : ClientCommand
 }
 
@@ -284,10 +287,11 @@ class RendezvousClientStateMachine(
     }
 
     private fun fail(reason: RendezvousFailure): List<ClientCommand> {
-        logger.debug { "rendezvous attempt failed: $reason" }
+        val atState = state
+        logger.debug { "rendezvous attempt failed: $reason in $atState after $nextIntro intro attempt(s)" }
         val out = destroyAll()
         state = RendezvousClientState.FAILED
-        out += ClientCommand.Failed(reason)
+        out += ClientCommand.Failed(reason, atState, nextIntro)
         return out
     }
 

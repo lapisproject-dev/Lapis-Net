@@ -70,6 +70,9 @@ class OnionServiceHost internal constructor(
 
     val address: OnionServiceAddress get() = machine.onionAddress
 
+    /** Dropped-work counters of the service state machine (diagnostics, no identifiers). */
+    internal fun serviceStats(): net.lapisphilosophorum.lapisnet.onion.ServiceStats = machine.stats
+
     /** Number of rendezvous sessions currently open. */
     fun openSessions(): Int = synchronized(lock) { streams.size }
 

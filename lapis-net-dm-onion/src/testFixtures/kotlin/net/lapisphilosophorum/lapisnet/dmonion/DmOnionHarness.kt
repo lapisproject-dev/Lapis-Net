@@ -349,6 +349,22 @@ class DmOnionNode(
         runCatching { node.stop() }
     }
 
+    /**
+     * One line of coarse load diagnostics (governor counters, rendezvous failures by reason and state, service-side
+     * drops, connect failures seen by the port). No targets or fingerprints. Printed by the multi-node tests so that a
+     * red run under load can be classified from its output.
+     */
+    fun diagnosticsLine(): String =
+        if (!running) {
+            "not running"
+        } else {
+            val d = runtime.diagnostics()
+            "admissions=${d.admissions} maxConsecFailures=${d.maxConsecutiveFailures} " +
+                "rdvFailures=${d.rendezvousFailures} rdvFailureStates=${d.rendezvousFailureStates} " +
+                "service=[${d.serviceStats}] connectFailures=${port.connectFailures.size}" +
+                (port.connectFailures.lastOrNull()?.let { " lastConnectFailure=$it" } ?: "")
+        }
+
     /** Hooks for rigs that add services on top of the DM stack (after the DM stack is up / before it is stopped). */
     var onStarted: (DmOnionNode) -> Unit = {}
     var onStopping: (DmOnionNode) -> Unit = {}

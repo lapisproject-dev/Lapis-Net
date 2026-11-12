@@ -14,7 +14,9 @@ import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onion.RelayCommand
 import net.lapisphilosophorum.lapisnet.onion.RelayMessage
 import net.lapisphilosophorum.lapisnet.onion.RendezvousClientConfig
+import net.lapisphilosophorum.lapisnet.onion.RendezvousClientState
 import net.lapisphilosophorum.lapisnet.onion.RendezvousClientStateMachine
+import net.lapisphilosophorum.lapisnet.onion.RendezvousFailure
 import java.security.SecureRandom
 import java.time.Clock
 import java.util.concurrent.CompletableFuture
@@ -45,6 +47,18 @@ class OnionRendezvousClient internal constructor(
     private val openStreams = CopyOnWriteArraySet<OnionRendezvousStream>()
 
     @Volatile private var closed = false
+
+    private val failureCounts =
+        java.util.concurrent
+            .ConcurrentHashMap<RendezvousFailure, java.util.concurrent.atomic.AtomicLong>()
+    private val failureStateCounts =
+        java.util.concurrent.ConcurrentHashMap<RendezvousClientState, java.util.concurrent.atomic.AtomicLong>()
+
+    /** How often attempts failed, by reason (diagnostics, no targets). */
+    fun failureStats(): Map<RendezvousFailure, Long> = failureCounts.mapValues { it.value.get() }
+
+    /** How often attempts failed, by the state they were in (diagnostics, no targets). */
+    fun failureStateStats(): Map<RendezvousClientState, Long> = failureStateCounts.mapValues { it.value.get() }
 
     /** Attempts in flight (leak checks). */
     fun pendingAttempts(): Int = sessions.size
@@ -325,8 +339,22 @@ class OnionRendezvousClient internal constructor(
             val toClose = circuits.values.toList() + listOfNotNull(prebuilt.also { prebuilt = null })
             circuits.clear()
             toClose.forEach { runCatching { it.close() } }
-            logger.debug { "rendezvous attempt failed: ${c.reason}" }
-            result.completeExceptionally(IllegalStateException("rendezvous failed: ${c.reason}"))
+            failureCounts
+                .computeIfAbsent(c.reason) {
+                    java.util.concurrent.atomic
+                        .AtomicLong()
+                }.incrementAndGet()
+            failureStateCounts
+                .computeIfAbsent(c.atState) {
+                    java.util.concurrent.atomic
+                        .AtomicLong()
+                }.incrementAndGet()
+            logger.debug { "rendezvous attempt failed: ${c.reason} in ${c.atState}" }
+            result.completeExceptionally(
+                IllegalStateException(
+                    "rendezvous failed: ${c.reason} in ${c.atState} after ${c.introAttempts} intro attempt(s)",
+                ),
+            )
         }
     }
 }

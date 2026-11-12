@@ -76,6 +76,34 @@ class CircuitBuildGovernor(
     private var pendingPool = 0
     private var locked = false
     private val open = ArrayList<Open>()
+    private val counters = HashMap<CircuitPurpose?, LongArray>()
+    private var maxConsecutiveFailuresSeen = 0
+
+    /** Coarse diagnostic counters per purpose (no targets): admissions by outcome and failed builds. */
+    class AdmissionCounts(
+        val granted: Long,
+        val delayed: Long,
+        val poolFull: Long,
+        val dropped: Long,
+        val locked: Long,
+        val failed: Long,
+    )
+
+    private fun count(
+        purpose: CircuitPurpose?,
+        slot: Int,
+    ) {
+        counters.getOrPut(purpose) { LongArray(COUNTER_SLOTS) }[slot]++
+    }
+
+    /** Snapshot of the diagnostic counters, per purpose (`null` = warm circuits). */
+    fun admissionStats(): Map<CircuitPurpose?, AdmissionCounts> =
+        synchronized(lock) {
+            counters.mapValues { (_, c) -> AdmissionCounts(c[0], c[1], c[2], c[3], c[4], c[5]) }
+        }
+
+    /** Highest number of consecutive failed builds seen so far (the backoff exponent). */
+    fun maxConsecutiveFailuresSeen(): Int = synchronized(lock) { maxConsecutiveFailuresSeen }
 
     private fun isServiceRendezvous(purpose: CircuitPurpose?): Boolean = purpose == CircuitPurpose.RENDEZVOUS_RECEIVER
 
@@ -98,41 +126,56 @@ class CircuitBuildGovernor(
         targetKey: String,
     ): Admission =
         synchronized(lock) {
-            if (locked) return Admission.Locked
-            val now = clock.millis()
-            if (isServiceRendezvous(purpose)) {
-                // own bucket, no backoff: failures of attacker-named rendezvous points must not block the node's own builds
-                val elapsed = (now - rendezvousRefillMillis).coerceAtLeast(0)
-                rendezvousRefillMillis = now
-                rendezvousTokens =
-                    minOf(
-                        serviceRendezvousBurst.toDouble(),
-                        rendezvousTokens + elapsed * serviceRendezvousPerMinute / 60_000.0,
-                    )
-                if (rendezvousTokens < 1.0) return Admission.Dropped
-                rendezvousTokens -= 1.0
-                return Admission.Granted
-            }
-            if (now <
-                blockedUntilMillis
-            ) {
-                return Admission.Delayed((blockedUntilMillis - now).coerceAtLeast(1).milliseconds)
-            }
-            val pool = isPool(purpose)
-            if (pool &&
-                open.count { isPool(it.purpose) } + pendingPool >= maxOpenClientCircuits
-            ) {
-                return Admission.PoolFull
-            }
-            refill(now)
-            if (tokens < 1.0) {
-                val ms = ((1.0 - tokens) * 60_000.0 / ratePerMinute).toLong().coerceAtLeast(1)
-                return Admission.Delayed(ms.milliseconds)
-            }
-            tokens -= 1.0
-            if (pool) pendingPool++
-            Admission.Granted
+            val a = admitUncounted(purpose)
+            count(
+                purpose,
+                when (a) {
+                    Admission.Granted -> 0
+                    is Admission.Delayed -> 1
+                    Admission.PoolFull -> 2
+                    Admission.Dropped -> 3
+                    Admission.Locked -> 4
+                },
+            )
+            a
         }
+
+    private fun admitUncounted(purpose: CircuitPurpose?): Admission {
+        if (locked) return Admission.Locked
+        val now = clock.millis()
+        if (isServiceRendezvous(purpose)) {
+            // own bucket, no backoff: failures of attacker-named rendezvous points must not block the node's own builds
+            val elapsed = (now - rendezvousRefillMillis).coerceAtLeast(0)
+            rendezvousRefillMillis = now
+            rendezvousTokens =
+                minOf(
+                    serviceRendezvousBurst.toDouble(),
+                    rendezvousTokens + elapsed * serviceRendezvousPerMinute / 60_000.0,
+                )
+            if (rendezvousTokens < 1.0) return Admission.Dropped
+            rendezvousTokens -= 1.0
+            return Admission.Granted
+        }
+        if (now <
+            blockedUntilMillis
+        ) {
+            return Admission.Delayed((blockedUntilMillis - now).coerceAtLeast(1).milliseconds)
+        }
+        val pool = isPool(purpose)
+        if (pool &&
+            open.count { isPool(it.purpose) } + pendingPool >= maxOpenClientCircuits
+        ) {
+            return Admission.PoolFull
+        }
+        refill(now)
+        if (tokens < 1.0) {
+            val ms = ((1.0 - tokens) * 60_000.0 / ratePerMinute).toLong().coerceAtLeast(1)
+            return Admission.Delayed(ms.milliseconds)
+        }
+        tokens -= 1.0
+        if (pool) pendingPool++
+        return Admission.Granted
+    }
 
     /**
      * Like [admit], but for a speculative build (the warm pool of wave V0.10.0-H): `true` only if the build is granted
@@ -187,7 +230,9 @@ class CircuitBuildGovernor(
         synchronized(lock) {
             if (isPool(purpose) && pendingPool > 0) pendingPool--
             if (isServiceRendezvous(purpose)) return@synchronized
+            count(purpose, 5)
             consecutiveFailures = (consecutiveFailures + 1).coerceAtMost(MAX_FAILURES)
+            if (consecutiveFailures > maxConsecutiveFailuresSeen) maxConsecutiveFailuresSeen = consecutiveFailures
             val factor = 1L shl (consecutiveFailures - 1).coerceAtMost(MAX_SHIFT)
             val delay = minOf(backoffMax.inWholeMilliseconds, backoffMin.inWholeMilliseconds * factor)
             blockedUntilMillis = clock.millis() + delay
@@ -219,6 +264,7 @@ class CircuitBuildGovernor(
 
     private companion object {
         const val WARM_TOKEN_RESERVE = 1.0
+        const val COUNTER_SLOTS = 6
         const val MAX_SHIFT = 20
         const val MAX_FAILURES = 64
     }
