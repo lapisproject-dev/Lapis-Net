@@ -40,6 +40,15 @@ enum class DmMessageType(
 
     /** Active since V0.8.7 - see this enum's own class doc comment. */
     CALL_SIGNAL(3),
+
+    /**
+     * Authenticated refusal of a first-contact `X3DH_INITIAL` whose one-time prekey was already consumed or unknown,
+     * or whose signed-prekey id is stale. NOT a [DmEnvelope]: it has its own fixed-size frame
+     * ([DmX3dhRejectionCodec]) and is only ever read through [DmEnvelopeCodec.decodeFrame] on the two live doors
+     * (direct stream, circuit). [DmEnvelopeCodec.decode] - and therefore every mailbox path and every node older than
+     * this type - treats it as malformed and drops it silently.
+     */
+    X3DH_REJECTED(4),
     ;
 
     companion object {

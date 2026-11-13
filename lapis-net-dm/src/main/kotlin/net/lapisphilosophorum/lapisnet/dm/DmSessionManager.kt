@@ -17,13 +17,16 @@ import net.lapisphilosophorum.lapisnet.identity.KeystoreDecryptionException
 import net.lapisphilosophorum.lapisnet.identity.KeystoreEncryption
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
+import net.lapisphilosophorum.lapisnet.identity.X25519PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.ratchet.CorruptedRatchetSessionException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSession
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSessionCodec
+import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyConsumptionException
+import net.lapisphilosophorum.lapisnet.ratchet.PrekeyConsumptionFailure
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import net.lapisphilosophorum.lapisnet.ratchet.RatchetMessageRejectedException
 import net.lapisphilosophorum.lapisnet.ratchet.X3dh
@@ -35,17 +38,22 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
+import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -296,8 +304,11 @@ class DmSessionManager private constructor(
         object : DmInboundSink {
             override fun acceptCircuitEnvelope(envelopeBytes: ByteArray) {
                 try {
-                    val envelope = DmEnvelopeCodec.decode(envelopeBytes)
-                    dispatchAnonymousInbound(envelope, "circuit", AnonymousInboundDoor.CIRCUIT)
+                    when (val frame = DmEnvelopeCodec.decodeFrame(envelopeBytes)) {
+                        is DmInboundFrame.Envelope ->
+                            dispatchAnonymousInbound(frame.envelope, "circuit", AnonymousInboundDoor.CIRCUIT)
+                        is DmInboundFrame.X3dhRejection -> handleX3dhRejection(frame.rejection, "circuit")
+                    }
                 } catch (e: MalformedDmEnvelopeException) {
                     logger.debug { "rejected malformed DM envelope from a circuit" }
                 } catch (e: RuntimeException) {
@@ -490,6 +501,45 @@ class DmSessionManager private constructor(
     internal var replyRouteCapacityPerIdentity: Int = MAX_CALL_REPLY_ROUTES_PER_IDENTITY
 
     internal fun replyRouteCountForTesting(): Int = synchronized(replyRoutesLock) { replyRoutes.size }
+
+    private val ctrRejectedOtkConsumed = AtomicLong()
+    private val ctrRejectedOtkUnknown = AtomicLong()
+    private val ctrRejectedSpkMismatch = AtomicLong()
+    private val ctrRejectionsSent = AtomicLong()
+    private val ctrRejectionsSuppressed = AtomicLong()
+    private val ctrRejectionsAccepted = AtomicLong()
+    private val ctrRejectionsIgnored = AtomicLong()
+    private val ctrRebootstrapsAfterRejection = AtomicLong()
+    private val ctrRebootstrapsUnacked = AtomicLong()
+    private val ctrTextRejectedNoSession = AtomicLong()
+
+    /** First-contact handshake counters - see [DmDiagnostics]. Counts only, never keys or identities. */
+    fun diagnostics(): DmDiagnostics =
+        DmDiagnostics(
+            x3dhInitialRejectedOtkConsumed = ctrRejectedOtkConsumed.get(),
+            x3dhInitialRejectedOtkUnknown = ctrRejectedOtkUnknown.get(),
+            x3dhInitialRejectedSpkMismatch = ctrRejectedSpkMismatch.get(),
+            rejectionsSent = ctrRejectionsSent.get(),
+            rejectionsSuppressedByRateLimit = ctrRejectionsSuppressed.get(),
+            rejectionsAccepted = ctrRejectionsAccepted.get(),
+            rejectionsIgnored = ctrRejectionsIgnored.get(),
+            rebootstrapsAfterRejection = ctrRebootstrapsAfterRejection.get(),
+            rebootstrapsUnacked = ctrRebootstrapsUnacked.get(),
+            textRejectedNoSession = ctrTextRejectedNoSession.get(),
+        )
+
+    /**
+     * Test/diagnostics hook, `null` in production: called after every outbound [X3dh.initiate] with the recipient,
+     * the chosen one-time prekey id (`null` = none offered) and the bundle's sequence number. Public only because
+     * multi-node tests in other modules use it; it never receives key material.
+     */
+    @Volatile
+    var onOneTimePrekeyChosenForTest: ((recipient: Secp256k1PublicKey, otkId: Int?, bundleSequence: Long) -> Unit)? =
+        null
+
+    /** Test-only: picks the one-time prekey id passed to [X3dh.initiate] as `preferredOneTimePrekeyId`. */
+    @Volatile
+    internal var oneTimePrekeyChooserForTest: ((PrekeyBundle) -> Int?)? = null
 
     /** Bounds concurrent [PrekeyStore.consumeOneTimePrekey] calls triggered by inbound `X3DH_INITIAL`
      * envelopes - closes a DoS gap found in this wave's own review round 3.
@@ -747,15 +797,24 @@ class DmSessionManager private constructor(
      * fresh sender-side [DoubleRatchetSession] - exactly [send]'s own former inline first-contact
      * block, unchanged in substance.
      *
+     * [excluded] are one-time prekey ids the recipient already refused for this unacknowledged initiation chain;
+     * [awaitBundleNewerThan] (`-1` = none) requires a bundle with a higher sequence number (stale signed prekey).
+     *
      * @throws DmUnknownRecipientException if [prekeyBundleGossip] has no bundle for [recipient].
-     * @throws DmHandshakeFailedException if X3DH initiation against that bundle fails.
+     * @throws DmHandshakeFailedException if X3DH initiation against that bundle fails, if every offered one-time
+     *   prekey is excluded ("no unused one-time prekey offered"), or if no sufficiently fresh bundle is known yet.
      */
     private fun bootstrapSenderSession(
         recipient: Secp256k1PublicKey,
-    ): Pair<DoubleRatchetSession, X3dhPreKeyMessageHeader> {
+        excluded: Set<Int> = emptySet(),
+        awaitBundleNewerThan: Long = -1,
+    ): SenderBootstrap {
         val bundle =
             prekeyBundleGossip.lookup(recipient)
                 ?: throw DmUnknownRecipientException("no prekey bundle for recipient ${who(recipient)}")
+        if (bundle.sequenceNumber <= awaitBundleNewerThan) {
+            throw DmHandshakeFailedException("waiting for a newer prekey bundle of ${who(recipient)}")
+        }
         val ownBinding =
             EncryptionKeyBinding.create(
                 localIdentity.secp256k1KeyPair,
@@ -769,9 +828,17 @@ class DmSessionManager private constructor(
                     initiatorEncryptionBinding = ownBinding,
                     initiatorX25519IdentityPrivateKey = ownX25519Private,
                     bundle = bundle,
+                    preferredOneTimePrekeyId = oneTimePrekeyChooserForTest?.invoke(bundle)?.takeIf { it !in excluded },
+                    excludedOneTimePrekeyIds = excluded,
                     random = random,
                 )
             } catch (e: X3dhException) {
+                if (excluded.isNotEmpty() && bundle.oneTimePrekeys.all { it.id in excluded }) {
+                    throw DmHandshakeFailedException(
+                        "no unused one-time prekey offered by ${who(recipient)} - waiting for a fresher bundle",
+                        e,
+                    )
+                }
                 throw DmHandshakeFailedException(
                     "X3DH initiation failed against ${who(recipient)}'s bundle",
                     e,
@@ -779,10 +846,22 @@ class DmSessionManager private constructor(
             } finally {
                 ownX25519Private.destroy()
             }
+        val chosenOtkId = initiation.header.oneTimePrekeyId
+        logger.debug {
+            "X3DH initiation to ${who(recipient)}: one-time prekey id=${chosenOtkId ?: "none"} of " +
+                "${bundle.oneTimePrekeys.size} offered"
+        }
+        onOneTimePrekeyChosenForTest?.invoke(recipient, chosenOtkId, bundle.sequenceNumber)
         val newSession = DoubleRatchetSession.initializeSender(initiation.session, bundle.signedPrekey, random)
         initiation.session.destroy()
-        return newSession to initiation.header
+        return SenderBootstrap(newSession, initiation.header, bundle)
     }
+
+    private class SenderBootstrap(
+        val session: DoubleRatchetSession,
+        val header: X3dhPreKeyMessageHeader,
+        val bundle: PrekeyBundle,
+    )
 
     /**
      * Sends [content] to [recipient]: resolves [recipient]'s [PeerDirectoryGossip] record FIRST
@@ -801,7 +880,12 @@ class DmSessionManager private constructor(
      *
      * @throws DmUnknownRecipientException if [recipient] has no [PeerDirectoryGossip] record (checked
      *   first, before any session work) or no [PrekeyBundleGossip] bundle (first-contact only).
-     * @throws DmHandshakeFailedException if X3DH initiation against [recipient]'s bundle fails.
+     * @throws DmHandshakeFailedException if X3DH initiation against [recipient]'s bundle fails - since the
+     *   one-time-prekey collision fix also "no unused one-time prekey offered..." (every offered prekey was refused
+     *   for this still unacknowledged initiation) or "waiting for a newer prekey bundle" (stale signed prekey).
+     *   A refused `X3DH_INITIAL` is still reported as sent; recovery after an authenticated rejection is
+     *   asynchronous (see `docs/architecture.adoc`, "One-time-prekey collisions and authenticated handshake
+     *   rejection").
      * @throws DmSessionException for a dial/send timeout or failure, or if the session cannot
      *   currently send (should not happen for a caller-visible session - see
      *   [DoubleRatchetSession.canSend]).
@@ -946,6 +1030,9 @@ class DmSessionManager private constructor(
      * [sendAuto] avoids it entirely by building the envelope via [prepareEnvelopeLocked] EXACTLY
      * ONCE per call, then reusing those SAME encoded bytes for whichever delivery path is actually
      * taken - there is no second encrypt, so there is no second, wrong-typed envelope to leak.
+     *
+     * Returns [DmSendOutcome.SENT_ONLINE] also for an `X3DH_INITIAL` the recipient later refuses (one-time-prekey
+     * collision); the authenticated rejection and the re-bootstrap happen asynchronously. Throws as [send].
      */
     fun sendAuto(
         recipient: Secp256k1PublicKey,
@@ -1158,14 +1245,75 @@ class DmSessionManager private constructor(
         plaintext: ByteArray,
     ): DmEnvelope {
         var session = getCachedOrLoad(recipient)
+        val pending = loadPendingInitiation(recipient)
+        val nowSecond = clock.instant().epochSecond
+        var fallbackBoot: SenderBootstrap? = null
+        var fallbackExcluded: Set<Int>? = null
+        if (session != null && pending != null && shouldRebootstrapUnacked(pending, nowSecond)) {
+            // Fallback (a): an initiation the peer never answered, old enough and used often enough - rebuild it with
+            // a fresh bundle. The one-time prekey the current chain used is excluded as well: the peer has most likely
+            // consumed it, and a cached bundle usually still offers it (republished only when the pool runs low).
+            // The new session is built FIRST; only if that succeeds is the old one destroyed and its file deleted
+            // (under this same peer lock, before the new one is written). If no usable bundle is known (none at all,
+            // every offered id excluded, or stale), the existing session is kept and used as before - the fallback
+            // never leaves the peer without a session, and the next send tries again.
+            val excludedForFallback = capExcludedIds(pending.excludedIds + listOfNotNull(pending.oneTimePrekeyId))
+            val fresh =
+                try {
+                    bootstrapSenderSession(recipient, excludedForFallback, pending.awaitBundleNewerThan)
+                } catch (e: DmSessionException) {
+                    logger.debug {
+                        "keeping the unacknowledged session with ${who(recipient)} - no usable bundle for a rebuild " +
+                            "(${e::class.simpleName})"
+                    }
+                    null
+                }
+            if (fresh != null) {
+                discardSessionLocked(recipient)
+                clearReplayBuffer(recipient)
+                session = null
+                fallbackBoot = fresh
+                fallbackExcluded = excludedForFallback
+                ctrRebootstrapsUnacked.incrementAndGet()
+                logger.info { "re-initiating the unacknowledged session with ${who(recipient)} (no reply received)" }
+            }
+        }
         val envelope: DmEnvelope
+        var newPending: DmPendingInitiation? = null
         if (session == null) {
-            val (newSession, header) = bootstrapSenderSession(recipient)
+            val boot =
+                fallbackBoot ?: bootstrapSenderSession(
+                    recipient,
+                    pending?.excludedIds ?: emptySet(),
+                    pending?.awaitBundleNewerThan ?: -1,
+                )
+            val newSession = boot.session
             val ratchetMessage = newSession.encrypt(plaintext)
             envelope =
-                DmEnvelope(DmMessageType.X3DH_INITIAL, localIdentity.secp256k1KeyPair.publicKey, header, ratchetMessage)
+                DmEnvelope(
+                    DmMessageType.X3DH_INITIAL,
+                    localIdentity.secp256k1KeyPair.publicKey,
+                    boot.header,
+                    ratchetMessage,
+                )
             session = newSession
+            newPending =
+                DmPendingInitiation(
+                    responderX25519IdentityKey = boot.bundle.x25519IdentityKey.bytes,
+                    ephemeralPublicKey = boot.header.ephemeralPublicKey.bytes,
+                    signedPrekeyId = boot.header.signedPrekeyId,
+                    oneTimePrekeyId = boot.header.oneTimePrekeyId,
+                    bundleSequence = boot.bundle.sequenceNumber,
+                    initiatedAtEpochSecond = nowSecond,
+                    sendsSinceInitiation = 0,
+                    rejectionRebootstraps = pending?.rejectionRebootstraps ?: 0,
+                    unackedRebootstraps = (pending?.unackedRebootstraps ?: 0) + if (fallbackBoot != null) 1 else 0,
+                    gaveUp = pending?.gaveUp ?: false,
+                    awaitBundleNewerThan = -1,
+                    excludedIds = fallbackExcluded ?: pending?.excludedIds ?: emptySet(),
+                )
         } else {
+            if (pending != null) newPending = pending.copy(sendsSinceInitiation = pending.sendsSinceInitiation + 1)
             // NOTE (V0.8.5 hardening pass finding, 2026-08-27, tracked not fixed here): this
             // check(...) throws a bare IllegalStateException, outside this class's documented
             // @throws taxonomy - pre-existing, not introduced by this wave. See the historical note
@@ -1181,6 +1329,28 @@ class DmSessionManager private constructor(
         // DoubleRatchetSession's own persist/destroy-ordering rule 3.
         persistSession(recipient, session)
         putCached(recipient, session)
+        if (newPending != null) {
+            try {
+                savePendingInitiation(recipient, newPending)
+            } catch (e: java.io.IOException) {
+                if (envelope.messageType != DmMessageType.X3DH_INITIAL) {
+                    // Only the send counter of an existing record was not updated: fallback (a) may fire later.
+                    logger.warn {
+                        "could not update the pending initiation for ${who(recipient)} (${e::class.simpleName})"
+                    }
+                } else {
+                    // A new session without its pending record would send an X3DH_INITIAL that neither a rejection
+                    // nor fallback (a) could repair. Roll the new session back (nothing was sent yet) and fail.
+                    try {
+                        discardSessionLocked(recipient)
+                    } catch (cleanup: java.io.IOException) {
+                        e.addSuppressed(cleanup)
+                    }
+                    throw DmSessionException("could not record the new initiation with ${who(recipient)}", e)
+                }
+            }
+            bufferForReplay(recipient, plaintext)
+        }
         // V0.8.6 - "this node itself sent that peer a message" half of DmAcceptedContacts' own
         // class doc comment, made reachable. A no-op when this manager was attach()ed without an
         // acceptedContacts instance (every prior wave's behavior, unchanged).
@@ -1285,6 +1455,7 @@ class DmSessionManager private constructor(
                             "${controller::class.qualifiedName}, not a DmSendHandle",
                     )
             sendHandle.sendEnvelope(envelopeBytes)
+            onDirectFrameSentForTest?.invoke(envelopeBytes)
         } finally {
             dialSemaphore.release()
         }
@@ -1355,9 +1526,9 @@ class DmSessionManager private constructor(
         fromPeerId: PeerId,
         envelopeBytes: ByteArray,
     ) {
-        val envelope =
+        val frame =
             try {
-                DmEnvelopeCodec.decode(envelopeBytes)
+                DmEnvelopeCodec.decodeFrame(envelopeBytes)
             } catch (e: MalformedDmEnvelopeException) {
                 logger.debug(e) { "rejected malformed DM envelope from $fromPeerId" }
                 return
@@ -1365,7 +1536,10 @@ class DmSessionManager private constructor(
                 logger.warn(e) { "unexpected exception decoding DM envelope from $fromPeerId - rejecting" }
                 return
             }
-        processInboundDmEnvelope(envelope, "peer $fromPeerId", fromPeerId)
+        when (frame) {
+            is DmInboundFrame.Envelope -> processInboundDmEnvelope(frame.envelope, "peer $fromPeerId", fromPeerId)
+            is DmInboundFrame.X3dhRejection -> handleX3dhRejection(frame.rejection, "direct stream")
+        }
     }
 
     /**
@@ -1625,6 +1799,16 @@ class DmSessionManager private constructor(
                                         replenishOneTimePrekeysIfLow()
                                         result
                                     } catch (e: PrekeyConsumptionException) {
+                                        val reason =
+                                            if (e.reason == PrekeyConsumptionFailure.ALREADY_CONSUMED) {
+                                                ctrRejectedOtkConsumed.incrementAndGet()
+                                                DmX3dhRejectionReason.ONE_TIME_PREKEY_CONSUMED
+                                            } else {
+                                                ctrRejectedOtkUnknown.incrementAndGet()
+                                                DmX3dhRejectionReason.ONE_TIME_PREKEY_UNKNOWN
+                                            }
+                                        // The OTK stays consumed; no SPK-only retry. Only an enqueue here.
+                                        scheduleX3dhRejection(claimedSender, header, reason, onlinePeerId)
                                         logger.debug(e) {
                                             "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
                                                 "${who(claimedSender)} - rejecting"
@@ -1667,6 +1851,15 @@ class DmSessionManager private constructor(
                                                 consumedOneTimePrekey = consumed,
                                             )
                                         } catch (e: X3dhException) {
+                                            if (header.signedPrekeyId != localPrekeyStore.signedPrekeyId) {
+                                                ctrRejectedSpkMismatch.incrementAndGet()
+                                                scheduleX3dhRejection(
+                                                    claimedSender,
+                                                    header,
+                                                    DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH,
+                                                    onlinePeerId,
+                                                )
+                                            }
                                             logger.debug(e) {
                                                 "X3DH respond failed for claimed sender " +
                                                     "${who(
@@ -1706,6 +1899,7 @@ class DmSessionManager private constructor(
                                 // leaves its mailbox pointer pending so a later poll pass - after the
                                 // X3DH_INITIAL pointer has been processed and installed a session - can
                                 // deliver it, instead of permanently losing a genuinely valid message.
+                                ctrTextRejectedNoSession.incrementAndGet()
                                 logger.debug {
                                     "no session for claimed sender ${who(claimedSender)} - rejecting TEXT " +
                                         "envelope for now, not marking permanently resolved"
@@ -1737,8 +1931,9 @@ class DmSessionManager private constructor(
                                     }
                             existing to false
                         }
-                        DmMessageType.RECEIPT -> {
-                            logger.debug { "reserved messageType ${envelope.messageType} rejected outright" }
+                        DmMessageType.RECEIPT, DmMessageType.X3DH_REJECTED -> {
+                            // X3DH_REJECTED never forms a DmEnvelope (DmEnvelope.init); defence in depth only.
+                            logger.debug { "messageType ${envelope.messageType} rejected outright" }
                             return@withPeerLock true // never accepted, regardless of node state
                         }
                     }
@@ -1763,6 +1958,9 @@ class DmSessionManager private constructor(
 
                 persistSession(claimedSender, session)
                 putCached(claimedSender, session)
+                // Any decrypted inbound message of this peer acknowledges an own pending initiation (also the glare
+                // case: the peer's own X3DH_INITIAL just replaced our unacknowledged session).
+                acknowledgeInitiationLocked(claimedSender)
                 // Durable X3DH_INITIAL replay guard commit - see recordAcceptedX3dhInitialEphemeralKey's
                 // own doc comment. Only set (non-null) on the X3DH_INITIAL branch above, and only
                 // reached here after session.decrypt already succeeded - never burns the durable
@@ -1868,6 +2066,500 @@ class DmSessionManager private constructor(
                     "(claimed sender ${who(claimedSender)})"
             }
             false
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // One-time-prekey collisions: authenticated X3DH_REJECTED (responder side), pending initiations, verified
+    // rejections, re-bootstrap with excluded ids and the unacknowledged-session fallback (initiator side).
+    // See docs/architecture.adoc, "One-time-prekey collisions and authenticated handshake rejection".
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /** Time source of the pending-initiation logic; injectable for tests. */
+    internal var clock: Clock = Clock.systemUTC()
+
+    /** Test seam: every inbound rejection frame, before any check. */
+    @Volatile
+    internal var onX3dhRejectionReceivedForTest: ((DmX3dhRejection) -> Unit)? = null
+
+    /** Test seam: every frame written to a direct stream (envelopes and rejections). */
+    @Volatile
+    internal var onDirectFrameSentForTest: ((ByteArray) -> Unit)? = null
+
+    /** Test seam: when set, re-send tasks are handed to it (delay in ms) instead of [rebootstrapScheduler]. */
+    internal var scheduleForTest: ((delayMillis: Long, task: () -> Unit) -> Unit)? = null
+
+    private val rebootstrapSchedulerDelegate =
+        lazy {
+            Executors.newSingleThreadScheduledExecutor { runnable ->
+                Thread(runnable, "lapis-net-dm-rebootstrap").apply { isDaemon = true }
+            }
+        }
+    private val rebootstrapScheduler: ScheduledExecutorService by rebootstrapSchedulerDelegate
+
+    /** Bounded queue, one daemon thread, excess silently discarded (and counted) - never blocks an inbound thread. */
+    private val rejectionExecutor =
+        ThreadPoolExecutor(
+            1,
+            1,
+            30,
+            TimeUnit.SECONDS,
+            ArrayBlockingQueue(REJECTION_QUEUE_CAPACITY),
+            { runnable -> Thread(runnable, "lapis-net-dm-x3dh-reject").apply { isDaemon = true } },
+            { _, _ -> ctrRejectionsSuppressed.incrementAndGet() },
+        ).apply { allowCoreThreadTimeOut(true) }
+
+    /** Claimed sender -> epoch millis of the last rejection sent to it; LRU-bounded. Guarded by itself. */
+    private val rejectionLastSent =
+        object : LinkedHashMap<Secp256k1PublicKey, Long>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Secp256k1PublicKey, Long>): Boolean =
+                size > MAX_TRACKED_REJECTION_SENDERS
+        }
+
+    /** Global budget for the one-time-prekey rejections (consumed/unknown id), which already passed
+     * [prekeyConsumptionRateLimiter]. */
+    private val rejectionGlobalLimiter = FixedWindowRateLimiter(MAX_REJECTIONS_PER_WINDOW, REJECTION_RATE_WINDOW)
+
+    /**
+     * Separate global budget for [DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH]. That path can be reached without a
+     * one-time prekey (`oneTimePrekeyId = null`), so it never touches [prekeyConsumptionRateLimiter] and costs a
+     * sender with a throwaway identity almost nothing. Sharing [rejectionGlobalLimiter] would let such frames use up
+     * the budget and suppress every real one-time-prekey collision rejection.
+     */
+    private val spkMismatchRejectionLimiter =
+        FixedWindowRateLimiter(MAX_REJECTIONS_PER_WINDOW, REJECTION_RATE_WINDOW)
+
+    /** Unacknowledged plaintexts per peer, memory only, for the replay after a verified rejection. */
+    private class ReplayBuffer {
+        val items = ArrayDeque<ByteArray>()
+        var bytes = 0
+        var overflowLogged = false
+
+        fun clear() {
+            items.forEach { it.fill(0) }
+            items.clear()
+            bytes = 0
+        }
+    }
+
+    private val replayBuffers = java.util.concurrent.ConcurrentHashMap<Secp256k1PublicKey, ReplayBuffer>()
+
+    /** Snapshots awaiting their re-send after a verified rejection (memory only, bounded like [replayBuffers]). */
+    private val pendingReplays = java.util.concurrent.ConcurrentHashMap<Secp256k1PublicKey, List<ByteArray>>()
+
+    /**
+     * Responder side. Only an enqueue (cheap rate checks, no crypto, no I/O): never dials under [withPeerLock].
+     * Called only after the binding check passed and the durable ephemeral replay registry did not match, for a
+     * consumed/unknown one-time prekey or a stale signed-prekey id.
+     */
+    private fun scheduleX3dhRejection(
+        claimedSender: Secp256k1PublicKey,
+        header: X3dhPreKeyMessageHeader,
+        reason: DmX3dhRejectionReason,
+        onlinePeerId: PeerId?,
+    ) {
+        val nowMillis = clock.millis()
+        val interval = if (anonymous) REJECTION_PER_SENDER_INTERVAL_ANONYMOUS else REJECTION_PER_SENDER_INTERVAL
+        val perSenderOk =
+            synchronized(rejectionLastSent) {
+                val last = rejectionLastSent[claimedSender]
+                if (last != null && nowMillis - last < interval.toMillis()) {
+                    false
+                } else {
+                    rejectionLastSent[claimedSender] = nowMillis
+                    true
+                }
+            }
+        val globalLimiter =
+            if (reason == DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH) {
+                spkMismatchRejectionLimiter
+            } else {
+                rejectionGlobalLimiter
+            }
+        if (!perSenderOk || !globalLimiter.tryAcquire()) {
+            ctrRejectionsSuppressed.incrementAndGet()
+            return
+        }
+        try {
+            rejectionExecutor.execute { emitX3dhRejection(claimedSender, header, reason, onlinePeerId) }
+        } catch (e: RuntimeException) {
+            ctrRejectionsSuppressed.incrementAndGet()
+        }
+    }
+
+    /** Runs on [rejectionExecutor]. Never throws; failures are logged on debug only. Never via a mailbox. */
+    private fun emitX3dhRejection(
+        claimedSender: Secp256k1PublicKey,
+        header: X3dhPreKeyMessageHeader,
+        reason: DmX3dhRejectionReason,
+        onlinePeerId: PeerId?,
+    ) {
+        try {
+            val fields =
+                DmX3dhRejectionCodec.Fields(
+                    rejecterIdentity = localIdentity.secp256k1KeyPair.publicKey,
+                    rejectedEphemeralPublicKey = header.ephemeralPublicKey,
+                    signedPrekeyId = header.signedPrekeyId,
+                    oneTimePrekeyId = header.oneTimePrekeyId,
+                    reason = reason,
+                    issuedAtEpochSecond = clock.instant().epochSecond,
+                )
+            val ownPrivate = localPrekeyStore.x25519IdentityPrivateKey()
+            val rejection =
+                try {
+                    DmX3dhRejectionCodec.create(ownPrivate, header.initiatorX25519IdentityKey, claimedSender, fields)
+                } finally {
+                    ownPrivate.destroy()
+                }
+            val bytes = DmX3dhRejectionCodec.encode(rejection)
+            val sent =
+                if (anonymous) {
+                    val transport = anonymousTransport ?: return
+                    val target = transport.resolve(claimedSender)
+                    target.online &&
+                        transport.deliverOnline(target, bytes, clock.instant().plus(ANONYMOUS_REJECTION_DEADLINE))
+                } else {
+                    // Reply on the connection the X3DH_INITIAL arrived on (no reflection to a third address); only
+                    // without a live context (offline mailbox) the claimed sender's directory record is dialled.
+                    val connection = onlinePeerId?.let { node.liveConnectionTo(it) }
+                    if (connection != null) {
+                        dispatchViaLocked(claimedSender, bytes, "open stream for X3DH rejection") {
+                            dmProtocol.openStreamOn(connection)
+                        }
+                    } else {
+                        val record = peerDirectory.lookup(claimedSender) ?: return
+                        dispatchOnlineLocked(claimedSender, record, bytes)
+                    }
+                    true
+                }
+            if (sent) {
+                ctrRejectionsSent.incrementAndGet()
+                logger.debug { "sent X3DH rejection ($reason) to ${who(claimedSender)}" }
+            }
+        } catch (e: RuntimeException) {
+            logger.debug { "could not send X3DH rejection to ${who(claimedSender)} (${e::class.simpleName})" }
+        }
+    }
+
+    /**
+     * Initiator side, from the two live doors only. Cheap state checks first, the DH/MAC last; any mismatch only
+     * counts [DmDiagnostics.rejectionsIgnored] and changes nothing. Never throws.
+     */
+    private fun handleX3dhRejection(
+        rejection: DmX3dhRejection,
+        door: String,
+    ) {
+        val peer = rejection.rejecterIdentity
+        onX3dhRejectionReceivedForTest?.invoke(rejection)
+        try {
+            withPeerLock(peer) {
+                val pending = loadPendingInitiation(peer)
+                val nowSecond = clock.instant().epochSecond
+                val earliest = (pending?.initiatedAtEpochSecond ?: 0L) - REJECTION_CLOCK_SKEW_SECONDS
+                val latest = nowSecond + REJECTION_CLOCK_SKEW_SECONDS
+                val matches =
+                    pending != null &&
+                        pending.ephemeralPublicKey.contentEquals(rejection.rejectedEphemeralPublicKey.bytes) &&
+                        pending.signedPrekeyId == rejection.signedPrekeyId &&
+                        pending.oneTimePrekeyId == rejection.oneTimePrekeyId &&
+                        rejection.issuedAtEpochSecond in earliest..latest &&
+                        getCachedOrLoad(peer) != null
+                if (!matches || pending == null) {
+                    ctrRejectionsIgnored.incrementAndGet()
+                    logger.debug { "ignored an X3DH rejection via $door (no matching pending initiation)" }
+                    return@withPeerLock
+                }
+                val ownPrivate = localPrekeyStore.x25519IdentityPrivateKey()
+                val valid =
+                    try {
+                        DmX3dhRejectionCodec.verifyTag(
+                            ownPrivate,
+                            X25519PublicKey(pending.responderX25519IdentityKey),
+                            localIdentity.secp256k1KeyPair.publicKey,
+                            rejection,
+                        )
+                    } finally {
+                        ownPrivate.destroy()
+                    }
+                if (!valid) {
+                    ctrRejectionsIgnored.incrementAndGet()
+                    logger.debug { "ignored an X3DH rejection via $door (tag does not verify)" }
+                    return@withPeerLock
+                }
+                ctrRejectionsAccepted.incrementAndGet()
+                discardSessionLocked(peer)
+                // Snapshot of what was sent under the refused initiation; the live buffer starts empty for the new chain.
+                val snapshot = takeReplayBuffer(peer)
+                val excluded = capExcludedIds(pending.excludedIds + listOfNotNull(rejection.oneTimePrekeyId))
+                val rebootstraps = pending.rejectionRebootstraps + 1
+                val awaitNewer =
+                    if (rejection.reason == DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH) pending.bundleSequence else -1
+                if (rebootstraps > MAX_REJECTION_REBOOTSTRAPS || pending.gaveUp) {
+                    savePendingInitiation(
+                        peer,
+                        pending.copy(
+                            rejectionRebootstraps = minOf(rebootstraps, 255),
+                            gaveUp = true,
+                            excludedIds = excluded,
+                            awaitBundleNewerThan = awaitNewer,
+                        ),
+                    )
+                    snapshot.forEach { it.fill(0) }
+                    logger.info { "giving up automatic re-initiation with ${who(peer)} after repeated rejections" }
+                    return@withPeerLock
+                }
+                val delayMillis = rebootstrapBackoffMillis(rebootstraps)
+                savePendingInitiation(
+                    peer,
+                    pending.copy(
+                        rejectionRebootstraps = rebootstraps,
+                        excludedIds = excluded,
+                        awaitBundleNewerThan = awaitNewer,
+                    ),
+                )
+                pendingReplays.put(peer, snapshot)?.forEach { it.fill(0) }
+                logger.debug { "X3DH initiation to ${who(peer)} refused (${rejection.reason}) - re-initiating" }
+                scheduleResend(peer, delayMillis, attempt = 1)
+            }
+        } catch (e: RuntimeException) {
+            logger.warn { "unexpected failure handling an X3DH rejection - ignored (${e::class.simpleName})" }
+        } catch (e: java.io.IOException) {
+            // savePendingInitiation/discardSessionLocked (full disk, permissions): not a RuntimeException.
+            logger.warn { "could not store the state after an X3DH rejection - ignored (${e::class.simpleName})" }
+        }
+    }
+
+    /** The excluded-id set bounded to [DmPendingInitiation.MAX_EXCLUDED_IDS] (the highest ids are kept). */
+    private fun capExcludedIds(ids: Set<Int>): Set<Int> =
+        ids
+            .sorted()
+            .takeLast(DmPendingInitiation.MAX_EXCLUDED_IDS)
+            .toSet()
+
+    /**
+     * 0 s, 30 s, 120 s for the 1st, 2nd, 3rd re-bootstrap, +-20 % jitter. The backoff applies only to the automatic
+     * re-send; a user send during that window bootstraps right away (with the excluded ids), it is not gated.
+     */
+    private fun rebootstrapBackoffMillis(n: Int): Long {
+        val base =
+            when (n) {
+                1 -> 0L
+                2 -> 30_000L
+                else -> 120_000L
+            }
+        if (base == 0L) return 0L
+        val jitter = (base * 0.2 * (random.nextDouble() * 2 - 1)).toLong()
+        return base + jitter
+    }
+
+    private fun scheduleResend(
+        peer: Secp256k1PublicKey,
+        delayMillis: Long,
+        attempt: Int,
+    ) {
+        val task = { resendAfterRejection(peer, attempt) }
+        val hook = scheduleForTest
+        if (hook != null) {
+            hook(delayMillis, task)
+            return
+        }
+        try {
+            rebootstrapScheduler.schedule(task, delayMillis, TimeUnit.MILLISECONDS)
+        } catch (e: RuntimeException) {
+            logger.debug { "re-send to ${who(peer)} not scheduled (${e::class.simpleName})" }
+        }
+    }
+
+    /**
+     * Re-bootstraps after a verified rejection and replays the buffered plaintexts: the first as `X3DH_INITIAL`
+     * (excluded ids, freshly read bundle), the rest as `TEXT`. If another session exists meanwhile, the buffer goes
+     * over it. Without a buffer (e.g. after a restart) nothing is sent; the next user send bootstraps.
+     */
+    private fun resendAfterRejection(
+        peer: Secp256k1PublicKey,
+        attempt: Int,
+    ) {
+        try {
+            withPeerLock(peer) {
+                // No pending record any more = the new chain was acknowledged meanwhile: still replay the snapshot.
+                val pending = loadPendingInitiation(peer)
+                if (pending?.gaveUp == true) {
+                    pendingReplays.remove(peer)?.forEach { it.fill(0) }
+                    return@withPeerLock
+                }
+                // The snapshot taken when the rejection was accepted: exactly the messages sent under the refused
+                // initiation. Later user sends belong to the new chain and are not part of it (no duplicates).
+                val items = pendingReplays.remove(peer) ?: return@withPeerLock
+                if (items.isEmpty()) return@withPeerLock
+                var index = 0
+                try {
+                    while (index < items.size) {
+                        deliverAutoLocked(peer, items[index])
+                        index++
+                    }
+                    ctrRebootstrapsAfterRejection.incrementAndGet()
+                } catch (e: DmSessionException) {
+                    // Nothing sent yet: keep the snapshot for the next attempt. After a partial send the sent items are
+                    // buffered under the new chain already; the rest is dropped (reported via the log only).
+                    if (index == 0) pendingReplays[peer] = items.map { it.copyOf() }
+                    if (attempt >= MAX_RESEND_ATTEMPTS) {
+                        pending?.let { savePendingInitiation(peer, it.copy(gaveUp = true)) }
+                        pendingReplays.remove(peer)?.forEach { it.fill(0) }
+                        logger.info { "giving up re-initiation with ${who(peer)} (${e::class.simpleName})" }
+                    } else {
+                        logger.debug { "re-initiation with ${who(peer)} postponed (${e::class.simpleName})" }
+                        scheduleResend(peer, RESEND_RETRY_DELAY.toMillis() * attempt, attempt + 1)
+                    }
+                } finally {
+                    items.forEach { it.fill(0) }
+                }
+            }
+        } catch (e: RuntimeException) {
+            logger.warn { "unexpected failure re-initiating a session - ignored (${e::class.simpleName})" }
+        } catch (e: java.io.IOException) {
+            logger.warn { "could not store the state while re-initiating a session - ignored (${e::class.simpleName})" }
+        }
+    }
+
+    /** MUST run inside [withPeerLock]. Builds an envelope for [plaintext] and delivers it like [sendAuto]. */
+    private fun deliverAutoLocked(
+        recipient: Secp256k1PublicKey,
+        plaintext: ByteArray,
+    ) {
+        if (anonymous) {
+            sendAnonymousAutoLocked(recipient, plaintext)
+            return
+        }
+        val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+        val record = peerDirectory.lookup(recipient)
+        if (record != null) {
+            try {
+                dispatchOnlineLocked(recipient, record, envelopeBytes)
+                return
+            } catch (e: DmSessionException) {
+                logger.debug { "re-send to ${who(recipient)} online failed - depositing offline" }
+            }
+        }
+        depositOfflineLocked(recipient, envelopeBytes, Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS)
+    }
+
+    private fun shouldRebootstrapUnacked(
+        pending: DmPendingInitiation,
+        nowSecond: Long,
+    ): Boolean =
+        pending.unackedRebootstraps < MAX_UNACKED_REBOOTSTRAPS &&
+            pending.sendsSinceInitiation >= UNACKED_REBOOTSTRAP_MIN_SENDS &&
+            nowSecond - pending.initiatedAtEpochSecond >= UNACKED_REBOOTSTRAP_AFTER.seconds
+
+    /** MUST run inside [withPeerLock]: destroys the cached session and deletes its file (no phantom reload). */
+    private fun discardSessionLocked(peer: Secp256k1PublicKey) {
+        synchronized(liveSessionCache) { liveSessionCache.remove(peer)?.destroy() }
+        Files.deleteIfExists(sessionFilePath(peer))
+    }
+
+    /** MUST run inside [withPeerLock]. */
+    private fun acknowledgeInitiationLocked(peer: Secp256k1PublicKey) {
+        Files.deleteIfExists(pendingInitiationPath(peer))
+        clearReplayBuffer(peer)
+    }
+
+    private fun bufferForReplay(
+        peer: Secp256k1PublicKey,
+        plaintext: ByteArray,
+    ) {
+        if (!replayBuffers.containsKey(peer) && replayBuffers.size >= MAX_REPLAY_PEERS) return
+        val buffer = replayBuffers.computeIfAbsent(peer) { ReplayBuffer() }
+        synchronized(buffer) {
+            if (buffer.items.size >= MAX_UNACKED_REPLAY_MESSAGES ||
+                buffer.bytes + plaintext.size > MAX_UNACKED_REPLAY_BYTES
+            ) {
+                if (!buffer.overflowLogged) {
+                    buffer.overflowLogged = true
+                    logger.info { "replay buffer for an unacknowledged session is full - later messages are not kept" }
+                }
+                return
+            }
+            buffer.items.addLast(plaintext.copyOf())
+            buffer.bytes += plaintext.size
+        }
+    }
+
+    /** Removes and returns copies of [peer]'s buffered plaintexts (the buffer's own arrays are zeroed). */
+    private fun takeReplayBuffer(peer: Secp256k1PublicKey): List<ByteArray> {
+        val buffer = replayBuffers.remove(peer) ?: return emptyList()
+        return synchronized(buffer) { buffer.items.map { it.copyOf() }.also { buffer.clear() } }
+    }
+
+    private fun clearReplayBuffer(peer: Secp256k1PublicKey) {
+        replayBuffers.remove(peer)?.let { synchronized(it) { it.clear() } }
+    }
+
+    internal fun replayBufferSizeForTest(peer: Secp256k1PublicKey): Int =
+        replayBuffers[peer]?.let { synchronized(it) { it.items.size } } ?: 0
+
+    internal fun hasPendingInitiationForTest(peer: Secp256k1PublicKey): Boolean = loadPendingInitiation(peer) != null
+
+    internal fun pendingInitiationForTest(peer: Secp256k1PublicKey): DmPendingInitiation? = loadPendingInitiation(peer)
+
+    /** Feeds a raw inbound live-door frame, as [handleInboundEnvelope] would (tests only). */
+    internal fun handleX3dhRejectionForTest(rejection: DmX3dhRejection) = handleX3dhRejection(rejection, "test")
+
+    private fun pendingInitiationPath(peer: Secp256k1PublicKey): Path {
+        val hex = peer.bytes.joinToString("") { "%02x".format(it) }
+        return sessionStoreDirectory.resolve("$hex.lndm.x3dhpending")
+    }
+
+    private fun loadPendingInitiation(peer: Secp256k1PublicKey): DmPendingInitiation? {
+        val target = pendingInitiationPath(peer)
+        if (!Files.exists(target)) return null
+        return try {
+            DmPendingInitiation.decode(Files.readAllBytes(target))
+        } catch (e: java.io.IOException) {
+            null
+        }
+    }
+
+    private fun savePendingInitiation(
+        peer: Secp256k1PublicKey,
+        record: DmPendingInitiation,
+    ) {
+        writeFileAtomically(pendingInitiationPath(peer), record.encode())
+    }
+
+    /**
+     * Atomic temp-file-then-[Files.move] write (owner-only permissions where POSIX is supported). On any failure the
+     * temp file is deleted (best effort) before the exception propagates, so a full disk leaves no `.tmp` debris.
+     *
+     * @throws java.io.IOException if the temp file cannot be created, written or moved into place.
+     */
+    private fun writeFileAtomically(
+        target: Path,
+        bytes: ByteArray,
+    ) {
+        val tempFile =
+            if (supportsPosixPermissions(sessionStoreDirectory)) {
+                Files.createTempFile(
+                    sessionStoreDirectory,
+                    "${target.fileName}.",
+                    ".tmp",
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")),
+                )
+            } else {
+                Files.createTempFile(sessionStoreDirectory, "${target.fileName}.", ".tmp")
+            }
+        var moved = false
+        try {
+            Files.write(tempFile, bytes)
+            Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            moved = true
+        } finally {
+            if (!moved) {
+                try {
+                    Files.deleteIfExists(tempFile)
+                } catch (e: java.io.IOException) {
+                    logger.debug { "could not delete temp file ${tempFile.fileName} (${e::class.simpleName})" }
+                }
+            }
         }
     }
 
@@ -2118,20 +2810,7 @@ class DmSessionManager private constructor(
         val updated = (existing + listOf(ephemeralKeyBytes)).takeLast(MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER)
         val bytes = ByteArray(updated.size * X3DH_INITIAL_EPHEMERAL_KEY_SIZE)
         updated.forEachIndexed { index, key -> key.copyInto(bytes, index * X3DH_INITIAL_EPHEMERAL_KEY_SIZE) }
-        val target = x3dhInitialEphemeralKeyRegistryPath(peer)
-        val tempFile =
-            if (supportsPosixPermissions(sessionStoreDirectory)) {
-                Files.createTempFile(
-                    sessionStoreDirectory,
-                    "${target.fileName}.",
-                    ".tmp",
-                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")),
-                )
-            } else {
-                Files.createTempFile(sessionStoreDirectory, "${target.fileName}.", ".tmp")
-            }
-        Files.write(tempFile, bytes)
-        Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        writeFileAtomically(x3dhInitialEphemeralKeyRegistryPath(peer), bytes)
     }
 
     /** Atomic temp-file-then-[Files.move] write - durable against a crash mid-write. See this
@@ -2146,20 +2825,7 @@ class DmSessionManager private constructor(
             cachedKeyLock.read {
                 DoubleRatchetSessionCodec.encodeWithKey(session, cachedKey, kdfParams, random)
             }
-        val target = sessionFilePath(peer)
-        val tempFile =
-            if (supportsPosixPermissions(sessionStoreDirectory)) {
-                Files.createTempFile(
-                    sessionStoreDirectory,
-                    "${target.fileName}.",
-                    ".tmp",
-                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")),
-                )
-            } else {
-                Files.createTempFile(sessionStoreDirectory, "${target.fileName}.", ".tmp")
-            }
-        Files.write(tempFile, bytes)
-        Files.move(tempFile, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        writeFileAtomically(sessionFilePath(peer), bytes)
     }
 
     /** Returns `null` - "no persisted session, start fresh" - not just when no file exists, but also
@@ -2267,6 +2933,12 @@ class DmSessionManager private constructor(
         mailboxRedeliveryScheduler.stop()
         anonymousTransport = null
         replenishmentExecutor.shutdownNow()
+        rejectionExecutor.shutdownNow()
+        if (rebootstrapSchedulerDelegate.isInitialized()) rebootstrapScheduler.shutdownNow()
+        replayBuffers.values.forEach { buffer -> synchronized(buffer) { buffer.clear() } }
+        replayBuffers.clear()
+        pendingReplays.values.forEach { list -> list.forEach { it.fill(0) } }
+        pendingReplays.clear()
         cachedKeyLock.write { cachedKey.fill(0) }
     }
 
@@ -2366,6 +3038,37 @@ class DmSessionManager private constructor(
 
         /** V0.10.0-F1 - offline lifetime of an anonymity-mode mailbox item: 48 hours, not 7 days. */
         const val ANONYMOUS_OFFLINE_TTL_SECONDS = 48L * 3600L
+
+        /** OTK collisions: an unacknowledged session older than this (and used [UNACKED_REBOOTSTRAP_MIN_SENDS] times)
+         * is rebuilt by the fallback, at most [MAX_UNACKED_REBOOTSTRAPS] times per unacknowledged chain. */
+        val UNACKED_REBOOTSTRAP_AFTER: Duration = Duration.ofMinutes(15)
+        const val UNACKED_REBOOTSTRAP_MIN_SENDS = 3
+        const val MAX_UNACKED_REBOOTSTRAPS = 2
+
+        /** OTK collisions: re-bootstraps after verified rejections per unacknowledged chain before giving up. */
+        const val MAX_REJECTION_REBOOTSTRAPS = 3
+
+        /** OTK collisions: re-send attempts when no usable bundle is known yet, before giving up. */
+        const val MAX_RESEND_ATTEMPTS = 3
+        val RESEND_RETRY_DELAY: Duration = Duration.ofSeconds(30)
+
+        /** OTK collisions, responder side: at most one rejection per claimed sender per interval, and globally
+         * [MAX_REJECTIONS_PER_WINDOW] per [REJECTION_RATE_WINDOW]; queue bounded by [REJECTION_QUEUE_CAPACITY]. */
+        val REJECTION_PER_SENDER_INTERVAL: Duration = Duration.ofSeconds(60)
+        val REJECTION_PER_SENDER_INTERVAL_ANONYMOUS: Duration = Duration.ofSeconds(300)
+        const val MAX_REJECTIONS_PER_WINDOW = 10
+        val REJECTION_RATE_WINDOW: Duration = Duration.ofSeconds(60)
+        const val REJECTION_QUEUE_CAPACITY = 16
+        const val MAX_TRACKED_REJECTION_SENDERS = 1_024
+        val ANONYMOUS_REJECTION_DEADLINE: Duration = Duration.ofSeconds(30)
+
+        /** Accepted clock skew of a rejection's issue time. */
+        const val REJECTION_CLOCK_SKEW_SECONDS = 120L
+
+        /** In-memory replay buffer of unacknowledged plaintexts (no call signals). */
+        const val MAX_UNACKED_REPLAY_MESSAGES = 16
+        const val MAX_UNACKED_REPLAY_BYTES = 256 * 1024
+        const val MAX_REPLAY_PEERS = 256
 
         /** V0.9.19 - at most this many live routes per sender identity (distinct connections). */
         const val MAX_CALL_REPLY_ROUTES_PER_IDENTITY = 4

@@ -242,9 +242,13 @@ class X3dhInitiation internal constructor(
  * - **One-time prekey collisions are inherent to gossip publication**, unlike Signal's server (which
  *   hands each one-time prekey to exactly one requester): a gossip-published [PrekeyBundle] is seen
  *   in full by every subscriber, so two initiators can independently pick the same one-time prekey;
- *   the second responder-side [PrekeyStore.consumeOneTimePrekey] then fails and that initiator must
- *   retry with `preferredOneTimePrekeyId = null`, falling back to signed-prekey-only X3DH - the same
- *   class of degradation X3DH itself documents for prekey exhaustion.
+ *   the second responder-side [PrekeyStore.consumeOneTimePrekey] then fails. There is NO
+ *   signed-prekey-only retry (an earlier revision of this comment claimed one; it was never built).
+ *   Recovery lives one layer up, in `lapis-net-dm`: the responder sends an authenticated
+ *   `X3DH_REJECTED` frame, and the initiator re-runs [initiate] with the refused id in
+ *   `excludedOneTimePrekeyIds`, which never downgrades silently - if every offered one-time prekey is
+ *   excluded, [initiate] throws instead (see `docs/architecture.adoc`, "One-time-prekey collisions and
+ *   authenticated handshake rejection").
  * - **The one-time-prekey rule a caller (a future wiring layer, V0.8.4) MUST obey, stated in bold
  *   because getting it wrong reopens exactly the reuse [PrekeyStore] closes:** consume the one-time
  *   prekey BEFORE calling [respond], and if consumption fails (unknown or already-consumed id), the
@@ -357,6 +361,7 @@ object X3dh {
         bundle: PrekeyBundle,
         nowEpochSecond: Long = Instant.now().epochSecond,
         preferredOneTimePrekeyId: Int? = null,
+        excludedOneTimePrekeyIds: Set<Int> = emptySet(),
         random: SecureRandom = SecureRandom(),
     ): X3dhInitiation {
         if (!PrekeyBundle.verify(bundle)) throw X3dhException("prekey bundle signature does not verify")
@@ -385,15 +390,24 @@ object X3dh {
             )
         }
 
+        // Excluded ids are ones the responder already refused (see DmSessionManager's authenticated
+        // X3DH_REJECTED handling). A bundle that OFFERS one-time prekeys, all of them excluded, is an
+        // error - never a silent downgrade to signed-prekey-only X3DH. Only a bundle offering NO one-time
+        // prekeys at all (spec-sanctioned exhaustion) yields `null`.
+        if (preferredOneTimePrekeyId != null && preferredOneTimePrekeyId in excludedOneTimePrekeyIds) {
+            throw X3dhException("preferredOneTimePrekeyId $preferredOneTimePrekeyId is excluded")
+        }
+        val candidates = bundle.oneTimePrekeys.filter { it.id !in excludedOneTimePrekeyIds }
         val oneTimePrekey =
             when {
                 preferredOneTimePrekeyId != null ->
-                    bundle.oneTimePrekeys.find { it.id == preferredOneTimePrekeyId }
+                    candidates.find { it.id == preferredOneTimePrekeyId }
                         ?: throw X3dhException(
                             "preferredOneTimePrekeyId $preferredOneTimePrekeyId is not present in this bundle",
                         )
                 bundle.oneTimePrekeys.isEmpty() -> null
-                else -> bundle.oneTimePrekeys[random.nextInt(bundle.oneTimePrekeys.size)]
+                candidates.isEmpty() -> throw X3dhException("all offered one-time prekeys are excluded")
+                else -> candidates[random.nextInt(candidates.size)]
             }
 
         val ephemeral = X25519KeyPair.generate(random)

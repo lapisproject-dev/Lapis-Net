@@ -27,7 +27,8 @@ import java.nio.ByteBuffer
  *   0      4   magic "LNDM"  (Lapis Net Direct Message)
  *   4      1   version = 1
  *   5      1   flags - reserved, must be zero
- *   6      1   messageType  (wire byte: 0=TEXT, 1=X3DH_INITIAL, 2=RECEIPT reserved, 3=CALL_SIGNAL - active since V0.8.7)
+ *   6      1   messageType  (wire byte: 0=TEXT, 1=X3DH_INITIAL, 2=RECEIPT reserved, 3=CALL_SIGNAL - active since V0.8.7;
+ *                            4=X3DH_REJECTED is NOT a DmEnvelope - see [decodeFrame] and [DmX3dhRejectionCodec])
  *   7     33   senderIdentity              (secp256k1 compressed public key)
  *  40      1   x3dhInitialHeaderPresent    (0 or 1; MUST equal 1 iff messageType == X3DH_INITIAL)
  *  41     32   x3dhInitiatorX25519PublicKey            (all-zero when absent)
@@ -195,6 +196,21 @@ object DmEnvelopeCodec {
         return out
     }
 
+    /**
+     * Decodes a frame from one of the two LIVE doors (direct `/lapis/dm` stream, anonymity circuit): either a
+     * [DmEnvelope] or, for wire type 4, a [DmX3dhRejection] (its own fixed-size layout, see [DmX3dhRejectionCodec]).
+     * The type byte at offset 6 is read first, then the matching decoder runs. Mailbox and sealed-mailbox paths keep
+     * using [decode], which treats type 4 as malformed - a rejection is never accepted through a mailbox.
+     *
+     * @throws MalformedDmEnvelopeException on any structural problem of either frame kind.
+     */
+    fun decodeFrame(bytes: ByteArray): DmInboundFrame {
+        if (bytes.size > 6 && bytes[6] == DmMessageType.X3DH_REJECTED.wireValue) {
+            return DmInboundFrame.X3dhRejection(DmX3dhRejectionCodec.decode(bytes))
+        }
+        return DmInboundFrame.Envelope(decode(bytes))
+    }
+
     /** @throws MalformedDmEnvelopeException on any structural problem - see this object's class doc
      *   comment for the exact, ordered set of checks. Never throws for a ratchet-message AEAD
      *   failure - [RatchetMessageCodec.decode] is a structural decode only, never an AEAD operation
@@ -228,8 +244,8 @@ object DmEnvelopeCodec {
             val messageType =
                 DmMessageType.fromWireValue(messageTypeByte)
                     ?: throw MalformedDmEnvelopeException("unknown dm messageType wire value $messageTypeByte")
-            if (messageType == DmMessageType.RECEIPT) {
-                throw MalformedDmEnvelopeException("messageType $messageType is reserved and rejected outright")
+            if (messageType == DmMessageType.RECEIPT || messageType == DmMessageType.X3DH_REJECTED) {
+                throw MalformedDmEnvelopeException("messageType $messageType is not a DmEnvelope")
             }
 
             val senderIdentityBytes = ByteArray(SENDER_IDENTITY_SIZE).also { input.readFully(it) }
@@ -338,4 +354,15 @@ object DmEnvelopeCodec {
             throw MalformedDmEnvelopeException("invalid dm envelope field", e)
         }
     }
+}
+
+/** What [DmEnvelopeCodec.decodeFrame] returns: an ordinary envelope or an authenticated handshake rejection. */
+sealed interface DmInboundFrame {
+    class Envelope(
+        val envelope: DmEnvelope,
+    ) : DmInboundFrame
+
+    class X3dhRejection(
+        val rejection: DmX3dhRejection,
+    ) : DmInboundFrame
 }

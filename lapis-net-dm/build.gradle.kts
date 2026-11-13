@@ -84,6 +84,8 @@ dependencies {
     api(project(":lapis-net-policy"))
     implementation(rootProject.libs.lightning.kmp)
     implementation(rootProject.libs.bitcoin.kmp)
+    implementation(rootProject.libs.bouncycastle.provider)
+    testImplementation(rootProject.libs.logback.classic)
     // testFixturesApi, not testFixturesImplementation: DmTestNode's own public constructor
     // properties (node/peerDirectory/prekeyStore/storage/pubsub/identity) put these five modules'
     // types directly in DmTestNode's own public API surface - the same "api, not implementation"

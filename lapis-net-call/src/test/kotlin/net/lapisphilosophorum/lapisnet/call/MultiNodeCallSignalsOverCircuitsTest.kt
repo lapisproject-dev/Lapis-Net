@@ -105,6 +105,18 @@ class MultiNodeCallSignalsOverCircuitsTest :
             relays.forEach { runCatching { it.close() } }
         }
 
+        val names = mapOf(a to "a", b to "b", c to "c", d to "d")
+
+        /** Logs every one-time-prekey choice with test-local names (no fingerprints); re-run after a node restart. */
+        fun installOtkHooks() {
+            all.forEach { n ->
+                n.rig.dm.onOneTimePrekeyChosenForTest = { recipient, otkId, seq ->
+                    val to = all.firstOrNull { it.rig.key == recipient }?.let { names[it] } ?: "?"
+                    println("TIMELINE dm: ${names[n]} chose otk ${otkId ?: "none"} seq $seq for $to")
+                }
+            }
+        }
+
         fun sees(
             viewer: CallNode,
             other: CallNode,
@@ -117,6 +129,10 @@ class MultiNodeCallSignalsOverCircuitsTest :
             to: CallNode,
         ) {
             var attempts = 0
+            val collisionsBefore =
+                to.rig.dm
+                    .diagnostics()
+                    .x3dhInitialRejectedOtkConsumed
             while (received.getValue(to).none { it.sender == from.rig.key } && attempts < 6) {
                 attempts++
                 val t0 = System.currentTimeMillis()
@@ -137,25 +153,32 @@ class MultiNodeCallSignalsOverCircuitsTest :
             withClue("DM session ${from.rig.key.fingerprint()} -> ${to.rig.key.fingerprint()}") {
                 received.getValue(to).any { it.sender == from.rig.key } shouldBe true
             }
+            // A one-time-prekey collision must heal through the authenticated rejection, in the first or second attempt.
+            if (to.rig.dm
+                    .diagnostics()
+                    .x3dhInitialRejectedOtkConsumed > collisionsBefore
+            ) {
+                println("TIMELINE call: OTK collision healed after $attempts attempt(s): ${from.rig.diagnosticsLine()}")
+                withClue("collision recovery ${from.rig.diagnosticsLine()}") {
+                    (
+                        from.rig.dm
+                            .diagnostics()
+                            .rebootstrapsAfterRejection >= 1
+                    ) shouldBe true
+                    (attempts <= 2) shouldBe true
+                }
+            }
         }
 
         test("four anonymity nodes start, see each other through the relays only and hold DM sessions")
             .config(timeout = 1500.seconds) {
                 all.forEach { it.rig.start() }
                 all.forEach { it.rig.awaitPublished() shouldBe true }
-                // A directory object published while the gossip mesh is still forming is only repeated hourly (by
-                // design); the test then restarts the node that is not seen, the way a user would.
+                installOtkHooks()
+                // Early republication (DirectoryRepublishSchedule) makes every node visible within minutes; the former
+                // restart-on-invisibility workaround was entered 0 times in 12 load runs before and 12 after the OTK fix.
                 val pairs = listOf(a to b, b to a, c to b, b to c, a to d)
-                for (attempt in 1..4) {
-                    val converged = awaitCondition(Duration.ofSeconds(75)) { pairs.all { (v, o) -> sees(v, o) } }
-                    if (converged) break
-                    println("TIMELINE call: restart branch entered (attempt $attempt)")
-                    pairs.filter { (v, o) -> !sees(v, o) }.map { it.second }.distinct().forEach {
-                        it.rig.stop()
-                        it.rig.start()
-                        it.rig.awaitPublished() shouldBe true
-                    }
-                }
+                awaitCondition(Duration.ofSeconds(300)) { pairs.all { (v, o) -> sees(v, o) } }
                 withClue(pairs.map { (v, o) -> sees(v, o) }.toString()) {
                     pairs.all { (v, o) -> sees(v, o) } shouldBe true
                 }

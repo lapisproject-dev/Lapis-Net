@@ -479,4 +479,18 @@ class PrekeyStoreTest :
             consumed.id shouldBe 0
             reopened.availableOneTimePrekeyIds() shouldBe emptyList()
         }
+
+        test("consumption failures carry their reason") {
+            val store =
+                PrekeyStore.create(
+                    Files.createTempDirectory("prekeystore-test"),
+                    DualKeyIdentity.generate(),
+                    oneTimePrekeyCount = 1,
+                )
+            store.consumeOneTimePrekey(0)
+            shouldThrow<PrekeyConsumptionException> { store.consumeOneTimePrekey(0) }.reason shouldBe
+                PrekeyConsumptionFailure.ALREADY_CONSUMED
+            shouldThrow<PrekeyConsumptionException> { store.consumeOneTimePrekey(99) }.reason shouldBe
+                PrekeyConsumptionFailure.UNKNOWN_ID
+        }
     })

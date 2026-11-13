@@ -38,7 +38,15 @@ private val FILE_PERMISSIONS = PosixFilePermissions.fromString("rw-------")
  * [PrekeyStoreFileFormat.MAX_ONE_TIME_PREKEY_ENTRIES] without enough tombstones available to prune. */
 class PrekeyConsumptionException(
     message: String,
+    /** Why consumption failed; `null` for the [PrekeyStore.generateOneTimePrekeys] capacity case. */
+    val reason: PrekeyConsumptionFailure? = null,
 ) : RuntimeException(message)
+
+/** The two [PrekeyStore.consumeOneTimePrekey] refusals - lets a caller report them distinctly. */
+enum class PrekeyConsumptionFailure {
+    UNKNOWN_ID,
+    ALREADY_CONSUMED,
+}
 
 /**
  * The result of a successful [PrekeyStore.consumeOneTimePrekey] call: the consumed [id] paired
@@ -307,9 +315,15 @@ class PrekeyStore private constructor(
         withExclusiveFileAccess { onDiskState ->
             val entry =
                 onDiskState.entries.find { it.id == id }
-                    ?: throw PrekeyConsumptionException("unknown one-time prekey id $id")
+                    ?: throw PrekeyConsumptionException(
+                        "unknown one-time prekey id $id",
+                        PrekeyConsumptionFailure.UNKNOWN_ID,
+                    )
             if (entry.state == OneTimePrekeyState.CONSUMED) {
-                throw PrekeyConsumptionException("one-time prekey $id has already been consumed")
+                throw PrekeyConsumptionException(
+                    "one-time prekey $id has already been consumed",
+                    PrekeyConsumptionFailure.ALREADY_CONSUMED,
+                )
             }
 
             val privateKeyCopy = entry.privateKeyBytes.copyOf()

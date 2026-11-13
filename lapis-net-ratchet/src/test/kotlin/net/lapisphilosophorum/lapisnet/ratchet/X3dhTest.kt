@@ -348,4 +348,47 @@ class X3dhTest :
                 )
             responderSession.sharedSecret.contentEquals(initiation.session.sharedSecret) shouldBe true
         }
+
+        test("excluded one-time prekey ids are never chosen; preferred-in-excluded and all-excluded throw") {
+            val alice = Party()
+            val bob = Party()
+            val bundle = bob.publishBundle()
+            val all = bundle.oneTimePrekeys.map { it.id }
+            val keep = all.last()
+            repeat(20) {
+                val init =
+                    X3dh.initiate(
+                        alice.identity.secp256k1KeyPair.publicKey,
+                        alice.encryptionBinding,
+                        alice.store.x25519IdentityPrivateKey(),
+                        bundle,
+                        nowEpochSecond = 0,
+                        excludedOneTimePrekeyIds = (all - keep).toSet(),
+                    )
+                init.header.oneTimePrekeyId shouldBe keep
+            }
+            shouldThrow<X3dhException> {
+                X3dh.initiate(
+                    alice.identity.secp256k1KeyPair.publicKey,
+                    alice.encryptionBinding,
+                    alice.store.x25519IdentityPrivateKey(),
+                    bundle,
+                    nowEpochSecond = 0,
+                    preferredOneTimePrekeyId = keep,
+                    excludedOneTimePrekeyIds = setOf(keep),
+                )
+            }
+            val allExcluded =
+                shouldThrow<X3dhException> {
+                    X3dh.initiate(
+                        alice.identity.secp256k1KeyPair.publicKey,
+                        alice.encryptionBinding,
+                        alice.store.x25519IdentityPrivateKey(),
+                        bundle,
+                        nowEpochSecond = 0,
+                        excludedOneTimePrekeyIds = all.toSet(),
+                    )
+                }
+            allExcluded.message shouldBe "all offered one-time prekeys are excluded"
+        }
     })

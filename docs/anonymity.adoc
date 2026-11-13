@@ -761,7 +761,19 @@ The refusal for the recipient happens before any session work, so a refused firs
 | call signalling | direct | not available in anonymity mode in wave F1 (superseded by wave G: over circuits, see <<call-signals-over-circuits>>)
 | call media | WebRTC | unchanged, not anonymisable by this design
 | 8, 14, 15 | GossipSub envelope, direct connections in general, DHT lookups | *largest remaining leaks*, unchanged (transport key, wave J)
+| new (fix) | `X3DH_REJECTED` after a one-time-prekey collision | only over circuits, framed like an envelope (same size class when traffic padding is on); never via a mailbox
 |===
+
+*One-time-prekey collisions (unreleased fix).* When a first-contact `X3DH_INITIAL` arrives over a circuit and its
+one-time prekey is already consumed, the responder resolves the initiator and sends an authenticated
+`X3DH_REJECTED` over a circuit of its own (see "One-time-prekey collisions and authenticated handshake rejection" in
+`architecture.adoc`). That is a reflection: an unauthenticated `X3DH_INITIAL` with a valid public binding makes the
+responder build a circuit to the claimed sender. It is bounded: one rejection per claimed sender per 300 s, at most
+10 per minute in total, a queue of 16, only towards a sender that is online. Reusing the inbound rendezvous circuit
+for the answer would avoid it but needs an extension of `AnonymousDmTransport` (a later wave). Republishing the
+bundle after every consumption (the alternative that only narrows the window) was rejected because it would show
+directory observers the time of every first contact. Log lines on this path name no peer (`who()` prints
+`<peer>`).
 
 === Honest limits of wave F1
 

@@ -3920,6 +3920,155 @@ DIFFERENT ephemeral key and is never blocked by this registry.
 * **`MailboxRedeliveryScheduler`'s tracking is in-memory-only, lost on restart** — see that class's
   own section above.
 
+=== One-time-prekey collisions and authenticated handshake rejection
+
+_Unreleased fix on top of V0.10.0-I._
+
+==== Problem
+
+A prekey bundle is published by gossip (or, in anonymity mode, through circuits) and seen in full by every
+subscriber. `X3dh.initiate` picks one of the offered one-time prekeys uniformly at random. Two initiators that use
+the same bundle version therefore pick the same one-time prekey with probability 1/n for n offered prekeys
+(n ≤ 11 for the anonymous publisher); a new initiator using a bundle that is stale by k earlier first contacts hits
+an already consumed one with probability about k/11. The anonymity-mode publisher refills the pool locally but does
+not republish on every consumption, so its bundles stay stale longer.
+
+The responder consumes the one-time prekey before `X3dh.respond` and must never retry without it (replay
+protection). Before this fix the second `X3DH_INITIAL` was dropped with a debug log; the second initiator kept its
+persisted session and every later message went out as `TEXT`, which the responder refused with "no session for
+claimed sender" forever. Measured on the unfixed code: 2 of 12 runs of `MultiNodeCallSignalsOverCircuitsTest`
+failed, both with two senders on the same one-time prekey id (`x3dhInitialRejectedOtkConsumed=1`,
+`textRejectedNoSession` rising to 5). With the fix (same load: 12 busy loops pinned to two cores): 24 of 24 runs
+green, 4 of them with a collision, each healed by one verified rejection in the first session attempt; 12 of 12
+runs of `MultiNodeDmOverCircuitsTest` and of `MultiNodeMailOverCircuitsTest` green. The earlier claim of a "retry-without-one-time-prekey fallback" in `X3dh` and
+the roadmap was never implemented and has been corrected.
+
+==== Mechanism
+
+[cols="1,3", options="header"]
+|===
+| Part | Behaviour
+| Responder | For a consumed or unknown one-time prekey id, or a signed-prekey id it does not hold, after the binding
+check and the durable ephemeral replay registry passed: enqueue an `X3DH_REJECTED` frame. Never after a replay
+registry hit, never for an invalid binding, never via a mailbox. The consumed prekey stays consumed.
+| Rate limits | One rejection per claimed sender per 60 s (300 s in anonymity mode, LRU of 1024 senders), at most 10
+per 60 s globally, a queue of 16 on one daemon thread, excess discarded and counted. The one-time-prekey path
+additionally passes the existing consumption rate limiter first.
+| Route | Direct mode: a new stream on the connection the `X3DH_INITIAL` arrived on (never to a third address); from
+the offline mailbox, the claimed sender's directory record. Anonymity mode: `resolve` + `deliverOnline` (30 s
+deadline), only if the sender is online.
+| Initiator | Keeps a durable record per still-unacknowledged initiation (`<peer>.lndm.x3dhpending`, 0600, unencrypted
+like the `.x3dhinit` registry: public keys, ids, counters and times, no secret). A rejection is acted on only if it
+matches that record exactly (ephemeral key, signed-prekey id, one-time prekey id), its issue time lies in
+[initiated − 120 s, now + 120 s], a session exists, and finally its tag verifies. Then: session destroyed and its
+file deleted under the peer lock, the id added to the excluded set, re-bootstrap after 0 s, 30 s, 120 s (±20 %
+jitter), at most 3 times; after that the record is kept as "gave up" and nothing is re-initiated automatically.
+The backoff gates only the automatic re-send; a user send in that window bootstraps at once (with the excluded ids).
+| Re-send | The plaintexts sent under the refused initiation (memory only, at most 16 messages / 256 KiB per peer, no
+call signals) are replayed: the first as `X3DH_INITIAL` with the excluded ids and a freshly read bundle, the rest as
+`TEXT`. If every offered one-time prekey is excluded (or the signed prekey was stale) and no newer bundle is known,
+the send waits and retries (30 s, 60 s, at most 3 attempts); it never downgrades to signed-prekey-only X3DH.
+| Acknowledgement | Any decrypted inbound message of the peer deletes the record and the buffer - also the peer's
+own `X3DH_INITIAL` (glare). Sessions without a record (all sessions from before this fix, all responder sessions)
+count as acknowledged: unchanged behaviour, no migration.
+| Fallback (a) | Without any rejection (sender offline, older responder): an unacknowledged session older than 15
+minutes with at least 3 sends since its `X3DH_INITIAL` is rebuilt on the next send, at most twice per chain, without
+replay (the responder may already hold those messages). The rebuild also excludes the one-time prekey id the current
+chain used (most likely consumed, while a cached bundle usually still offers it). The new session is built before the
+old one is deleted: if no usable bundle is known (none, every offered id excluded), the existing session is kept and
+used, and the next send tries again.
+|===
+
+`send`/`sendAuto` still report `SENT_ONLINE` for the refused `X3DH_INITIAL`; recovery is asynchronous. They may now
+throw `DmHandshakeFailedException("no unused one-time prekey offered...")` or "waiting for a newer prekey bundle".
+
+==== Wire frame `X3DH_REJECTED` (type 4, 122 bytes, big-endian)
+
+[cols="1,1,4", options="header"]
+|===
+| Offset | Length | Field
+| 0 | 4 | magic `LNDM`
+| 4 | 1 | version 1
+| 5 | 1 | flags 0
+| 6 | 1 | messageType 4
+| 7 | 33 | rejecter identity (secp256k1, the responder)
+| 40 | 32 | ephemeral public key of the refused `X3DH_INITIAL`
+| 72 | 4 | signed-prekey id named by it
+| 76 | 1 | one-time prekey id present (0/1)
+| 77 | 4 | one-time prekey id (0 if absent)
+| 81 | 1 | reason: 1 consumed, 2 unknown, 3 signed-prekey mismatch
+| 82 | 8 | issued at (epoch seconds)
+| 90 | 32 | tag = HMAC-SHA256(K, bytes 0..89)
+|===
+
+`K = HKDF-SHA256(ikm = X25519(IK_responder, IK_initiator), salt = 0^32, info = "LapisNet:dm-x3dh-reject:v1" ||
+initiator identity (33) || responder identity (33))`. A MAC rather than a secp256k1 signature: both parties can
+compute it, so it is no transferable proof that the responder processed a handshake of the initiator (a signature
+would weaken the deniability X3DH provides); it is cheaper; a third party holding neither identity key cannot forge
+it. The X3DH shared secret is never used. Fresh `HKDFBytesGenerator`/`HMac` per call, constant-time comparison,
+DH output and key zeroed, the private identity key destroyed after use.
+
+Only the two live doors parse it (`DmEnvelopeCodec.decodeFrame`). `DmEnvelopeCodec.decode` - every mailbox path,
+the sealed-mailbox codec and every node older than this fix - treats type 4 as malformed and drops it silently,
+without penalty or connection loss (`DmProtocol` and the circuit framing carry frames as opaque, length-bounded
+bytes). On a circuit it is framed like any envelope (padded to the envelope size class when traffic padding is on).
+
+==== Alternatives considered
+
+* (a) Unacknowledged-session timeout alone: needs no new wire type but recovers only after 15 minutes and loses
+  messages; kept as a bounded fallback.
+* (b) Authenticated rejection: chosen as the primary mechanism.
+* (c) Republishing the bundle after every consumption: only narrows the window, and in anonymity mode would reveal
+  the time of every first contact to directory observers and cost a circuit publication each. Rejected.
+* (d) Signed-prekey-only X3DH as the default retry: gives up the one-time-prekey forward secrecy of the first
+  message. Rejected; with every offered prekey excluded the initiator waits for a newer bundle instead.
+* (e) Signal style, repeating the X3DH header until the first reply: heals a lost `X3DH_INITIAL` but not a
+  collision. Not chosen.
+
+==== Security arguments
+
+* Replay: the consumed one-time prekey is never released; a replayed accepted `X3DH_INITIAL` hits the durable
+  ephemeral registry and gets no rejection; a replayed genuine rejection names an old ephemeral key and no longer
+  matches after the re-bootstrap.
+* Downgrade: no signed-prekey-only default; exclusion is enforced in `X3dh.initiate`.
+* Spoofing: without one of the two identity keys no valid tag exists; only unacknowledged sessions are affected.
+* Accepted: whoever compromises `IK_initiator` can feed that initiator rejections. The consequence is a
+  re-bootstrap, not a loss of confidentiality.
+* `MAX_TRACKED_X3DH_INITIAL_EPHEMERAL_KEYS_PER_PEER = 8` on the responder: one chain causes at most 3 + 2 extra
+  accepted handshakes, so real re-handshakes are not evicted in practice.
+
+==== Constants
+
+`REJECTION_PER_SENDER_INTERVAL` 60 s (`_ANONYMOUS` 300 s), `MAX_REJECTIONS_PER_WINDOW` 10 per
+`REJECTION_RATE_WINDOW` 60 s (two separate budgets: one for the one-time-prekey rejections, one for
+`SIGNED_PREKEY_MISMATCH`), `REJECTION_QUEUE_CAPACITY` 16, `MAX_TRACKED_REJECTION_SENDERS` 1024,
+`ANONYMOUS_REJECTION_DEADLINE` 30 s, `REJECTION_CLOCK_SKEW_SECONDS` 120, `MAX_REJECTION_REBOOTSTRAPS` 3,
+`MAX_RESEND_ATTEMPTS` 3, `RESEND_RETRY_DELAY` 30 s, `UNACKED_REBOOTSTRAP_AFTER` 15 min,
+`UNACKED_REBOOTSTRAP_MIN_SENDS` 3, `MAX_UNACKED_REBOOTSTRAPS` 2, `MAX_UNACKED_REPLAY_MESSAGES` 16,
+`MAX_UNACKED_REPLAY_BYTES` 256 KiB, `MAX_REPLAY_PEERS` 256, at most 16 excluded ids per record.
+
+==== Honest limits
+
+* Messages sent before a fallback (a) re-bootstrap may be lost; the buffer is not replayed there.
+* A rejection only reaches an initiator that is online; an older responder sends none, then only (a) helps.
+* After a restart of the initiator the replay buffer is gone; the record survives and the next user send excludes
+  the refused id.
+* Messages after the first one in a partially failed re-send are dropped (logged).
+* The replay changes the order when the user sends again before the re-send ran.
+* Rejection budget can be exhausted. A sender with throwaway identities and self-signed bindings can send
+  `X3DH_INITIAL` frames that each cost the responder a rejection: a stale signed-prekey id without a one-time
+  prekey costs the sender almost nothing (it never touches the prekey-consumption limiter). Such frames have
+  their own budget (10 per 60 s), so they no longer suppress the rejections for real one-time-prekey collisions;
+  a flood of frames naming unknown or consumed one-time prekeys still uses up the shared one-time-prekey budget
+  (bounded by the prekey-consumption limiter). A forged initial that names a victim A (A's binding is public)
+  also uses up A's per-sender slot at the responder for 60 s (300 s in anonymity mode), so a real rejection to A
+  in that interval is suppressed. In every case only the recovery is delayed: the initiator then recovers via
+  fallback (a) after 15 minutes and 3 sends. Confidentiality and integrity are not affected.
+* A full disk or missing write permission while storing the pending initiation of a new session rolls that
+  session back and fails the send (`DmSessionException`); nothing is sent. The same failure while handling a
+  rejection or a re-send is logged and ignored.
+* Verified on loopback only (unit tests and the multi-node tests), not on real networks.
+
 == DM attachments and acceptance policy (V0.8.6)
 
 Target: attachments for direct messages, and an opt-in acceptance/quarantine policy so a node can

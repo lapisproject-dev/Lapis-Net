@@ -362,7 +362,8 @@ class DmOnionNode(
             "admissions=${d.admissions} maxConsecFailures=${d.maxConsecutiveFailures} " +
                 "rdvFailures=${d.rendezvousFailures} rdvFailureStates=${d.rendezvousFailureStates} " +
                 "service=[${d.serviceStats}] connectFailures=${port.connectFailures.size}" +
-                (port.connectFailures.lastOrNull()?.let { " lastConnectFailure=$it" } ?: "")
+                (port.connectFailures.lastOrNull()?.let { " lastConnectFailure=$it" } ?: "") +
+                " dm=[${dm.diagnostics()}]"
         }
 
     /** Hooks for rigs that add services on top of the DM stack (after the DM stack is up / before it is stopped). */

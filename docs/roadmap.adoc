@@ -619,8 +619,11 @@ handshake (V0.8.2)" section). Deliberate scope cuts, stated as such in the code'
   other's state machine. Closing THAT needs a durable session registry keyed by the initiator's
   ephemeral public key, which remains V0.8.4's to build.
 * **One-time-prekey collisions are inherent to gossip publication** (unlike Signal's server, which
-  hands each prekey to exactly one requester) — mitigated by uniform-random selection and a
-  documented retry-without-one-time-prekey fallback.
+  hands each prekey to exactly one requester) — mitigated by uniform-random selection. _Correction:_
+  this bullet originally also claimed a "documented retry-without-one-time-prekey fallback"; that
+  fallback was never implemented. A collision left the second initiator with a session the
+  responder never had. Replaced by the authenticated `X3DH_REJECTED` frame and re-bootstrap with
+  excluded ids (see "Fix — one-time-prekey collisions" below and `architecture.adoc`).
 * **No XEdDSA, no signed-prekey rotation scheduler.** `PrekeyStore.rotateSignedPrekey` is exposed as
   a directly callable primitive; nothing in this wave calls it periodically.
 * **`CidBytesValidation` is not invoked anywhere in this wave** — no `io.ipfs.cid.Cid` field exists
@@ -752,7 +755,10 @@ Deliberate scope cuts, stated as such in the code's own doc comments rather than
   closed** — see the corrected V0.8.2 Progress bullet above.
 * **No multi-device / no session migration between devices.**
 * **No automatic signed-prekey-driven session re-establishment**, no session expiry, no periodic
-  re-keying scheduler.
+  re-keying scheduler. _Later narrowed:_ an initiator now re-establishes a still UNACKNOWLEDGED
+  first-contact session after an authenticated rejection (one-time prekey consumed/unknown, stale
+  signed-prekey id) or, as a bounded fallback, after 15 minutes and 3 unanswered sends; established
+  (acknowledged) sessions are still never re-established automatically.
 
 === V0.8.4 — Online DM stream
 
@@ -2203,3 +2209,11 @@ _Unreleased. Internal wave identifier, no release number. No user-visible featur
 * *Done:* multi-node tests on real loopback nodes for a late subscriber behind a node that already holds a service descriptor (`MultiNodeDescriptorMultiHopVisibilityTest`), failure of the primary guard with failover to the backup (`MultiNodeGuardFailoverTest`), a mode switch ON, NORMAL, ON by restart (`MultiNodeDmModeSwitchRestartTest`), and mail and call signals after a restart with a new onion address (extensions of `MultiNodeMailOverCircuitsTest` and `MultiNodeCallSignalsOverCircuitsTest`); a Sybil simulation of the real path selection (`SybilPathSimulation`, small sample in `check`, full run with `-PlapisSybilFull=true`, table in `anonymity.adoc`); the review package `external-review.adoc`. The first multi-node test found a real defect (the byte-identical descriptor repeat was not forwarded beyond the first hop); the repeat slots now send a fresh signed version of the descriptor (`OnionServiceStateMachine.refreshDescriptor`, `ServiceDescriptorRepublisher`, at most 4 versions per minute), covered by unit, concurrency and validator-conformance tests.
 * *Open:* the external cryptographic and anonymity review has not taken place and is recommended before any claim of anonymity; a restarted node still sees long-running peers only after their next publication (no catch-up path); everything was verified on loopback with an injected locator, not on real networks, behind NATs or under load; the Sybil figures come from a model with stated assumptions; the mode-switch test does not assert that the ratchet session survives a restart; wave J (GossipSub, DHT, content fetches) and the transport-key decoupling remain.
 * *Decisions pending:* the questions in `external-review.adoc`; whether the fresh-version republication is acceptable as a visible pattern.
+
+== Fix — one-time-prekey collisions in first-contact DMs (authenticated handshake rejection)
+
+_Unreleased. Internal wave identifier._
+
+* *Done:* two first-contact senders that pick the same one-time prekey from a gossiped bundle no longer leave the second one with a dead session. The responder answers the refused `X3DH_INITIAL` (one-time prekey consumed or unknown, or a stale signed-prekey id) with an authenticated `X3DH_REJECTED` frame (wire type 4, fixed 122 bytes, HMAC-SHA256 under a key from the static X25519 identity DH: deniable, unforgeable without an identity key), only on the live doors, rate-limited per sender and globally; the initiator checks it against its durable, still unacknowledged initiation record (`.x3dhpending`), discards the session and re-bootstraps with the refused id excluded (backoff 0 s, 30 s, 120 s, at most 3 times), replaying the plaintexts sent under the refused initiation from a bounded in-memory buffer. `X3dh.initiate` takes `excludedOneTimePrekeyIds` and never downgrades silently to signed-prekey-only. Fallback without a rejection: an unacknowledged session older than 15 minutes with at least 3 sends is rebuilt, at most twice, without replay. Diagnostics counters (`DmSessionManager.diagnostics()`). Older nodes drop the new frame silently (malformed, no penalty). See "One-time-prekey collisions and authenticated handshake rejection" in `architecture.adoc`.
+* *Open:* a rejection reaches the initiator only while it is online; an older responder sends none (then only the fallback helps); messages sent under a rebuilt session by the fallback can be lost; in anonymity mode the rejection builds its own circuit to the initiator (rate-limited reflection) instead of reusing the inbound rendezvous circuit; verified on loopback only.
+* *Decisions pending:* fallback (a) on by default (15 min / 3 sends / at most 2); automatic replay of buffered plaintexts after a verified rejection; waiting (no signed-prekey-only downgrade) when every offered one-time prekey is excluded; answering over the inbound rendezvous circuit in a later wave.

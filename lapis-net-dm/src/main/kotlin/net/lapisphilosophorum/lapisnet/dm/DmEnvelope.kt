@@ -47,6 +47,9 @@ class DmEnvelope internal constructor(
         require(messageType != DmMessageType.RECEIPT) {
             "messageType RECEIPT is reserved and rejected outright"
         }
+        require(messageType != DmMessageType.X3DH_REJECTED) {
+            "X3DH_REJECTED is a DmX3dhRejection frame, never a DmEnvelope"
+        }
         require((messageType == DmMessageType.X3DH_INITIAL) == (x3dhInitialHeader != null)) {
             "x3dhInitialHeader must be present iff messageType is X3DH_INITIAL"
         }
