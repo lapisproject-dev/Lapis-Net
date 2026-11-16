@@ -55,35 +55,104 @@ class OnionPathSelector(
     private val clock: Clock,
     private val options: PathSelectionOptions = PathSelectionOptions(),
 ) {
+    /** The hop list (by reference) of the last path handed out with the primary probe, until it is handed back. */
+    private val probeLock = Any()
+    private var probePath: List<OnionRelayDescriptor>? = null
+
     /**
      * Selects a full path ending at [lastHop] (or at a drawn relay if `null`).
      *
      * With [lastHopChosenRemotely] the last hop was named by a remote party (rendezvous point of an INTRODUCE, intro
      * point of a service descriptor). It is then NEVER refused because of the guard: whether a build works must not
      * depend on the guard, otherwise a remote party could probe for the guard's identity and network. The diversity rule
-     * then only applies to the middle hops (towards the guard strictly; towards the last hop as far as possible).
+     * then only applies to the middle hops (towards the guard strictly; towards the last hop as far as possible). If such
+     * a last hop equals the effective guard, the circuit enters through the other persisted guard
+     * ([GuardManager.alternativeGuard]); if that is not usable the answer is [PathSelectionResult.GuardConflict].
+     *
+     * [forBuild] `false` marks a check without a build: it never takes the guard manager's primary probe. A probe taken
+     * for a path that is not handed out (conflict, no path, entry through the other guard) is released again; a caller
+     * that then does not build the selected path hands the probe back with [releaseUnusedPath].
      */
     fun select(
         lastHop: OnionRelayDescriptor?,
         hops: Int = PathPolicy.PRODUCTION_PATH_LENGTH,
         lastHopChosenRemotely: Boolean = false,
+        forBuild: Boolean = true,
     ): PathSelectionResult {
         require(hops in PathPolicy.PRODUCTION_PATH_LENGTH..OnionConstants.MAX_HOPS) { "path length out of range" }
         val now = clock.millis() / 1000
         val cands = candidates(now)
         val last = lastHop?.let { toCandidate(it, now) }
         if (last != null && last.identity == ownIdentity) throw PathConflictException()
-        val guardDescriptor = guards.primaryUsable(cands.map { it.descriptor }) { pickGuard(cands, it, null, hops) }
+        val first =
+            guards.firstHopWithProbe(
+                cands.map { it.descriptor },
+                { pickGuard(cands, it, null, hops) },
+                forBuild,
+            )
+        val guardDescriptor = first.descriptor
+        // a primary probe taken for a path that is not handed out goes back to the guard manager (no first-hop result)
+        val result =
+            try {
+                selectWith(guardDescriptor, cands, last, hops, lastHopChosenRemotely)
+            } catch (e: PathConflictException) {
+                if (first.probe) guards.releaseProbe(guardDescriptor!!.identity)
+                throw e
+            }
+        if (!first.probe) return result
+        val selected = result as? PathSelectionResult.Selected
+        if (selected == null || selected.hops.first().identity != guardDescriptor!!.identity) {
+            guards.releaseProbe(guardDescriptor!!.identity)
+            return result
+        }
+        synchronized(probeLock) { probePath = selected.hops }
+        return PathSelectionResult.Selected(selected.hops, probe = true)
+    }
+
+    /** Hands back the primary probe of a path from [select] that is not built after all (no first-hop result). */
+    fun releaseUnusedPath(selected: PathSelectionResult.Selected) {
+        if (selected.probe) releaseUnbuiltPath(selected.hops)
+    }
+
+    /**
+     * Hands back the primary probe if [path] is THE hop list (same object) that [select] last handed out with the probe;
+     * a no-op for every other path. A path that merely starts at the primary (entry through the alternative guard while
+     * the backup is the effective guard, or the primary's own non-probe use) never carries the probe, and releasing for
+     * it would free a probe that another build still has in flight. A probe path whose reference was lost (a copied
+     * list) is not released and falls back to the probe timeout of the guard manager: a delay, never a second probe.
+     */
+    fun releaseUnbuiltPath(path: List<OnionRelayDescriptor>) {
+        val carried =
+            synchronized(probeLock) {
+                if (probePath != null && probePath === path) {
+                    probePath = null
+                    true
+                } else {
+                    false
+                }
+            }
+        if (carried) guards.releaseProbe(path.first().identity)
+    }
+
+    private fun selectWith(
+        guardDescriptor: OnionRelayDescriptor?,
+        cands: List<Candidate>,
+        last: Candidate?,
+        hops: Int,
+        lastHopChosenRemotely: Boolean,
+    ): PathSelectionResult {
         var guard =
             guardDescriptor?.let { d -> cands.firstOrNull { it.identity == d.identity } }
                 ?: return PathSelectionResult.Insufficient
         if (lastHopChosenRemotely && last != null && last.identity == guard.identity) {
             // A relay can not appear twice in a path, and the build must not fail because of the guard (that would let
-            // a remote party probe for it): enter through the persistent backup guard for this one circuit.
-            val backupId = guards.snapshot().backup?.identity
+            // a remote party probe for it): enter through the other persisted guard for this one circuit. After a
+            // failover the effective guard is the backup, so the other one is the primary (a dead primary then fails the
+            // build like any guard outage). Never a new guard: the exposure stays {primary, backup}.
+            val otherId = guards.alternativeGuard(guard.identity, cands.map { it.descriptor })?.identity
             guard =
-                cands.firstOrNull { it.identity == backupId && it.identity != last.identity }
-                    ?: return PathSelectionResult.Insufficient
+                cands.firstOrNull { it.identity == otherId && it.identity != last.identity }
+                    ?: return PathSelectionResult.GuardConflict
         }
         if (!lastHopChosenRemotely) {
             if (last != null && last.identity == guard.identity) throw PathConflictException()
@@ -119,19 +188,31 @@ class OnionPathSelector(
     }
 
     /**
-     * Draws one relay to serve as an endpoint (introduction, rendezvous or publish relay): diverse to the guard and not in
-     * [exclude]. `null` if there is none.
+     * Draws one relay to serve as an endpoint (introduction, rendezvous or publish relay): diverse to the guard (and to a
+     * primary guard marked unreachable, so that a probe build over it does not conflict), not in [exclude] and not that
+     * marked primary itself. `null` if there is none. Never takes the primary probe.
      */
     fun selectEndpoint(exclude: Set<Secp256k1PublicKey>): OnionRelayDescriptor? {
         val now = clock.millis() / 1000
         val cands = candidates(now)
         val guardDescriptor =
-            guards.primaryUsable(
+            guards.firstHop(
                 cands.map { it.descriptor },
-            ) { pickGuard(cands, it, null, PathPolicy.PRODUCTION_PATH_LENGTH) }
-                ?: return null
+                { pickGuard(cands, it, null, PathPolicy.PRODUCTION_PATH_LENGTH) },
+                forBuild = false,
+            ) ?: return null
         val guard = cands.firstOrNull { it.identity == guardDescriptor.identity } ?: return null
-        val allowed = cands.filter { it.identity !in exclude && it.identity != guard.identity && !conflicts(it, guard) }
+        val marked = guards.markedPrimaryIdentity()
+        // diverse to the marked primary as well: a later probe build over the primary must not conflict with the endpoint
+        val markedCandidate = marked?.let { m -> cands.firstOrNull { it.identity == m } }
+        val allowed =
+            cands.filter {
+                it.identity !in exclude &&
+                    it.identity != guard.identity &&
+                    it.identity != marked &&
+                    !conflicts(it, guard) &&
+                    (markedCandidate == null || !conflicts(it, markedCandidate))
+            }
         return pickWeighted(allowed)?.descriptor
     }
 
@@ -324,6 +405,7 @@ class SelectingOnionPathProvider(
             return when (val r = selector.select(last, lastHopChosenRemotely = purpose in REMOTE_LAST_HOP)) {
                 is PathSelectionResult.Selected -> r.hops
                 PathSelectionResult.Insufficient -> throw InsufficientRelaysException()
+                PathSelectionResult.GuardConflict -> throw GuardConflictException()
             }
         } catch (e: InsufficientRelaysException) {
             onFailure(e)

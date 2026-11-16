@@ -162,6 +162,12 @@ class OnionRendezvousClient internal constructor(
         private var timer: ScheduledFuture<*>? = null
         private val buildTimeout = sessionConfig.introBuildTimeout
 
+        /**
+         * Set when the circuit governor refused the RENDEZVOUS circuit. The state machine only sees a failed circuit and
+         * ends in RENDEZVOUS_POINT; the refusal is carried on as the cause so that nothing retries it.
+         */
+        private var rendezvousRefusal: CircuitAdmissionException? = null
+
         fun start() {
             synchronized(lock) {
                 drain { execute(machine.start()) }
@@ -277,6 +283,12 @@ class OnionRendezvousClient internal constructor(
                         return@synchronized
                     }
                     if (error != null || circuit == null) {
+                        val refusal = admissionRefusal(error)
+                        if (refusal != null &&
+                            c.purpose == net.lapisphilosophorum.lapisnet.onion.CircuitPurpose.RENDEZVOUS_SENDER
+                        ) {
+                            rendezvousRefusal = refusal
+                        }
                         enqueue(HsEvent.CircuitFailed(c.ref))
                         return@synchronized
                     }
@@ -350,11 +362,36 @@ class OnionRendezvousClient internal constructor(
                         .AtomicLong()
                 }.incrementAndGet()
             logger.debug { "rendezvous attempt failed: ${c.reason} in ${c.atState}" }
-            result.completeExceptionally(
-                IllegalStateException(
-                    "rendezvous failed: ${c.reason} in ${c.atState} after ${c.introAttempts} intro attempt(s)",
-                ),
-            )
+            val refusal = rendezvousRefusal.takeIf { c.reason == RendezvousFailure.RENDEZVOUS_POINT }
+            result.completeExceptionally(RendezvousFailedException(c.reason, c.atState, c.introAttempts, refusal))
         }
     }
+}
+
+/** The governor refusal behind a failed build, if that is what it was. */
+private fun admissionRefusal(error: Throwable?): CircuitAdmissionException? {
+    var c = error
+    while (c != null) {
+        if (c is CircuitAdmissionException) return c
+        if (c.cause === c) return null
+        c = c.cause
+    }
+    return null
+}
+
+/**
+ * A rendezvous attempt ended in the client state machine's FAILED state. The message is unchanged from the former
+ * `IllegalStateException` and carries no target, address or relay: only the reason, the state and the number of
+ * introduction attempts. [cause] is the circuit governor's refusal when the rendezvous circuit was not admitted
+ * (reason [RendezvousFailure.RENDEZVOUS_POINT]); its message carries only the refusal kind.
+ */
+@ExperimentalOnionApi
+class RendezvousFailedException(
+    val reason: RendezvousFailure,
+    val atState: RendezvousClientState,
+    val introAttempts: Int,
+    cause: Throwable? = null,
+) : IllegalStateException("rendezvous failed: $reason in $atState after $introAttempts intro attempt(s)", cause) {
+    /** `true` if the circuit governor refused the rendezvous circuit (no retry may follow, see the anonymity docs). */
+    val refusedByGovernor: Boolean get() = cause is CircuitAdmissionException
 }

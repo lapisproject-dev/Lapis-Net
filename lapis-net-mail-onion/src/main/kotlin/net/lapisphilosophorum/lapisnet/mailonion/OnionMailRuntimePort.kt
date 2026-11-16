@@ -12,6 +12,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
+import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
 
 /** The narrow view of the anonymity runtime that the mail adapter uses; a seam so the adapter can be tested with fakes. */
@@ -23,10 +24,18 @@ interface OnionMailRuntimePort {
 
     fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability
 
+    /**
+     * Opens a channel to the service. [timeout] bounds each rendezvous attempt; the production port may retry once with
+     * another rendezvous point (see `AnonymityRuntime.connectToService`), so the future completes within
+     * [connectWaitBound] of [timeout].
+     */
     fun connect(
         descriptor: OnionServiceDescriptor,
         timeout: Duration,
     ): CompletableFuture<FrameChannel>
+
+    /** How long a [connect] with [timeout] may take at most (all attempts); a caller waits this long. */
+    fun connectWaitBound(timeout: Duration): Duration = timeout
 
     fun recordRecipientUnreachable()
 }
@@ -49,6 +58,9 @@ class AnonymityRuntimeMailPort(
         runtime
             .connectToService(descriptor, OnionServiceApp.MAIL, timeout.toKotlinDuration())
             .thenApply { StreamFrameChannel(it) as FrameChannel }
+
+    override fun connectWaitBound(timeout: Duration): Duration =
+        AnonymityRuntime.connectWaitBound(timeout.toKotlinDuration()).toJavaDuration()
 
     override fun recordRecipientUnreachable() = runtime.recordRecipientUnreachable()
 

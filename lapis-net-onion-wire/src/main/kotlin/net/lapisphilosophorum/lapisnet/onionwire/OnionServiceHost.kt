@@ -4,6 +4,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptorIndex
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
+import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
 import net.lapisphilosophorum.lapisnet.onion.CircuitRef
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.HsEvent
@@ -13,10 +14,14 @@ import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceStateMachine
 import net.lapisphilosophorum.lapisnet.onion.RelayCommand
 import net.lapisphilosophorum.lapisnet.onion.ServiceCommand
+import net.lapisphilosophorum.lapisnet.onionwire.path.GuardConflictException
+import net.lapisphilosophorum.lapisnet.onionwire.path.InsufficientRelaysException
+import net.lapisphilosophorum.lapisnet.onionwire.path.PathConflictException
 import java.security.SecureRandom
 import java.time.Clock
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
@@ -72,6 +77,23 @@ class OnionServiceHost internal constructor(
 
     /** Dropped-work counters of the service state machine (diagnostics, no identifiers). */
     internal fun serviceStats(): net.lapisphilosophorum.lapisnet.onion.ServiceStats = machine.stats
+
+    private val rendezvousCounters = BuildCounters()
+    private val introCounters = BuildCounters()
+
+    /**
+     * Outcome counters of the circuits this host builds, by purpose (diagnostics; counts only, no relay, rendezvous
+     * point or address).
+     */
+    internal fun hostBuildStats(): HostBuildStats =
+        HostBuildStats(rendezvous = rendezvousCounters.snapshot(), intro = introCounters.snapshot())
+
+    private fun countersOf(purpose: CircuitPurpose): BuildCounters? =
+        when (purpose) {
+            CircuitPurpose.RENDEZVOUS_RECEIVER -> rendezvousCounters
+            CircuitPurpose.INTRO -> introCounters
+            else -> null
+        }
 
     /** Number of rendezvous sessions currently open. */
     fun openSessions(): Int = synchronized(lock) { streams.size }
@@ -198,14 +220,30 @@ class OnionServiceHost internal constructor(
             queue.addLast(HsEvent.CircuitFailed(c.ref))
             return
         }
+        val counters = countersOf(c.purpose)
         val path =
             try {
                 paths.pathEndingAt(endpoint, c.purpose)
             } catch (e: RuntimeException) {
+                counters?.let { k ->
+                    when (e) {
+                        is GuardConflictException -> k.guardConflict.incrementAndGet()
+                        is InsufficientRelaysException -> k.pathRefused.incrementAndGet()
+                        is PathConflictException -> k.pathConflict.incrementAndGet()
+                        else -> k.buildFailed.incrementAndGet()
+                    }
+                }
                 queue.addLast(HsEvent.CircuitFailed(c.ref))
                 return
             }
         factory.build(path, config.buildTimeout, c.purpose).whenComplete { circuit, error ->
+            if (error != null ||
+                circuit == null
+            ) {
+                counters?.buildFailed?.incrementAndGet()
+            } else {
+                counters?.built?.incrementAndGet()
+            }
             locked {
                 if (stopped) {
                     circuit?.close()
@@ -322,4 +360,39 @@ class OnionServiceHost internal constructor(
         firstPublish.completeExceptionally(IllegalStateException("closed"))
         runCatching { onClosed?.invoke() }
     }
+}
+
+/** Coarse build outcome counters of one circuit purpose of an [OnionServiceHost] (no identities). */
+internal data class BuildOutcomeStats(
+    /** The path selector found no path ([InsufficientRelaysException] other than a guard conflict). */
+    val pathRefused: Long,
+    /** The remotely chosen last hop equalled the effective guard and no other persisted guard was usable. */
+    val guardConflict: Long,
+    /** The prescribed last hop collided with the guard ([PathConflictException]). */
+    val pathConflict: Long,
+    /** The circuit factory failed (timeout, link loss, admission). */
+    val buildFailed: Long,
+    val built: Long,
+) {
+    override fun toString(): String =
+        "pathRefused=$pathRefused guardConflict=$guardConflict pathConflict=$pathConflict buildFailed=$buildFailed built=$built"
+}
+
+/** See [OnionServiceHost.hostBuildStats]. */
+internal data class HostBuildStats(
+    val rendezvous: BuildOutcomeStats,
+    val intro: BuildOutcomeStats,
+) {
+    override fun toString(): String = "rendezvous[$rendezvous] intro[$intro]"
+}
+
+private class BuildCounters {
+    val pathRefused = AtomicLong()
+    val guardConflict = AtomicLong()
+    val pathConflict = AtomicLong()
+    val buildFailed = AtomicLong()
+    val built = AtomicLong()
+
+    fun snapshot() =
+        BuildOutcomeStats(pathRefused.get(), guardConflict.get(), pathConflict.get(), buildFailed.get(), built.get())
 }

@@ -427,7 +427,8 @@ class MultiNodeMailOverCircuitsTest :
                                 hidden.descriptor,
                                 OnionServiceApp.MAIL,
                                 40.seconds,
-                            ).get(60, java.util.concurrent.TimeUnit.SECONDS)
+                                // two attempts of 40 s (rendezvous retry) + at most 6 s jitter + margin
+                            ).get(100, java.util.concurrent.TimeUnit.SECONDS)
                 }
             }
             streams.isNotEmpty() shouldBe true

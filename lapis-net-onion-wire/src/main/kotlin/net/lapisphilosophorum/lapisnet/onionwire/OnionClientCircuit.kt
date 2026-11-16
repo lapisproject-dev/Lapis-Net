@@ -271,6 +271,11 @@ internal class CircuitPolicy(
     val evictIdle: () -> Boolean = { false },
     /** A rate-limit delay longer than this fails the build instead of waiting. */
     val maxDefer: Duration = 30.seconds,
+    /**
+     * A path that was selected but refused before any link was tried (no first-hop result follows): lets the guard
+     * manager take back a primary probe the path may carry, so a refusal never counts as a failed probe.
+     */
+    val unbuiltPath: (List<OnionRelayDescriptor>) -> Unit = {},
 )
 
 /**
@@ -312,6 +317,7 @@ internal class OnionCircuitFactory(
         val p = policy ?: return buildNow(path, timeout, null, purpose, "")
         if (path.size < PathPolicy.PRODUCTION_PATH_LENGTH) {
             val e = CircuitAdmissionException(CircuitAdmissionException.Kind.PATH_TOO_SHORT)
+            runCatching { p.unbuiltPath(path) }
             p.onError(e)
             return CompletableFuture.failedFuture(e)
         }
@@ -336,6 +342,7 @@ internal class OnionCircuitFactory(
 
         fun refuse(kind: CircuitAdmissionException.Kind): CompletableFuture<OnionClientCircuit> {
             val e = CircuitAdmissionException(kind)
+            runCatching { p.unbuiltPath(path) }
             p.onError(e)
             return CompletableFuture.failedFuture(e)
         }

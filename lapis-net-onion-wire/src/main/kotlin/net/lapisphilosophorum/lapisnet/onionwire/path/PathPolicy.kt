@@ -191,7 +191,15 @@ data class PathSelectionOptions(
 
 /** No diverse path can be built from the known relays. The message carries no identity and no address. */
 @ExperimentalOnionApi
-class InsufficientRelaysException : RuntimeException("insufficient relays")
+open class InsufficientRelaysException : RuntimeException("insufficient relays")
+
+/**
+ * A remotely chosen last hop equals the effective guard and no other persisted guard is usable, so no circuit can be
+ * built (see [PathSelectionResult.GuardConflict]). A subclass of [InsufficientRelaysException], so existing callers are
+ * unaffected. The message carries no identity.
+ */
+@ExperimentalOnionApi
+class GuardConflictException : InsufficientRelaysException()
 
 /** The prescribed last hop collides with the guard (same network, family or identity). The message carries no detail. */
 @ExperimentalOnionApi
@@ -201,7 +209,15 @@ class PathConflictException : RuntimeException("path conflict")
 sealed interface PathSelectionResult {
     class Selected(
         val hops: List<OnionRelayDescriptor>,
+        /** `true` if the first hop is the guard manager's primary probe (see [OnionPathSelector.releaseUnusedPath]). */
+        val probe: Boolean = false,
     ) : PathSelectionResult
 
     data object Insufficient : PathSelectionResult
+
+    /**
+     * The last hop was chosen remotely, equals the effective guard, and no other persisted guard is usable to enter the
+     * network for this circuit. Counted separately from [Insufficient] (one bit per event, no identity).
+     */
+    data object GuardConflict : PathSelectionResult
 }

@@ -11,6 +11,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
+import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
 
 /** A bidirectional message channel to the other end of a rendezvous stream (what the framing needs of it). */
@@ -34,10 +35,18 @@ interface OnionDmRuntimePort {
 
     fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability
 
+    /**
+     * Opens a channel to the service. [timeout] bounds each rendezvous attempt; the production port may retry once with
+     * another rendezvous point (see `AnonymityRuntime.connectToService`), so the future completes within
+     * [connectWaitBound] of [timeout].
+     */
     fun connect(
         descriptor: OnionServiceDescriptor,
         timeout: Duration,
     ): CompletableFuture<FrameChannel>
+
+    /** How long a [connect] with [timeout] may take at most (all attempts); a caller waits this long. */
+    fun connectWaitBound(timeout: Duration): Duration = timeout
 
     fun publishMailboxItems(items: List<ByteArray>): CompletableFuture<Boolean>
 
@@ -80,6 +89,9 @@ class AnonymityRuntimePort(
         runtime
             .connectToService(descriptor, OnionServiceApp.DM, timeout.toKotlinDuration())
             .thenApply { StreamFrameChannel(it) as FrameChannel }
+
+    override fun connectWaitBound(timeout: Duration): Duration =
+        AnonymityRuntime.connectWaitBound(timeout.toKotlinDuration()).toJavaDuration()
 
     override fun publishMailboxItems(items: List<ByteArray>): CompletableFuture<Boolean> =
         runtime.publishMailboxItems(items)

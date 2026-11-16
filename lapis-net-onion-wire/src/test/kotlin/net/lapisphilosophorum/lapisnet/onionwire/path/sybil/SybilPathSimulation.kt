@@ -196,7 +196,9 @@ class SybilPathSimulation(
                         }
                         if (g && e) anyBoth = true
                     }
-                    PathSelectionResult.Insufficient -> insufficient.incrementAndGet()
+                    PathSelectionResult.Insufficient, PathSelectionResult.GuardConflict ->
+                        insufficient
+                            .incrementAndGet()
                 }
             }
             if (anyBoth) ever.incrementAndGet()

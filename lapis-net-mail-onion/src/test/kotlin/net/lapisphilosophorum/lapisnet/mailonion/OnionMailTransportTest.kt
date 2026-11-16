@@ -22,6 +22,7 @@ class OnionMailTransportTest :
     FunSpec({
         class Rig(
             deliveryTimeout: Duration = Duration.ofSeconds(5),
+            connectTimeout: Duration = Duration.ofSeconds(25),
         ) {
             val port = FakeMailPort()
             val dmPort = FakePort()
@@ -37,6 +38,7 @@ class OnionMailTransportTest :
                     { bundles[it] },
                     redelivery,
                     retry,
+                    connectTimeout = connectTimeout,
                     deliveryTimeout = deliveryTimeout,
                 )
             val sink = CollectingMailSink()
@@ -239,6 +241,37 @@ class OnionMailTransportTest :
                 waitFor { r.retry.pendingCount() == 1 } shouldBe true
                 // the abandoned circuits were closed
                 waitFor { r.port.clientEnds.all { it.isClosed } } shouldBe true
+            } finally {
+                r.close()
+            }
+        }
+
+        test("a connect that outlasts the per-attempt timeout but not the port's wait bound (a retry) is waited for") {
+            // 200 ms per attempt; the stream arrives after 2 s, as after a second rendezvous attempt
+            val r = Rig(connectTimeout = Duration.ofMillis(200))
+            try {
+                r.hidden()
+                r.port.connectDelayMillis = 2_000
+                r.port.waitBound = { it.multipliedBy(2).plusSeconds(3) }
+                r.transport.deliver(listOf(r.recipient.key), r.frame, emptyList(), AnonymousMailSizeClass.INLINE)
+                waitFor { r.sink.received.size == 1 } shouldBe true
+                r.redelivery.pendingCount() shouldBe 0
+                r.retry.pendingCount() shouldBe 0
+                r.port.connects.get() shouldBe 1
+            } finally {
+                r.close()
+            }
+        }
+
+        test("without the longer wait bound the same slow connect is given up and the mail queued (control)") {
+            val r = Rig(connectTimeout = Duration.ofMillis(200))
+            try {
+                r.hidden()
+                r.port.connectDelayMillis = 2_000
+                r.transport.deliver(listOf(r.recipient.key), r.frame, emptyList(), AnonymousMailSizeClass.INLINE)
+                waitFor { r.redelivery.pendingCount() == 1 } shouldBe true
+                // the abandoned stream is closed once it arrives
+                waitFor { r.port.clientEnds.isNotEmpty() && r.port.clientEnds.all { it.isClosed } } shouldBe true
             } finally {
                 r.close()
             }

@@ -244,7 +244,7 @@ class OnionMailTransport(
         try {
             val future = port.connect(descriptor, connectTimeout)
             pending = future
-            channel = future.get(connectTimeout.toMillis() + 1000, TimeUnit.MILLISECONDS)
+            channel = future.get(port.connectWaitBound(connectTimeout).toMillis() + 1000, TimeUnit.MILLISECONDS)
         } catch (e: ExecutionException) {
             logger.debug {
                 "mail stream could not be opened (${generateSequence<Throwable>(

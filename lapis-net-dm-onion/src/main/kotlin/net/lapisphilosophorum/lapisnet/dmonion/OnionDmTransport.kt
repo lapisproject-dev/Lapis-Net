@@ -165,7 +165,9 @@ class OnionDmTransport(
             if (timeout.isNegative || timeout.isZero) return null
             val future = port.connect(descriptor, timeout)
             pendingConnect = future
-            channel = future.get(timeout.toMillis() + 1000, TimeUnit.MILLISECONDS)
+            // all attempts of the port (a rendezvous retry included), but never beyond the send deadline
+            val wait = minOf(port.connectWaitBound(timeout), remaining)
+            channel = future.get(wait.toMillis() + 1000, TimeUnit.MILLISECONDS)
         } catch (e: ExecutionException) {
             logger.debug { "DM stream could not be opened (${rootName(e)})" }
         } catch (e: TimeoutException) {

@@ -80,17 +80,21 @@ internal class WarmCircuitPool(
         var started = false
         try {
             val endpoint = selector.selectEndpoint(emptySet()) ?: return
-            val path =
+            val selected =
                 try {
-                    (selector.select(endpoint, lastHopChosenRemotely = false) as? PathSelectionResult.Selected)?.hops
+                    selector.select(endpoint, lastHopChosenRemotely = false) as? PathSelectionResult.Selected
                 } catch (e: PathConflictException) {
                     null
                 } ?: return
+            val path = selected.hops
             val key =
                 endpoint.identity.bytes
                     .joinToString("") { "%02x".format(it) }
-            // answered by onBuilt/onFailed inside the factory
-            if (!governor.tryAdmitNow(null, key)) return
+            // answered by onBuilt/onFailed inside the factory; a refused build hands a primary probe back unused
+            if (!governor.tryAdmitNow(null, key)) {
+                selector.releaseUnusedPath(selected)
+                return
+            }
             started = true
             synchronized(lock) { buildsStarted++ }
             factory.buildGranted(path, buildTimeout).whenComplete { circuit, error ->

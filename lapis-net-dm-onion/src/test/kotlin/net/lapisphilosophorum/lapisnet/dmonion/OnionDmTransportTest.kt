@@ -202,6 +202,80 @@ class OnionDmTransportTest :
             }
         }
 
+        class WaitRig(
+            connectTimeout: java.time.Duration,
+        ) {
+            val port = FakePort()
+            val recipient = Peer()
+            val redelivery = AnonymousMailboxRedelivery(port, tickMillis = 3_600_000)
+            val inbound = OnionDmInboundHandler(CollectingSink())
+            val transport =
+                OnionDmTransport(
+                    port,
+                    { recipient.bundle },
+                    redelivery,
+                    connectTimeout = connectTimeout,
+                    sweepMillis = 30,
+                )
+
+            init {
+                port.onConnect = { inbound.handleChannel(it) }
+                val record = recipient.record()
+                val descriptor = recipient.descriptor()
+                port.reachability = { DirectoryReachability.Hidden(record, descriptor) }
+            }
+
+            val target: AnonymousDmTarget by lazy { transport.resolve(recipient.key) }
+
+            fun close() {
+                transport.close()
+                inbound.close()
+            }
+        }
+
+        test("a connect that outlasts the per-attempt timeout but not the port's wait bound (a retry) is waited for") {
+            // 200 ms per attempt; the stream arrives after 2 s, as after a second rendezvous attempt
+            val r = WaitRig(java.time.Duration.ofMillis(200))
+            try {
+                r.port.connectDelayMillis = 2_000
+                r.port.waitBound = { it.multipliedBy(2).plusSeconds(3) }
+                r.transport.deliverOnline(r.target, ByteArray(10) { 1 }, deadline()) shouldBe true
+                r.port.connects.get() shouldBe 1
+            } finally {
+                r.close()
+            }
+        }
+
+        test("without the longer wait bound the same slow connect is given up (control for the test above)") {
+            val r = WaitRig(java.time.Duration.ofMillis(200))
+            try {
+                r.port.connectDelayMillis = 2_000
+                // default bound = the per-attempt timeout: waits 200 ms + 1 s slack, less than the 2 s connect
+                r.transport.deliverOnline(r.target, ByteArray(10) { 1 }, deadline()) shouldBe false
+                // the abandoned stream is closed once it arrives
+                val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                while (r.port.clientEnds.any { !it.isClosed } && System.nanoTime() < end) Thread.sleep(20)
+                r.port.clientEnds.all { it.isClosed } shouldBe true
+            } finally {
+                r.close()
+            }
+        }
+
+        test("the DM transport never waits for a connect beyond its send deadline, whatever the port's wait bound") {
+            val r = WaitRig(java.time.Duration.ofSeconds(25))
+            try {
+                r.port.connectDelayMillis = 20_000
+                r.port.waitBound = { it.multipliedBy(2).plusSeconds(6) }
+                val started = System.nanoTime()
+                r.transport.deliverOnline(r.target, ByteArray(10) { 1 }, Instant.now().plusMillis(500)) shouldBe false
+                val tookMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+                // remaining (500 ms) plus the fixed 1 s slack, far below the 56 s bound and the 20 s connect
+                (tookMillis < 5_000) shouldBe true
+            } finally {
+                r.close()
+            }
+        }
+
         test("depositOffline queues the same envelope for announcement") {
             val r = Rig()
             try {

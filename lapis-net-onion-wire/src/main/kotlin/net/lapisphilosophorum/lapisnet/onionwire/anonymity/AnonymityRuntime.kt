@@ -99,11 +99,13 @@ class AnonymityRuntime private constructor(
     private val warm: WarmCircuitPool,
     private val cover: CoverTrafficScheduler?,
     private val shaper: EgressShaper?,
+    private val random: SecureRandom,
 ) : AutoCloseable {
     private val lifecycle = Any()
 
     @Volatile internal var hostStarted = false
     private val recipientUnreachable = AtomicLong(0)
+    private val rendezvousRetries = AtomicLong(0)
     private var state = State.RUNNING
     private var maintenance: NodeServiceSupervisor.PeriodicJob? = null
     internal var maintenanceTick: () -> Unit = {}
@@ -163,6 +165,8 @@ class AnonymityRuntime private constructor(
                 "accepted=${st.accepted} rateLimited=${st.rateLimited} concurrencyLimited=${st.concurrencyLimited} " +
                     "malformed=${st.malformed} replays=${st.replays} cacheFull=${st.cacheFull} " +
                     "unknownRendezvousPoint=${st.unknownRendezvousPoint}",
+            hostBuilds = host.hostBuildStats().toString(),
+            rendezvousRetries = rendezvousRetries.get(),
         )
     }
 
@@ -189,36 +193,55 @@ class AnonymityRuntime private constructor(
     /**
      * Opens a rendezvous stream to the onion service described by [descriptor] and sends the HELLO frame for [app].
      * The rendezvous point is a path-selector endpoint; an endpoint that conflicts with the guard is replaced (at most
-     * [RENDEZVOUS_ENDPOINT_TRIES] times). Fails with the cause of the underlying build/rendezvous failure; a failed
-     * attempt is never retried here, the circuit governor's backoff applies.
+     * [RENDEZVOUS_ENDPOINT_TRIES] times). A rendezvous that times out in AWAIT_RENDEZVOUS2 or fails at the rendezvous
+     * point is retried ONCE with a different rendezvous point after a random 2 to 6 seconds, without a warm circuit
+     * (see [RendezvousRetry]: the service may be unable to use a rendezvous point that equals its own guard). [timeout]
+     * applies to each attempt, so the future completes after at most `2 * timeout + 6 s`. Any other failure (a clear
+     * answer of the service, a refusal of the circuit governor) is not retried; the governor's backoff applies to every
+     * attempt.
      */
     fun connectToService(
         descriptor: OnionServiceDescriptor,
         app: OnionServiceApp,
         timeout: Duration,
+    ): CompletableFuture<OnionRendezvousStream> = connectToServiceVia(descriptor, app, timeout, null)
+
+    /**
+     * [connectToService] with a prescribed FIRST rendezvous point (tests only: reproduces a rendezvous point that equals
+     * the service's guard); the retry still draws its rendezvous point from the selector. No warm circuit is used.
+     */
+    internal fun connectToServiceVia(
+        descriptor: OnionServiceDescriptor,
+        app: OnionServiceApp,
+        timeout: Duration,
+        firstRendezvousPoint: OnionRelayDescriptor?,
     ): CompletableFuture<OnionRendezvousStream> {
         if (!ready()) return CompletableFuture.failedFuture(InsufficientRelaysException())
         // a warm circuit (wave V0.10.0-H) already ends at a suitable rendezvous point: its one use is this one
-        val prebuilt = warm.take(CircuitPurpose.RENDEZVOUS_SENDER)
-        var endpoint: OnionRelayDescriptor? = prebuilt?.lastHop
-        val exclude = HashSet<Secp256k1PublicKey>()
-        repeat(RENDEZVOUS_ENDPOINT_TRIES) {
-            if (endpoint != null) return@repeat
-            val candidate = selector.selectEndpoint(exclude) ?: return@repeat
-            try {
-                selector.select(candidate, lastHopChosenRemotely = false)
-                endpoint = candidate
-            } catch (e: PathConflictException) {
-                exclude += candidate.identity
-            }
-        }
+        val prebuilt = if (firstRendezvousPoint == null) warm.take(CircuitPurpose.RENDEZVOUS_SENDER) else null
         val rendezvousPoint =
-            endpoint ?: run {
+            firstRendezvousPoint ?: prebuilt?.lastHop ?: pickRendezvousPoint(emptySet()) ?: run {
                 prebuilt?.let { runCatching { it.circuit.close() } }
                 return CompletableFuture.failedFuture(InsufficientRelaysException())
             }
-        return rendezvousClient
-            .connectWith(descriptor.address(), paths, rendezvousPoint, descriptor, timeout, prebuilt?.circuit)
+        val retry =
+            RendezvousRetry<OnionRendezvousStream, WarmCircuitPool.Prebuilt>(
+                attempt = { rp, warmCircuit, t ->
+                    rendezvousClient.connectWith(descriptor.address(), paths, rp, descriptor, t, warmCircuit?.circuit)
+                },
+                selectRendezvousPoint = ::pickRendezvousPoint,
+                schedule = { delay, task ->
+                    wire.linkManager().schedule(delay) { task() } ?: throw IllegalStateException("scheduler closed")
+                },
+                random = random,
+                isClosed = ::stopped,
+                onRetry = { rendezvousRetries.incrementAndGet() },
+                maxAttempts = RENDEZVOUS_ATTEMPTS,
+                jitterMax = RENDEZVOUS_RETRY_JITTER_MAX,
+                discard = { it.close() },
+            )
+        return retry
+            .run(rendezvousPoint, prebuilt, timeout)
             .thenCompose { stream ->
                 if (stream.send(OnionServiceHello.encode(app))) {
                     CompletableFuture.completedFuture(stream)
@@ -227,6 +250,24 @@ class AnonymityRuntime private constructor(
                     CompletableFuture.failedFuture(IllegalStateException("could not send the service HELLO"))
                 }
             }
+    }
+
+    /**
+     * A rendezvous point: a path-selector endpoint not in [exclude]; one that conflicts with the guard is replaced (at
+     * most [RENDEZVOUS_ENDPOINT_TRIES] times). The conflict check builds nothing and never takes the primary probe.
+     */
+    private fun pickRendezvousPoint(exclude: Set<Secp256k1PublicKey>): OnionRelayDescriptor? {
+        val excluded = HashSet(exclude)
+        repeat(RENDEZVOUS_ENDPOINT_TRIES) {
+            val candidate = selector.selectEndpoint(excluded) ?: return null
+            try {
+                selector.select(candidate, lastHopChosenRemotely = false, forBuild = false)
+                return candidate
+            } catch (e: PathConflictException) {
+                excluded += candidate.identity
+            }
+        }
+        return null
     }
 
     /**
@@ -284,6 +325,15 @@ class AnonymityRuntime private constructor(
         private const val INTRO_POINTS = 3
         private const val PUBLISH_CANDIDATES = 3
         private const val RENDEZVOUS_ENDPOINT_TRIES = 3
+
+        /** Rendezvous attempts of [connectToService]: the first and at most one retry (see [RendezvousRetry]). */
+        internal const val RENDEZVOUS_ATTEMPTS = 2
+
+        /** The longest random wait before the rendezvous retry. */
+        internal val RENDEZVOUS_RETRY_JITTER_MAX = 6.seconds
+
+        /** How long [connectToService] with a per-attempt [timeout] may take at most: all attempts plus the jitter. */
+        fun connectWaitBound(timeout: Duration): Duration = timeout * RENDEZVOUS_ATTEMPTS + RENDEZVOUS_RETRY_JITTER_MAX
 
         /**
          * Starts anonymity mode on [wire], which must have been attached with [DirectoryAnonymityMode.ON].
@@ -374,6 +424,9 @@ class AnonymityRuntime private constructor(
                             }
                         },
                         onError = { record(codeOf(it)) },
+                        // a refused build never tried its first hop: the probe goes back unused, but only if THIS
+                        // path carries it (a non-probe entry through the marked primary must not free another's probe)
+                        unbuiltPath = selector::releaseUnbuiltPath,
                     ),
                 )
 
@@ -462,6 +515,7 @@ class AnonymityRuntime private constructor(
                         warm,
                         cover,
                         shaper,
+                        random,
                     )
 
                 var publisherStarted = false
@@ -562,4 +616,8 @@ data class AnonymityDiagnostics(
     val rendezvousFailures: Map<String, Long>,
     val rendezvousFailureStates: Map<String, Long>,
     val serviceStats: String,
+    /** Build outcomes of the service host's circuits by purpose (counts only, see `OnionServiceHost.hostBuildStats`). */
+    val hostBuilds: String = "",
+    /** How often [AnonymityRuntime.connectToService] retried a rendezvous with a second rendezvous point. */
+    val rendezvousRetries: Long = 0,
 )

@@ -347,7 +347,8 @@ class MultiNodeDmOverCircuitsTest :
                             opened =
                                 a.runtime
                                     .connectToService(hidden.descriptor, OnionServiceApp.DM, 40.seconds)
-                                    .get(60, TimeUnit.SECONDS)
+                                    // two attempts of 40 s (rendezvous retry) + at most 6 s jitter + margin
+                                    .get(100, TimeUnit.SECONDS)
                         } catch (e: java.util.concurrent.ExecutionException) {
                             failures +=
                                 generateSequence<Throwable>(

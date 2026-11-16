@@ -17,6 +17,7 @@ import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /** One end of an in-memory channel pair; sends are delivered synchronously to the peer's receiver. */
@@ -88,6 +89,14 @@ class FakePort : OnionDmRuntimePort {
     @Volatile var connectFails = false
     val clientEnds = CopyOnWriteArrayList<FakeChannel>()
 
+    /** A connect completes only after this long (a rendezvous retry that outlasts the per-attempt timeout). */
+    @Volatile var connectDelayMillis = 0L
+
+    /** What [connectWaitBound] answers (the production port: all attempts plus the retry jitter). */
+    @Volatile var waitBound: (Duration) -> Duration = { it }
+
+    override fun connectWaitBound(timeout: Duration): Duration = waitBound(timeout)
+
     override fun ready(): Boolean = ready
 
     override fun resolveIdentity(identity: Secp256k1PublicKey): DirectoryReachability = reachability(identity)
@@ -100,6 +109,16 @@ class FakePort : OnionDmRuntimePort {
         if (connectFails) return CompletableFuture.failedFuture(IllegalStateException("no route"))
         val (client, server) = FakeChannel.pair()
         clientEnds += client
+        val delay = connectDelayMillis
+        if (delay > 0) {
+            return CompletableFuture.supplyAsync(
+                {
+                    onConnect(server)
+                    client as FrameChannel
+                },
+                CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS),
+            )
+        }
         onConnect(server)
         return CompletableFuture.completedFuture(client)
     }

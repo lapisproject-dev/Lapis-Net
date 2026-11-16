@@ -35,8 +35,9 @@ import kotlin.time.Duration.Companion.seconds
  * and key rotation would move with it), so that the descriptor of a dead relay leaves every index in real time.
  *
  * Security property under test: ONE guard outage does not rotate the guard (the primary stays in the persisted state, a
- * failure is only counted), the node never falls back to announcing from its own address, and as soon as the dead
- * primary's descriptor is gone the backup serves as first hop. The 72-hour and 24-hour rotation rules are covered by
+ * failure is only counted), the node never falls back to announcing from its own address, and after the first
+ * first-hop failure the dead primary is marked unreachable (in memory) so that the backup serves as first hop while
+ * P's descriptor is still valid. The 72-hour and 24-hour rotation rules are covered by
  * the unit tests in `GuardManagerTest`, not here. Loopback with a synthetic locator, not real networks.
  */
 class MultiNodeGuardFailoverTest :
@@ -61,6 +62,9 @@ class MultiNodeGuardFailoverTest :
         lateinit var runtimeA: AnonymityRuntime
         lateinit var runtimeB: AnonymityRuntime
         val guardFileA = a.dir.resolve("onion").resolve("guards.bin")
+        val guardFileB = b.dir.resolve("onion").resolve("guards.bin")
+        var outageStartNanos = 0L
+        var introBuiltAtOutage = 0L
 
         fun guardsOfA(): GuardState =
             EncryptedFileGuardStateStore(
@@ -104,8 +108,27 @@ class MultiNodeGuardFailoverTest :
 
         lateinit var primary: Secp256k1PublicKey
         lateinit var backup: Secp256k1PublicKey
+
+        fun guardsOfB(): GuardState? =
+            runCatching {
+                EncryptedFileGuardStateStore(guardFileB, b.identity).use { (it.load() as? GuardLoad.Loaded)?.state }
+            }.getOrNull()
+
+        // Diagnostic timeline (counts and booleans only, no keys): how the outage unfolds on both nodes.
+        fun timeline(label: String) {
+            val sinceOutage = if (outageStartNanos == 0L) -1 else (System.nanoTime() - outageStartNanos) / 1_000_000_000
+            val gb = guardsOfB()
+            val pDescriptorAtA = a.wire.descriptors.current(primary, now()) != null
+            println(
+                "TIMELINE guard-failover [$label] t+${sinceOutage}s pDescriptorAtA=$pDescriptorAtA " +
+                    "bPrimaryIsP=${gb?.primary?.identity == primary} bBackupIsP=${gb?.backup?.identity == primary} " +
+                    "bBackupIsK=${gb?.backup?.identity == backup} " +
+                    "A.lastError=${runtimeA.status().lastError.wire} B.lastError=${runtimeB.status().lastError.wire}",
+            )
+            println("TIMELINE guard-failover [$label] A.diagnostics=${runtimeA.diagnostics()}")
+            println("TIMELINE guard-failover [$label] B.diagnostics=${runtimeB.diagnostics()}")
+        }
         var sequenceBefore = 0L
-        var introBefore: List<net.lapisphilosophorum.lapisnet.onion.IntroPointEntry> = emptyList()
 
         test(
             "A publishes over its primary guard; the guard file names primary P and backup K, A holds one onion link",
@@ -136,19 +159,22 @@ class MultiNodeGuardFailoverTest :
 
         test(
             "P goes down: builds fail at the first hop, nothing is published from the own node, no guard rotation",
-        ).config(timeout = 240.seconds) {
+        ).config(timeout = 300.seconds) {
             val p = relays.first { it.key == primary }
             val gossipBefore = scannerA.gossip.size
+            introBuiltAtOutage =
+                Regex("""intro\[[^\]]*built=(\d+)""")
+                    .find(runtimeA.diagnostics().hostBuilds)!!
+                    .groupValues[1]
+                    .toLong()
             p.close()
-            // Reference point AFTER the outage began: early refresh versions sent before P went down must not count.
-            // Early sends of an already running schedule keep the same introduction points, so the introduction points
-            // are compared as well: only a rebuild over the backup yields new ones.
+            outageStartNanos = System.nanoTime()
+            // Reference point AFTER the outage began.
             val ref =
                 b.wire.serviceDescriptors
                     .current(serviceKeyA.publicKey, now())
                     .shouldNotBeNull()
             sequenceBefore = ref.sequenceNumber
-            introBefore = ref.introPoints
             // builds toward the dead guard fail: the failure is counted, the primary is NOT replaced
             var counted = false
             awaitTrue(Duration.ofSeconds(35)) {
@@ -165,63 +191,132 @@ class MultiNodeGuardFailoverTest :
             scannerA.gossip.size shouldBe gossipBefore
             scannerA.leaks(scannerA.gossip.map { it.second }, scannerA.addressNeedles()) shouldBe emptyList()
             println("TIMELINE guard-failover: failures counted=$counted, lastError=${runtimeA.status().lastError.wire}")
+            timeline("end of test 2")
+            // INSUFFICIENT_RELAYS: an introduction slot that points at K is a path conflict once K is the first hop
             setOf(
                 AnonymityErrorCode.NONE,
+                AnonymityErrorCode.INSUFFICIENT_RELAYS,
                 AnonymityErrorCode.BUILD_FAILED,
                 AnonymityErrorCode.BUILD_TIMEOUT,
                 AnonymityErrorCode.PUBLISH_FAILED,
             ).contains(runtimeA.status().lastError) shouldBe true
+
+            // P is marked unreachable after its first failure: the backup K carries A's builds BEFORE P's descriptor
+            // expired (before the fix: only once that descriptor had left A's index). Every first hop is P or K and P is
+            // dead, so a newly built introduction circuit went over K. The republication of the service descriptor can
+            // still take longer: an introduction slot that points at K is now a path conflict and is replaced only after
+            // the host's slot backoff (pre-existing deterministic replacement, see docs/anonymity.adoc).
+            fun introBuilt(): Long =
+                Regex("""intro\[[^\]]*built=(\d+)""")
+                    .find(runtimeA.diagnostics().hostBuilds)!!
+                    .groupValues[1]
+                    .toLong()
+            val builtBefore = introBuiltAtOutage
+            var pDescriptorStillKnown = false
+            awaitTrue(Duration.ofSeconds(60)) {
+                Thread.sleep(1000) // not a busy loop: it would drain the circuit build governor
+                runtimeA.maintainNow()
+                val known = a.wire.descriptors.current(primary, now()) != null
+                val built = introBuilt() > builtBefore
+                if (built) pDescriptorStillKnown = known
+                built
+            } shouldBe true
+            timeline("first introduction circuit over the backup")
+            pDescriptorStillKnown shouldBe true
+            guardsOfA().primary.shouldNotBeNull().identity shouldBe primary
         }
 
         test(
-            "once P's descriptor expired, the backup K is the first hop: publication succeeds again and B connects to A",
-        ).config(timeout = 400.seconds) {
-            // The directory objects are not due for republication, but A's service rebuilds its introduction circuits
-            // over the backup and publishes a NEW service descriptor through circuits: B sees a higher sequence number.
-            val published =
-                awaitTrue(Duration.ofSeconds(300)) {
-                    Thread.sleep(1000) // not a busy loop: it would drain the circuit build governor
-                    runtimeA.maintainNow()
-                    runtimeB.maintainNow()
-                    val d = b.wire.serviceDescriptors.current(serviceKeyA.publicKey, now())
-                    d != null && d.sequenceNumber > sequenceBefore && d.introPoints != introBefore
-                }
-            published shouldBe true
+            "after the failover to the backup K (P still dead, its descriptor expired): B connects to A over circuits",
+        ).config(timeout = 500.seconds) {
+            // A's service rebuilt its introduction circuits over K to the SAME introduction relays (they are alive; only
+            // the first hop changed), so the introduction points of B's descriptor stay valid and need no republication.
+            // Before the fix the rebuild came only after P's descriptor expired and then also replaced introduction
+            // points; that is no longer required here. B must see a descriptor at least as new as at the outage.
+            // While P's relay descriptor is still listed, P is a candidate middle hop and rendezvous point for EVERY node
+            // (a dead relay stays in the directory until its descriptor expires; a general property, not the guard logic
+            // tested here), so a circuit may still fail through it. The connection is therefore made once P's
+            // descriptor has left both indexes, as before the fix.
+            awaitTrue(Duration.ofSeconds(180)) {
+                Thread.sleep(1000) // not a busy loop: it would drain the circuit build governor
+                runtimeA.maintainNow()
+                runtimeB.maintainNow()
+                val d = b.wire.serviceDescriptors.current(serviceKeyA.publicKey, now())
+                d != null &&
+                    d.sequenceNumber >= sequenceBefore &&
+                    a.wire.descriptors.current(primary, now()) == null &&
+                    b.wire.descriptors.current(primary, now()) == null
+            } shouldBe true
             // the only onion link of A leads to K; the persisted primary is still P (replacement comes after 72 hours)
             awaitTrue(Duration.ofSeconds(30)) { a.wire.linkCount() == 1 } shouldBe true
             guardsOfA().primary.shouldNotBeNull().identity shouldBe primary
 
-            // B resolves the (possibly re-published) descriptor of A and talks to it over circuits. Right after the
-            // failover A's new introduction circuits may still be settling, so a single rendezvous timeout is not a
-            // defect: retry up to 3 times within 180 s, fetching a fresh descriptor for every attempt.
-            val deadline = System.nanoTime() + Duration.ofSeconds(180).toNanos()
-            var stream: OnionRendezvousStream? = null
-            var lastFailure: Throwable? = null
-            var attempt = 0
-            while (stream == null && attempt < 3 && System.nanoTime() < deadline) {
-                attempt++
-                val descriptor =
-                    awaitedDescriptor { b.wire.serviceDescriptors.current(serviceKeyA.publicKey, now()) }
+            // B resolves the re-published descriptor of A and talks to it over circuits: ONE call. If B's rendezvous
+            // point happens to be A's effective guard K, A can not build to it (no other usable guard: P is dead) and
+            // drops the rendezvous; connectToService then retries once with another rendezvous point (RendezvousRetry).
+            // Budget: 2 x 45 s per attempt + at most 6 s jitter + margin.
+            val descriptor = awaitedDescriptor { b.wire.serviceDescriptors.current(serviceKeyA.publicKey, now()) }
+            val stream =
                 try {
-                    stream =
-                        runtimeB
-                            .connectToService(descriptor, OnionServiceApp.DM, 45.seconds)
-                            .get(60, TimeUnit.SECONDS)
+                    runtimeB
+                        .connectToService(descriptor, OnionServiceApp.DM, 45.seconds)
+                        .get(120, TimeUnit.SECONDS)
                 } catch (e: Exception) {
-                    lastFailure = e
-                    println("TIMELINE guard-failover: connect attempt $attempt failed: $e")
-                    runtimeA.maintainNow()
-                    runtimeB.maintainNow()
-                    Thread.sleep(3000)
+                    timeline("connect failed: $e")
+                    throw e
                 }
-            }
-            if (stream == null) throw AssertionError("B could not connect to A after $attempt attempts", lastFailure)
+            timeline("connected, rendezvousRetries=${runtimeB.diagnostics().rendezvousRetries}")
             val got = ConcurrentLinkedQueue<ByteArray>()
             stream.onReceive { got += it }
             val sent = List(10) { i -> ByteArray(1 + i * 53) { (it + i).toByte() } }
             sent.forEach { stream.send(it) shouldBe true }
             awaitTrue(Duration.ofSeconds(60)) { got.size == 10 } shouldBe true
             got.toList().zip(sent).all { (x, y) -> x.contentEquals(y) } shouldBe true
+            stream.close()
+        }
+
+        test(
+            "B's rendezvous point equals A's effective guard K: A can not build to it, B retries once and connects",
+        ).config(timeout = 300.seconds) {
+            // once P's descriptor left A's index, K is A's only usable guard: a rendezvous circuit to K is impossible
+            awaitTrue(Duration.ofSeconds(150)) {
+                Thread.sleep(1000)
+                a.wire.descriptors.current(primary, now()) == null
+            } shouldBe true
+
+            fun rendezvousGuardConflicts(): Long =
+                Regex("""rendezvous\[[^\]]*guardConflict=(\d+)""")
+                    .find(runtimeA.diagnostics().hostBuilds)!!
+                    .groupValues[1]
+                    .toLong()
+            val conflictsBefore = rendezvousGuardConflicts()
+            val retriesBefore = runtimeB.diagnostics().rendezvousRetries
+            val k =
+                b.wire.descriptors
+                    .current(backup, now())
+                    .shouldNotBeNull()
+            val descriptor = awaitedDescriptor { b.wire.serviceDescriptors.current(serviceKeyA.publicKey, now()) }
+            val stream =
+                try {
+                    runtimeB
+                        .connectToServiceVia(descriptor, OnionServiceApp.DM, 45.seconds, k)
+                        .get(120, TimeUnit.SECONDS)
+                } catch (e: Exception) {
+                    timeline("forced rendezvous point K failed: $e")
+                    throw e
+                }
+            timeline("forced rendezvous point K connected")
+            // If K is also B's own effective guard, B can not even build its rendezvous circuit to K (a locally chosen
+            // last hop equal to the guard is a path conflict): the first attempt then fails at B with RENDEZVOUS_POINT
+            // before A is involved. The retry covers both cases; A's guard conflict is only asserted in the first.
+            val gb = guardsOfB()
+            val bEffectiveGuard = if (gb?.primary?.identity == primary) gb.backup?.identity else gb?.primary?.identity
+            if (bEffectiveGuard != backup) (rendezvousGuardConflicts() > conflictsBefore) shouldBe true
+            runtimeB.diagnostics().rendezvousRetries shouldBe retriesBefore + 1
+            val got = ConcurrentLinkedQueue<ByteArray>()
+            stream.onReceive { got += it }
+            stream.send(byteArrayOf(1, 2, 3)) shouldBe true
+            awaitTrue(Duration.ofSeconds(60)) { got.size == 1 } shouldBe true
             stream.close()
         }
 
