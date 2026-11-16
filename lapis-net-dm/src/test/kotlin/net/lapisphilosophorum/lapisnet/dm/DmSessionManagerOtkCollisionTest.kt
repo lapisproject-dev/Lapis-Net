@@ -130,6 +130,26 @@ private fun collidingTrio(
     return trio to sharedId
 }
 
+/**
+ * [connectAndConverge] republishes [responder]'s prekey bundle every 500 ms until [viewer] sees one, so bundles with a
+ * higher sequence number can still be in flight when it returns (measured under CPU load: [viewer] saw sequence 1 on
+ * return and sequence 2 a few milliseconds later). Publishes one more bundle and waits until [viewer] holds exactly that
+ * one. The bundle index keeps the highest sequence number and [responder] publishes nothing else (its pool stays far
+ * above the replenish watermark), so no newer bundle can arrive afterwards. Returns that sequence number.
+ */
+private fun settleBundle(
+    responder: DmTestNode,
+    viewer: DmTestNode,
+): Long {
+    val key = responder.identity.secp256k1KeyPair.publicKey
+    val bundle = responder.prekeyStore.publishBundle(responder.identity, Instant.now().epochSecond + 3600)
+    responder.prekeyBundleGossip.announce(bundle)
+    awaitTrue(Duration.ofSeconds(30)) {
+        viewer.prekeyBundleGossip.lookup(key)?.sequenceNumber == bundle.sequenceNumber
+    } shouldBe true
+    return bundle.sequenceNumber
+}
+
 /** Rebuilds [genuine] (an X3DH_INITIAL) with a fresh ephemeral key and the given one-time prekey id. */
 private fun forgedInitial(
     genuine: DmEnvelope,
@@ -164,11 +184,11 @@ class DmSessionManagerOtkCollisionTest :
                 val cChoices = CopyOnWriteArrayList<Int?>()
                 t.c.dmSessionManager.onOneTimePrekeyChosenForTest = { _, id, _ -> cChoices += id }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.bodiesFrom(t.a.identity.secp256k1KeyPair.publicKey).isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.a.identity.secp256k1KeyPair.publicKey).isNotEmpty() }
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c 1"))
                 awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.cKey).contains("from c 1") } shouldBe true
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c 2"))
-                awaitTrue(Duration.ofSeconds(20)) { t.bodiesFrom(t.cKey).contains("from c 2") } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.cKey).contains("from c 2") } shouldBe true
                 Thread.sleep(1_000)
                 t.bodiesFrom(t.cKey).count { it == "from c 1" } shouldBe 1
                 t.bodiesFrom(t.cKey).count { it == "from c 2" } shouldBe 1
@@ -187,10 +207,10 @@ class DmSessionManagerOtkCollisionTest :
                 cChoices.first() shouldBe sharedId
                 cChoices.last() shouldNotBe sharedId
                 // B -> C works over the recovered session, and acknowledges it.
-                val toC = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val toC = CopyOnWriteArrayList<DmInboundMessage>()
                 t.c.dmSessionManager.addInboundListener { toC.add(it) }
                 t.b.dmSessionManager.send(t.cKey, DmContent(body = "from b"))
-                awaitTrue(Duration.ofSeconds(20)) { toC.any { it.content.body == "from b" } } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { toC.any { it.content.body == "from b" } } shouldBe true
                 t.c.dmSessionManager.hasPendingInitiationForTest(t.bKey) shouldBe false
             } finally {
                 t.stop()
@@ -209,7 +229,7 @@ class DmSessionManagerOtkCollisionTest :
                 b.prekeyBundleGossip.announce(
                     b.prekeyStore.publishBundle(b.identity, Instant.now().epochSecond + 3600, maxOneTimePrekeys = 1),
                 )
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     a.prekeyBundleGossip
                         .lookup(bKey)
                         ?.oneTimePrekeys
@@ -219,7 +239,7 @@ class DmSessionManagerOtkCollisionTest :
                             ?.oneTimePrekeys
                             ?.size == 1
                 } shouldBe true
-                val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
                 b.dmSessionManager.addInboundListener { received.add(it) }
                 a.dmSessionManager.send(bKey, DmContent(body = "from a"))
                 c.dmSessionManager.send(bKey, DmContent(body = "from c"))
@@ -278,14 +298,14 @@ class DmSessionManagerOtkCollisionTest :
                 val genuine = CopyOnWriteArrayList<DmX3dhRejection>()
                 t.c.dmSessionManager.onX3dhRejectionReceivedForTest = { genuine += it }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() }
                 // Hold the re-send so the session state between the checks is observable.
                 val held = CopyOnWriteArrayList<() -> Unit>()
                 t.c.dmSessionManager.scheduleForTest = { _, task -> held += task }
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c"))
-                awaitTrue(Duration.ofSeconds(20)) { genuine.size == 1 } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { genuine.size == 1 } shouldBe true
                 held.forEach { it() }
-                awaitTrue(Duration.ofSeconds(20)) { t.bodiesFrom(t.cKey).contains("from c") } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.cKey).contains("from c") } shouldBe true
                 val c = t.c.dmSessionManager
                 val ignoredBefore = c.diagnostics().rejectionsIgnored
                 val pendingBefore = c.pendingInitiationForTest(t.bKey)!!.encode()
@@ -315,10 +335,10 @@ class DmSessionManagerOtkCollisionTest :
                 c.liveSessionForTest(t.bKey) shouldNotBe null
 
                 // (6) once B answered, the session is acknowledged: a rejection is ignored, the session stays.
-                val toC = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val toC = CopyOnWriteArrayList<DmInboundMessage>()
                 c.addInboundListener { toC.add(it) }
                 t.b.dmSessionManager.send(t.cKey, DmContent(body = "ack"))
-                awaitTrue(Duration.ofSeconds(20)) { toC.isNotEmpty() } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { toC.isNotEmpty() } shouldBe true
                 c.handleX3dhRejectionForTest(forged)
                 c.diagnostics().rejectionsIgnored shouldBe ignoredBefore + 3
                 c.liveSessionForTest(t.bKey) shouldNotBe null
@@ -349,13 +369,13 @@ class DmSessionManagerOtkCollisionTest :
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c"))
                 val expected = listOf(0L..0L, 24_000L..36_000L, 96_000L..144_000L)
                 for (round in 0 until 3) {
-                    awaitTrue(Duration.ofSeconds(20)) { scheduled.size == round + 1 } shouldBe true
+                    awaitTrue(Duration.ofSeconds(30)) { scheduled.size == round + 1 } shouldBe true
                     scheduled[round].first shouldBeGreaterThanOrEqual expected[round].first
                     scheduled[round].first shouldBeLessThanOrEqual expected[round].last
                     clock.advance(Duration.ofSeconds(301))
                     scheduled[round].second()
                 }
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     t.c.dmSessionManager
                         .pendingInitiationForTest(t.bKey)
                         ?.gaveUp == true
@@ -377,9 +397,9 @@ class DmSessionManagerOtkCollisionTest :
                 t.c.dmSessionManager.onDirectFrameSentForTest = { frames += it }
                 t.c.dmSessionManager.scheduleForTest = { _, _ -> }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() }
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c"))
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     t.b.dmSessionManager
                         .diagnostics()
                         .rejectionsSent == 1L
@@ -419,9 +439,9 @@ class DmSessionManagerOtkCollisionTest :
                 t.c.dmSessionManager.onDirectFrameSentForTest = { frames += it }
                 t.c.dmSessionManager.scheduleForTest = { _, _ -> }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() }
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c"))
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     t.b.dmSessionManager
                         .diagnostics()
                         .rejectionsSent == 1L
@@ -437,7 +457,7 @@ class DmSessionManagerOtkCollisionTest :
                     )
                 }
                 val spkBudget = DmSessionManager.MAX_REJECTIONS_PER_WINDOW.toLong()
-                awaitTrue(Duration.ofSeconds(20)) { bm.diagnostics().rejectionsSent == 1L + spkBudget } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { bm.diagnostics().rejectionsSent == 1L + spkBudget } shouldBe true
                 Thread.sleep(500)
                 bm.diagnostics().rejectionsSent shouldBe 1L + spkBudget
                 // A real one-time-prekey collision (a new sender naming the consumed id) is still answered.
@@ -445,7 +465,7 @@ class DmSessionManagerOtkCollisionTest :
                     t.c.node.peerId,
                     DmEnvelopeCodec.encode(forgedInitial(genuine, sharedId, DualKeyIdentity.generate())),
                 )
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     bm.diagnostics().rejectionsSent == 2L + spkBudget
                 } shouldBe true
             } finally {
@@ -475,7 +495,7 @@ class DmSessionManagerOtkCollisionTest :
                 Files.delete(blocked)
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c, again"))
                 t.c.dmSessionManager.hasPendingInitiationForTest(t.bKey) shouldBe true
-                awaitTrue(Duration.ofSeconds(20)) { t.bodiesFrom(t.cKey).contains("from c, again") } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.cKey).contains("from c, again") } shouldBe true
             } finally {
                 t.stop()
             }
@@ -487,7 +507,7 @@ class DmSessionManagerOtkCollisionTest :
                 val aFrames = CopyOnWriteArrayList<ByteArray>()
                 t.a.dmSessionManager.onDirectFrameSentForTest = { aFrames += it }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() } shouldBe true
                 val before = t.b.dmSessionManager.diagnostics()
                 t.b.dmSessionManager.handleInboundEnvelope(t.a.node.peerId, aFrames.first())
                 Thread.sleep(500)
@@ -506,12 +526,18 @@ class DmSessionManagerOtkCollisionTest :
             try {
                 connectAndConverge(c, b)
                 val bKey = b.identity.secp256k1KeyPair.publicKey
+                val cKey = c.identity.secp256k1KeyPair.publicKey
                 val cm = c.dmSessionManager
                 cm.clock = clock
                 val initials = CopyOnWriteArrayList<Int?>()
                 cm.onOneTimePrekeyChosenForTest = { _, id, _ -> initials += id }
+                val atB = CopyOnWriteArrayList<DmInboundMessage>()
+                b.dmSessionManager.addInboundListener { atB.add(it) }
 
-                fun sendN(n: Int) = repeat(n) { cm.send(bKey, DmContent(body = "m")) }
+                fun sendN(
+                    n: Int,
+                    body: String = "m",
+                ) = repeat(n) { cm.send(bKey, DmContent(body = body)) }
                 sendN(4) // INITIAL + 3 TEXT
                 initials.size shouldBe 1
                 clock.advance(Duration.ofMinutes(16))
@@ -527,17 +553,20 @@ class DmSessionManagerOtkCollisionTest :
                 cm.pendingInitiationForTest(bKey)!!.excludedIds shouldBe setOf(initials[0]!!, initials[1]!!)
                 sendN(3)
                 clock.advance(Duration.ofMinutes(16))
-                sendN(1)
+                sendN(1, body = "last before ack")
                 initials.size shouldBe 3 // MAX_UNACKED_REBOOTSTRAPS reached
+                // B must have processed C's last frame before it sends: B's inbound handler takes B's peer lock for C
+                // on the Netty event loop, while B's send holds that lock and waits for a stream open that needs the
+                // same event loop - the send would stall until DIAL_TIMEOUT (pre-existing, see the commit message).
+                awaitTrue(Duration.ofSeconds(30)) {
+                    atB.any { it.sender == cKey && it.content.body == "last before ack" }
+                } shouldBe true
+                b.dmSessionManager.liveSessionForTest(cKey) shouldNotBe null
                 // Once B answers, no fallback any more.
-                val toC = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val toC = CopyOnWriteArrayList<DmInboundMessage>()
                 cm.addInboundListener { toC.add(it) }
-                awaitTrue(Duration.ofSeconds(20)) {
-                    b.dmSessionManager.liveSessionForTest(c.identity.secp256k1KeyPair.publicKey) !=
-                        null
-                }
-                b.dmSessionManager.send(c.identity.secp256k1KeyPair.publicKey, DmContent(body = "ack"))
-                awaitTrue(Duration.ofSeconds(20)) { toC.isNotEmpty() } shouldBe true
+                b.dmSessionManager.send(cKey, DmContent(body = "ack"))
+                awaitTrue(Duration.ofSeconds(30)) { toC.isNotEmpty() } shouldBe true
                 cm.hasPendingInitiationForTest(bKey) shouldBe false
                 sendN(4)
                 clock.advance(Duration.ofMinutes(60))
@@ -562,24 +591,24 @@ class DmSessionManagerOtkCollisionTest :
                 b.prekeyBundleGossip.announce(
                     b.prekeyStore.publishBundle(b.identity, Instant.now().epochSecond + 3600, maxOneTimePrekeys = 1),
                 )
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     c.prekeyBundleGossip
                         .lookup(bKey)
                         ?.oneTimePrekeys
                         ?.size == 1
                 } shouldBe true
-                val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
                 b.dmSessionManager.addInboundListener { received.add(it) }
                 val cm = c.dmSessionManager
                 cm.clock = clock
                 val initials = CopyOnWriteArrayList<Int?>()
                 cm.onOneTimePrekeyChosenForTest = { _, id, _ -> initials += id }
                 repeat(4) { cm.send(bKey, DmContent(body = "m$it")) } // INITIAL + 3 TEXT
-                awaitTrue(Duration.ofSeconds(20)) { received.count { it.sender == cKey } == 4 } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { received.count { it.sender == cKey } == 4 } shouldBe true
                 initials.size shouldBe 1
                 clock.advance(Duration.ofMinutes(16))
                 cm.send(bKey, DmContent(body = "after the threshold"))
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     received.any { it.sender == cKey && it.content.body == "after the threshold" }
                 } shouldBe true
                 initials.size shouldBe 1
@@ -590,7 +619,7 @@ class DmSessionManagerOtkCollisionTest :
                 pending.oneTimePrekeyId shouldBe initials.single()
                 // Once a fresh bundle arrives, the next send rebuilds around the consumed id.
                 b.prekeyBundleGossip.announce(b.prekeyStore.publishBundle(b.identity, Instant.now().epochSecond + 3600))
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     (
                         c.prekeyBundleGossip
                             .lookup(bKey)
@@ -602,7 +631,7 @@ class DmSessionManagerOtkCollisionTest :
                 initials.size shouldBe 2
                 initials.last() shouldNotBe initials.first()
                 cm.diagnostics().rebootstrapsUnacked shouldBe 1L
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     received.any { it.sender == cKey && it.content.body == "rebuilt" }
                 } shouldBe true
             } finally {
@@ -616,9 +645,11 @@ class DmSessionManagerOtkCollisionTest :
             val c = buildDmTestNode()
             try {
                 connectAndConverge(c, b)
+                // Without this, a late bundle from connectAndConverge can arrive after the rejection and count as "newer".
+                val settled = settleBundle(b, c)
                 val bKey = b.identity.secp256k1KeyPair.publicKey
                 val cKey = c.identity.secp256k1KeyPair.publicKey
-                val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
                 b.dmSessionManager.addInboundListener { received.add(it) }
                 val cm = c.dmSessionManager
                 val chosen = CopyOnWriteArrayList<Pair<Int?, Long>>()
@@ -626,9 +657,10 @@ class DmSessionManagerOtkCollisionTest :
                 val scheduled = CopyOnWriteArrayList<Pair<Long, () -> Unit>>()
                 cm.scheduleForTest = { delay, task -> scheduled += delay to task }
                 cm.send(bKey, DmContent(body = "spk"))
-                awaitTrue(Duration.ofSeconds(20)) { received.any { it.sender == cKey } } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { received.any { it.sender == cKey } } shouldBe true
                 val pending = cm.pendingInitiationForTest(bKey)!!
                 val staleSequence = pending.bundleSequence
+                staleSequence shouldBe settled
                 // B's authenticated SIGNED_PREKEY_MISMATCH for exactly this initiation (tagged with B's real key).
                 val bPrivate = b.prekeyStore.x25519IdentityPrivateKey()
                 val rejection =
@@ -668,7 +700,7 @@ class DmSessionManagerOtkCollisionTest :
 
                 // B republishes (higher sequence number): the next attempt bootstraps against it and replays.
                 b.prekeyBundleGossip.announce(b.prekeyStore.publishBundle(b.identity, Instant.now().epochSecond + 3600))
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     (c.prekeyBundleGossip.lookup(bKey)?.sequenceNumber ?: -1) > staleSequence
                 } shouldBe true
                 scheduled[1].second()
@@ -677,7 +709,7 @@ class DmSessionManagerOtkCollisionTest :
                 chosen.last().second shouldBeGreaterThan staleSequence
                 cm.diagnostics().rebootstrapsAfterRejection shouldBe 1L
                 cm.pendingInitiationForTest(bKey)!!.awaitBundleNewerThan shouldBe -1L
-                awaitTrue(Duration.ofSeconds(20)) {
+                awaitTrue(Duration.ofSeconds(30)) {
                     received.count { it.sender == cKey && it.content.body == "spk" } == 2
                 } shouldBe true
                 received.none { it.content.body == "too early" } shouldBe true
@@ -692,6 +724,8 @@ class DmSessionManagerOtkCollisionTest :
             val c = buildDmTestNode()
             try {
                 connectAndConverge(c, b)
+                // Without this, a late bundle from connectAndConverge lets the first re-send attempt succeed.
+                val settled = settleBundle(b, c)
                 val bKey = b.identity.secp256k1KeyPair.publicKey
                 val cKey = c.identity.secp256k1KeyPair.publicKey
                 val cm = c.dmSessionManager
@@ -699,6 +733,7 @@ class DmSessionManagerOtkCollisionTest :
                 cm.scheduleForTest = { delay, task -> scheduled += delay to task }
                 cm.send(bKey, DmContent(body = "spk"))
                 val pending = cm.pendingInitiationForTest(bKey)!!
+                pending.bundleSequence shouldBe settled
                 val bPrivate = b.prekeyStore.x25519IdentityPrivateKey()
                 val rejection =
                     try {
@@ -769,12 +804,12 @@ class DmSessionManagerOtkCollisionTest :
             var c2: DmTestNode? = null
             try {
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() }
                 val captured = CopyOnWriteArrayList<DmX3dhRejection>()
                 t.c.dmSessionManager.onX3dhRejectionReceivedForTest = { captured += it }
                 t.c.dmSessionManager.scheduleForTest = { _, _ -> } // the rejection is captured, its re-send dropped
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "lost"))
-                awaitTrue(Duration.ofSeconds(20)) { captured.isNotEmpty() } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { captured.isNotEmpty() } shouldBe true
                 // Restart C over the same session directory; the pending record must survive it.
                 val cIdentity = t.c.identity
                 t.c.stop()
@@ -809,10 +844,10 @@ class DmSessionManagerOtkCollisionTest :
                 c.dmSessionManager.sendOffline(bKey, DmContent(body = "c first"))
                 c.dmSessionManager.hasPendingInitiationForTest(bKey) shouldBe true
                 c.dmSessionManager.replayBufferSizeForTest(bKey) shouldBe 1
-                val toC = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
+                val toC = CopyOnWriteArrayList<DmInboundMessage>()
                 c.dmSessionManager.addInboundListener { toC.add(it) }
                 b.dmSessionManager.send(cKey, DmContent(body = "b first"))
-                awaitTrue(Duration.ofSeconds(20)) { toC.isNotEmpty() } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { toC.isNotEmpty() } shouldBe true
                 c.dmSessionManager.hasPendingInitiationForTest(bKey) shouldBe false
                 c.dmSessionManager.replayBufferSizeForTest(bKey) shouldBe 0
             } finally {
@@ -828,9 +863,9 @@ class DmSessionManagerOtkCollisionTest :
                 val ids = CopyOnWriteArrayList<Int?>()
                 t.c.dmSessionManager.onOneTimePrekeyChosenForTest = { _, id, _ -> ids += id }
                 t.a.dmSessionManager.send(t.bKey, DmContent(body = "from a"))
-                awaitTrue(Duration.ofSeconds(20)) { t.received.isNotEmpty() }
+                awaitTrue(Duration.ofSeconds(30)) { t.received.isNotEmpty() }
                 t.c.dmSessionManager.send(t.bKey, DmContent(body = "from c"))
-                awaitTrue(Duration.ofSeconds(20)) { t.bodiesFrom(t.cKey).isNotEmpty() } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { t.bodiesFrom(t.cKey).isNotEmpty() } shouldBe true
                 ids.size shouldBeInRange 1..2
                 if (ids.size == 2) ids.last() shouldNotBe sharedId
             } finally {
