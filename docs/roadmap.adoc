@@ -2227,3 +2227,21 @@ _Unreleased. Internal wave identifier; the version stays 0.12.0, no tag._
 * *Diagnostics:* `AnonymityDiagnostics.hostBuilds` (service-side build outcomes per purpose) and `rendezvousRetries`, counts only.
 * *Open:* the guard-conflict oracle (a client can find a service's guard by trying rendezvous points while the service has a single usable guard) remains; closing it needs a third persisted guard (guard file format change, more exposure). `OnionServiceHost.replaceIntro` still replaces an introduction relay deterministically (`firstOrNull`), so a slot that points at the new effective guard is replaced only after the slot backoff. A dead relay stays a candidate middle hop and rendezvous point for every node until its descriptor expires.
 * *Decisions pending:* the time budget per attempt (instead of one total budget); not closing the oracle in this wave; the retry parameters (one retry, 2 to 6 s, probe 30 s to 10 min); these were taken from the plan's proposals without a separate confirmation.
+
+== V0.10.0-J — Traffic anonymisation, part 10: GossipSub, DHT and content fetches
+
+_Unreleased. Internal wave identifier; the version stays 0.12.0, no tag._ Cut into four parts (J1a, J1b, J2, J3); only J1a is implemented.
+
+* *Done (J1a, transport hygiene):* in anonymity mode a per-run transport key that is never stored (`TransportKeyPolicy`), no mDNS, `StorageNetworkMode.LOCAL_ONLY` (no Bitswap, no Kademlia, every network operation of `NabuStorage` refused, `RemoteContentSource` as the only way to remote content), `GossipAnonymityPolicy` (topic allowlist, every own publication refused, forwarding unchanged), start refused with an explicit `--auto-relay=true`, `--publish-relay-reliability=true` or `--dht-fallback=true`, `NodeWiringOptions.effective()`, the tombstone of the OFF to ON switch through a circuit (directory object type 4, validated and published by the relay, `UNKNOWN_TYPE` from a relay without it), no DHT tombstone, 409 (`anonymity-publish-unavailable`, `anonymity-connect-unavailable`) for posts, Karma votes, trust grants, self-links, LTR records and manual connections in the browser, the start warning updated in Kotlin, `app.js` and the docs. Mode off is unchanged (tests for the PeerId, mDNS, the protocol set, the storage mode, the gossip behaviour and the endpoints).
+* *Open:* J1b (connection confinement to the guards, `/lapis/onion-relay-directory/1.0.0` snapshot, closing inbound connections from outside the allowed set), J2 (relay role LOOKUP, `OnionLookupClient`, `NabuLookupSink`, circuit-backed `RemoteContentSource`), J3 (timeline and rendezvous consumers, status counters, final warning text). In J1a the node still meshes over direct connections that show its address, finds relays only through gossip and can not fetch content it does not hold. No multi-node load test for J1a. No external review.
+* *Decisions pending (Q1 to Q9, conservative default in brackets):*
+** Q1, cut: four runs J1a, J1b, J2, J3 [four runs; this run did J1a only].
+** Q2, transport key: fresh per run, one per guard, or stored [fresh per run, implemented].
+** Q3, connection confinement: only the guards plus a relay directory snapshot protocol, or a receive-only mesh with arbitrary peers [guards only; open].
+** Q4, relay role LOOKUP: on by default with `--onion-relay-lookup=false`, or opt-in [on by default; open].
+** Q5, own publications in anonymity mode: refused with 409, a `GOSSIP_PUBLISH` role later [refused, implemented].
+** Q6, option conflicts: explicit `true` of auto-relay, relay-reliability publishing or DHT fallback refuses the start [implemented].
+** Q7, tombstone: through a circuit as type 4, no DHT tombstone, no IPNS write through a relay [implemented].
+** Q8, LOOKUP constants: 128 KiB largest answer, classes 2/8/32/128 KiB, 4 requests per circuit at the relay and 1 by the client, 1 open LOOKUP circuit and 2 builds per minute [open].
+** Q9, listen socket: keep listening and close connections from outside the allowed set, or do not listen [keep listening; open].
+

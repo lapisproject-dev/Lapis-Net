@@ -9,6 +9,13 @@ enum class DirectoryObjectType(
     ANONYMOUS_PEER_RECORD(1),
     ONION_SERVICE_DESCRIPTOR(2),
     PREKEY_BUNDLE(3),
+
+    /**
+     * Wave V0.10.0-J1a: the address-free `PeerRecord` tombstone of a node that switched from normal to anonymity mode.
+     * The relay validates it and publishes it on the peer-record topic; the node itself sends nothing. A relay of an
+     * older version answers `UNKNOWN_TYPE` and the client moves on to another relay.
+     */
+    TOMBSTONE_PEER_RECORD(4),
     ;
 
     companion object {

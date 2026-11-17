@@ -80,7 +80,7 @@ private const val MAX_PUBLISHED_MESSAGES_PER_RPC = 48
 private const val MAX_SUBSCRIPTIONS_PER_RPC = 64
 
 /** Thrown when a GossipSub attach/publish/subscribe operation fails or times out. */
-class GossipPubSubException(
+open class GossipPubSubException(
     message: String,
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
@@ -100,7 +100,21 @@ class GossipPubSubException(
 class GossipPubSub private constructor(
     private val gossip: Gossip,
     private val publisher: PubsubPublisherApi,
+    /** Anonymity mode (wave V0.10.0-J1a); `null` in normal mode, where nothing below is restricted. */
+    private val policy: GossipAnonymityPolicy? = null,
 ) {
+    /** Number of subscriptions refused by the anonymity policy (tests, status; the topic names are not kept). */
+    val refusedSubscriptions: Long get() = refusedSubscribe.get()
+
+    /** Number of own publications refused by the anonymity policy (tests, status). */
+    val refusedPublications: Long get() = refusedPublish.get()
+
+    private val refusedSubscribe = AtomicLong(0)
+    private val refusedPublish = AtomicLong(0)
+
+    /** `true` when this instance runs under an anonymity policy (own publications are refused, topics allow-listed). */
+    val anonymityRestricted: Boolean get() = policy != null
+
     /**
      * Subscribes to [topic]. [handler] runs once per received message and its returned
      * [ValidationResult] directly gates re-propagation to the rest of the GossipSub mesh -
@@ -118,6 +132,11 @@ class GossipPubSub private constructor(
         topic: String,
         handler: (bytes: ByteArray, from: PeerId) -> ValidationResult,
     ): PubsubSubscription {
+        if (policy != null && topic !in policy.allowedTopics) {
+            refusedSubscribe.incrementAndGet()
+            // the topic name is deliberately not part of the message (a per-identity topic would name the identity)
+            throw GossipAnonymityRefusedException("topic not allowed in anonymity mode")
+        }
         val validator =
             Function<MessageApi, CompletableFuture<ValidationResult>> { message ->
                 // ByteBufUtil.getBytes is a non-destructive full-readable-bytes copy - unlike a
@@ -193,6 +212,11 @@ class GossipPubSub private constructor(
         bytes: ByteArray,
         timeout: Duration = DEFAULT_TIMEOUT,
     ): Boolean {
+        if (policy != null) {
+            // checked before the test tap: a refused publication must not even look like an attempt
+            refusedPublish.incrementAndGet()
+            throw GossipAnonymityRefusedException("publishing from this node is not available in anonymity mode")
+        }
         outboundTap?.invoke(topic, bytes.copyOf())
         try {
             awaitOrWrap("publish to gossip topic $topic", timeout) {
@@ -248,7 +272,11 @@ class GossipPubSub private constructor(
          * after an existing connection is already up means GossipSub never opens a mesh stream on
          * it, and messages will silently never be delivered to or from that peer.
          */
-        fun attach(node: LapisNode): GossipPubSub {
+        fun attach(
+            node: LapisNode,
+            /** V0.10.0-J1a: the anonymity-mode policy; `null` (the default) keeps normal mode unchanged. */
+            policy: GossipAnonymityPolicy? = null,
+        ): GossipPubSub {
             val host = node.host
             val params = buildGossipParams()
             val routerBuilder = GossipRouterBuilder()
@@ -265,9 +293,10 @@ class GossipPubSub private constructor(
             node.addConnectionHandler(gossip)
             val seqNo = AtomicLong(System.currentTimeMillis())
             val publisher = gossip.createPublisher(host.privKey) { seqNo.incrementAndGet() }
-            logger.info { "attached GossipSub to host ${host.peerId}" }
+            logger.info { "attached GossipSub" }
             warnIfConnectedBeforeAttach(node)
-            return GossipPubSub(gossip, publisher)
+            if (policy != null) logger.info { "GossipSub runs under the anonymity policy (receive and forward only)" }
+            return GossipPubSub(gossip, publisher, policy)
         }
 
         /**

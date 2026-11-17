@@ -354,6 +354,7 @@ class OnionWire private constructor(
                                         pubsub,
                                         clock,
                                         prekeys,
+                                        peerDirectory,
                                     ),
                             mailboxSink =
                                 mailboxSinkOverride

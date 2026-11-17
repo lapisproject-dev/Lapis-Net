@@ -23,6 +23,12 @@ interface DirectoryPublicationChannel {
     fun publishPrekeyBundle(bundle: PrekeyBundle): CompletableFuture<Boolean>
 
     fun publishServiceDescriptor(descriptor: OnionServiceDescriptor): CompletableFuture<Boolean>
+
+    /**
+     * Wave V0.10.0-J1a: the address-free tombstone of an OFF to ON switch. The default refuses (completes with `false`):
+     * only a channel that does not expose the origin may carry it in anonymity mode.
+     */
+    fun publishTombstone(tombstone: PeerRecord): CompletableFuture<Boolean> = CompletableFuture.completedFuture(false)
 }
 
 /** Publishes from the own node through the gossip classes. REVEALS THE ORIGIN: never use it in mode ON in production. */

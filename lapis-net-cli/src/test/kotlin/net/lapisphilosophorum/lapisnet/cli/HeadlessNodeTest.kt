@@ -11,6 +11,7 @@ import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DirectoryDhtLimits
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
+import net.lapisphilosophorum.lapisnet.networking.deriveLibp2pPeerId
 import net.lapisphilosophorum.lapisnet.networking.relay.AutoRelayConfig
 import java.nio.file.Files
 import kotlin.time.Duration.Companion.milliseconds
@@ -74,6 +75,41 @@ class HeadlessNodeTest :
                 on.stop()
                 off.stop()
             }
+        }
+
+        test("V0.10.0-J1a: anonymity on uses a per-run transport key; off keeps the identity-derived one").config(
+            timeout = 120.seconds,
+        ) {
+            val identity = DualKeyIdentity.generate()
+
+            fun startWith(options: NodeWiringOptions) =
+                HeadlessNode.start(
+                    options = options,
+                    identity = identity,
+                    bootstrapPeers = emptyList(),
+                    listenAddress = Multiaddr("/ip4/127.0.0.1/tcp/0"),
+                    dataDirectory = Files.createTempDirectory("headless-transport-key"),
+                    onionKeyPassphrase = { null },
+                )
+            val derived = identity.deriveLibp2pPeerId()
+            val off = startWith(NodeWiringOptions())
+            try {
+                off.node.peerId shouldBe derived
+                off.storage.networkMode shouldBe net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode.NETWORK
+            } finally {
+                off.stop()
+            }
+            val seen = ArrayList<io.libp2p.core.PeerId>()
+            repeat(2) {
+                val on = startWith(NodeWiringOptions.resolve(mapOf("anonymity" to "on")))
+                try {
+                    (on.node.peerId == derived) shouldBe false
+                    seen += on.node.peerId
+                } finally {
+                    on.stop()
+                }
+            }
+            (seen[0] == seen[1]) shouldBe false
         }
 
         test("dht-fallback=false attaches no DHT").config(timeout = 90.seconds) {
@@ -207,6 +243,11 @@ class HeadlessNodeTest :
                 node.anonymity.shouldNotBeNull()
                 node.options.holePunching shouldBe net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode.OFF
                 node.node.holePunching.shouldBeNull()
+                // wave J1a: no mDNS, local-only storage, no DHT, receive-only gossip, nothing refused at start
+                node.node.mdnsRunning shouldBe false
+                node.storage.networkMode shouldBe net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode.LOCAL_ONLY
+                node.directoryDht.shouldBeNull()
+                node.options.dhtFallback shouldBe false
                 // the real locator sees no diverse path (no relays at all): a status code, never a direct publication
                 var status = node.anonymityStatus()
                 val deadline = System.nanoTime() + 20_000_000_000L

@@ -8,8 +8,10 @@ import net.lapisphilosophorum.lapisnet.directory.DescriptorIngestOutcome
 import net.lapisphilosophorum.lapisnet.directory.MalformedAnonymousPeerRecordException
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorGossip
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorIndex
+import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleIndex
+import net.lapisphilosophorum.lapisnet.directory.RelayedTombstoneOutcome
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.onion.CellFormatException
 import net.lapisphilosophorum.lapisnet.onion.DirectoryObjectType
@@ -50,6 +52,8 @@ internal class GossipDirectoryPublishSink(
     private val clock: Clock,
     /** The node's own prekey-bundle gossip, so bundles already received over the topic are not republished. */
     private val nodeBundles: PrekeyBundleGossip? = null,
+    /** V0.10.0-J1a: the peer directory, for relayed tombstones; without it a tombstone is answered `UNKNOWN_TYPE`. */
+    private val peerDirectory: PeerDirectoryGossip? = null,
 ) : DirectoryPublishSink {
     /** Relay-local dedupe for prekey bundles, so duplicate or stale bundles are not put on the topic again. */
     private val seenBundles = PrekeyBundleIndex()
@@ -63,11 +67,24 @@ internal class GossipDirectoryPublishSink(
                 DirectoryObjectType.ANONYMOUS_PEER_RECORD -> anonymousRecord(objectBytes)
                 DirectoryObjectType.ONION_SERVICE_DESCRIPTOR -> serviceDescriptor(objectBytes)
                 DirectoryObjectType.PREKEY_BUNDLE -> prekeyBundle(objectBytes)
+                DirectoryObjectType.TOMBSTONE_PEER_RECORD -> tombstone(objectBytes)
             }
         } catch (e: RuntimeException) {
             logger.debug { "directory publish failed (${e.javaClass.simpleName}) for $type" }
             DirectoryPublishStatus.RATE_LIMITED
         }
+
+    private fun tombstone(bytes: ByteArray): Byte {
+        val directory = peerDirectory ?: return DirectoryPublishStatus.UNKNOWN_TYPE
+        // known or superseded: same answer as a new one, not published again
+        return when (directory.relayTombstone(bytes, clock.millis() / 1000)) {
+            RelayedTombstoneOutcome.MALFORMED -> DirectoryPublishStatus.MALFORMED
+            RelayedTombstoneOutcome.INVALID -> DirectoryPublishStatus.INVALID
+            RelayedTombstoneOutcome.PUBLISHED, RelayedTombstoneOutcome.KNOWN -> DirectoryPublishStatus.ACCEPTED
+            // nothing was published (failing storage on this relay): retryable, so the client moves to another relay
+            RelayedTombstoneOutcome.NOT_STORED -> DirectoryPublishStatus.RATE_LIMITED
+        }
+    }
 
     private fun anonymousRecord(bytes: ByteArray): Byte {
         val record =

@@ -53,7 +53,9 @@ import java.time.Clock
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
@@ -68,8 +70,9 @@ private val logger = KotlinLogging.logger {}
  * **What it does:** the node publishes its directory presence (anonymous peer record, prekey bundle, service
  * descriptor) ONLY through circuits whose first hop is a persistent guard, and (wave V0.10.0-F1) carries direct messages
  * over rendezvous circuits and sealed mailbox items announced by relays. **What it does NOT do:** mail and call
- * signalling still use direct connections and reveal the IP address; GossipSub, the DHT and fetches still show
- * identity and IP; the libp2p transport key is still the identity key (see docs/anonymity.adoc). Hence
+ * signalling still use direct connections and reveal the IP address; since wave V0.10.0-J1a the transport key is
+ * per run and the node serves and queries neither the DHT nor content, but it still meshes over direct connections
+ * that show its address (see docs/anonymity.adoc). Hence
  * [ANONYMITY_INCOMPLETE_WARNING] at every start.
  *
  * Lifecycle: `start` -> running -> [close]. [close] is idempotent, stops new circuit builds first, then closes the
@@ -338,8 +341,9 @@ class AnonymityRuntime private constructor(
         /**
          * Starts anonymity mode on [wire], which must have been attached with [DirectoryAnonymityMode.ON].
          *
-         * @param tombstonePublisher sends the address-free tombstone of an OFF to ON switch from the own node (once);
-         * see [AnonymousDirectoryPublisher] for its contract
+         * @param tombstonePublisher test seam only: replaces the circuit-based path of the address-free tombstone of an
+         * OFF to ON switch (see [AnonymousDirectoryPublisher] for its contract). `null` (production, wave V0.10.0-J1a):
+         * the tombstone goes through a circuit to a publish relay, which announces it; nothing leaves the own node.
          */
         fun start(
             wire: OnionWire,
@@ -350,7 +354,7 @@ class AnonymityRuntime private constructor(
             modeStore: DirectoryModeStore,
             prekeyStore: PrekeyStore?,
             serviceKey: Ed25519KeyPair,
-            tombstonePublisher: (PeerRecord) -> Unit,
+            tombstonePublisher: ((PeerRecord) -> Unit)? = null,
             supervisor: NodeServiceSupervisor,
             random: SecureRandom = SecureRandom(),
             clock: Clock = Clock.systemUTC(),
@@ -470,7 +474,8 @@ class AnonymityRuntime private constructor(
                         modeStore,
                         clockMillis = clock::millis,
                         capabilities = capabilities,
-                        tombstonePublisher = tombstonePublisher,
+                        tombstonePublisher =
+                            tombstonePublisher ?: { tombstone -> publishTombstoneOrThrow(recording, tombstone) },
                     )
                 closers += { anonymousPublisher.close() }
                 // padding and timing (V0.10.0-H): the cover scheduler and the egress shaper, both bounded and timer-driven
@@ -568,6 +573,35 @@ class AnonymityRuntime private constructor(
         }
 
         private const val STOP_WAIT_SECONDS = 30L
+        private const val TOMBSTONE_WAIT_SECONDS = 90L
+
+        /**
+         * The production tombstone path of an OFF to ON switch (wave V0.10.0-J1a): through [channel] (a circuit to a
+         * publish relay). Contract of [AnonymousDirectoryPublisher]: throws when the tombstone was not delivered, so the
+         * transition is retried along its backoff. A future that does not complete within [waitSeconds] is cancelled.
+         */
+        internal fun publishTombstoneOrThrow(
+            channel: DirectoryPublicationChannel,
+            tombstone: PeerRecord,
+            waitSeconds: Long = TOMBSTONE_WAIT_SECONDS,
+        ) {
+            val future = channel.publishTombstone(tombstone)
+            val sent =
+                try {
+                    future.get(waitSeconds, TimeUnit.SECONDS) == true
+                } catch (e: TimeoutException) {
+                    future.cancel(true)
+                    false
+                } catch (e: ExecutionException) {
+                    false
+                } catch (e: InterruptedException) {
+                    future.cancel(true)
+                    Thread.currentThread().interrupt()
+                    false
+                }
+            if (!sent) throw IllegalStateException("tombstone not published")
+        }
+
         private const val RESET_STICKY_MILLIS = 3_600_000L
 
         internal fun codeOf(t: Throwable): AnonymityErrorCode =
@@ -607,6 +641,8 @@ private class RecordingChannel(
 
     override fun publishServiceDescriptor(descriptor: OnionServiceDescriptor) =
         watch(delegate.publishServiceDescriptor(descriptor))
+
+    override fun publishTombstone(tombstone: PeerRecord) = watch(delegate.publishTombstone(tombstone))
 }
 
 /** Diagnostic snapshot of an [AnonymityRuntime] (see [AnonymityRuntime.diagnostics]). */

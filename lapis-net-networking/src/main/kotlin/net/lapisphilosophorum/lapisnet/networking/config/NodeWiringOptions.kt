@@ -128,6 +128,33 @@ data class NodeWiringOptions(
             base.copy(mode = holePunching, declaredPrivate = reachability == DeclaredReachability.PRIVATE)
         }
 
+    /**
+     * V0.10.0-J1a: the libp2p host key. In anonymity mode a fresh key per run, never stored, so that no connection
+     * shows the PeerId bound to the identity; otherwise the identity-derived key (unchanged).
+     */
+    fun transportKeyPolicy(): TransportKeyPolicy =
+        if (anonymity == AnonymityMode.ON) TransportKeyPolicy.EphemeralPerRun else TransportKeyPolicy.IdentityDerived
+
+    /**
+     * V0.10.0-J1a: the options as the node applies them. [resolve] already refuses an explicit conflict; this also
+     * covers options built directly in code: in anonymity mode the DHT fallback, auto-relay and relay-reliability
+     * publishing are off whatever the fields say.
+     */
+    fun effective(): NodeWiringOptions =
+        if (anonymity == AnonymityMode.ON) {
+            copy(
+                autoRelay = false,
+                dhtFallback = false,
+                publishRelayReliability = false,
+                holePunching = HolePunchMode.OFF,
+            )
+        } else {
+            this
+        }
+
+    /** V0.10.0-J1a: mDNS announces the PeerId and the listen addresses on the LAN; off in anonymity mode. */
+    fun mdnsEnabled(): Boolean = anonymity != AnonymityMode.ON
+
     /** `true` when the operator declared `private` but did not switch auto-relay on (the library heuristic then sees UNSPECIFIED). */
     val declaredPrivateWithoutAutoRelay: Boolean
         get() = reachability == DeclaredReachability.PRIVATE && !autoRelay
@@ -175,10 +202,9 @@ data class NodeWiringOptions(
             if (autoRelayExplicit == true && reachability != DeclaredReachability.PRIVATE) {
                 throw InvalidWiringOptionException("--auto-relay requires --reachability=private")
             }
-            val autoRelay = autoRelayExplicit ?: (reachability == DeclaredReachability.PRIVATE)
-            val dhtFallback = raw[KEY_DHT_FALLBACK]?.let { parseBoolean(KEY_DHT_FALLBACK, it) } ?: true
-            val publish =
-                raw[KEY_PUBLISH_RELAY_RELIABILITY]?.let { parseBoolean(KEY_PUBLISH_RELAY_RELIABILITY, it) } ?: false
+            val dhtFallbackExplicit = raw[KEY_DHT_FALLBACK]?.let { parseBoolean(KEY_DHT_FALLBACK, it) }
+            val publishExplicit =
+                raw[KEY_PUBLISH_RELAY_RELIABILITY]?.let { parseBoolean(KEY_PUBLISH_RELAY_RELIABILITY, it) }
             val holePunchingRaw = raw[KEY_HOLE_PUNCHING]?.let { parseHolePunching(it) }
             val onionRelay = raw[KEY_ONION_RELAY]?.let { parseBoolean(KEY_ONION_RELAY, it) } ?: false
             val anonymity = raw[KEY_ANONYMITY]?.let { parseAnonymity(it) } ?: AnonymityMode.OFF
@@ -197,7 +223,22 @@ data class NodeWiringOptions(
                 if (onionRelay) {
                     throw InvalidWiringOptionException("onion-relay cannot be combined with anonymity=on")
                 }
+                // wave V0.10.0-J1a: each of these reveals identity and address (relay reservation, signed Madli vector
+                // from the own node, DHT queries); an explicit true is a conflict, a missing key resolves to false
+                if (autoRelayExplicit == true) {
+                    throw InvalidWiringOptionException("auto-relay cannot be enabled while anonymity=on")
+                }
+                if (publishExplicit == true) {
+                    throw InvalidWiringOptionException("publish-relay-reliability cannot be enabled while anonymity=on")
+                }
+                if (dhtFallbackExplicit == true) {
+                    throw InvalidWiringOptionException("dht-fallback cannot be enabled while anonymity=on")
+                }
             }
+            val anonymous = anonymity == AnonymityMode.ON
+            val autoRelay = !anonymous && (autoRelayExplicit ?: (reachability == DeclaredReachability.PRIVATE))
+            val dhtFallback = !anonymous && (dhtFallbackExplicit ?: true)
+            val publish = !anonymous && (publishExplicit ?: false)
             val holePunching =
                 if (anonymity == AnonymityMode.ON) HolePunchMode.OFF else holePunchingRaw ?: HolePunchMode.AUTO
             return NodeWiringOptions(
@@ -297,10 +338,10 @@ data class NodeWiringOptions(
             |Shared node options (--key=value; defaults in brackets):
             |  --reachability=public|private|undeclared   [undeclared]
             |        How this node is reachable from the outside. Never guessed: declare it.
-            |  --auto-relay=true|false                    [true if reachability=private, else false]
+            |  --auto-relay=true|false                    [true if reachability=private, else false; false with --anonymity=on]
             |        Hold reservations with relay nodes picked from the peer directory (ranked by Madli).
             |        Requires --reachability=private. This node never becomes a relay server.
-            |  --dht-fallback=true|false                  [true]
+            |  --dht-fallback=true|false                  [true; false with --anonymity=on]
             |        Use the DHT as a fallback for peer records, prekeys and offline mail/DM pointers.
             |        METADATA: DHT lookups reveal query timing and key interest (inbox, prekey and directory
             |        keys) to the DHT peers asked. Disable with --dht-fallback=false.
@@ -309,7 +350,7 @@ data class NodeWiringOptions(
             |        --reachability=private. on = always (aborts the start where SO_REUSEPORT is missing, e.g.
             |        Windows). off = no hole punching and no Identify. Verified on loopback only. Uses a
             |        transport whose listener port other processes of the same OS user may share.
-            |  --publish-relay-reliability=true|false     [false]
+            |  --publish-relay-reliability=true|false     [false; refused with --anonymity=on]
             |        Publish the relay reliability observed by this node as signed Madli vectors.
             |        Default off: older nodes reject v2 vectors as invalid and lower the gossip peer score of
             |        whoever forwards them.
@@ -321,8 +362,11 @@ data class NodeWiringOptions(
             |        the descriptor makes this node's identity and address publicly known as a relay.
             |  --anonymity=on|off   (experimental, default off) anonymises directory, direct messages, mail and call signals; call media is direct
             |        With on: the directory entry is published only through circuits (persistent guards, diverse
-            |        paths), hole punching is switched off, and the start is refused together with
-            |        --hole-punching=auto|on or --onion-relay=true.
+            |        paths), the transport key is fresh per run and never stored, mDNS, hole punching, the DHT,
+            |        auto-relay and content serving are off, and nothing is published from the node itself. The
+            |        start is refused together with --hole-punching=auto|on, --onion-relay=true, --auto-relay=true,
+            |        --publish-relay-reliability=true or --dht-fallback=true. The node still meshes over direct
+            |        connections that show its address.
             |  --anonymity-allow-call-media=true|false    [false]   (only with --anonymity=on)
             |        Allow calls in anonymity mode. Call media then connects directly and reveals your IP
             |        address to the other party and to network observers.

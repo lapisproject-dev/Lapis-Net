@@ -16,6 +16,7 @@ import net.lapisphilosophorum.lapisnet.directory.DirectoryTransitionPlan
 import net.lapisphilosophorum.lapisnet.directory.InMemoryDirectoryModeStore
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerCapability
+import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PeerRecordCodec
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
@@ -54,6 +55,9 @@ class MultiNodeAnonymousDirectoryTest :
         fun now() = Clock.systemUTC().millis() / 1000
 
         val relays = List(5) { WireTestNode(relay = true).also { all += it } }
+        // wave J1a: what the relays publish themselves (the tombstone is published by one of them, on A's behalf)
+        val relayGossip = java.util.concurrent.CopyOnWriteArrayList<Pair<String, ByteArray>>()
+        relays.forEach { r -> r.pubsub.outboundTap = { topic, bytes -> relayGossip += topic to bytes } }
         val a = WireTestNode(relay = false, directoryMode = DirectoryAnonymityMode.ON).also { all += it }
         val b = WireTestNode(relay = false).also { all += it }
         for (i in relays.indices) for (j in i + 1 until relays.size) relays[i].connectTo(relays[j])
@@ -118,9 +122,10 @@ class MultiNodeAnonymousDirectoryTest :
                     capturing,
                     modeStore,
                     capabilities = setOf(AnonymousCapability.DM),
+                    // wave J1a: the tombstone goes through a circuit; a relay publishes it, A publishes nothing itself
                     tombstonePublisher = {
                         tombstone = it
-                        a.peerDirectory.announce(it) // the one permitted publication from the own node
+                        check(capturing.publishTombstone(it).get(60, TimeUnit.SECONDS)) { "tombstone not published" }
                     },
                 )
             try {
@@ -174,19 +179,15 @@ class MultiNodeAnonymousDirectoryTest :
         test("the leak scanner finds NOTHING of A's addresses or transport identity (positive control included)") {
             val toldTombstone = tombstone.shouldNotBeNull()
             val tombstoneBytes = PeerRecordCodec.encode(toldTombstone)
-            // A published nothing by itself except the address-free tombstone, on the peer record topic
-            scanner.gossip.size shouldBe 1
-            scanner.gossip
-                .single()
-                .second
-                .contentEquals(tombstoneBytes) shouldBe true
+            // wave J1a: A published NOTHING by itself, not even the tombstone (it went through a circuit)
+            scanner.gossip.size shouldBe 0
+            capturing.tombstones.single().sequenceNumber shouldBe toldTombstone.sequenceNumber
+            scanner.leaks(listOf(tombstoneBytes), scanner.addressNeedles()) shouldBe emptyList()
 
             val everything = scanner.gossip.map { it.second } + capturing.objects
             scanner.leaks(everything, scanner.addressNeedles()) shouldBe emptyList()
-            // the identity needles are absent from every circuit object and from every gossip message except the tombstone
-            val withoutTombstone =
-                scanner.gossip.map { it.second }.filter { !it.contentEquals(tombstoneBytes) } + capturing.objects
-            scanner.leaks(withoutTombstone, scanner.identityNeedles()) shouldBe emptyList()
+            // the identity needles are absent from every circuit object (the tombstone is kept apart: identity-bound by design)
+            scanner.leaks(capturing.objects, scanner.identityNeedles()) shouldBe emptyList()
             (capturing.objects.size >= 3) shouldBe true // record, bundle and service descriptor were really sent
 
             // positive control: an ordinary peer record of A is full of exactly these needles
@@ -210,6 +211,13 @@ class MultiNodeAnonymousDirectoryTest :
             awaitTrue(java.time.Duration.ofSeconds(30)) {
                 all2.all { n -> n.wire.anonymousDirectory().resolve(a.key) is DirectoryReachability.Hidden }
             } shouldBe true
+            // wave J1a: exactly one relay published the tombstone on A's behalf
+            val told = tombstone.shouldNotBeNull()
+            // (the later anonymous record supersedes it in every index, so it is observed on the relays' own publications)
+            val tombstoneBytes = PeerRecordCodec.encode(told)
+            relayGossip.count { (topic, bytes) ->
+                topic == PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC && bytes.contentEquals(tombstoneBytes)
+            } shouldBe 1
             for (n in all2) {
                 val record: PeerRecord? = n.peerDirectory.lookup(a.key)
                 (record?.addresses ?: emptyList()).size shouldBe 0

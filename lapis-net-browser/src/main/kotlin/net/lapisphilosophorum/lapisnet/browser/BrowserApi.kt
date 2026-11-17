@@ -233,6 +233,45 @@ class BrowserApiDependencies(
     val anonymityActive: Boolean = false,
 )
 
+/** 409 body of the wave V0.10.0-J1a refusals: a human text plus a stable machine code. */
+@Serializable
+data class AnonymityRefusalResponse(
+    val error: String,
+    val code: String,
+)
+
+/** Machine code of a refused own publication (post, vote, trust grant, self-link, LTR record) in anonymity mode. */
+internal const val CODE_ANONYMITY_PUBLISH_UNAVAILABLE = "anonymity-publish-unavailable"
+
+/** Machine code of a refused manual connection in anonymity mode. */
+internal const val CODE_ANONYMITY_CONNECT_UNAVAILABLE = "anonymity-connect-unavailable"
+
+internal const val TEXT_ANONYMITY_PUBLISH_UNAVAILABLE: String =
+    "Publishing from this node is not available while anonymity mode is on: it would tie the signed content to " +
+        "this node's address."
+
+internal const val TEXT_ANONYMITY_CONNECT_UNAVAILABLE: String =
+    "Manual connections are not available while anonymity mode is on: they would show this node's address to the peer."
+
+/** Answers 409 and returns `true` while anonymity mode is on (the caller then returns). */
+private suspend fun io.ktor.server.application.ApplicationCall.refusePublishInAnonymity(active: Boolean): Boolean {
+    if (!active) return false
+    respond(
+        HttpStatusCode.Conflict,
+        AnonymityRefusalResponse(TEXT_ANONYMITY_PUBLISH_UNAVAILABLE, CODE_ANONYMITY_PUBLISH_UNAVAILABLE),
+    )
+    return true
+}
+
+private suspend fun io.ktor.server.application.ApplicationCall.refuseConnectInAnonymity(active: Boolean): Boolean {
+    if (!active) return false
+    respond(
+        HttpStatusCode.Conflict,
+        AnonymityRefusalResponse(TEXT_ANONYMITY_CONNECT_UNAVAILABLE, CODE_ANONYMITY_CONNECT_UNAVAILABLE),
+    )
+    return true
+}
+
 /** Shown instead of the connect QR code while anonymity mode is on (it would contain the node's own address). */
 internal const val ANONYMITY_CONNECT_REFUSAL: String =
     "The connect code is disabled while anonymity mode is on: it contains this node's address."
@@ -428,6 +467,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         post("/api/posts") {
+            if (call.refusePublishInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<NewPostRequest>()
             val bytes = request.text.toByteArray(Charsets.UTF_8)
             if (bytes.size !in 1..MAX_POST_BODY_BYTES) {
@@ -443,6 +483,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         post("/api/karma") {
+            if (call.refusePublishInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<NewKarmaVoteRequest>()
             val targetCid = parseCidOrNull(request.targetCid)
             if (targetCid == null) {
@@ -482,6 +523,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         // lapis-net-virtus/build.gradle.kts's header comment on that scope cut). It only verifies
         // the resulting proof and, if valid, authors and announces the LtrRecord.
         post("/api/ltr/lightning") {
+            if (call.refusePublishInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<NewLightningLtrRequest>()
 
             val cid = parseCidOrNull(request.cid)
@@ -600,6 +642,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         post("/api/trust") {
+            if (call.refusePublishInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<TrustRequest>()
             val target = parseHexPublicKeyOrNull(request.targetPublicKeyHex)
             if (target == null) {
@@ -639,6 +682,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         post("/api/peers/connect") {
+            if (call.refuseConnectInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<ConnectPeerRequest>()
             val multiaddr = runCatching { Multiaddr(request.multiaddr) }.getOrNull()
             val peerId = multiaddr?.getPeerId()
@@ -693,6 +737,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         }
 
         post("/api/connect/uri") {
+            if (call.refuseConnectInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<ConnectUriRequest>()
             val parsed = ConnectUri.parseOrNull(request.uri)
             if (parsed == null) {
@@ -720,6 +765,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
         // third party didn't already have a path to, and TrustPathFinder's shortest-path rule makes
         // the near (already-known) edge decisive over any far self-linked sock-puppet edge.
         post("/api/self-link") {
+            if (call.refusePublishInAnonymity(deps.anonymityActive)) return@post
             val request = call.receive<SelfLinkRequest>()
             val target = parseHexPublicKeyOrNull(request.targetPublicKeyHex)
             if (target == null) {

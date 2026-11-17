@@ -117,7 +117,45 @@ class NabuStorage private constructor(
     private val clock: () -> Long = System::nanoTime,
     /** UTC wall clock of IPNS record validity; tests move it. */
     private val wallClock: () -> Instant = Instant::now,
+    /** Wave V0.10.0-J1a: [StorageNetworkMode.LOCAL_ONLY] in anonymity mode, see there. */
+    val networkMode: StorageNetworkMode = StorageNetworkMode.NETWORK,
+    /** Wave V0.10.0-J1a: the only way to content not held locally in [StorageNetworkMode.LOCAL_ONLY]; may be `null`. */
+    private val remote: RemoteContentSource? = null,
 ) {
+    /** Number of network operations refused in [StorageNetworkMode.LOCAL_ONLY] (tests, status). */
+    val refusedNetworkOperations: Long get() = refused.get()
+
+    private val refused =
+        java.util.concurrent.atomic
+            .AtomicLong(0)
+
+    /** Throws [AnonymousStorageRefusedException] in [StorageNetworkMode.LOCAL_ONLY]. The message names no key. */
+    private fun requireNetwork(operation: String) {
+        if (networkMode == StorageNetworkMode.LOCAL_ONLY) {
+            refused.incrementAndGet()
+            throw AnonymousStorageRefusedException("$operation is not available in anonymity mode")
+        }
+    }
+
+    /**
+     * [StorageNetworkMode.LOCAL_ONLY]: a block from the [remote] source's cache, accepted only when it is a raw block
+     * whose SHA-256 matches [cid]; stored unserved, so it is never offered to anyone.
+     */
+    private fun remoteCached(
+        cid: Cid,
+        timeout: Duration,
+    ): ByteArray? {
+        val source = remote ?: return null
+        val bytes = runCatching { source.blockIfCached(cid) }.getOrNull() ?: return null
+        if (!matchesCid(cid, bytes)) {
+            logger.debug { "remote content source returned a block that does not match its CID - dropped" }
+            return null
+        }
+        runCatching { putUnserved(bytes, timeout) }
+            .onFailure { logger.debug { "could not store a remotely fetched block: ${it.javaClass.simpleName}" } }
+        return bytes
+    }
+
     private val stopped = AtomicBoolean(false)
 
     /** Completed by [stop]; ends every blocking DHT wait early. */
@@ -289,6 +327,11 @@ class NabuStorage private constructor(
         val deadline = start + timeout.toNanos()
         val local = localLookup(cid, timeout)
         if (local.isPresent) return local.get()
+        if (networkMode == StorageNetworkMode.LOCAL_ONLY) {
+            // explicit peers would mean a direct dial; without them only the remote source's cache is asked
+            if (peers.isNotEmpty()) requireNetwork("fetching from a named peer")
+            return if (stopped.get()) null else remoteCached(cid, timeout)
+        }
         if (stopped.get()) return null
 
         return try {
@@ -499,6 +542,7 @@ class NabuStorage private constructor(
         requirePositive(timeout)
         val deadline = start + timeout.toNanos()
         val walkDeadline = start + timeout.toNanos() / 2
+        requireNetwork("providing a block")
         failIfStopped()
         val us = PeerAddresses.fromHost(host)
         return withOperationPermit(deadline) {
@@ -561,6 +605,7 @@ class NabuStorage private constructor(
     ): Set<PeerId> {
         val start = System.nanoTime()
         requirePositive(timeout)
+        requireNetwork("finding providers")
         failIfStopped()
         return lookupProviders(cid, desiredCount, start + timeout.toNanos()).map { it.peerId }.toSet()
     }
@@ -610,6 +655,7 @@ class NabuStorage private constructor(
         requirePositive(timeout)
         val deadline = start + timeout.toNanos()
         val walkDeadline = start + timeout.toNanos() / 2
+        requireNetwork("publishing an IPNS value")
         failIfStopped()
         val publisher = PeerId.fromPubKey(signingKey.publicKey())
         val key =
@@ -677,6 +723,7 @@ class NabuStorage private constructor(
         val key =
             runCatching { ipnsKeyFor(publisher) }.getOrNull()
                 ?: throw IllegalArgumentException("only Ed25519 peer IDs have an IPNS name")
+        if (networkMode == StorageNetworkMode.LOCAL_ONLY) return resolveThroughRemote(publisher, key, timeout)
         val local = engine.ipnsStore.get(publisher, wallClock())
         val remote =
             withOperationPermit(deadline) {
@@ -699,6 +746,26 @@ class NabuStorage private constructor(
     }
 
     /**
+     * [StorageNetworkMode.LOCAL_ONLY]: asks the [remote] source for the raw record and validates it completely here
+     * (signature by [publisher]'s key, name, expiry), exactly like an answer of a DHT peer. `null` without a source.
+     */
+    private fun resolveThroughRemote(
+        publisher: PeerId,
+        key: ByteArray,
+        timeout: Duration,
+    ): IpnsValue? {
+        val source = remote ?: return null
+        val raw = runCatching { source.resolveIpnsRecord(key.copyOf(), timeout) }.getOrNull() ?: return null
+        val record =
+            IpnsRecordCodec.validate(key, raw, wallClock(), limits)?.takeIf { it.publisher == publisher }
+                ?: run {
+                    logger.debug { "remote content source returned an IPNS record that does not validate - dropped" }
+                    return null
+                }
+        return IpnsValue(record.publisher, record.value, record.sequence, record.notValidAfter, record.ttl)
+    }
+
+    /**
      * Registers [address] (must include a `/p2p/<peerId>` component, e.g. via
      * [Multiaddr.withP2P]) as a peer's dialable address, so a later [get] call can pass that
      * peer explicitly and have Bitswap actually reach it. Bitswap's wire protocol resolves peer
@@ -715,6 +782,7 @@ class NabuStorage private constructor(
         address: Multiaddr,
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
+        requireNetwork("registering a peer address")
         val peerId =
             address.getPeerId()
                 ?: throw NabuStorageException("address is missing a /p2p/<peerId> component: $address")
@@ -739,6 +807,7 @@ class NabuStorage private constructor(
         address: Multiaddr,
         timeout: Duration = DEFAULT_CONNECT_TIMEOUT,
     ): Boolean {
+        requireNetwork("connecting to a DHT peer")
         val peerId =
             address.getPeerId()
                 ?: throw NabuStorageException("address is missing a /p2p/<peerId> component: $address")
@@ -923,7 +992,20 @@ class NabuStorage private constructor(
             blockstoreDir: Path,
             localDht: Boolean = true,
             limits: DhtLimits = DhtLimits(),
-        ): NabuStorage = attachWithClock(node, blockstoreDir, localDht, limits, System::nanoTime)
+            /** Wave V0.10.0-J1a: [StorageNetworkMode.LOCAL_ONLY] in anonymity mode (nothing registered on the host). */
+            networkMode: StorageNetworkMode = StorageNetworkMode.NETWORK,
+            /** Wave V0.10.0-J1a: content source for [StorageNetworkMode.LOCAL_ONLY]; ignored in [StorageNetworkMode.NETWORK]. */
+            remote: RemoteContentSource? = null,
+        ): NabuStorage =
+            attachWithClock(
+                node,
+                blockstoreDir,
+                localDht,
+                limits,
+                System::nanoTime,
+                networkMode = networkMode,
+                remote = remote,
+            )
 
         /** [attach] with an injectable clock for the repeat window and the want lifetime (tests age both). */
         internal fun attachWithClock(
@@ -933,7 +1015,10 @@ class NabuStorage private constructor(
             limits: DhtLimits,
             clock: () -> Long,
             wallClock: () -> Instant = Instant::now,
+            networkMode: StorageNetworkMode = StorageNetworkMode.NETWORK,
+            remote: RemoteContentSource? = null,
         ): NabuStorage {
+            val serving = networkMode == StorageNetworkMode.NETWORK
             val host = node.host
             val blockstore = FileBlockstore(blockstoreDir)
             val privateDir = blockstoreDir.resolveSibling(blockstoreDir.fileName.toString() + "-private")
@@ -949,14 +1034,14 @@ class NabuStorage private constructor(
             // connected peers, and without setAddressBook, dialPeer() can't resolve addresses -
             // both failures are swallowed silently inside Bitswap.sendWants's try/catch.
             bitswap.setAddressBook(host.addressBook)
-            host.addProtocolHandler(bitswap)
+            if (serving) host.addProtocolHandler(bitswap)
             // node.addConnectionHandler, NOT host.addConnectionHandler: a relayed inbound
             // connection is accepted by the circuit-relay stop protocol rather than by a listening
             // transport, so it never reaches jvm-libp2p's own connection-handler broadcast. A
             // Bitswap registered on the Host alone would simply not know that a peer reachable only
             // through a relay exists, and would never answer or send wants to it - the same gap
             // GossipPubSub.attach closes the same way. See LapisNode.addConnectionHandler.
-            node.addConnectionHandler(bitswap)
+            if (serving) node.addConnectionHandler(bitswap)
 
             val ourPeerId = Multihash.deserialize(host.peerId.bytes)
             val engine =
@@ -970,7 +1055,8 @@ class NabuStorage private constructor(
                 )
             val kademlia = Kademlia(engine, localDht)
             kademlia.setAddressBook(host.addressBook)
-            host.addProtocolHandler(kademlia)
+            // LOCAL_ONLY: neither Bitswap nor Kademlia answers anyone (no "holds CID X" probe, no routing-table entry)
+            if (serving) host.addProtocolHandler(kademlia)
 
             // Register this node's own listen addresses in its own address book. Nabu's
             // KademliaEngine looks its own addresses up there - not from the Host - when it
@@ -988,7 +1074,7 @@ class NabuStorage private constructor(
             // "cross-node DHT provider discovery does not work" defect documented since V0.1.4;
             // see docs/architecture.adoc and MultiNodeDhtProviderDiscoveryTest. setAddrs (not
             // addAddrs) so that attaching twice or re-registering never duplicates entries.
-            host.addressBook.setAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
+            if (serving) host.addressBook.setAddrs(host.peerId, 0, *host.listenAddresses().toTypedArray()).join()
 
             return NabuStorage(
                 host,
@@ -1002,7 +1088,22 @@ class NabuStorage private constructor(
                 localDht,
                 clock,
                 wallClock,
+                networkMode,
+                if (serving) null else remote,
             )
         }
     }
+}
+
+/** `true` iff [bytes] is the raw block that [cid] (CIDv1, raw codec, SHA-256) names. A new digest per call. */
+internal fun matchesCid(
+    cid: Cid,
+    bytes: ByteArray,
+): Boolean {
+    if (cid.codec != Cid.Codec.Raw || cid.type != Multihash.Type.sha2_256) return false
+    val digest =
+        java.security.MessageDigest
+            .getInstance("SHA-256")
+            .digest(bytes)
+    return java.security.MessageDigest.isEqual(digest, cid.hash)
 }

@@ -38,10 +38,12 @@ private val logger = KotlinLogging.logger {}
  * is published by the `OnionServiceHost`, whose publisher callback points at the same channel.
  *
  * Mode switch: the first [tick] after [start] asks the [DirectoryModeTransition] whether the previous run was in
- * normal mode. If so, [tombstonePublisher] receives the address-free tombstone [PeerRecord] to send once (gossip and
- * `DirectoryDht.publishTombstone`; that is wired by the caller, it is the one publication from the own node) before
- * the first anonymous record goes out with a higher sequence number. [tombstonePublisher] contract: it MUST throw if
- * the tombstone could not be sent (no mesh peer, DHT failure); the tick is then retried. Returning normally marks the
+ * normal mode. If so, [tombstonePublisher] receives the address-free tombstone [PeerRecord] to send once before the
+ * first anonymous record goes out with a higher sequence number. In production (wave V0.10.0-J1a) the caller wires it
+ * to [DirectoryPublicationChannel.publishTombstone], so the tombstone travels through a circuit to a publish relay and
+ * nothing leaves the own node. [tombstonePublisher] contract: it MUST throw if the tombstone could not be sent (no
+ * relay accepted it); the transition is then retried along [failureBackoff] and [retryInterval], like a failed record
+ * publication, and no anonymous record goes out before it succeeded (fail-closed). Returning normally marks the
  * transition as done and it is never repeated. A tombstone is only built after a persisted normal-mode (`OFF`) state. The way back (anonymous to normal) is handled by
  * [DirectoryModeTransition.prepare] with [DirectoryAnonymityMode.OFF] at the next start in normal mode.
  *
@@ -175,9 +177,21 @@ class AnonymousDirectoryPublisher(
         }
         val now = clockMillis()
         if (!transitionDone) {
+            // a failed tombstone is retried along the same backoff as a failed record, never once per second
+            if (now < backoffUntilMillis) return false
             when (val plan = transition.prepare(DirectoryAnonymityMode.ON)) {
                 DirectoryTransitionPlan.None -> Unit
-                is DirectoryTransitionPlan.Tombstone -> tombstonePublisher(plan.record)
+                is DirectoryTransitionPlan.Tombstone -> {
+                    try {
+                        tombstonePublisher(plan.record)
+                    } catch (e: RuntimeException) {
+                        // the publisher may have blocked for a long time: back off from when it gave up
+                        recordFailure(clockMillis())
+                        throw e
+                    }
+                    consecutiveFailures = 0
+                    backoffUntilMillis = 0L
+                }
                 is DirectoryTransitionPlan.Revocation -> Unit
             }
             transitionDone = true
@@ -230,11 +244,16 @@ class AnonymousDirectoryPublisher(
             publications++
             return true
         }
+        recordFailure(now)
+        return !republishDue
+    }
+
+    /** Moves [backoffUntilMillis] along [failureBackoff], then [retryInterval], after a failed publication. */
+    private fun recordFailure(now: Long) {
         consecutiveFailures++
         val delay =
             if (consecutiveFailures <= failureBackoff.size) failureBackoff[consecutiveFailures - 1] else retryInterval
         backoffUntilMillis = now + delay.inWholeMilliseconds
-        return !republishDue
     }
 
     private fun await(future: java.util.concurrent.CompletableFuture<Boolean>): Boolean =

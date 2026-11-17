@@ -23,6 +23,7 @@ import net.lapisphilosophorum.lapisnet.madli.DailyRelayReliabilityPublication
 import net.lapisphilosophorum.lapisnet.madli.MadliGossip
 import net.lapisphilosophorum.lapisnet.madli.MadliRelayRanker
 import net.lapisphilosophorum.lapisnet.madli.MadliRelayReliabilityPublisher
+import net.lapisphilosophorum.lapisnet.networking.GossipAnonymityPolicy
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
@@ -42,6 +43,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkL
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import java.nio.file.Files
 import java.nio.file.Path
@@ -123,6 +125,9 @@ internal class HeadlessNode private constructor(
             /** Test seam: must return a `RelayNetworkLocator`; typed `Any` so the experimental onion type does not leak to callers. */
             anonymityLocator: ((PeerDirectoryGossip) -> Any)? = null,
         ): HeadlessNode {
+            // V0.10.0-J1a: effective values (anonymity mode switches DHT, auto-relay and publishing off)
+            @Suppress("NAME_SHADOWING")
+            val options = options.effective()
             Files.createDirectories(dataDirectory)
             val rollback = mutableListOf<() -> Unit>()
             try {
@@ -132,13 +137,23 @@ internal class HeadlessNode private constructor(
                         listenAddress,
                         options.relayConfig(RelayConfig.CLIENT_ONLY.copy(autoRelay = autoRelayConfig)),
                         options.holePunchConfig(),
+                        // V0.10.0-J1a: per-run transport key and no mDNS in anonymity mode
+                        transportKey = options.transportKeyPolicy(),
+                        mdnsEnabled = options.mdnsEnabled(),
                     )
                 node.start(bootstrapPeers = bootstrapPeers)
                 rollback += { runCatching { node.stop() } }
-                val storage = NabuStorage.attach(node, dataDirectory)
+                val anonymousNode = options.anonymity == AnonymityMode.ON
+                // V0.10.0-J1a: in anonymity mode the node neither serves nor queries the DHT and content
+                val storage =
+                    NabuStorage.attach(
+                        node,
+                        dataDirectory,
+                        networkMode = if (anonymousNode) StorageNetworkMode.LOCAL_ONLY else StorageNetworkMode.NETWORK,
+                    )
                 rollback += { runCatching { storage.stop() } }
-                // GossipPubSub must attach before any connect().
-                val pubsub = GossipPubSub.attach(node)
+                // GossipPubSub must attach before any connect(). Anonymity mode: receive and forward only.
+                val pubsub = GossipPubSub.attach(node, if (anonymousNode) GossipAnonymityPolicy() else null)
                 rollback += { runCatching { pubsub.stop() } }
                 val veritas = VeritasGossip.attach(pubsub, storage)
                 rollback += { runCatching { veritas.stop() } }
@@ -290,10 +305,7 @@ internal class HeadlessNode private constructor(
                             modeStore,
                             prekeyStore = null,
                             serviceKey = Ed25519KeyPair.generate(),
-                            tombstonePublisher = { tombstone ->
-                                peerDirectory.announce(tombstone)
-                                directoryDht?.publishTombstone(identity, tombstone)
-                            },
+                            // V0.10.0-J1a: no tombstonePublisher - the tombstone goes through a circuit (relay publishes)
                             supervisor = supervisor,
                             capabilities = emptySet(),
                             // the headless node has no calls: the call-media exposure text never applies

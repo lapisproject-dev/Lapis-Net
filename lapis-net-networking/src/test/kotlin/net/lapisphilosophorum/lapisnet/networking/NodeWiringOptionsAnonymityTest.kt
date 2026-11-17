@@ -9,6 +9,7 @@ import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityPaddingMode
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
+import net.lapisphilosophorum.lapisnet.networking.config.TransportKeyPolicy
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchConfig
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode
 
@@ -146,5 +147,62 @@ class NodeWiringOptionsAnonymityTest :
             NodeWiringOptions.envNameOf(NodeWiringOptions.KEY_ANONYMITY_PADDING) shouldBe "LAPISNET_ANONYMITY_PADDING"
             (NodeWiringOptions.KEY_ANONYMITY_PADDING in NodeWiringOptions.KNOWN_KEYS) shouldBe true
             NodeWiringOptions.HELP_TEXT shouldContain "--anonymity-padding=standard|off"
+        }
+
+        test(
+            "V0.10.0-J1a: an explicit auto-relay, relay-reliability publishing or DHT fallback is a conflict with on",
+        ) {
+            shouldThrow<InvalidWiringOptionException> {
+                resolve("--anonymity=on", "--reachability=private", "--auto-relay=true")
+            }.message shouldBe "auto-relay cannot be enabled while anonymity=on"
+            shouldThrow<InvalidWiringOptionException> {
+                resolve("--anonymity=on", "--publish-relay-reliability=true")
+            }.message shouldBe "publish-relay-reliability cannot be enabled while anonymity=on"
+            shouldThrow<InvalidWiringOptionException> { resolve("--anonymity=on", "--dht-fallback=true") }
+                .message shouldBe "dht-fallback cannot be enabled while anonymity=on"
+            // explicit false is fine
+            resolve("--anonymity=on", "--auto-relay=false", "--dht-fallback=false", "--publish-relay-reliability=false")
+                .dhtFallback shouldBe false
+        }
+
+        test("V0.10.0-J1a: with on and no key, DHT fallback, auto-relay and publishing resolve to false") {
+            val on = resolve("--anonymity=on", "--reachability=private")
+            on.dhtFallback shouldBe false
+            on.autoRelay shouldBe false
+            on.publishRelayReliability shouldBe false
+            // the relay config does not become PRIVATE (no reservation ever)
+            on.relayConfig().reachability shouldBe
+                net.lapisphilosophorum.lapisnet.networking.relay.NodeReachability.UNSPECIFIED
+        }
+
+        test("V0.10.0-J1a: mode off keeps every earlier default and combination") {
+            resolve().dhtFallback shouldBe true
+            resolve().autoRelay shouldBe false
+            resolve("--reachability=private").autoRelay shouldBe true
+            resolve(
+                "--reachability=private",
+                "--auto-relay=true",
+                "--dht-fallback=true",
+                "--publish-relay-reliability=true",
+            ).publishRelayReliability shouldBe true
+            resolve().transportKeyPolicy() shouldBe TransportKeyPolicy.IdentityDerived
+            resolve().mdnsEnabled() shouldBe true
+            resolve().effective() shouldBe resolve()
+        }
+
+        test(
+            "V0.10.0-J1a: on means a per-run transport key, no mDNS, and effective() also covers options built in code",
+        ) {
+            val on = resolve("--anonymity=on")
+            on.transportKeyPolicy() shouldBe TransportKeyPolicy.EphemeralPerRun
+            on.mdnsEnabled() shouldBe false
+            val built =
+                NodeWiringOptions(anonymity = AnonymityMode.ON, autoRelay = true, publishRelayReliability = true)
+            val effective = built.effective()
+            effective.dhtFallback shouldBe false
+            effective.autoRelay shouldBe false
+            effective.publishRelayReliability shouldBe false
+            effective.holePunching shouldBe HolePunchMode.OFF
+            NodeWiringOptions.HELP_TEXT shouldContain "fresh per run"
         }
     })

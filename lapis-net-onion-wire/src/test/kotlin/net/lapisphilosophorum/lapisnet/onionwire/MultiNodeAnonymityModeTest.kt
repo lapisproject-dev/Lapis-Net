@@ -3,13 +3,14 @@
 package net.lapisphilosophorum.lapisnet.onionwire
 
 import io.kotest.core.spec.style.FunSpec
-import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
+import io.libp2p.core.pubsub.ValidationResult
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.DirectoryModeState
 import net.lapisphilosophorum.lapisnet.directory.DirectoryReachability
 import net.lapisphilosophorum.lapisnet.directory.InMemoryDirectoryModeStore
+import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
 import net.lapisphilosophorum.lapisnet.directory.PeerRecordCodec
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
@@ -24,6 +25,7 @@ import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import java.nio.file.Files
 import java.time.Clock
 import java.time.Duration
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -48,6 +50,28 @@ class MultiNodeAnonymityModeTest :
             b.connectTo(it)
         }
         val scanner = AnonymityLeakScanner(a)
+        // wave J1a: the relays' own gossip, to see which of them published A's tombstone on its behalf
+        val relayPeerRecords = CopyOnWriteArrayList<ByteArray>()
+        relays.forEach { r ->
+            r.pubsub.outboundTap = { topic, bytes ->
+                if (topic == PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC) relayPeerRecords += bytes
+            }
+        }
+
+        // what B receives on the peer-record topic (a second subscription; it never vetoes B's own validator)
+        val tombstonesAtB = CopyOnWriteArrayList<PeerRecord>()
+        b.pubsub.subscribe(PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC) { bytes, _ ->
+            runCatching { PeerRecordCodec.decode(bytes) }
+                .getOrNull()
+                ?.takeIf { it.identity == a.key && it.addresses.isEmpty() }
+                ?.let { tombstonesAtB += it }
+            ValidationResult.Valid
+        }
+
+        fun relayedTombstonesOfA(): List<PeerRecord> =
+            relayPeerRecords
+                .mapNotNull { runCatching { PeerRecordCodec.decode(it) }.getOrNull() }
+                .filter { it.identity == a.key && it.addresses.isEmpty() }
         val locator = MapLocator()
         val dir = Files.createTempDirectory("anonymity-mode-test")
         val prekeys = PrekeyStore.create(dir.resolve("prekeys"), a.identity)
@@ -59,7 +83,6 @@ class MultiNodeAnonymityModeTest :
                 ),
             )
         val serviceKey = Ed25519KeyPair.generate()
-        var tombstone: PeerRecord? = null
         lateinit var runtime: AnonymityRuntime
 
         test("descriptors converge, then A starts anonymity mode") {
@@ -80,11 +103,8 @@ class MultiNodeAnonymityModeTest :
                     modeStore,
                     prekeys,
                     serviceKey,
-                    { t ->
-                        tombstone = t
-                        a.peerDirectory.announce(t)
-                    },
-                    a.supervisor,
+                    // the production path (no tombstone seam): the tombstone goes through a circuit to a relay
+                    supervisor = a.supervisor,
                     governor = CircuitBuildGovernor(Clock.systemUTC(), ratePerMinute = 600, burst = 100),
                 )
             runtime.status().mode shouldBe "on"
@@ -98,6 +118,14 @@ class MultiNodeAnonymityModeTest :
                 runtime.maintenanceTick()
                 runtime.publications() >= 1
             } shouldBe true
+            // the OFF-to-ON transition really happened on the production path: a relay published the address-free
+            // tombstone of A before the anonymous record, and the mode is persisted as ON only after that
+            relayedTombstonesOfA().isEmpty() shouldBe false
+            modeStore.load()!!.mode shouldBe DirectoryAnonymityMode.ON
+            // the relay's publication reached the mesh: B (normal mode) received A's address-free tombstone over
+            // gossip, which retires A's old address-bearing record on peers that never see the anonymous record
+            awaitTrue(Duration.ofSeconds(60)) { tombstonesAtB.isNotEmpty() } shouldBe true
+            tombstonesAtB.first().sequenceNumber shouldBe relayedTombstonesOfA().first().sequenceNumber
             awaitTrue(Duration.ofSeconds(90)) {
                 b.wire.anonymousDirectory().resolve(a.key) is DirectoryReachability.Hidden
             } shouldBe true
@@ -120,16 +148,13 @@ class MultiNodeAnonymityModeTest :
         }
 
         test(
-            "the leak scanner finds nothing of A's addresses or transport identity outside the address-free tombstone",
+            "A publishes nothing from its own node, not even the tombstone, and the tombstone carries no address",
         ) {
-            val t = tombstone.shouldNotBeNull()
-            val tombstoneBytes = PeerRecordCodec.encode(t)
-            scanner.gossip.size shouldBe 1
-            scanner.gossip
-                .single()
-                .second
-                .contentEquals(tombstoneBytes) shouldBe true
-            scanner.leaks(scanner.gossip.map { it.second }, scanner.addressNeedles()) shouldBe emptyList()
+            // wave J1a: the tombstone went through a circuit, so A's own outbound gossip stays empty
+            scanner.gossip.size shouldBe 0
+            val relayed = relayedTombstonesOfA()
+            relayed.isEmpty() shouldBe false
+            scanner.leaks(relayed.map { PeerRecordCodec.encode(it) }, scanner.addressNeedles()) shouldBe emptyList()
         }
 
         test("stopping sends DESTROY: the relays keep no circuit of A, and a restart reuses the same guard") {
@@ -153,8 +178,7 @@ class MultiNodeAnonymityModeTest :
                     modeStore,
                     prekeys,
                     Ed25519KeyPair.generate(),
-                    { },
-                    a.supervisor,
+                    supervisor = a.supervisor,
                     governor = CircuitBuildGovernor(Clock.systemUTC(), ratePerMinute = 600, burst = 100),
                 )
             try {

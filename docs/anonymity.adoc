@@ -3,6 +3,8 @@
 
 == Status
 
+*Wave J1a (transport hygiene in anonymity mode, unreleased; first part of wave J) changes what a node in anonymity mode shows on its direct connections. Its libp2p transport key is fresh per run and never stored, so no connection shows the PeerId bound to the identity; mDNS is off; the node neither serves nor queries the DHT and content (Bitswap and Kademlia are not registered, the DHT fallback, auto-relay and relay-reliability publishing are off and refused when set explicitly); GossipSub only receives and forwards on a fixed topic allowlist and publishes nothing of its own; the tombstone of a switch from normal to anonymity mode goes through a circuit and a relay publishes it; posting, votes, trust grants, self-links, LTR records and manual connections are refused with 409. The node still meshes over direct connections that show its address (to its bootstrap peers and every peer that connects), still dials relays directly, and can not fetch content it does not already hold. Connection confinement to the guards (J1b), lookups through circuits (J2) and the consumers (J3) are NOT implemented.* No external cryptographic or anonymity review has taken place. See <<gossip-dht-fetches>>.
+
 *Wave I (multi-node tests, Sybil simulation, review package, unreleased) adds no feature for the user. It tests more of what exists on real loopback nodes (a late subscriber behind a node that already holds a service descriptor, failure of the primary guard, a mode switch by restart, mail and call signals after a restart with a new onion address), simulates the real path selection against an adversary that controls part of the relays, and prepares the external review in link:external-review.adoc[external-review.adoc]. It fixed one defect that the new test found: the repeat slots of the early republication sent the service descriptor byte-identically, which a node that already holds it ignores and does not forward; they now send a fresh signed version (see <<early-republication>>). The external review itself has not taken place.* See <<wave-i>>.
 
 *Wave H (padding and timing protection, unreleased) makes the traffic of a node in anonymity mode harder to read for a local observer of its guard connection: message sizes are padded to size classes, cover cells are sent towards the guard on a randomised schedule, outgoing cells leave in time slices, and circuits are built in advance. It makes observation by a local observer or a single relay harder; it is NOT protection against a global passive observer, and it does not hide that and roughly when the node is active.* See <<padding-and-timing>>.
@@ -39,7 +41,7 @@ Diagram sources are committed as kUML; GitHub does not render the `[kuml]` block
 * Anonymous content. Content confidentiality stays with the existing end-to-end layers (X3DH/Double Ratchet, hybrid ECIES).
 * Protection against a global passive observer who sees both ends of a circuit (traffic confirmation). Not defended, see the threat model.
 * The media path of calls. WebRTC reveals IP addresses through ICE; signalling can be anonymised, media cannot without a separate design.
-* GossipSub, the DHT and content fetches in part 1 (wave J, later).
+* Anonymous publication of own gossip (posts, votes, trust grants, LTR records, Madli vectors) and anonymous writes into the DHT. Wave J1a refuses them in anonymity mode; a later wave may add a relay role for them.
 * Tor equivalence. This is a small, purpose-built onion design for a small network, with a much smaller anonymity set than Tor.
 
 [[threat-model]]
@@ -83,6 +85,28 @@ These exist in the current release and must be closed before any anonymity claim
 . *Small anonymity set.* Few relays mean weak anonymity regardless of cryptography.
 . *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
 . *Correlation by provoked teardown.* Any party on a path can destroy a circuit and correlate the effect elsewhere (DoS-based correlation). Not prevented.
+
+Wave J continues this list (numbers 9 to 22; the D-row numbers of the table in <<directory-anonymity>> are a different numbering and are cited as "D-row N"). The state after wave J1a:
+
+[cols="1,4,3,3"]
+|===
+| No. | Leak | Closed by | Remains
+
+| 9 | The libp2p host key was the identity key in anonymity mode too: every connection showed a PeerId bound to the identity together with the IP address | J1a: fresh key per run (`TransportKeyPolicy.EphemeralPerRun`), never stored | Every peer the node connects to sees the IP address and the PeerId of this run; two runs from the same address are linkable through the address
+| 10 | mDNS announced the identity-bound PeerId and the listen addresses on the LAN (new finding, not in an earlier inventory) | J1a: no mDNS object in anonymity mode | -
+| 11 | GossipSub mesh and subscriptions: every mesh neighbour sees PeerId, IP and the topic set; the anonymity topics mark the node | J1a: fixed topic allowlist; the PeerId is per run | Open (J1b): the mesh still runs over direct connections to arbitrary peers; CLI and browser subscribe to different subsets of the allowlist
+| 12 | Own gossip publications tie signed content to the address (tombstone OFF to ON, Madli publisher, posts, votes, trust grants, LTR records) | J1a: every own publication refused in `GossipPubSub`; tombstone through a circuit; 409 in the browser | Posting, votes, trust grants and LTR records are unavailable in anonymity mode
+| 13 | IHAVE/IWANT/GRAFT/PRUNE and peer exchange show which message ids the node holds or wants | - | Open (J1b): every mesh neighbour still sees them
+| 14 | Kademlia server: the node sat in foreign routing tables and answered GET_PROVIDERS for blocks it holds | J1a: Kademlia not registered (`StorageNetworkMode.LOCAL_ONLY`) | -
+| 15 | Kademlia client: DHT maintenance and lookups (`DirectoryDht`, `--dht-fallback` defaulted to true in anonymity mode) | J1a: no `DirectoryDht`, DHT fallback off and refused when explicit | Open (J2): no replacement; relay discovery only through gossip, so a new node may wait for the next relay descriptor announcement (up to 6 hours)
+| 16 | Bitswap server: a probe "does this node hold CID X" | J1a: Bitswap not registered | -
+| 17 | Content fetches show the CID (interest) to providers and DHT peers | J1a: no fetch at all in anonymity mode | Open (J2/J3): content the node does not hold is shown as unavailable
+| 18 | Manual connections (`/api/peers/connect`, `/api/connect/uri`) | J1a: 409 in the browser | Open (J1b): `LapisNode.connect` itself is not restricted (the onion link layer uses it)
+| 19 | Circuit-relay-v2 reservations (`--auto-relay`), D-row 11 | J1a: off in anonymity mode, an explicit `true` refuses the start | -
+| 20 | The listen socket accepts anyone who knows the address | - | Open (J1b)
+| 21 | Registered protocol ids (circuit-relay hop and stop, onion) form a small fingerprint | - | Documented only
+| 22 | Lookups through circuits (planned, J2) would show the CID or IPNS name to the exit relay | - | Not applicable until J2 exists
+|===
 
 == Circuit design
 
@@ -961,7 +985,7 @@ The API answers an accepted send the same way whether the bundle was delivered a
 
 *What it is.* A call has two paths. The *signals* (INVITE, ACCEPT, REJECT, HANGUP; they carry the SDP) now travel over circuits for a node in anonymity mode. The *media* (the audio itself) is a direct WebRTC connection and can not be moved onto circuits: the two parties must learn each other's address to connect. This wave therefore moves the signals and is honest about the media. There is no second cryptographic layer: the Double Ratchet session between the two identities stays the only end-to-end layer, and the route is chosen inside `DmSessionManager` exactly like for direct messages. `CallManager` stays transport-independent and `lapis-net-call` still depends on `lapis-net-dm` only (the module graph is unchanged; the multi-node test uses the test fixtures of `lapis-net-dm-onion`).
 
-At every start in anonymity mode the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). Since wave H there are four fixed texts, chosen by the call-media option and by `--anonymity-padding`. Calls off, padding standard (the default): _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ Calls allowed with `--anonymity-allow-call-media=true`, padding standard: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ Calls off, `--anonymity-padding=off`: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches still show your identity and address._ Calls allowed, padding off: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches still show your identity and address._ The four texts are the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, `ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF_CALL_MEDIA_EXPOSED` (selected by `anonymityIncompleteWarning`), in `app.js` and here (a test compares them). The browser status panel says _Call signals: through circuits_ and, depending on the option, _Call media: off (would reveal your IP address)_ or _Call media: direct connection, your IP address is visible to the other party and to network observers_, and, since wave H, an eighth line about padding.
+At every start in anonymity mode the node warns (log, CLI stderr, a notice in the browser that can not be dismissed). Since wave H there are four fixed texts (their common ending was updated in wave J1a), chosen by the call-media option and by `--anonymity-padding`. Calls off, padding standard (the default): _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable._ Calls allowed with `--anonymity-allow-call-media=true`, padding standard: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable._ Calls off, `--anonymity-padding=off`: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable._ Calls allowed, padding off: _Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable._ The four texts are the same character for character in `ANONYMITY_INCOMPLETE_WARNING`, `ANONYMITY_INCOMPLETE_WARNING_CALL_MEDIA_EXPOSED`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF`, `ANONYMITY_INCOMPLETE_WARNING_PADDING_OFF_CALL_MEDIA_EXPOSED` (selected by `anonymityIncompleteWarning`), in `app.js` and here (a test compares them). The browser status panel says _Call signals: through circuits_ and, depending on the option, _Call media: off (would reveal your IP address)_ or _Call media: direct connection, your IP address is visible to the other party and to network observers_, and, since wave H, an eighth line about padding.
 
 === Signal path
 
@@ -1342,5 +1366,70 @@ Wave F1 adds the module `lapis-net-dm-onion` (adapter between `lapis-net-dm` and
 | G | Done (unreleased): call signals over circuits (online only, same ratchet session, no reply route); calls off in anonymity mode by default; `--anonymity-allow-call-media=true` allows them with a confirmation per call, media stays direct and reveals the IP address; reduced SDP candidates (public host only); `CIRCUIT_LOST`; no wire change.
 | H | Done (unreleased): padding and timing protection against a local observer: size classes inside the end-to-end layer (frame types 4 and 5), cover `DROP` cells to hop 2 on a randomised schedule with a budget, 50 ms egress slices with a burst tail, a warm circuit pool (one use each), `--anonymity-padding=standard|off`. Not protection against a global passive observer; the return direction, mailbox item counts and the introduction circuit stay open. See <<padding-and-timing>>.
 | I | Done (unreleased): multi-node tests (late subscriber behind a holder, guard failover, mode switch by restart, mail and call signals after a restart with a new onion address), Sybil simulation of the real path selection, fresh signed service descriptor versions at the repeat slots (found by the multi-node test), and the review package link:external-review.adoc[external-review.adoc]. The external review itself has not taken place. See <<wave-i>>.
-| J (later) | GossipSub, DHT and content fetches.
+| J1a | Done (unreleased): transport hygiene in anonymity mode: per-run transport key, no mDNS, no Bitswap and no Kademlia (`StorageNetworkMode.LOCAL_ONLY`), receive-only GossipSub with a topic allowlist, conflicts with `--auto-relay`, `--publish-relay-reliability` and `--dht-fallback`, tombstone through a circuit (directory object type 4), 409 for own publications and manual connections in the browser.
+| J1b, J2, J3 (later) | Connection confinement to the guards and the relay directory snapshot (J1b), the relay role LOOKUP for DHT and block lookups through circuits (J2), and the consumers of those lookups (J3).
 |===
+
+[[gossip-dht-fetches]]
+== GossipSub, DHT and content fetches (wave V0.10.0-J, unreleased)
+
+Wave J is cut into four parts (J1a, J1b, J2, J3, one pipeline run each). *Only J1a is implemented.* The version stays 0.12.0, there is no tag. No external cryptographic or anonymity review has taken place, and nothing here makes anonymity mode released or ready for use.
+
+=== Transport key
+
+`LapisNode.create` takes a `TransportKeyPolicy`. `IdentityDerived` (the default, normal mode) keeps the key derived from the identity. `EphemeralPerRun` (anonymity mode, chosen by `NodeWiringOptions.transportKeyPolicy()`) generates a fresh Ed25519 key per process run from `SecureRandom`; it is never written and never logged, and the seed bytes the policy generated are overwritten once the libp2p key object exists (copies inside the libp2p and BouncyCastle objects are not under our control). `PeerRecord` and `IdentityBinding` are built from the identity, never from the host's PeerId, so no published object ties the identity to the PeerId of the run. The Noise handshake, the GossipSub message signature (`from` field) and the onion links use the per-run key. Relays still see a new PeerId per run; the onion layer works with identities, not PeerIds.
+
+=== Connection confinement
+
+Not implemented (J1b). In J1a the node still connects to its bootstrap peers, accepts inbound connections and dials relays directly for its onion links; every one of these peers sees its address and the PeerId of the run.
+
+=== Relay directory snapshot
+
+Not implemented (J1b). Relay descriptors reach a node in anonymity mode only through gossip (the DHT discovery path is gone in this mode). A node started after the relays may therefore report `insufficient-relays` until the relays announce their descriptors again.
+
+=== Gossip in anonymity mode
+
+`GossipPubSub.attach(node, GossipAnonymityPolicy())`: `subscribe` refuses every topic outside `ANONYMITY_GOSSIP_ALLOWLIST` with `GossipAnonymityRefusedException` (the message names no topic), and `publish` and `publishReporting` refuse every own publication before anything is handed to the router (the leak scanner's tap sees nothing). Forwarding of other nodes' messages is the router's job and continues. The allowlist holds the shared, global topics only (anonymous peer records, service and relay descriptors, the anonymous mailbox topic, Madli vectors, peer records, prekey bundles, Veritas, Virtus LTR, Karma, post announcements); no identity-scoped topic. A test compares it with the real topic constants.
+
+=== DHT and storage in anonymity mode
+
+`NabuStorage.attach(..., networkMode = StorageNetworkMode.LOCAL_ONLY)` registers neither Bitswap nor Kademlia on the host and does not put the node's own addresses into its address book. `provide`, `findProviders`, `publishIpnsValue`, `registerPeerAddress`, `connectToDhtPeer` and `get` with explicit peers throw `AnonymousStorageRefusedException`. `get` without peers answers from the local and the unserved store, and otherwise from a `RemoteContentSource` if one is attached; a remotely supplied block is used only when its SHA-256 matches a raw-codec CID and is stored unserved, and a remotely supplied IPNS record is validated like a DHT answer (signature by the requested name's key, expiry). In J1a no `RemoteContentSource` exists in production, so content the node does not hold is unavailable. `DirectoryDht`, its maintenance job and the DHT outbox are not attached. `NodeWiringOptions.effective()` switches the DHT fallback, auto-relay and relay-reliability publishing off in anonymity mode even for options built in code; `resolve` refuses an explicit `true` for any of them together with `--anonymity=on`.
+
+=== Tombstone through a circuit
+
+A node that ran in normal mode before used to gossip its address-free tombstone (and write it to the DHT) from itself when it switched to anonymity mode, which tied the identity to the address of that run. Since J1a the `AnonymityRuntime` sends it through a circuit as the new directory object `TOMBSTONE_PEER_RECORD` (type 4) of DIRECTORY_PUBLISH. The relay validates it with the checks of the peer-record gossip validator plus "no address" and "not expired", publishes it once on the peer-record topic and answers a repeat with the same status. A relay without a peer directory (or of an older version) answers `UNKNOWN_TYPE`, and the client tries another relay. There is no DHT tombstone in anonymity mode any more: an old DHT value of the node stays visible until its validity ends (at most 24 hours). A relay that cannot store the tombstone (failing storage) answers `RATE_LIMITED`, never `ACCEPTED`, so the client moves on to another relay. If no relay accepts the tombstone, the transition is retried along the same backoff as a failed record publication (5 s, 15 s, 45 s, then once a minute) and the anonymous record is not published until it succeeds (fail-closed).
+
+=== Lookups through circuits
+
+Not implemented (J2). The planned relay role LOOKUP (DHT and block lookups on behalf of anonymous clients, fixed-size messages, size classes, client-side verification) and the circuit-backed `RemoteContentSource` are open.
+
+=== Refusals the user sees
+
+In anonymity mode the browser answers `409` with `{"error": ..., "code": "anonymity-publish-unavailable"}` for `POST /api/posts`, `/api/karma`, `/api/trust`, `/api/ltr/lightning` and `/api/self-link`, and with `code` `anonymity-connect-unavailable` for `POST /api/peers/connect` and `/api/connect/uri` (as before, `GET /api/connect/info` and `/api/connect/qr.svg` answer 409 as well). The start is refused with `auto-relay cannot be enabled while anonymity=on`, `publish-relay-reliability cannot be enabled while anonymity=on` or `dht-fallback cannot be enabled while anonymity=on` when one of these is set to `true` explicitly. The start warning ends, in all four texts, with: _the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable._
+
+=== Leak inventory after wave J1a
+
+See the table under <<known-leaks>> (numbers 9 to 22). Update of the D-row table: D-row 11 (auto-relay reservation) and D-row 12 (relay-reliability publishing) are no longer allowed in anonymity mode; the DHT tombstone of the mode switch is gone.
+
+=== Honest limits of wave J1a
+
+* The node still meshes over direct connections to arbitrary peers; each of them sees its address, the PeerId of the run and its topic set. Two runs from the same address are linkable.
+* The node can not fetch content it does not already hold, and finds relays only through gossip.
+* Posting, votes, trust grants, self-links and LTR records are unavailable in anonymity mode.
+* Verified on loopback only, with unit and multi-node tests; no real network, no NAT, no load test for this part.
+* No external cryptographic or anonymity review has taken place.
+
+=== Assumptions awaiting confirmation (wave J)
+
+Each was implemented (or, for J1b to J3, planned) with the conservative variant; each needs a decision:
+
+* *Q1, cut:* four pipeline runs (J1a, J1b, J2, J3), each on its own local branch. This run implemented J1a only.
+* *Q2, transport key:* a fresh, never stored Ed25519 key per run in anonymity mode (alternatives: one key per guard, or a stored key; both link runs). Implemented in J1a.
+* *Q3, connection confinement:* only the guards (and the bootstrap peers while relays are missing), plus the protocol `/lapis/onion-relay-directory/1.0.0` for relay descriptor snapshots (alternative: a receive-only mesh with arbitrary peers). Open (J1b).
+* *Q4, relay role LOOKUP:* on by default on relays of the version that has it, with `--onion-relay-lookup=false` to switch it off (alternative: opt-in). Open (J2).
+* *Q5, own publications:* refused with 409 (`anonymity-publish-unavailable`) in this wave; a relay role `GOSSIP_PUBLISH` later. Implemented in J1a.
+* *Q6, option conflicts:* an explicit `--auto-relay=true`, `--publish-relay-reliability=true` or `--dht-fallback=true` with `--anonymity=on` refuses the start; a missing key resolves to off. This tightens the earlier behaviour (D-rows 11 and 12 were allowed). Implemented in J1a.
+* *Q7, tombstone:* through a circuit as directory object type 4; no DHT tombstone in anonymity mode (an old DHT value stays visible up to 24 hours); no IPNS write through a relay. Implemented in J1a.
+* *Q8, LOOKUP constants:* largest answer 128 KiB, size classes 2, 8, 32 and 128 KiB, 4 requests per circuit at the relay and 1 by the client, at most 1 open LOOKUP circuit and 2 builds per minute within the existing pool. Open (J2).
+* *Q9, listen socket:* keep listening and close every inbound connection from outside the allowed set (alternative: do not listen). Open (J1b).
+

@@ -11,6 +11,8 @@ import net.lapisphilosophorum.lapisnet.directory.ONION_SERVICE_DESCRIPTOR_GOSSIP
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorGossip
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorIndex
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
+import net.lapisphilosophorum.lapisnet.directory.PeerRecord
+import net.lapisphilosophorum.lapisnet.directory.PeerRecordCodec
 import net.lapisphilosophorum.lapisnet.directory.PrekeyBundleGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
@@ -19,6 +21,7 @@ import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.onion.DirectoryObjectType
+import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishBody
 import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.IntroPointEntry
 import net.lapisphilosophorum.lapisnet.onion.OnionKeyBinding
@@ -57,6 +60,7 @@ class GossipDirectoryPublishSinkTest :
                 serviceIndex,
                 pubsub,
                 clock,
+                peerDirectory = peerDirectory,
             )
         afterSpec {
             runCatching { peerDirectory.stop() }
@@ -202,5 +206,120 @@ class GossipDirectoryPublishSinkTest :
             val status = sink.publish(DirectoryObjectType.PREKEY_BUNDLE, tampered)
             (status == DirectoryPublishStatus.INVALID || status == DirectoryPublishStatus.MALFORMED) shouldBe true
             count(topic) shouldBe before
+        }
+
+        test("V0.10.0-J1a: a valid address-free tombstone is published once by the relay; a repeat is answered alike") {
+            val topic = PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC
+            val other = DualKeyIdentity.generate()
+            val tombstone =
+                PeerRecord.create(other, emptyList(), emptySet(), 42, now() + 3600, now())
+            val bytes = PeerRecordCodec.encode(tombstone)
+            (bytes.size <= DirectoryPublishBody.MAX_OBJECT_SIZE) shouldBe true
+            val before = count(topic)
+            sink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, bytes) shouldBe DirectoryPublishStatus.ACCEPTED
+            count(topic) shouldBe before + 1
+            published.last().second.contentEquals(bytes) shouldBe true
+            sink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, bytes) shouldBe DirectoryPublishStatus.ACCEPTED
+            count(topic) shouldBe before + 1
+        }
+
+        test("V0.10.0-J1a: a tombstone with an address, expired or tampered is rejected and never published") {
+            val topic = PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC
+            val other = DualKeyIdentity.generate()
+            val before = count(topic)
+            val withAddress =
+                PeerRecord.create(
+                    other,
+                    listOf(
+                        io.libp2p.core.multiformats
+                            .Multiaddr("/ip4/203.0.113.7/tcp/4001"),
+                    ),
+                    emptySet(),
+                    5,
+                    now() + 3600,
+                    now(),
+                )
+            sink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, PeerRecordCodec.encode(withAddress)) shouldBe
+                DirectoryPublishStatus.INVALID
+            val expired = PeerRecord.create(other, emptyList(), emptySet(), 6, now() - 10, now() - 3600)
+            sink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, PeerRecordCodec.encode(expired)) shouldBe
+                DirectoryPublishStatus.INVALID
+            val tampered =
+                PeerRecordCodec.encode(
+                    PeerRecord.create(other, emptyList(), emptySet(), 7, now() + 3600, now()),
+                )
+            tampered[tampered.size - 1] = (tampered[tampered.size - 1].toInt() xor 0x55).toByte()
+            val status = sink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, tampered)
+            (status == DirectoryPublishStatus.INVALID || status == DirectoryPublishStatus.MALFORMED) shouldBe true
+            count(topic) shouldBe before
+        }
+
+        test(
+            "V0.10.0-J1a: a tombstone the relay cannot persist is answered RATE_LIMITED (retryable) and never published",
+        ) {
+            // fail-closed: a relay with a failing blockstore must not report ACCEPTED for a tombstone it never
+            // published, otherwise the client would mark the OFF-to-ON transition done and never retry
+            val failingNode =
+                LapisNode
+                    .create(
+                        DualKeyIdentity.generate(),
+                    ).also { it.start(bootstrapPeers = emptyList()) }
+            val dir = Files.createTempDirectory("sink-failing").resolve("storage").also { Files.createDirectories(it) }
+            val failingStorage = NabuStorage.attach(failingNode, dir)
+            val failingPubsub = GossipPubSub.attach(failingNode)
+            val failingDirectory = PeerDirectoryGossip.attach(failingPubsub, failingStorage)
+            val failingIndex = OnionServiceDescriptorIndex()
+            val failingPublished = CopyOnWriteArrayList<Pair<String, ByteArray>>()
+            failingPubsub.outboundTap = { topic, bytes -> failingPublished += topic to bytes }
+            try {
+                val failingSink =
+                    GossipDirectoryPublishSink(
+                        AnonymousPeerRecordGossip.attach(failingPubsub, failingDirectory.anonymousRecords, clock),
+                        OnionServiceDescriptorGossip.attach(failingPubsub, failingIndex, clock),
+                        failingIndex,
+                        failingPubsub,
+                        clock,
+                        peerDirectory = failingDirectory,
+                    )
+                dir.toFile().deleteRecursively()
+                Files.writeString(dir, "not a directory any more")
+                val tombstone =
+                    PeerRecord.create(DualKeyIdentity.generate(), emptyList(), emptySet(), 9, now() + 3600, now())
+                failingSink.publish(
+                    DirectoryObjectType.TOMBSTONE_PEER_RECORD,
+                    PeerRecordCodec.encode(tombstone),
+                ) shouldBe
+                    DirectoryPublishStatus.RATE_LIMITED
+                failingPublished.count { it.first == PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC } shouldBe 0
+            } finally {
+                runCatching { failingDirectory.stop() }
+                runCatching { failingPubsub.stop() }
+                runCatching { failingStorage.stop() }
+                runCatching { failingNode.stop() }
+            }
+        }
+
+        test(
+            "V0.10.0-J1a: a sink without a peer directory answers a tombstone with UNKNOWN_TYPE, like an older relay",
+        ) {
+            val oldSink =
+                GossipDirectoryPublishSink(
+                    AnonymousPeerRecordGossip.attach(pubsub, peerDirectory.anonymousRecords, clock),
+                    OnionServiceDescriptorGossip.attach(pubsub, serviceIndex, clock),
+                    serviceIndex,
+                    pubsub,
+                    clock,
+                )
+            val tombstone =
+                PeerRecord.create(
+                    DualKeyIdentity.generate(),
+                    emptyList(),
+                    emptySet(),
+                    1,
+                    now() + 600,
+                    now(),
+                )
+            oldSink.publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, PeerRecordCodec.encode(tombstone)) shouldBe
+                DirectoryPublishStatus.UNKNOWN_TYPE
         }
     })

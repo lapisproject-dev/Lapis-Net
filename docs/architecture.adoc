@@ -5773,6 +5773,10 @@ Module boundary: `lapis-net-dm` has no dependency on any onion module; it owns t
 
 Wave F2 (mail over circuits, unreleased) follows the same module boundary: `lapis-net-mail` owns the `AnonymousMailTransport` and `AnonymousMailInboundSink` interfaces and the anonymous modes of `MailSender` and `InboxGossip` and depends on no onion code; the new adapter module `lapis-net-mail-onion` depends on `lapis-net-mail`, `lapis-net-dm-onion` (stream framing, re-announcement queue) and `lapis-net-onion-wire`. The sealed mailbox item is now the generic `SealedMailboxBox` in `lapis-net-directory` (kinds DM and MAIL), shared by both adapters. Design, formats, limits and honest limits: `anonymity.adoc`, section "Mail over circuits".
 
+=== Transport hygiene in anonymity mode (V0.10.0-J1a, unreleased)
+
+`lapis-net-networking`: `TransportKeyPolicy` (identity-derived or fresh per run) and the `mdnsEnabled` switch of `LapisNode.create`; `GossipAnonymityPolicy` with `ANONYMITY_GOSSIP_ALLOWLIST` for `GossipPubSub.attach` (subscriptions restricted, own publications refused); `NodeWiringOptions.transportKeyPolicy()`, `mdnsEnabled()` and `effective()`. `lapis-net-storage`: `StorageNetworkMode` (`NETWORK`, `LOCAL_ONLY`) and the interface `RemoteContentSource` for `NabuStorage.attach` (kept in this module so the storage does not depend on the onion layer; the circuit-backed implementation is planned for wave J2). `lapis-net-onion`: directory object type `TOMBSTONE_PEER_RECORD` (4); `lapis-net-directory`: `DirectoryPublicationChannel.publishTombstone` and `PeerDirectoryGossip.relayTombstone`; `lapis-net-onion-wire`: the relay sink publishes relayed tombstones, `AnonymityRuntime` sends the tombstone through its publisher. The module graph is unchanged. Connection confinement and the relay role LOOKUP are not implemented; see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
+
 == Diagrams
 
 Diagrams for this repository are authored in kUML and embedded via the

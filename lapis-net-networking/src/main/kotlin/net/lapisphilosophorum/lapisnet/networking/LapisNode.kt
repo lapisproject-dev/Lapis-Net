@@ -15,6 +15,7 @@ import io.libp2p.protocol.Identify
 import io.libp2p.security.noise.NoiseXXSecureChannel
 import io.libp2p.transport.tcp.TcpTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.config.TransportKeyPolicy
 import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrBinding
 import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrProtocol
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchAddressFilter
@@ -161,7 +162,8 @@ class LapisNodeException(
  */
 class LapisNode private constructor(
     val host: Host,
-    private val mdns: MDnsDiscovery,
+    /** `null` when mDNS is switched off (anonymity mode, wave V0.10.0-J1a): no multicast socket is ever opened. */
+    private val mdns: MDnsDiscovery?,
     /**
      * Circuit-Relay-v2 NAT traversal for this node: obtain and hold reservations on other peers'
      * relays so peers that cannot dial this node directly can still reach it through one. Always
@@ -237,6 +239,18 @@ class LapisNode private constructor(
     internal val connectsBeforeGossipAttach = AtomicInteger(0)
 
     val peerId: PeerId get() = host.peerId
+
+    /** `true` while mDNS discovery runs (tests; always `false` when the node was created without mDNS). */
+    val mdnsRunning: Boolean get() = mdns != null && mdnsStarted.get() && !stopped.get()
+
+    private val mdnsStarted = AtomicBoolean(false)
+
+    /** The protocol IDs the host currently answers (tests: the mode-off regression snapshot). */
+    internal fun registeredProtocolIds(): Set<String> =
+        host
+            .getProtocols()
+            .flatMap { it.protocolDescriptor.announceProtocols }
+            .toSet()
 
     /**
      * This node's local relay-usage balance for [peer] (`received - served`, in relayed bytes,
@@ -383,7 +397,10 @@ class LapisNode private constructor(
     ) {
         awaitOrWrap("start host", timeout) { host.start() }
         warnOnReachabilityMismatch()
-        awaitOrWrap("start mDNS discovery", timeout) { mdns.start() }
+        mdns?.let { m ->
+            awaitOrWrap("start mDNS discovery", timeout) { m.start() }
+            mdnsStarted.set(true)
+        }
         bootstrapPeers.forEach { address ->
             host.network
                 .connect(address)
@@ -449,7 +466,10 @@ class LapisNode private constructor(
             .onFailure { logger.warn(it) { "failed to stop automatic relay selection cleanly" } }
         runCatching { relayClient.stop() }
             .onFailure { logger.warn(it) { "failed to stop relay reservation renewal cleanly" } }
-        val mdnsFailure = runCatching { awaitOrWrap("stop mDNS discovery", timeout) { mdns.stop() } }.exceptionOrNull()
+        val mdnsFailure =
+            mdns?.let { m ->
+                runCatching { awaitOrWrap("stop mDNS discovery", timeout) { m.stop() } }.exceptionOrNull()
+            }
         if (mdnsFailure != null) {
             logger.warn(mdnsFailure) { "failed to stop mDNS discovery cleanly, stopping host anyway" }
         }
@@ -490,6 +510,10 @@ class LapisNode private constructor(
             listenAddress: Multiaddr = DEFAULT_LISTEN_ADDRESS,
             relayConfig: RelayConfig = RelayConfig.CLIENT_ONLY,
             holePunchConfig: HolePunchConfig = HolePunchConfig.DISABLED,
+            /** V0.10.0-J1a: [TransportKeyPolicy.EphemeralPerRun] in anonymity mode; the default keeps normal mode unchanged. */
+            transportKey: TransportKeyPolicy = TransportKeyPolicy.IdentityDerived,
+            /** V0.10.0-J1a: `false` in anonymity mode - no mDNS object, no multicast socket, no LAN announcement. */
+            mdnsEnabled: Boolean = true,
         ): LapisNode {
             val punchRequested = holePunchConfig.isActive(relayConfig.reachability == NodeReachability.PRIVATE)
             if (punchRequested && !ReusePortSupport.available) {
@@ -504,7 +528,7 @@ class LapisNode private constructor(
             var reuseTransport: ReusePortTcpTransport? = null
             val dcutrProtocol = DcutrProtocol(holePunchConfig.protocolTimeout)
             val dcutrBinding = DcutrBinding(dcutrProtocol)
-            val privKey = identity.deriveLibp2pPrivKey()
+            val privKey = transportKey.resolve(identity)
             val connectionCap = ConnectionCapHandler()
             // Relayed inbound connections never pass through NetworkImpl's own connection handler
             // (they are accepted by the stop protocol, not by a listening transport), so the
@@ -618,7 +642,7 @@ class LapisNode private constructor(
                 relayClient.onReservationHeld = { observer.observeAsync(it) }
                 holePunchManager = manager
             }
-            val mdns = MDnsDiscovery(builtHost)
+            val mdns = if (mdnsEnabled) MDnsDiscovery(builtHost) else null
             val node =
                 LapisNode(
                     builtHost,
@@ -637,7 +661,7 @@ class LapisNode private constructor(
                     punchRoles,
                     announcedHandlers,
                 )
-            mdns.addHandler { peerInfo ->
+            mdns?.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {
                     logger.info { "mDNS discovered peer ${peerInfo.peerId}" }
                 } else {

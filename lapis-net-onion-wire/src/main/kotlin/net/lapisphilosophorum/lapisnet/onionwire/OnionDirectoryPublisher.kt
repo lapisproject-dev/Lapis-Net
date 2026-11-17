@@ -5,6 +5,8 @@ import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecordCodec
 import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
+import net.lapisphilosophorum.lapisnet.directory.PeerRecord
+import net.lapisphilosophorum.lapisnet.directory.PeerRecordCodec
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.onion.CellFormatException
 import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
@@ -88,6 +90,12 @@ class OnionDirectoryPublisher internal constructor(
 
     override fun publishServiceDescriptor(descriptor: OnionServiceDescriptor): CompletableFuture<Boolean> =
         publish(DirectoryObjectType.ONION_SERVICE_DESCRIPTOR, OnionServiceDescriptorCodec.encode(descriptor))
+
+    override fun publishTombstone(tombstone: PeerRecord): CompletableFuture<Boolean> {
+        // a tombstone must carry no address: refused here already, the relay checks it again
+        if (tombstone.addresses.isNotEmpty()) return CompletableFuture.completedFuture(false)
+        return publish(DirectoryObjectType.TOMBSTONE_PEER_RECORD, PeerRecordCodec.encode(tombstone))
+    }
 
     private fun publish(
         type: DirectoryObjectType,

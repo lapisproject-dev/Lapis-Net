@@ -170,6 +170,47 @@ class PeerDirectoryGossip private constructor(
         bytes: ByteArray,
     ): Boolean = ingestVerified(record, bytes, "the DHT", storage, index) == IngestOutcome.ACCEPTED
 
+    /**
+     * Wave V0.10.0-J1a: a relay publishes the address-free tombstone of a node that switched to anonymity mode, on that
+     * node's behalf (the tombstone arrived through a circuit, so the mesh sees the relay as the publisher). [bytes] is
+     * validated exactly like a gossip message (structure, signature, binding, possession), plus: no address and not
+     * expired at [nowEpochSecond]. A valid but already known or superseded tombstone is not published again
+     * ([RelayedTombstoneOutcome.KNOWN]); the caller answers that the same way as a new one (no oracle). A tombstone that
+     * could not be persisted ([RelayedTombstoneOutcome.NOT_STORED]) is neither indexed nor published; the caller must
+     * answer it with a retryable status, never as accepted.
+     */
+    fun relayTombstone(
+        bytes: ByteArray,
+        nowEpochSecond: Long = Instant.now().epochSecond,
+    ): RelayedTombstoneOutcome {
+        val record =
+            try {
+                PeerRecordCodec.decode(bytes)
+            } catch (e: MalformedPeerRecordException) {
+                return RelayedTombstoneOutcome.MALFORMED
+            }
+        if (record.addresses.isNotEmpty() || record.notValidAfterEpochSecond < nowEpochSecond) {
+            return RelayedTombstoneOutcome.INVALID
+        }
+        if (!PeerRecord.verify(record) || !record.verifyBinding() || !record.verifyPossession()) {
+            return RelayedTombstoneOutcome.INVALID
+        }
+        return when (ingestVerified(record, bytes, "a relayed tombstone", storage, index)) {
+            IngestOutcome.ACCEPTED -> {
+                pubsub.publish(PEER_RECORD_GOSSIP_TOPIC, bytes)
+                RelayedTombstoneOutcome.PUBLISHED
+            }
+            // LOST_RACE: an identical or newer record for the same identity won concurrently; the tombstone is
+            // already known or superseded here, nothing is lost by not publishing it again
+            IngestOutcome.DECLINED,
+            IngestOutcome.LOST_RACE,
+            -> RelayedTombstoneOutcome.KNOWN
+            // nothing was stored or published: the caller must not report success (fail-closed, the client retries
+            // with another relay)
+            IngestOutcome.PERSIST_FAILED -> RelayedTombstoneOutcome.NOT_STORED
+        }
+    }
+
     /** Unsubscribes from the gossip topic. No other sub-resources to release - mirrors
      * `VeritasGossip.stop` exactly. */
     fun stop() {
@@ -360,4 +401,15 @@ class PeerDirectoryGossip private constructor(
             return IngestOutcome.ACCEPTED
         }
     }
+}
+
+/** Result of [PeerDirectoryGossip.relayTombstone] (wave V0.10.0-J1a). */
+enum class RelayedTombstoneOutcome {
+    MALFORMED,
+    INVALID,
+    PUBLISHED,
+    KNOWN,
+
+    /** Valid, but `NabuStorage.put` failed: nothing was indexed or published (retryable, not a success). */
+    NOT_STORED,
 }

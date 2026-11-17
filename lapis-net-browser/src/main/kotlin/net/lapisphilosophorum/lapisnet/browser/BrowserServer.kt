@@ -63,6 +63,7 @@ import net.lapisphilosophorum.lapisnet.mailonion.AnonymousMailSubscriber
 import net.lapisphilosophorum.lapisnet.mailonion.OnionMailInboundHandler
 import net.lapisphilosophorum.lapisnet.mailonion.OnionMailRetryQueue
 import net.lapisphilosophorum.lapisnet.mailonion.OnionMailTransport
+import net.lapisphilosophorum.lapisnet.networking.GossipAnonymityPolicy
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
 import net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode
@@ -84,6 +85,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
 import net.lapisphilosophorum.lapisnet.virtus.LtrGossip
 import java.nio.file.Path
@@ -515,13 +517,17 @@ class BrowserServer private constructor(
             // ordinary (non-failure) shutdown path.
             val cleanupOnFailure = mutableListOf<() -> Unit>()
             try {
-                val wiring = config.wiring
+                // V0.10.0-J1a: effective values (anonymity mode switches DHT, auto-relay and publishing off)
+                val wiring = config.wiring.effective()
                 val node =
                     LapisNode.create(
                         identity,
                         listenAddress,
                         relayConfig = wiring.relayConfig(RelayConfig.CLIENT_ONLY.copy(autoRelay = autoRelayConfig)),
                         holePunchConfig = wiring.holePunchConfig(),
+                        // V0.10.0-J1a: per-run transport key and no mDNS in anonymity mode
+                        transportKey = wiring.transportKeyPolicy(),
+                        mdnsEnabled = wiring.mdnsEnabled(),
                     )
                 node.start(bootstrapPeers = bootstrapPeers)
                 cleanupOnFailure += { runCatching { node.stop() } }
@@ -538,13 +544,20 @@ class BrowserServer private constructor(
                     }
                 }
 
-                val storage = NabuStorage.attach(node, dataDirectory)
+                val anonymousNode = wiring.anonymity == AnonymityMode.ON
+                // V0.10.0-J1a: in anonymity mode the node neither serves nor queries the DHT and content
+                val storage =
+                    NabuStorage.attach(
+                        node,
+                        dataDirectory,
+                        networkMode = if (anonymousNode) StorageNetworkMode.LOCAL_ONLY else StorageNetworkMode.NETWORK,
+                    )
                 cleanupOnFailure += { runCatching { storage.stop() } }
                 // GossipPubSub must attach before any LapisNode.connect() call - see
                 // GossipPubSub.attach's doc comment. BrowserServer.start() never calls connect()
                 // itself (that happens later, via POST /api/peers/connect), so this ordering
                 // constraint is satisfied by construction, not by caller discipline.
-                val pubsub = GossipPubSub.attach(node)
+                val pubsub = GossipPubSub.attach(node, if (anonymousNode) GossipAnonymityPolicy() else null)
                 cleanupOnFailure += { runCatching { pubsub.stop() } }
                 val veritas = VeritasGossip.attach(pubsub, storage)
                 cleanupOnFailure += { runCatching { veritas.stop() } }
@@ -930,10 +943,7 @@ class BrowserServer private constructor(
                             modeStore,
                             prekeyStore,
                             Ed25519KeyPair.generate(),
-                            tombstonePublisher = { tombstone ->
-                                peerDirectory.announce(tombstone)
-                                directoryDht?.publishTombstone(identity, tombstone)
-                            },
+                            // V0.10.0-J1a: no tombstonePublisher - the tombstone goes through a circuit (relay publishes)
                             supervisor = supervisor,
                             capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
                             incompleteWarning = anonymityWarning,

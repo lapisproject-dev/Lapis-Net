@@ -53,13 +53,16 @@ private const val WARNING_HEAD =
 private const val WARNING_PADDED =
     ", padded to size classes with cover cells towards the guard; this does not hide traffic from an observer " +
         "who sees both ends"
+
+/** Wave V0.10.0-J1a: what is still exposed (replaces "the network mesh, DHT lookups and fetches still show ..."). */
+private const val WARNING_REMAINING =
+    "the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still " +
+        "meshes over direct connections that show your address; posting, votes and trust grants are unavailable."
 private const val WARNING_CALLS_OFF_TAIL =
-    "calls are off because call media would reveal your IP address; the network mesh, DHT lookups and fetches " +
-        "still show your identity and address."
+    "calls are off because call media would reveal your IP address; " + WARNING_REMAINING
 private const val WARNING_CALLS_EXPOSED_TAIL =
     "calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals " +
-        "your IP address to the other party and to network observers; the network mesh, DHT lookups and fetches " +
-        "still show your identity and address."
+        "your IP address to the other party and to network observers; " + WARNING_REMAINING
 
 /** The sentence that `--anonymity-padding=off` adds: what an observer of the connection can then see. */
 const val ANONYMITY_PADDING_OFF_SENTENCE: String =

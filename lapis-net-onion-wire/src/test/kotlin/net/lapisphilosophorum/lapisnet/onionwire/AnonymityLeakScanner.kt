@@ -44,6 +44,16 @@ internal class CapturingChannel(
         objects += OnionServiceDescriptorCodec.encode(descriptor)
         return delegate.publishServiceDescriptor(descriptor)
     }
+
+    /** Tombstones handed to the circuit (wave J1a); kept apart from [objects]: a tombstone carries the identity by design. */
+    val tombstones = CopyOnWriteArrayList<net.lapisphilosophorum.lapisnet.directory.PeerRecord>()
+
+    override fun publishTombstone(
+        tombstone: net.lapisphilosophorum.lapisnet.directory.PeerRecord,
+    ): CompletableFuture<Boolean> {
+        tombstones += tombstone
+        return delegate.publishTombstone(tombstone)
+    }
 }
 
 /**
