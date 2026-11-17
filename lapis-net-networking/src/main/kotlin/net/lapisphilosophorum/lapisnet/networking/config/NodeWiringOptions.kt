@@ -1,5 +1,8 @@
 package net.lapisphilosophorum.lapisnet.networking.config
 
+import io.libp2p.core.multiformats.Multiaddr
+import io.libp2p.core.multiformats.Protocol
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinement
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchConfig
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchMode
 import net.lapisphilosophorum.lapisnet.networking.relay.NodeReachability
@@ -154,6 +157,42 @@ data class NodeWiringOptions(
 
     /** V0.10.0-J1a: mDNS announces the PeerId and the listen addresses on the LAN; off in anonymity mode. */
     fun mdnsEnabled(): Boolean = anonymity != AnonymityMode.ON
+
+    /**
+     * V0.10.0-J1b: a fresh [ConnectionConfinement] in anonymity mode (connections only to the guards, and to the
+     * bootstrap peers while the anonymity controller allows them), `null` otherwise.
+     */
+    fun connectionConfinement(): ConnectionConfinement? =
+        if (anonymity ==
+            AnonymityMode.ON
+        ) {
+            ConnectionConfinement()
+        } else {
+            null
+        }
+
+    /** V0.10.0-J1b: `false` in anonymity mode - the node does not listen at all (an explicit listen address is ignored). */
+    fun listensInboundConnections(): Boolean = anonymity != AnonymityMode.ON
+
+    /**
+     * V0.10.0-J1b: in anonymity mode every bootstrap address must name its peer (`/p2p/<id>`, the confinement allows
+     * peers, not addresses) and must not be relayed. Refuses the start otherwise; a no-op in normal mode.
+     *
+     * @throws InvalidWiringOptionException for an address the confined node could not use
+     */
+    fun validateBootstrapPeers(peers: List<Multiaddr>) {
+        if (anonymity != AnonymityMode.ON) return
+        for (address in peers) {
+            if (runCatching { address.getPeerId() }.getOrNull() == null) {
+                throw InvalidWiringOptionException(
+                    "bootstrap peer address must include /p2p/<peer id> while anonymity=on",
+                )
+            }
+            if (address.has(Protocol.P2PCIRCUIT)) {
+                throw InvalidWiringOptionException("bootstrap peer address must not be relayed while anonymity=on")
+            }
+        }
+    }
 
     /** `true` when the operator declared `private` but did not switch auto-relay on (the library heuristic then sees UNSPECIFIED). */
     val declaredPrivateWithoutAutoRelay: Boolean
@@ -365,8 +404,9 @@ data class NodeWiringOptions(
             |        paths), the transport key is fresh per run and never stored, mDNS, hole punching, the DHT,
             |        auto-relay and content serving are off, and nothing is published from the node itself. The
             |        start is refused together with --hole-punching=auto|on, --onion-relay=true, --auto-relay=true,
-            |        --publish-relay-reliability=true or --dht-fallback=true. The node still meshes over direct
-            |        connections that show its address.
+            |        --publish-relay-reliability=true or --dht-fallback=true. The node does not listen and
+            |        connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard
+            |        connection; each of them sees your address. Bootstrap addresses must include /p2p/<peer id>.
             |  --anonymity-allow-call-media=true|false    [false]   (only with --anonymity=on)
             |        Allow calls in anonymity mode. Call media then connects directly and reveals your IP
             |        address to the other party and to network observers.

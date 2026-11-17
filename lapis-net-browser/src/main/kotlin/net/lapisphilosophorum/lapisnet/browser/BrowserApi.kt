@@ -316,6 +316,14 @@ data class NodeStatusResponse(
     val anonymityCoverSent: Long = 0,
     /** Cover cells suppressed because the cover budget was spent (a number). */
     val anonymityCoverBudgetExhausted: Long = 0,
+    /** V0.10.0-J1b: `"off"|"bootstrapping"|"guards-only"|"unconfined"` (connection confinement state). */
+    val anonymityConnectionState: String = "off",
+    /** V0.10.0-J1b: live connections to the guards (a number). */
+    val anonymityGuardConnections: Int = 0,
+    /** V0.10.0-J1b: no bootstrap peer is configured, so the confined node can reach no relay. */
+    val anonymityNoBootstrapPeers: Boolean = false,
+    /** V0.10.0-J1b: no bootstrap peer serves snapshots; the guard choice relies on the gossip view. */
+    val anonymityGossipOnlyRelayView: Boolean = false,
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */

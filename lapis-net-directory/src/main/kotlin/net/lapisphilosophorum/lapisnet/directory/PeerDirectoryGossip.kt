@@ -171,6 +171,17 @@ class PeerDirectoryGossip private constructor(
     ): Boolean = ingestVerified(record, bytes, "the DHT", storage, index) == IngestOutcome.ACCEPTED
 
     /**
+     * Wave V0.10.0-J1b: takes a relay's peer record from a relay directory snapshot that
+     * [RelayDirectorySnapshotIngest] fully verified ([PeerRecord.verify], [verifyBinding], [verifyPossession], expiry,
+     * and that it belongs to the relay descriptor it came with) into persistence and the index, like [ingestFromDht].
+     * **Never re-published**, for the same amplification reason. Returns whether it ended up tracked.
+     */
+    internal fun ingestFromSnapshot(
+        record: PeerRecord,
+        bytes: ByteArray,
+    ): Boolean = ingestVerified(record, bytes, "a relay directory snapshot", storage, index) == IngestOutcome.ACCEPTED
+
+    /**
      * Wave V0.10.0-J1a: a relay publishes the address-free tombstone of a node that switched to anonymity mode, on that
      * node's behalf (the tombstone arrived through a circuit, so the mesh sees the relay as the publisher). [bytes] is
      * validated exactly like a gossip message (structure, signature, binding, possession), plus: no address and not

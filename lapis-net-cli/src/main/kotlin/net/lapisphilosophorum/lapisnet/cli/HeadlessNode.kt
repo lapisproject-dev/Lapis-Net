@@ -129,6 +129,10 @@ internal class HeadlessNode private constructor(
             @Suppress("NAME_SHADOWING")
             val options = options.effective()
             Files.createDirectories(dataDirectory)
+            // V0.10.0-J1b: in anonymity mode the node connects only to guards and bootstrap peers, which must name their
+            // peer id; the start is refused otherwise (never silently skipped)
+            options.validateBootstrapPeers(bootstrapPeers)
+            val confinement = options.connectionConfinement()
             val rollback = mutableListOf<() -> Unit>()
             try {
                 val node =
@@ -140,8 +144,11 @@ internal class HeadlessNode private constructor(
                         // V0.10.0-J1a: per-run transport key and no mDNS in anonymity mode
                         transportKey = options.transportKeyPolicy(),
                         mdnsEnabled = options.mdnsEnabled(),
+                        // V0.10.0-J1b: no listener, dials only to the allowed set
+                        confinement = confinement,
                     )
-                node.start(bootstrapPeers = bootstrapPeers)
+                // V0.10.0-J1b: a confined node's bootstrap peers are dialled by the anonymity controller
+                node.start(bootstrapPeers = if (confinement != null) emptyList() else bootstrapPeers)
                 rollback += { runCatching { node.stop() } }
                 val anonymousNode = options.anonymity == AnonymityMode.ON
                 // V0.10.0-J1a: in anonymity mode the node neither serves nor queries the DHT and content
@@ -311,6 +318,8 @@ internal class HeadlessNode private constructor(
                             // the headless node has no calls: the call-media exposure text never applies
                             incompleteWarning = anonymityIncompleteWarning(false, options.anonymityPadding),
                             padding = TrafficPaddingConfig.of(options.anonymityPadding),
+                            confinement = confinement,
+                            bootstrapPeers = bootstrapPeers,
                         )
                     val started = anonymity
                     rollback += { started.close() }

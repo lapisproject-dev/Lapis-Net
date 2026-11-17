@@ -9,6 +9,7 @@ import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptorGossip
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptorIndex
+import net.lapisphilosophorum.lapisnet.directory.OnionRelayDirectoryServer
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorGossip
 import net.lapisphilosophorum.lapisnet.directory.OnionServiceDescriptorIndex
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
@@ -61,6 +62,13 @@ class OnionWire private constructor(
      * in anonymity mode (it receives them). A node in the normal mode never subscribes to it.
      */
     val mailboxGossip: AnonymousMailboxGossip?,
+    /** The node this wire is attached to (wave V0.10.0-J1b: the anonymity controller dials through it). */
+    private val node: LapisNode,
+    /**
+     * Serves `/lapis/onion-relay-directory/1.0.0` (wave V0.10.0-J1b, assumption Q10): registered on every node in
+     * normal mode, never in anonymity mode. `null` in anonymity mode.
+     */
+    internal val relayDirectoryServer: OnionRelayDirectoryServer?,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val hidden = CopyOnWriteArrayList<AutoCloseable>()
@@ -282,12 +290,17 @@ class OnionWire private constructor(
 
     internal fun linkManager(): OnionLinkManager = links
 
+    internal fun lapisNode(): LapisNode = node
+
+    internal fun peerDirectoryGossip(): PeerDirectoryGossip = peerDirectory
+
     /** Idempotent. Order: hosts and clients, relay service, descriptor gossip, link manager. */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         hidden.forEach { runCatching { it.close() } }
         if (factoryHolder.isInitialized()) runCatching { factory.close() }
         runCatching { relayService?.close() }
+        runCatching { relayDirectoryServer?.close() }
         runCatching { mailboxGossip?.stop() }
         runCatching { serviceGossip.stop() }
         runCatching { anonymousGossip.stop() }
@@ -325,6 +338,7 @@ class OnionWire private constructor(
             val anonymousGossip = AnonymousPeerRecordGossip.attach(pubsub, peerDirectory.anonymousRecords, clock)
             val links = OnionLinkManager(config, node, clock)
             var service: OnionRelayService? = null
+            var directoryServer: OnionRelayDirectoryServer? = null
             val mailboxGossip =
                 if (config.relayMode || directoryMode == DirectoryAnonymityMode.ON) {
                     AnonymousMailboxGossip.attach(pubsub, index, clock)
@@ -364,6 +378,13 @@ class OnionWire private constructor(
                 } else {
                     logger.info { "onion relay mode off" }
                 }
+                // V0.10.0-J1b: nodes in normal mode hand out relay snapshots to nodes in anonymity mode; a node in
+                // anonymity mode never serves (its protocol set stays as in J1a)
+                if (directoryMode == DirectoryAnonymityMode.OFF) {
+                    val server = OnionRelayDirectoryServer.of(index, peerDirectory, clock)
+                    node.host.addProtocolHandler(server.binding)
+                    directoryServer = server
+                }
                 return OnionWire(
                     index,
                     gossip,
@@ -376,8 +397,11 @@ class OnionWire private constructor(
                     anonymousGossip,
                     directoryMode,
                     mailboxGossip,
+                    node,
+                    directoryServer,
                 )
             } catch (e: Exception) {
+                runCatching { directoryServer?.close() }
                 runCatching { mailboxGossip?.stop() }
                 runCatching { service?.close() }
                 runCatching { anonymousGossip.stop() }

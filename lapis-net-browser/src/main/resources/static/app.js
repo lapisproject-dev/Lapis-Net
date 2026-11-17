@@ -132,16 +132,16 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
 // Used instead when calls are allowed (--anonymity-allow-call-media=true), and for an unknown/missing callMedia value
 // (fail safe: show the more alarming text).
 const ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
 // V0.10.0-H: the same two texts for --anonymity-padding=off (also the fail-safe for an unknown/missing padding value).
 const ANONYMITY_WARNING_TEXT_PADDING_OFF =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
 const ANONYMITY_WARNING_TEXT_PADDING_OFF_CALL_MEDIA_EXPOSED =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still meshes over direct connections that show your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -185,6 +185,25 @@ function anonymityPaddingLine(status) {
   );
 }
 
+// V0.10.0-J1b: the connection line; fixed texts and a number only, the state comes as an enum-like string
+const ANONYMITY_CONNECTION_LABELS = {
+  "bootstrapping": "contacting bootstrap peers (they see your address)",
+  "guards-only": "guards only",
+  "unconfined": "not confined",
+};
+
+function anonymityConnectionLine(status) {
+  const label = ANONYMITY_CONNECTION_LABELS[status.anonymityConnectionState] || "unknown";
+  let line = "Connections: " + label + ", " + status.anonymityGuardConnections + " guard connection(s)";
+  if (status.anonymityNoBootstrapPeers === true) {
+    line += "; no bootstrap peer configured, no relay can be reached";
+  }
+  if (status.anonymityGossipOnlyRelayView === true) {
+    line += "; no bootstrap peer serves relay snapshots, guards are chosen from gossip only";
+  }
+  return line;
+}
+
 function renderAnonymityStatus(status) {
   const warning = document.getElementById("anonymity-warning");
   const line = document.getElementById("node-status-anonymity");
@@ -202,6 +221,7 @@ function renderAnonymityStatus(status) {
         .concat([
         "On (experimental): " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)",
         anonymityPaddingLine(status),
+        anonymityConnectionLine(status),
       ])
     : ["off"];
   for (const text of lines) {

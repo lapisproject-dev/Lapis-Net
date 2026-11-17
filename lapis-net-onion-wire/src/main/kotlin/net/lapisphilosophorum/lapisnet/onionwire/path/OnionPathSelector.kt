@@ -27,6 +27,24 @@ class Candidate internal constructor(
 }
 
 /**
+ * Gate and preference for choosing a NEW guard (wave V0.10.0-J1b, eclipse protection of a confined node). While
+ * [mayChooseNewGuard] is `false` no new guard is chosen at all (already persisted guards are used as before). When at
+ * least [MIN_CONFIRMED_FOR_PREFERENCE] of all candidates have [confirmations] of two or more distinct directory sources,
+ * only those are offered (for the primary and for the backup); otherwise all. It narrows the choice; no diversity rule is relaxed.
+ */
+@ExperimentalOnionApi
+interface GuardChoiceGate {
+    fun mayChooseNewGuard(): Boolean
+
+    fun confirmations(identity: Secp256k1PublicKey): Int
+
+    companion object {
+        const val MIN_CONFIRMATIONS = 2
+        const val MIN_CONFIRMED_FOR_PREFERENCE = 3
+    }
+}
+
+/**
  * Chooses relays for circuits (wave V0.10.0-E). Network-free and deterministic for a given [random] sequence.
  *
  * **Path:** hop 1 is the persistent primary guard; the last hop is prescribed by the caller (publish relay, intro point,
@@ -54,7 +72,19 @@ class OnionPathSelector(
     private val random: SecureRandom,
     private val clock: Clock,
     private val options: PathSelectionOptions = PathSelectionOptions(),
+    /** Wave V0.10.0-J1b: `null` (the default) keeps the guard choice of wave E unchanged. */
+    private val guardGate: GuardChoiceGate? = null,
 ) {
+    /**
+     * Picks a new guard among [offered] with the same rule as the first-hop choice of [select] (weights, diversity check,
+     * [GuardChoiceGate]); `null` if none qualifies or the gate is closed. Used as the `pick` of [GuardManager.maintain]
+     * by a confined node, so the backup is chosen by the same rule as the primary.
+     */
+    fun pickNewGuard(offered: List<OnionRelayDescriptor>): OnionRelayDescriptor? {
+        val cands = candidates(clock.millis() / 1000)
+        return pickGuard(cands, offered, null, PathPolicy.PRODUCTION_PATH_LENGTH)
+    }
+
     /** The hop list (by reference) of the last path handed out with the primary probe, until it is handed back. */
     private val probeLock = Any()
     private var probePath: List<OnionRelayDescriptor>? = null
@@ -268,12 +298,24 @@ class OnionPathSelector(
         last: Candidate?,
         hops: Int,
     ): OnionRelayDescriptor? {
+        val gate = guardGate
+        if (gate != null && !gate.mayChooseNewGuard()) return null
         val offeredIds = offered.map { it.identity }.toSet()
         var pool =
             cands.filter {
                 it.identity in offeredIds &&
                     (last == null || (it.identity != last.identity && !conflicts(it, last)))
             }
+        if (gate != null) {
+            // counted over ALL candidates, not over the offered pool: the backup is picked from a pool without the
+            // primary, and a threshold on that smaller pool would switch the preference off exactly then (found in the
+            // J1b load series: an unconfirmed Sybil became the backup). Once enough confirmed relays exist, only
+            // confirmed ones are offered, even if none of them qualifies here (no guard rather than an unconfirmed one).
+            val confirmedTotal = cands.count { gate.confirmations(it.identity) >= GuardChoiceGate.MIN_CONFIRMATIONS }
+            if (confirmedTotal >= GuardChoiceGate.MIN_CONFIRMED_FOR_PREFERENCE) {
+                pool = pool.filter { gate.confirmations(it.identity) >= GuardChoiceGate.MIN_CONFIRMATIONS }
+            }
+        }
         repeat(GUARD_TRIES) {
             val g = pickWeighted(pool) ?: return null
             if (hasDiversePathAround(g, cands, last, hops)) return g.descriptor

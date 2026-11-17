@@ -16,6 +16,10 @@ import io.libp2p.security.noise.NoiseXXSecureChannel
 import io.libp2p.transport.tcp.TcpTransport
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.networking.config.TransportKeyPolicy
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConfiningTransport
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinedException
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinement
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinementHandler
 import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrBinding
 import net.lapisphilosophorum.lapisnet.networking.dcutr.DcutrProtocol
 import net.lapisphilosophorum.lapisnet.networking.dcutr.HolePunchAddressFilter
@@ -139,7 +143,7 @@ private class ConnectionCapHandler : ConnectionHandler {
 }
 
 /** Thrown when a node lifecycle or connection operation fails or times out. */
-class LapisNodeException(
+open class LapisNodeException(
     message: String,
     cause: Throwable? = null,
 ) : RuntimeException(message, cause)
@@ -205,6 +209,12 @@ class LapisNode private constructor(
     /** Handlers registered through [addConnectionHandler], so a direct connection that replaced a relayed one can be announced again. */
     private val announcedHandlers: java.util.concurrent.CopyOnWriteArrayList<ConnectionHandler> =
         java.util.concurrent.CopyOnWriteArrayList(),
+    /**
+     * Connection confinement of anonymity mode (wave V0.10.0-J1b), `null` in normal mode. With it the node does not
+     * listen, every dial outside the allowed set is refused before TCP starts, and connections outside it are closed.
+     */
+    val confinement: ConnectionConfinement? = null,
+    private val confinementGate: ConnectionConfinementHandler? = null,
 ) {
     @Volatile
     private var autoRelay: RelayAutoSelector? = null
@@ -328,9 +338,29 @@ class LapisNode private constructor(
      * only through a relay is concerned.
      */
     fun addConnectionHandler(handler: ConnectionHandler) {
-        announcedHandlers += handler
-        host.addConnectionHandler(handler)
-        relayInboundHandlers += handler
+        // under confinement a connection outside the allowed set is never announced (the gate closes it first)
+        val effective = confinementGate?.let { ConnectionConfinementHandler.Gated(it, handler) } ?: handler
+        announcedHandlers += effective
+        host.addConnectionHandler(effective)
+        relayInboundHandlers += effective
+    }
+
+    /**
+     * Closes every open connection whose remote peer is not in [allowed] (wave V0.10.0-J1b). Covers the connections in
+     * the network table (direct and outgoing relayed); an accepted relayed inbound connection is closed by the
+     * confinement handler when it arrives (a node in anonymity mode holds no relay reservation, so none can arrive).
+     * Returns the number of connections closed.
+     */
+    fun closeConnectionsOutside(allowed: Set<PeerId>): Int {
+        var count = 0
+        for (c in host.network.connections.toList()) {
+            val remote = runCatching { c.secureSession().remoteId }.getOrNull()
+            if (remote != null && remote in allowed) continue
+            if (c.closeFuture().isDone) continue
+            count++
+            runCatching { c.close() }
+        }
+        return count
     }
 
     /** Peers discovered via mDNS so far. Never auto-dialed - see the class doc. */
@@ -368,6 +398,11 @@ class LapisNode private constructor(
         peer: PeerInfo,
         timeout: Duration = DEFAULT_TIMEOUT,
     ): Connection {
+        // wave V0.10.0-J1b: outside the confined set nothing is dialled and no existing connection is handed out
+        if (confinement != null && !confinement.isAllowed(peer.peerId)) {
+            confinement.countRefusedDial()
+            throw ConnectionConfinedException("connect refused: peer outside the confined set")
+        }
         // Counted before the reuse shortcut on purpose: a reused connection that was accepted before
         // GossipSub attached is equally one GossipSub never saw.
         if (!gossipAttached) connectsBeforeGossipAttach.incrementAndGet()
@@ -395,6 +430,10 @@ class LapisNode private constructor(
         bootstrapPeers: List<Multiaddr> = emptyList(),
         timeout: Duration = DEFAULT_TIMEOUT,
     ) {
+        // wave V0.10.0-J1b: under confinement the anonymity controller dials the bootstrap peers itself
+        require(confinement == null || bootstrapPeers.isEmpty()) {
+            "a confined node dials its bootstrap peers through the anonymity controller"
+        }
         awaitOrWrap("start host", timeout) { host.start() }
         warnOnReachabilityMismatch()
         mdns?.let { m ->
@@ -514,7 +553,18 @@ class LapisNode private constructor(
             transportKey: TransportKeyPolicy = TransportKeyPolicy.IdentityDerived,
             /** V0.10.0-J1a: `false` in anonymity mode - no mDNS object, no multicast socket, no LAN announcement. */
             mdnsEnabled: Boolean = true,
+            /**
+             * V0.10.0-J1b: connection confinement of anonymity mode; `null` (the default) keeps normal mode unchanged.
+             * With it: no listen address at all ([listenAddress] is ignored), TCP and relay dials are checked by
+             * [ConfiningTransport], and [ConnectionConfinementHandler] runs before the connection cap on both paths.
+             */
+            confinement: ConnectionConfinement? = null,
         ): LapisNode {
+            if (confinement != null && listenAddress != DEFAULT_LISTEN_ADDRESS) {
+                // the address itself is not logged
+                logger.warn { "listen address ignored: a node in anonymity mode does not accept connections" }
+            }
+            val confinementGate = confinement?.let { ConnectionConfinementHandler(it) }
             val punchRequested = holePunchConfig.isActive(relayConfig.reachability == NodeReachability.PRIVATE)
             if (punchRequested && !ReusePortSupport.available) {
                 val message = "hole punching needs SO_REUSEPORT: ${ReusePortSupport.describeUnavailability()}"
@@ -524,18 +574,26 @@ class LapisNode private constructor(
                 logger.warn { "$message - hole punching stays off" }
             }
             val punchActive = punchRequested && ReusePortSupport.available
+            // the reuse-port transport is not wrapped: hole punching and confinement exclude each other
+            require(
+                !(punchActive && confinement != null),
+            ) { "hole punching cannot be combined with connection confinement" }
             val punchRoles = PunchRoleRegistry(holePunchConfig.maxConcurrentUpgrades * 4)
             var reuseTransport: ReusePortTcpTransport? = null
             val dcutrProtocol = DcutrProtocol(holePunchConfig.protocolTimeout)
             val dcutrBinding = DcutrBinding(dcutrProtocol)
             val privKey = transportKey.resolve(identity)
-            val connectionCap = ConnectionCapHandler()
+            val rawConnectionCap = ConnectionCapHandler()
+            // V0.10.0-J1b: a refused connection must take no slot in the cap
+            val connectionCap: ConnectionHandler =
+                confinementGate?.let { ConnectionConfinementHandler.Gated(it, rawConnectionCap) } ?: rawConnectionCap
             // Relayed inbound connections never pass through NetworkImpl's own connection handler
             // (they are accepted by the stop protocol, not by a listening transport), so the
             // connection cap has to be reachable from there too. The SAME handler instance is used
             // on both paths, and each connection only ever traverses one of them, so a connection
-            // is counted exactly once either way.
-            val relayInboundHandlers = ConnectionHandler.createBroadcast(listOf(connectionCap))
+            // is counted exactly once either way. The confinement handler, when present, runs first.
+            val relayInboundHandlers =
+                ConnectionHandler.createBroadcast(listOfNotNull(confinementGate, connectionCap))
 
             val ledger = RelayUsageLedger()
             val reliability = RelayReliabilityTracker()
@@ -558,12 +616,17 @@ class LapisNode private constructor(
                             add { upgrader ->
                                 ReusePortTcpTransport(upgrader, punchRoles).also { reuseTransport = it }
                             }
+                        } else if (confinement != null) {
+                            add { upgrader -> ConfiningTransport(TcpTransport(upgrader), confinement) }
                         } else {
                             add(::TcpTransport)
                         }
                         add { upgrader ->
-                            LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits, ledger, reliability)
-                                .also { relayTransport = it }
+                            val relay =
+                                LapisRelayTransport(upgrader, hopBinding, relayConfig.clientLimits, ledger, reliability)
+                                    .also { relayTransport = it }
+                            // a confined node never dials /p2p-circuit (permitsDial refuses it)
+                            if (confinement != null) ConfiningTransport(relay, confinement) else relay
                         }
                     }
                     secureChannels {
@@ -580,8 +643,11 @@ class LapisNode private constructor(
                         if (holePunchConfig.answersIdentify) add(Identify())
                         if (punchActive) add(dcutrBinding)
                     }
-                    network {
-                        listen(listenAddress.toString())
+                    // V0.10.0-J1b: a confined node does not listen at all (no Noise responder a prober could reach)
+                    if (confinement == null) {
+                        network {
+                            listen(listenAddress.toString())
+                        }
                     }
                 }
             hopProtocol.setHost(builtHost)
@@ -600,7 +666,8 @@ class LapisNode private constructor(
             stopProtocol.holdsReservationWith = relayClient::holdsReservationWith
             // Registered BEFORE start() - see MAX_CONCURRENT_CONNECTIONS's own doc comment for why
             // that ordering matters here (no "attached too late" gap, unlike GossipPubSub.attach's
-            // documented must-be-before-connect() precondition).
+            // documented must-be-before-connect() precondition). The confinement handler goes first.
+            confinementGate?.let { builtHost.addConnectionHandler(it) }
             builtHost.addConnectionHandler(connectionCap)
             val announcedHandlers = java.util.concurrent.CopyOnWriteArrayList<ConnectionHandler>()
             var holePunchManager: HolePunchManager? = null
@@ -660,7 +727,10 @@ class LapisNode private constructor(
                     reuseTransport,
                     punchRoles,
                     announcedHandlers,
+                    confinement,
+                    confinementGate,
                 )
+            confinement?.addShrinkListener { node.closeConnectionsOutside(confinement.allowedSnapshot()) }
             mdns?.addHandler { peerInfo ->
                 if (node.discovered.record(peerInfo)) {
                     logger.info { "mDNS discovered peer ${peerInfo.peerId}" }

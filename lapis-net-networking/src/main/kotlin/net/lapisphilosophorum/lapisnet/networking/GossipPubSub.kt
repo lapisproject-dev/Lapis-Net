@@ -278,7 +278,7 @@ class GossipPubSub private constructor(
             policy: GossipAnonymityPolicy? = null,
         ): GossipPubSub {
             val host = node.host
-            val params = buildGossipParams()
+            val params = buildGossipParams(anonymous = policy != null)
             val routerBuilder = GossipRouterBuilder()
             routerBuilder.params = params
             val router = routerBuilder.build()
@@ -339,11 +339,25 @@ class GossipPubSub private constructor(
          * [MAX_GOSSIP_MESSAGE_SIZE]'s doc comment for why [attach] always builds params explicitly
          * through [GossipParamsBuilder] rather than trusting any implicit default.
          */
-        internal fun buildGossipParams(): GossipParams =
-            GossipParamsBuilder()
-                .maxGossipMessageSize(MAX_GOSSIP_MESSAGE_SIZE)
-                .maxPublishedMessages(MAX_PUBLISHED_MESSAGES_PER_RPC)
-                .maxSubscriptions(MAX_SUBSCRIPTIONS_PER_RPC)
-                .build()
+        internal fun buildGossipParams(anonymous: Boolean = false): GossipParams {
+            val builder =
+                GossipParamsBuilder()
+                    .maxGossipMessageSize(MAX_GOSSIP_MESSAGE_SIZE)
+                    .maxPublishedMessages(MAX_PUBLISHED_MESSAGES_PER_RPC)
+                    .maxSubscriptions(MAX_SUBSCRIPTIONS_PER_RPC)
+            if (anonymous) {
+                // Wave V0.10.0-J1b, peer exchange (PX) is ignored in anonymity mode. jvm-libp2p 1.3.5 has no `doPX`
+                // switch on GossipParamsBuilder (checked with javap): PX peers of a PRUNE are handed to
+                // `connectCallback` (default: a no-op) after `maxPeersAcceptedInPruneMsg` truncation. Both are pinned
+                // here so that a library default change can not start dialling: no PX peer is accepted, none is sent
+                // (the node does not advertise its guards), and the callback is an explicit no-op. The transport
+                // confinement would refuse such a dial anyway (second barrier).
+                builder
+                    .maxPeersAcceptedInPruneMsg(0)
+                    .maxPeersSentInPruneMsg(0)
+                    .connectCallback { _, _ -> }
+            }
+            return builder.build()
+        }
     }
 }

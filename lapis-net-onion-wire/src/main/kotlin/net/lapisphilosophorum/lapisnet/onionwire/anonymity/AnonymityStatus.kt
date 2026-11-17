@@ -22,7 +22,7 @@ enum class AnonymityErrorCode(
 data class AnonymityStatus(
     /** `"off"` or `"on"`. */
     val mode: String,
-    /** `true` whenever the mode is on: call media and the network mesh are not anonymised. */
+    /** `true` whenever the mode is on: call media is not anonymised and guards and bootstrap peers see the address. */
     val incomplete: Boolean,
     val guards: Int,
     val activeCircuits: Int,
@@ -38,6 +38,20 @@ data class AnonymityStatus(
     val coverCellsSent: Long = 0,
     /** Cover cells not sent because the cover budget was spent (a number). */
     val coverBudgetExhausted: Long = 0,
+    /** V0.10.0-J1b: `"bootstrapping"`, `"guards-only"`, `"unconfined"` (no confinement) or `"off"`. */
+    val connectionState: String = "off",
+    /** V0.10.0-J1b: live connections to the two guards (a number). */
+    val guardConnections: Int = 0,
+    /** V0.10.0-J1b: relay directory snapshots requested since start (a number). */
+    val snapshotFetches: Long = 0,
+    /** V0.10.0-J1b: snapshot entries not taken (invalid, over budget, stale, expired; a number). */
+    val snapshotRejectedEntries: Long = 0,
+    /** V0.10.0-J1b: the first guard choice relies on a single configured directory source (assumption Q14). */
+    val singleDirectorySource: Boolean = false,
+    /** V0.10.0-J1b: no bootstrap peer is configured, so a confined node can reach no relay (`no-bootstrap-peers`). */
+    val noBootstrapPeers: Boolean = false,
+    /** V0.10.0-J1b: no source serves snapshots; the guard choice relies on the gossip view (`gossip-only-relay-view`). */
+    val gossipOnlyRelayView: Boolean = false,
 ) {
     companion object {
         val OFF = AnonymityStatus("off", false, 0, 0, AnonymityErrorCode.NONE, null)
@@ -54,10 +68,14 @@ private const val WARNING_PADDED =
     ", padded to size classes with cover cells towards the guard; this does not hide traffic from an observer " +
         "who sees both ends"
 
-/** Wave V0.10.0-J1a: what is still exposed (replaces "the network mesh, DHT lookups and fetches still show ..."). */
+/**
+ * What is still exposed. Wave V0.10.0-J1a replaced "the network mesh, DHT lookups and fetches still show ..."; wave
+ * V0.10.0-J1b replaced "but it still meshes over direct connections that show your address".
+ */
 private const val WARNING_REMAINING =
-    "the transport key is fresh per run and the node neither serves nor queries the DHT or content, but it still " +
-        "meshes over direct connections that show your address; posting, votes and trust grants are unavailable."
+    "the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only " +
+        "to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; " +
+        "each of them sees your address; posting, votes and trust grants are unavailable."
 private const val WARNING_CALLS_OFF_TAIL =
     "calls are off because call media would reveal your IP address; " + WARNING_REMAINING
 private const val WARNING_CALLS_EXPOSED_TAIL =

@@ -151,6 +151,14 @@ internal fun runCli(
                 // the CLI has no calls, so the call-media exposure text never applies (as before wave H)
                 "WARNING: ${anonymityIncompleteWarning(false, options.anonymityPadding)}",
             )
+            if (headless.anonymityStatus().noBootstrapPeers) {
+                // V0.10.0-J1b: no listener, no mDNS: without a bootstrap peer a confined node reaches no relay
+                err.println(
+                    "WARNING: no bootstrap peer configured (no-bootstrap-peers): in anonymity mode the node " +
+                        "can reach no relay and stays bootstrapping; set ${BootstrapConfig.ENV_VAR} or " +
+                        BootstrapConfig.FILE_NAME,
+                )
+            }
         }
         out.println("Press Ctrl+C to stop.")
         awaitShutdown(headless::stop)

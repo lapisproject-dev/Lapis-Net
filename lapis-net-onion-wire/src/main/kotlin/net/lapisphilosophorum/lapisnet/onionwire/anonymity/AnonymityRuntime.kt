@@ -3,6 +3,7 @@
 package net.lapisphilosophorum.lapisnet.onionwire.anonymity
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.AnonymousCapability
 import net.lapisphilosophorum.lapisnet.directory.AnonymousMailboxGossip
 import net.lapisphilosophorum.lapisnet.directory.AnonymousPeerRecord
@@ -13,9 +14,11 @@ import net.lapisphilosophorum.lapisnet.directory.DirectoryPublicationChannel
 import net.lapisphilosophorum.lapisnet.directory.DirectoryReachability
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.directory.PeerRecord
+import net.lapisphilosophorum.lapisnet.directory.RelayDirectorySnapshotIngest
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinement
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
 import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
@@ -38,6 +41,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.SliceTimer
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
 import net.lapisphilosophorum.lapisnet.onionwire.path.EncryptedFileGuardStateStore
+import net.lapisphilosophorum.lapisnet.onionwire.path.GuardChoiceGate
 import net.lapisphilosophorum.lapisnet.onionwire.path.GuardManager
 import net.lapisphilosophorum.lapisnet.onionwire.path.InsufficientRelaysException
 import net.lapisphilosophorum.lapisnet.onionwire.path.OnionPathSelector
@@ -59,6 +63,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
@@ -103,6 +108,8 @@ class AnonymityRuntime private constructor(
     private val cover: CoverTrafficScheduler?,
     private val shaper: EgressShaper?,
     private val random: SecureRandom,
+    /** Wave V0.10.0-J1b: the connection controller of a confined node, `null` without confinement. */
+    private val connections: AnonymousConnectionController? = null,
 ) : AutoCloseable {
     private val lifecycle = Any()
 
@@ -145,8 +152,22 @@ class AnonymityRuntime private constructor(
             warmCircuits = warm.size(),
             coverCellsSent = cover?.sentCount() ?: 0L,
             coverBudgetExhausted = cover?.suppressedCount() ?: 0L,
+            connectionState = connections?.state()?.wire ?: CONNECTIONS_UNCONFINED,
+            guardConnections = connections?.guardConnections() ?: 0,
+            snapshotFetches = connections?.snapshotFetches() ?: 0L,
+            snapshotRejectedEntries = connections?.snapshotRejectedEntries() ?: 0L,
+            singleDirectorySource = connections?.singleDirectorySource() ?: false,
+            noBootstrapPeers = connections?.noBootstrapPeers() ?: false,
+            gossipOnlyRelayView = connections?.gossipOnlyRelayView() ?: false,
         )
     }
+
+    /** The identities of the persisted primary and backup guard (tests only). */
+    internal fun guardIdentitiesForTest(): List<Secp256k1PublicKey> =
+        guards.snapshot().let { listOfNotNull(it.primary?.identity, it.backup?.identity) }
+
+    /** The connection controller (tests only). */
+    internal fun connectionsForTest(): AnonymousConnectionController? = connections
 
     /**
      * Coarse counters for load diagnostics (tests, bug reports): governor admissions per purpose, rendezvous client
@@ -170,6 +191,10 @@ class AnonymityRuntime private constructor(
                     "unknownRendezvousPoint=${st.unknownRendezvousPoint}",
             hostBuilds = host.hostBuildStats().toString(),
             rendezvousRetries = rendezvousRetries.get(),
+            connectionState = connections?.state()?.wire ?: CONNECTIONS_UNCONFINED,
+            guardConnections = connections?.guardConnections() ?: 0,
+            snapshotFetches = connections?.snapshotFetches() ?: 0L,
+            snapshotRejectedEntries = connections?.snapshotRejectedEntries() ?: 0L,
         )
     }
 
@@ -298,6 +323,7 @@ class AnonymityRuntime private constructor(
         try {
             governor.lockdown()
             maintenance?.cancel()
+            runCatching { connections?.close() }
             runCatching { cover?.close() }
             runCatching { warm.close() }
             runCatching { router.close() }
@@ -325,6 +351,9 @@ class AnonymityRuntime private constructor(
     companion object {
         private val running = ConcurrentHashMap.newKeySet<Path>()
         private val stopping = ConcurrentHashMap<Path, CountDownLatch>()
+
+        /** [AnonymityStatus.connectionState] of a runtime started without confinement (multi-node tests of wave E). */
+        const val CONNECTIONS_UNCONFINED = "unconfined"
         private const val INTRO_POINTS = 3
         private const val PUBLISH_CANDIDATES = 3
         private const val RENDEZVOUS_ENDPOINT_TRIES = 3
@@ -364,6 +393,16 @@ class AnonymityRuntime private constructor(
             incompleteWarning: String = ANONYMITY_INCOMPLETE_WARNING,
             /** V0.10.0-H: padding and timing protection; [TrafficPaddingConfig.OFF] switches the whole wave off. */
             padding: TrafficPaddingConfig = TrafficPaddingConfig.STANDARD,
+            /**
+             * V0.10.0-J1b: the connection confinement the node was created with. `null` (the default) keeps everything as
+             * in wave J1a (tests that mesh freely); with it an [AnonymousConnectionController] keeps the node connected to
+             * its guards only, fetches relay snapshots and gates the choice of new guards.
+             */
+            confinement: ConnectionConfinement? = null,
+            /** V0.10.0-J1b: the bootstrap addresses (each with `/p2p/<id>`) the controller contacts; only with [confinement]. */
+            bootstrapPeers: List<Multiaddr> = emptyList(),
+            /** V0.10.0-J1b test seam: replaces the network side of the controller. */
+            confinedNetwork: ConfinedNetwork? = null,
         ): AnonymityRuntime {
             require(wire.directoryMode == DirectoryAnonymityMode.ON) { "the onion wire is not in anonymity mode" }
             val key = homeDir.toAbsolutePath().normalize()
@@ -397,6 +436,25 @@ class AnonymityRuntime private constructor(
                     GuardManager(guardStore, random, clock, missingIsReset = previousWasOn) {
                         record(AnonymityErrorCode.GUARD_STATE_RESET)
                     }
+                // wave J1b: snapshot ingest and the gate of a new guard choice (only with confinement)
+                val ingest =
+                    confinement?.let {
+                        RelayDirectorySnapshotIngest.of(
+                            wire.descriptors,
+                            wire.peerDirectoryGossip(),
+                            clock,
+                        )
+                    }
+                val controllerRef = AtomicReference<AnonymousConnectionController?>(null)
+                val guardGate =
+                    ingest?.let { snapshotIngest ->
+                        object : GuardChoiceGate {
+                            override fun mayChooseNewGuard(): Boolean = controllerRef.get()?.relayViewReady() == true
+
+                            override fun confirmations(identity: Secp256k1PublicKey): Int =
+                                snapshotIngest.sourcesFor(identity)
+                        }
+                    }
                 val selector =
                     OnionPathSelector(
                         { wire.descriptors.snapshot(clock.millis() / 1000) },
@@ -406,6 +464,7 @@ class AnonymityRuntime private constructor(
                         guards = guards,
                         random = random,
                         clock = clock,
+                        guardGate = guardGate,
                     )
                 val paths = SelectingOnionPathProvider(selector) { record(AnonymityErrorCode.INSUFFICIENT_RELAYS) }
                 val warm =
@@ -499,6 +558,28 @@ class AnonymityRuntime private constructor(
                         null
                     }
                 if (shaper != null) closers += { wire.uninstallEgressShaper() }
+                lateinit var runtimeRef: AnonymityRuntime
+                val controller =
+                    if (confinement != null && ingest != null) {
+                        AnonymousConnectionController(
+                            confinement,
+                            bootstrapPeers,
+                            guards,
+                            selector,
+                            wire.descriptors,
+                            { id, now -> wire.peerDirectoryGossip().lookup(id, now) },
+                            confinedNetwork ?: LapisNodeConfinedNetwork(wire.lapisNode()),
+                            ingest,
+                            clock,
+                            random,
+                            onRelayViewChanged = { runtimeRef.maintainNow() },
+                        ).also { c ->
+                            controllerRef.set(c)
+                            closers += { c.close() }
+                        }
+                    } else {
+                        null
+                    }
                 val runtime =
                     AnonymityRuntime(
                         key,
@@ -521,7 +602,9 @@ class AnonymityRuntime private constructor(
                         cover,
                         shaper,
                         random,
+                        controller,
                     )
+                runtimeRef = runtime
 
                 var publisherStarted = false
                 var lastPublications = 0
@@ -529,7 +612,12 @@ class AnonymityRuntime private constructor(
                 runtime.maintenanceTick = {
                     synchronized(maintenanceLock) {
                         if (runtime.stopped()) return@synchronized
-                        guards.maintain(wire.descriptors.snapshot(clock.millis() / 1000))
+                        if (controller == null) {
+                            guards.maintain(wire.descriptors.snapshot(clock.millis() / 1000))
+                        } else {
+                            // wave J1b: a new guard (backup included) is chosen by the gated rule of the path selector
+                            guards.maintain(wire.descriptors.snapshot(clock.millis() / 1000), selector::pickNewGuard)
+                        }
                         for (h in governor.expired(clock.instant())) {
                             runCatching { (h as OnionClientCircuit).close() }
                             governor.onClosed(h)
@@ -553,6 +641,7 @@ class AnonymityRuntime private constructor(
                             lastError.set(null)
                         }
                     }
+                    controller?.tick()
                 }
                 val job =
                     supervisor.launchPeriodic(
@@ -562,6 +651,15 @@ class AnonymityRuntime private constructor(
                         initialDelay = 1.seconds,
                     ) { runtime.maintenanceTick() }
                 runtime.attachMaintenance(job)
+                if (controller != null) {
+                    supervisor.launchPeriodic(
+                        "anonymity-confinement",
+                        interval = 30.seconds,
+                        jitter = 3.seconds,
+                        initialDelay = 100.milliseconds,
+                    ) { controller.tick() }
+                    controller.tick()
+                }
                 cover?.start()
                 logger.warn { incompleteWarning }
                 return runtime
@@ -656,4 +754,9 @@ data class AnonymityDiagnostics(
     val hostBuilds: String = "",
     /** How often [AnonymityRuntime.connectToService] retried a rendezvous with a second rendezvous point. */
     val rendezvousRetries: Long = 0,
+    /** V0.10.0-J1b: see [AnonymityStatus.connectionState]. */
+    val connectionState: String = "off",
+    val guardConnections: Int = 0,
+    val snapshotFetches: Long = 0,
+    val snapshotRejectedEntries: Long = 0,
 )

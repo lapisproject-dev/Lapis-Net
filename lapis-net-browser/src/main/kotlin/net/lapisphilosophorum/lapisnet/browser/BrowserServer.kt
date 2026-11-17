@@ -519,6 +519,9 @@ class BrowserServer private constructor(
             try {
                 // V0.10.0-J1a: effective values (anonymity mode switches DHT, auto-relay and publishing off)
                 val wiring = config.wiring.effective()
+                // V0.10.0-J1b: in anonymity mode bootstrap addresses must name their peer id (start refused otherwise)
+                wiring.validateBootstrapPeers(bootstrapPeers)
+                val confinement = wiring.connectionConfinement()
                 val node =
                     LapisNode.create(
                         identity,
@@ -528,8 +531,11 @@ class BrowserServer private constructor(
                         // V0.10.0-J1a: per-run transport key and no mDNS in anonymity mode
                         transportKey = wiring.transportKeyPolicy(),
                         mdnsEnabled = wiring.mdnsEnabled(),
+                        // V0.10.0-J1b: no listener, dials only to the guards (and bootstrap peers while needed)
+                        confinement = confinement,
                     )
-                node.start(bootstrapPeers = bootstrapPeers)
+                // V0.10.0-J1b: a confined node's bootstrap peers are dialled by the anonymity controller
+                node.start(bootstrapPeers = if (confinement != null) emptyList() else bootstrapPeers)
                 cleanupOnFailure += { runCatching { node.stop() } }
                 if (wiring.dhtFallback) {
                     logger.info {
@@ -948,6 +954,8 @@ class BrowserServer private constructor(
                             capabilities = setOf(AnonymousCapability.DM, AnonymousCapability.MAIL),
                             incompleteWarning = anonymityWarning,
                             padding = TrafficPaddingConfig.of(wiring.anonymityPadding),
+                            confinement = confinement,
+                            bootstrapPeers = bootstrapPeers,
                         )
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
@@ -1103,6 +1111,10 @@ class BrowserServer private constructor(
                         anonymityWarmCircuits = anonymityRuntime?.status()?.warmCircuits ?: 0,
                         anonymityCoverSent = anonymityRuntime?.status()?.coverCellsSent ?: 0,
                         anonymityCoverBudgetExhausted = anonymityRuntime?.status()?.coverBudgetExhausted ?: 0,
+                        anonymityConnectionState = anonymityRuntime?.status()?.connectionState ?: "off",
+                        anonymityGuardConnections = anonymityRuntime?.status()?.guardConnections ?: 0,
+                        anonymityNoBootstrapPeers = anonymityRuntime?.status()?.noBootstrapPeers ?: false,
+                        anonymityGossipOnlyRelayView = anonymityRuntime?.status()?.gossipOnlyRelayView ?: false,
                         callMedia = callMediaPolicy.wire,
                     )
                 }

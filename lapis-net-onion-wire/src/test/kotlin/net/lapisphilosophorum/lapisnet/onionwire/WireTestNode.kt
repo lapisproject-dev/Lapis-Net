@@ -4,10 +4,14 @@ import io.libp2p.core.PeerInfo
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
 import net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
+import net.lapisphilosophorum.lapisnet.networking.GossipAnonymityPolicy
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.networking.config.TransportKeyPolicy
+import net.lapisphilosophorum.lapisnet.networking.confinement.ConnectionConfinement
 import net.lapisphilosophorum.lapisnet.networking.lifecycle.NodeServiceSupervisor
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
+import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Clock
@@ -51,14 +55,27 @@ class WireTestNode(
     directoryMode: DirectoryAnonymityMode = DirectoryAnonymityMode.OFF,
     directorySink: DirectoryPublishSink? = null,
     mailboxSink: MailboxPublishSink? = null,
+    /** Wave V0.10.0-J1b: a confined node as in production anonymity mode (no listener, per-run key, no mDNS). */
+    val confinement: ConnectionConfinement? = null,
 ) : AutoCloseable {
-    val node: LapisNode = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
+    val node: LapisNode =
+        if (confinement == null) {
+            LapisNode.create(identity)
+        } else {
+            LapisNode.create(
+                identity,
+                transportKey = TransportKeyPolicy.EphemeralPerRun,
+                mdnsEnabled = false,
+                confinement = confinement,
+            )
+        }.also { it.start(bootstrapPeers = emptyList()) }
     val storage: NabuStorage =
         NabuStorage.attach(
             node,
             dir.resolve("storage").also { Files.createDirectories(it) },
+            networkMode = if (confinement == null) StorageNetworkMode.NETWORK else StorageNetworkMode.LOCAL_ONLY,
         )
-    val pubsub: GossipPubSub = GossipPubSub.attach(node)
+    val pubsub: GossipPubSub = GossipPubSub.attach(node, if (confinement == null) null else GossipAnonymityPolicy())
     val peerDirectory: PeerDirectoryGossip = PeerDirectoryGossip.attach(pubsub, storage)
     val supervisor = NodeServiceSupervisor("onion-wire-test")
     val keyFile: Path = dir.resolve("relay.onionkeys")

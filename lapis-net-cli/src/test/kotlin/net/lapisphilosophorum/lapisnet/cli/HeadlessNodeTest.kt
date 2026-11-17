@@ -112,6 +112,47 @@ class HeadlessNodeTest :
             (seen[0] == seen[1]) shouldBe false
         }
 
+        test(
+            "V0.10.0-J1b: anonymity on listens nowhere, is confined and refuses a bootstrap address without /p2p",
+        ).config(
+            timeout = 120.seconds,
+        ) {
+            val on = NodeWiringOptions.resolve(mapOf("anonymity" to "on"))
+            val refused =
+                runCatching {
+                    HeadlessNode.start(
+                        options = on,
+                        identity = DualKeyIdentity.generate(),
+                        bootstrapPeers = listOf(Multiaddr("/ip4/127.0.0.1/tcp/4001")),
+                        listenAddress = Multiaddr("/ip4/127.0.0.1/tcp/0"),
+                        dataDirectory = Files.createTempDirectory("headless-confined-refused"),
+                        onionKeyPassphrase = { null },
+                    )
+                }
+            refused.isFailure shouldBe true
+            (refused.exceptionOrNull()!!.message!!) shouldContain "must include /p2p/<peer id>"
+            val node = start(on)
+            try {
+                node.node.listenAddresses().isEmpty() shouldBe true
+                node.node.confinement.shouldNotBeNull()
+                // no bootstrap peer was configured: the node stays bootstrapping and holds no connection
+                node.anonymityStatus().connectionState shouldBe "bootstrapping"
+                // the dead state is flagged in the status (CLI stderr warning, browser panel), not silent
+                node.anonymityStatus().noBootstrapPeers shouldBe true
+                node.node.host.network.connections
+                    .isEmpty() shouldBe true
+            } finally {
+                node.stop()
+            }
+            val off = start(NodeWiringOptions())
+            try {
+                off.node.confinement.shouldBeNull()
+                off.node.listenAddresses().isEmpty() shouldBe false
+            } finally {
+                off.stop()
+            }
+        }
+
         test("dht-fallback=false attaches no DHT").config(timeout = 90.seconds) {
             val node = start(NodeWiringOptions.resolve(mapOf("dht-fallback" to "false")))
             try {
