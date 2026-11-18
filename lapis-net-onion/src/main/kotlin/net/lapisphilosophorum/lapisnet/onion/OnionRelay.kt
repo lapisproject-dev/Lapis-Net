@@ -70,6 +70,22 @@ sealed interface RelayAction {
         override fun toString(): String = "DeliverMailboxItem(length=${itemBytes.size})"
     }
 
+    /**
+     * A validated LOOKUP_REQUEST arrived at this relay (wave V0.10.0-J2): the host looks the key up and answers with
+     * the fragments of one LOOKUP_RESPONSE through [OnionRelay.replyLookupFragment]. The key is never logged.
+     */
+    class DeliverLookupRequest(
+        val circuitHandle: Long,
+        val requestId: Int,
+        val op: LookupOperation,
+        key: ByteArray,
+    ) : RelayAction {
+        private val storedKey = key.copyOf()
+        val key: ByteArray get() = storedKey.copyOf()
+
+        override fun toString(): String = "DeliverLookupRequest(op=$op)"
+    }
+
     /** The circuit identified by [circuitHandle] is gone. */
     data class CircuitClosed(
         val circuitHandle: Long,
@@ -94,6 +110,7 @@ private enum class CircuitRole {
     SPLICED,
     DIRECTORY_PUBLISHING,
     MAILBOX_PUBLISHING,
+    LOOKUP,
 }
 
 private class RelayCircuit(
@@ -129,6 +146,10 @@ private class RelayCircuit(
     var mailboxNextFragment = 0
     var mailboxStartedMillis = 0L
     var mailboxBlocked = false
+
+    // Lookups (wave V0.10.0-J2); guarded by [lock].
+    var lookupRequests = 0
+    var lookupOutstanding = false
 }
 
 /**
@@ -182,6 +203,17 @@ class OnionRelay(
     private val linkPublishCounters = ConcurrentHashMap<Long, WindowCounter>()
     private val globalMailboxCounter = WindowCounter(limits.mailboxPublishGlobalPerMinute, clock)
     private val linkMailboxCounters = ConcurrentHashMap<Long, WindowCounter>()
+    private val globalLookupCounter = WindowCounter(limits.lookupRequestsGlobalPerMinute, clock)
+    private val linkLookupCounters = ConcurrentHashMap<Long, WindowCounter>()
+
+    /**
+     * Test seam (wave V0.10.0-J2): behaves like a relay of version 0.12.0 that does not know LOOKUP_REQUEST - the
+     * message is treated like an unknown command (the circuit is destroyed with AUTH_FAILED towards both sides). Never
+     * set in production.
+     */
+    @ExperimentalOnionApi
+    @Volatile
+    var legacyNoLookup = false
 
     // Work that must run OUTSIDE every circuit lock (never hold two circuit locks at once): collected while a
     // lock is held, executed by the public entry points after all locks are released.
@@ -332,6 +364,7 @@ class OnionRelay(
         linkCreateBuckets.remove(link.value)
         linkPublishCounters.remove(link.value)
         linkMailboxCounters.remove(link.value)
+        linkLookupCounters.remove(link.value)
         return out
     }
 
@@ -388,6 +421,31 @@ class OnionRelay(
             val c = byHandle[circuitHandle] ?: return@entry emptyList()
             c.lock.withLock {
                 if (c.closed) emptyList() else sendBackward(c, message)
+            }
+        }
+
+    /**
+     * Sends one LOOKUP_RESPONSE fragment ([body], exactly [LookupResponseBody.BODY_SIZE] bytes) backwards on the circuit
+     * of an earlier [RelayAction.DeliverLookupRequest]. Only while that request is outstanding; the last fragment
+     * (`fragIndex == fragCount - 1`) ends it, so the circuit may carry the next request.
+     */
+    fun replyLookupFragment(
+        circuitHandle: Long,
+        body: ByteArray,
+    ): List<RelayAction> =
+        entry {
+            val c = byHandle[circuitHandle] ?: return@entry emptyList()
+            c.lock.withLock {
+                if (c.closed || c.role != CircuitRole.LOOKUP || !c.lookupOutstanding) return@withLock emptyList()
+                val header =
+                    try {
+                        LookupResponseBody.decodeFragmentHeader(body)
+                    } catch (e: CellFormatException) {
+                        return@withLock emptyList()
+                    }
+                val out = sendBackward(c, RelayMessage(RelayCommand.LOOKUP_RESPONSE, 0, body))
+                if (header.fragIndex == header.fragCount - 1) c.lookupOutstanding = false
+                out
             }
         }
 
@@ -616,6 +674,14 @@ class OnionRelay(
             RelayCommand.RENDEZVOUS_DATA -> handleRendezvousData(c, msg)
             RelayCommand.DIRECTORY_PUBLISH -> handleDirectoryPublish(c, msg)
             RelayCommand.MAILBOX_PUBLISH -> handleMailboxPublish(c, msg)
+            RelayCommand.LOOKUP_REQUEST ->
+                @OptIn(ExperimentalOnionApi::class)
+                if (legacyNoLookup) {
+                    // exactly what an older relay does: the unknown command fails the layer decode
+                    teardown(c, DestroyReason.AUTH_FAILED, Notify.BOTH)
+                } else {
+                    handleLookupRequest(c, msg)
+                }
             // Replies and forwarded messages never arrive "locally" at a relay.
             RelayCommand.INTRO_ESTABLISHED,
             RelayCommand.INTRODUCE2,
@@ -624,6 +690,7 @@ class OnionRelay(
             RelayCommand.RENDEZVOUS2,
             RelayCommand.DIRECTORY_PUBLISHED,
             RelayCommand.MAILBOX_PUBLISHED,
+            RelayCommand.LOOKUP_RESPONSE,
             -> teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
         }
 
@@ -859,6 +926,71 @@ class OnionRelay(
         c.mailboxBuffer = null
         c.mailboxItemsDone++
         return listOf(RelayAction.DeliverMailboxItem(c.handle, buffer))
+    }
+
+    /**
+     * Lookups (wave V0.10.0-J2): accepted only at the last hop of a circuit with no other role, at most
+     * `lookupRequestsPerCircuit` per circuit and at most one outstanding at a time (a second one while the first is
+     * unanswered destroys the circuit). The body length is checked, then the per-link and global rate limits, then the
+     * header. A broken header destroys the circuit; a rate limit, an unknown version or operation and a disabled
+     * lookup role are answered here, with the three fragments of the smallest size class, so they cost the relay no
+     * lookup. Everything else goes to the host as [RelayAction.DeliverLookupRequest].
+     */
+    private fun handleLookupRequest(
+        c: RelayCircuit,
+        msg: RelayMessage,
+    ): List<RelayAction> {
+        if (c.role == CircuitRole.NONE) {
+            if (!canTakeRole(c)) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        } else if (c.role != CircuitRole.LOOKUP) {
+            return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        }
+        if (c.lookupOutstanding) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        if (c.lookupRequests >= limits.lookupRequestsPerCircuit) {
+            return teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+        }
+        c.role = CircuitRole.LOOKUP
+        c.lookupRequests++
+        val data = msg.data
+        if (data.size != LookupRequestBody.BODY_SIZE) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        val linkCounter =
+            linkLookupCounters.computeIfAbsent(c.prevLink.value) {
+                WindowCounter(limits.lookupRequestsPerLinkPerMinute, clock)
+            }
+        if (!linkCounter.tryAcquire() || !globalLookupCounter.tryAcquire()) {
+            logger.debug { "lookup refused: rate limit" }
+            return answerLookup(c, data[1].toInt() and 0xFF, LookupStatus.RATE_LIMITED)
+        }
+        val decoded =
+            try {
+                LookupRequestBody.decode(data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        return when (decoded) {
+            is LookupRequestBody.Decoded.Unsupported -> answerLookup(c, decoded.requestId, decoded.status)
+            is LookupRequestBody.Decoded.Request ->
+                if (!limits.lookupEnabled) {
+                    answerLookup(c, decoded.requestId, LookupStatus.DISABLED)
+                } else {
+                    c.lookupOutstanding = true
+                    listOf(RelayAction.DeliverLookupRequest(c.handle, decoded.requestId, decoded.op, decoded.key))
+                }
+        }
+    }
+
+    /** Caller holds [c]'s lock: the error answer [status] as the fragments of class 0. */
+    private fun answerLookup(
+        c: RelayCircuit,
+        requestId: Int,
+        status: Byte,
+    ): List<RelayAction> {
+        val out = ArrayList<RelayAction>()
+        for (body in LookupResponseBody.encodeAnswer(requestId, status, ByteArray(0), random)) {
+            out += sendBackward(c, RelayMessage(RelayCommand.LOOKUP_RESPONSE, 0, body))
+            if (c.closed) break
+        }
+        return out
     }
 
     private fun handleExtend(

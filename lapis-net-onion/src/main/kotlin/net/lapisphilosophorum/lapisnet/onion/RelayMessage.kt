@@ -36,6 +36,10 @@ enum class RelayCommand(
     // Sealed mailbox item publication through a circuit (wave V0.10.0-F1): client to last hop, and its acknowledgement.
     MAILBOX_PUBLISH(18),
     MAILBOX_PUBLISHED(19),
+
+    // Lookups through a circuit (wave V0.10.0-J2): client to last hop, and the fragmented answer.
+    LOOKUP_REQUEST(20),
+    LOOKUP_RESPONSE(21),
     ;
 
     companion object {

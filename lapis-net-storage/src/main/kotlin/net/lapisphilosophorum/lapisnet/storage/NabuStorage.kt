@@ -353,14 +353,81 @@ class NabuStorage private constructor(
         }
     }
 
+    /**
+     * Wave V0.10.0-J2, the LOOKUP role of a relay: fetches [cid] for an anonymous client WITHOUT keeping it. Only in
+     * [StorageNetworkMode.NETWORK]. A block in the PUBLIC blockstore is returned at once; the unserved store (blocks
+     * this node received over anonymous paths) is never consulted, so a lookup can not probe it. Otherwise providers
+     * are looked up and the block is fetched like [get] does, but the Bitswap want is registered with
+     * `addToBlockstore = false` (Nabu then writes the received block nowhere), so the relay neither stores nor serves
+     * nor announces what anonymous clients ask for; [provide] is never called. Exception: a want for the same block
+     * that this node itself already registered (own [get]) keeps its own setting. `null` when not found in [timeout].
+     */
+    fun fetchTransient(
+        cid: Cid,
+        timeout: Duration,
+    ): ByteArray? {
+        check(networkMode == StorageNetworkMode.NETWORK) { "fetchTransient is a relay function (network mode only)" }
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        val deadline = start + timeout.toNanos()
+        val local = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }
+        if (local.isPresent) return local.get()
+        if (stopped.get()) return null
+        return try {
+            val hints = HashMap<PeerId, List<Multiaddr>>()
+            val discovered = lookupProviders(cid, limits.maxProvidersPerKey, start + timeout.toNanos() / 2)
+            discovered.forEach { hints[it.peerId] = it.addresses }
+            val targets = discovered.map { it.peerId }
+            if (targets.isEmpty()) return null
+            val block = fetch(cid, targets, hints, deadline, persist = false)
+            // the want completed, so its re-send threads end: the next client may ask the same providers again
+            if (block !=
+                null
+            ) {
+                synchronized(recentFetches) { targets.forEach { recentFetches.remove(cid.toString() to it) } }
+            }
+            block
+        } catch (e: NabuStorageException) {
+            logger.debug { "transient fetch failed: ${e.javaClass.simpleName}" }
+            null
+        }
+    }
+
+    /**
+     * Wave V0.10.0-J2: [StorageNetworkMode.LOCAL_ONLY] only. The local stores first, then the [RemoteContentSource]
+     * (circuit lookups), blocking up to [timeout]; a block that does not hash to [cid] is dropped, a valid one is
+     * stored unserved. Never call it on an event loop. [get] stays non-blocking in this mode (it asks only the
+     * source's cache); this explicit call is for consumers that may wait.
+     */
+    fun getThroughRemote(
+        cid: Cid,
+        timeout: Duration,
+    ): ByteArray? {
+        check(networkMode == StorageNetworkMode.LOCAL_ONLY) { "getThroughRemote is for anonymity mode only" }
+        requirePositive(timeout)
+        val local = localLookup(cid, timeout)
+        if (local.isPresent) return local.get()
+        if (stopped.get()) return null
+        val source = remote ?: return null
+        val bytes = runCatching { source.fetchBlock(cid, LookupLimits.MAX_CONTENT, timeout) }.getOrNull() ?: return null
+        if (bytes.size > LookupLimits.MAX_CONTENT || !matchesCid(cid, bytes)) {
+            logger.debug { "remote content source returned a block that does not match its CID - dropped" }
+            return null
+        }
+        runCatching { putUnserved(bytes, timeout) }
+            .onFailure { logger.debug { "could not store a remotely fetched block: ${it.javaClass.simpleName}" } }
+        return bytes
+    }
+
     private fun fetch(
         cid: Cid,
         targets: List<PeerId>,
         hints: Map<PeerId, List<Multiaddr>>,
         deadlineNanos: Long,
+        persist: Boolean = true,
     ): ByteArray? {
         // The want future is shared by every waiter for this block; it must never be cancelled here.
-        val want = bitswapEngine.getWant(Want(cid), true)
+        val want = bitswapEngine.getWant(Want(cid), persist)
         var submitted = 0
         for (peer in targets) {
             if (recentlyRequested(cid, peer)) continue
@@ -375,7 +442,7 @@ class NabuStorage private constructor(
                         // The want is registered for THIS peer only, so it is put in no other peer's wantlist.
                         bitswapEngine.refresh(Want(cid), peer)
                         bitswapRequestsSent.incrementAndGet()
-                        runCatching { bitswap.get(Want(cid), host, setOf(peer), true) }
+                        runCatching { bitswap.get(Want(cid), host, setOf(peer), persist) }
                             .onFailure { logger.debug { "bitswap request failed: ${it.javaClass.simpleName}" } }
                     }
                 }
@@ -724,6 +791,42 @@ class NabuStorage private constructor(
             runCatching { ipnsKeyFor(publisher) }.getOrNull()
                 ?: throw IllegalArgumentException("only Ed25519 peer IDs have an IPNS name")
         if (networkMode == StorageNetworkMode.LOCAL_ONLY) return resolveThroughRemote(publisher, key, timeout)
+        val best = resolveBest(publisher, key, deadline) ?: return null
+        return IpnsValue(best.publisher, best.value, best.sequence, best.notValidAfter, best.ttl)
+    }
+
+    /**
+     * Wave V0.10.0-J2, the LOOKUP role of a relay: the raw signed record behind the routing key [key]
+     * (`/ipns/<Ed25519 multihash>`), found and validated exactly like [resolveIpnsValue] (the newest valid record
+     * wins). Only in [StorageNetworkMode.NETWORK]; `null` for a key that is no canonical Ed25519 IPNS name or when
+     * nothing valid was found within [timeout].
+     */
+    fun resolveIpnsRecordRaw(
+        key: ByteArray,
+        timeout: Duration,
+    ): ByteArray? {
+        check(
+            networkMode == StorageNetworkMode.NETWORK,
+        ) { "resolveIpnsRecordRaw is a relay function (network mode only)" }
+        val start = System.nanoTime()
+        requirePositive(timeout)
+        failIfStopped()
+        if (!RemoteContentVerifier.isIpnsRoutingKey(key)) return null
+        val publisher = parseIpnsKey(key) ?: return null
+        return try {
+            resolveBest(publisher, key.copyOf(), start + timeout.toNanos())?.raw?.copyOf()
+        } catch (e: NabuStorageException) {
+            logger.debug { "relay-side IPNS resolution failed: ${e.javaClass.simpleName}" }
+            null
+        }
+    }
+
+    /** The newest valid record of [publisher] from the own store and a bounded `GET_VALUE` walk. */
+    private fun resolveBest(
+        publisher: PeerId,
+        key: ByteArray,
+        deadline: Long,
+    ): ValidatedIpnsRecord? {
         val local = engine.ipnsStore.get(publisher, wallClock())
         val remote =
             withOperationPermit(deadline) {
@@ -738,11 +841,9 @@ class NabuStorage private constructor(
                     throw NabuStorageException("failed to resolve", e)
                 }
             }
-        val best =
-            (remote + listOfNotNull(local)).fold(null as ValidatedIpnsRecord?) { acc, r ->
-                if (acc == null || r.isNewerThan(acc)) r else acc
-            } ?: return null
-        return IpnsValue(best.publisher, best.value, best.sequence, best.notValidAfter, best.ttl)
+        return (remote + listOfNotNull(local)).fold(null as ValidatedIpnsRecord?) { acc, r ->
+            if (acc == null || r.isNewerThan(acc)) r else acc
+        }
     }
 
     /**

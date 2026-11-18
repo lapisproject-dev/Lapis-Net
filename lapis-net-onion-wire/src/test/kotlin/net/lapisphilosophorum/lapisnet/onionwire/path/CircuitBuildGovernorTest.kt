@@ -202,4 +202,76 @@ class CircuitBuildGovernorTest :
             // the lifetime runs from the build: 10.5 minutes after it the circuit has expired although it was retagged late
             g.expired(clock.instant()) shouldBe listOf(h)
         }
+
+        val lookup = CircuitPurpose.LOOKUP
+
+        test("J2: at most one lookup circuit is open or being built; closing it frees the slot") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, ratePerMinute = 600, burst = 100)
+            g.admit(lookup, "a") shouldBe granted
+            g.admit(lookup, "b") shouldBe CircuitBuildGovernor.Admission.PoolFull
+            val h = Any()
+            g.onBuilt(h, lookup, "a")
+            g.admit(lookup, "b") shouldBe CircuitBuildGovernor.Admission.PoolFull
+            g.lookupOpenCount() shouldBe 1
+            g.onClosed(h)
+            g.admit(lookup, "b") shouldBe granted
+            g.onFailed(lookup)
+            // the lookup bucket (2 per minute) is used up by the two grants above
+            clock.advanceSeconds(31)
+            g.admit(lookup, "c") shouldBe granted
+        }
+
+        test("J2: two lookup builds per minute (Delayed, not refused), from a bucket of their own") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, ratePerMinute = 600, burst = 100)
+            repeat(2) {
+                g.admit(lookup, "x$it") shouldBe granted
+                val h = Any()
+                g.onBuilt(h, lookup, "x$it")
+                g.onClosed(h)
+            }
+            val d = g.admit(lookup, "x2").shouldBeInstanceOf<CircuitBuildGovernor.Admission.Delayed>()
+            (d.retryAfter > 0.seconds && d.retryAfter <= 30.seconds) shouldBe true
+            // publications are not starved by the lookup bucket
+            g.admit(purpose, "publish") shouldBe granted
+            clock.advanceSeconds(31)
+            g.admit(lookup, "x2") shouldBe granted
+        }
+
+        test("J2: lookups count into the pool of four and into the general budget of six per minute") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock)
+            // the general bucket: burst 3; one lookup takes one of them
+            g.admit(lookup, "l") shouldBe granted
+            g.onBuilt(Any(), lookup, "l")
+            g.admit(purpose, "p1") shouldBe granted
+            g.admit(purpose, "p2") shouldBe granted
+            g.admit(purpose, "p3").shouldBeInstanceOf<CircuitBuildGovernor.Admission.Delayed>()
+            val pool = CircuitBuildGovernor(clock, ratePerMinute = 600, burst = 100)
+            repeat(3) { i ->
+                pool.admit(purpose, "q$i") shouldBe granted
+                pool.onBuilt(Any(), purpose, "q$i")
+            }
+            pool.admit(lookup, "l") shouldBe granted
+            pool.onBuilt(Any(), lookup, "l")
+            pool.poolOpenCount() shouldBe 4
+            pool.admit(purpose, "q4") shouldBe CircuitBuildGovernor.Admission.PoolFull
+        }
+
+        test("J2: retagging a warm circuit to LOOKUP respects the limit of one") {
+            val clock = WireTestClock()
+            val g = CircuitBuildGovernor(clock, ratePerMinute = 600, burst = 100)
+            val open = Any()
+            g.admit(lookup, "l") shouldBe granted
+            g.onBuilt(open, lookup, "l")
+            val warm = Any()
+            g.tryAdmitNow(null, "w") shouldBe true
+            g.onBuilt(warm, null, "w")
+            g.retag(warm, lookup, "w") shouldBe false
+            g.lookupOpenCount() shouldBe 1
+            g.onClosed(open)
+            g.retag(warm, lookup, "w") shouldBe true
+            g.lookupOpenCount() shouldBe 1
+        }
     })

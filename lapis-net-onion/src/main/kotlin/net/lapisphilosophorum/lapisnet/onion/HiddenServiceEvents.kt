@@ -14,6 +14,9 @@ enum class CircuitPurpose {
     INTRODUCE,
     DIRECTORY_PUBLISH,
     MAILBOX_PUBLISH,
+
+    /** A content or IPNS lookup through a LOOKUP relay (wave V0.10.0-J2); one request per circuit. */
+    LOOKUP,
 }
 
 /** Input of the pure hidden-service state machines. */

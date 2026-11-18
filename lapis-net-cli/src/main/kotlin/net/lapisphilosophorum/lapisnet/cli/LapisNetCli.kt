@@ -125,6 +125,7 @@ internal fun runCli(
             "  reachability=${options.reachability.name.lowercase()} auto-relay=${options.autoRelay} " +
                 "dht-fallback=${options.dhtFallback} publish-relay-reliability=${options.publishRelayReliability} " +
                 "hole-punching=${options.holePunching.name.lowercase()} onion-relay=${options.onionRelay} " +
+                (if (options.onionRelay) "onion-relay-lookup=${options.onionRelayLookup} " else "") +
                 "anonymity=${options.anonymity.name.lowercase()}" +
                 (if (options.anonymity == AnonymityMode.ON) " padding=${options.anonymityPadding.wire}" else "") +
                 if (headless.node.holePunching != null) " (active)" else "",
@@ -136,7 +137,13 @@ internal fun runCli(
         }
         if (options.onionRelay) {
             out.println("  onion relay: infrastructure only, no traffic is anonymised")
+            if (options.onionRelayLookup) {
+                out.println(
+                    "  onion relay lookup: on - this relay asks the DHT and Bitswap for anonymous clients and is seen as the asker",
+                )
+            }
         }
+        options.warnings.forEach { err.println("lapisnet node: warning: $it") }
         if (options.anonymity == AnonymityMode.ON) {
             out.println("  anonymity: experimental and incomplete (see the warning on stderr)")
             if (options.anonymityAllowCallMedia) {

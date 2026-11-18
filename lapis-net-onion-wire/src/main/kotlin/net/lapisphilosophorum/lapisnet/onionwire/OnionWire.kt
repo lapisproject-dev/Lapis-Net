@@ -27,6 +27,9 @@ import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
 import net.lapisphilosophorum.lapisnet.onion.RendezvousClientConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.WarmCircuitPool
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClient
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClientConfig
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupSink
 import java.nio.file.Path
 import java.time.Clock
 import java.util.concurrent.CopyOnWriteArrayList
@@ -223,6 +226,34 @@ class OnionWire private constructor(
         return publisher
     }
 
+    /**
+     * Lookups through circuits (wave V0.10.0-J2): [lookupRelays] names the candidate last hops (anonymity mode passes
+     * path-selector endpoints), [paths] the path. The client refuses everything while no circuit policy is installed
+     * (fail closed). Closed with this facade.
+     */
+    @ExperimentalOnionApi
+    internal fun lookupClient(
+        paths: OnionPathProvider,
+        lookupRelays: () -> List<OnionRelayDescriptor>,
+        config: OnionLookupClientConfig = OnionLookupClientConfig(),
+        prebuilt: ((net.lapisphilosophorum.lapisnet.onion.CircuitPurpose) -> WarmCircuitPool.Prebuilt?)? = null,
+    ): OnionLookupClient {
+        check(!closed.get()) { "closed" }
+        val client =
+            OnionLookupClient(
+                factory,
+                paths,
+                lookupRelays,
+                config,
+                clock,
+                prebuilt = prebuilt,
+                offLoop = links::submit,
+            )
+        hidden += client
+        client.onClosed = { hidden.remove(client) }
+        return client
+    }
+
     /** Resolution over the mixed directory (anonymous and address-bearing entries); no caller is wired to it yet. */
     fun anonymousDirectory(): AnonymousDirectory =
         AnonymousDirectory(peerDirectory, serviceDescriptors, null) { clock.instant() }
@@ -326,6 +357,8 @@ class OnionWire private constructor(
             directorySinkOverride: DirectoryPublishSink? = null,
             prekeys: PrekeyBundleGossip? = null,
             mailboxSinkOverride: MailboxPublishSink? = null,
+            /** Wave V0.10.0-J2: what the LOOKUP role of a relay asks (the relay's own storage); `null` answers DISABLED. */
+            lookupSink: OnionLookupSink? = null,
         ): OnionWire {
             // A relay descriptor binds identity, peer ID and dialability publicly: a node can not be both (wave V0.10.0-D).
             require(!(directoryMode == DirectoryAnonymityMode.ON && config.relayMode)) {
@@ -373,6 +406,7 @@ class OnionWire private constructor(
                             mailboxSink =
                                 mailboxSinkOverride
                                     ?: mailboxGossip?.let { GossipMailboxPublishSink(it) },
+                            lookupSink = lookupSink,
                             clock = clock,
                         )
                 } else {

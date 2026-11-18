@@ -16,6 +16,8 @@ import net.lapisphilosophorum.lapisnet.onion.DestroyReason
 import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
+import net.lapisphilosophorum.lapisnet.onion.LookupResponseBody
+import net.lapisphilosophorum.lapisnet.onion.LookupStatus
 import net.lapisphilosophorum.lapisnet.onion.MailboxPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.OnionKeyRing
 import net.lapisphilosophorum.lapisnet.onion.OnionRelay
@@ -23,6 +25,8 @@ import net.lapisphilosophorum.lapisnet.onion.RelayAction
 import net.lapisphilosophorum.lapisnet.onion.RelayCommand
 import net.lapisphilosophorum.lapisnet.onion.RelayMessage
 import net.lapisphilosophorum.lapisnet.onion.StatusBody
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupService
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupSink
 import java.security.SecureRandom
 import java.time.Clock
 import java.util.concurrent.ConcurrentHashMap
@@ -59,7 +63,22 @@ class OnionRelayService private constructor(
     private val clock: Clock,
     private val directorySink: DirectoryPublishSink?,
     private val mailboxSink: MailboxPublishSink?,
+    private val random: SecureRandom,
 ) : AutoCloseable {
+    /** Wave V0.10.0-J2: the LOOKUP role; `null` without a sink (then every lookup is answered DISABLED). */
+    @Volatile internal var lookupService: OnionLookupService? = null
+
+    /**
+     * Test seam (wave V0.10.0-J2, never set in production): replaces the whole answer to a lookup with the given
+     * fragments (sent unpaced and unvalidated), so client tests can play a lying or broken relay. `null` = normal.
+     */
+    @Volatile internal var lookupAnswerOverrideForTest: ((RelayAction.DeliverLookupRequest) -> List<ByteArray>?)? = null
+
+    /** Test seam: the relay state machine behaves like a relay without the LOOKUP role (see `OnionRelay.legacyNoLookup`). */
+    internal fun simulateLegacyRelayForTest(legacy: Boolean) {
+        relay.legacyNoLookup = legacy
+    }
+
     private val ownIdentity: Secp256k1PublicKey = identity.secp256k1KeyPair.publicKey
     private val linkTargets = ConcurrentHashMap<Long, Secp256k1PublicKey>()
     private val jobs = ArrayList<NodeServiceSupervisor.PeriodicJob>()
@@ -89,6 +108,9 @@ class OnionRelayService private constructor(
     }
 
     fun linkCount(): Int = links.linkCount()
+
+    /** Wave V0.10.0-J2: `true` if this relay answers lookups (relay lookup on and a sink attached). */
+    val lookupRoleActive: Boolean get() = lookupService != null && !closed
 
     /** The descriptor currently announced, or `null` before the first publication. */
     fun currentDescriptor(): OnionRelayDescriptor? =
@@ -144,6 +166,7 @@ class OnionRelayService private constructor(
                 is RelayAction.DeliverLocal -> deliver(action)
                 is RelayAction.DeliverDirectoryPublish -> deliverDirectoryPublish(action)
                 is RelayAction.DeliverMailboxItem -> deliverMailboxItem(action)
+                is RelayAction.DeliverLookupRequest -> deliverLookup(action)
                 is RelayAction.CircuitClosed -> Unit
             }
         }
@@ -228,6 +251,31 @@ class OnionRelayService private constructor(
         if (!accepted) replyMailbox(action.circuitHandle, MailboxPublishStatus.RATE_LIMITED)
     }
 
+    private fun deliverLookup(action: RelayAction.DeliverLookupRequest) {
+        val override = lookupAnswerOverrideForTest?.invoke(action)
+        if (override != null) {
+            override.forEach { replyLookupFragment(action.circuitHandle, it) }
+            return
+        }
+        val service = lookupService
+        if (service != null) {
+            service.onRequest(action)
+        } else {
+            // the state machine accepted the request although no sink exists: answer as a disabled role
+            LookupResponseBody
+                .encodeAnswer(action.requestId, LookupStatus.DISABLED, ByteArray(0), random)
+                .forEach { replyLookupFragment(action.circuitHandle, it) }
+        }
+    }
+
+    internal fun replyLookupFragment(
+        handle: Long,
+        body: ByteArray,
+    ) {
+        if (closed) return
+        execute(relay.replyLookupFragment(handle, body))
+    }
+
     private fun replyMailbox(
         handle: Long,
         status: Byte,
@@ -307,6 +355,7 @@ class OnionRelayService private constructor(
         closed = true
         jobs.forEach { it.cancel() }
         links.acceptInbound = false
+        runCatching { lookupService?.close() }
         relay.close()
         ring.close()
         keyStore.close()
@@ -329,6 +378,7 @@ class OnionRelayService private constructor(
             links: OnionLinkManager,
             directorySink: DirectoryPublishSink? = null,
             mailboxSink: MailboxPublishSink? = null,
+            lookupSink: OnionLookupSink? = null,
             quality: OnionRelayQualityTracker = OnionRelayQualityTracker(),
             clock: Clock = Clock.systemUTC(),
             random: SecureRandom = SecureRandom(),
@@ -341,7 +391,9 @@ class OnionRelayService private constructor(
                 if (mode == OnionKeyStore.LoadResult.EPHEMERAL) {
                     logger.warn { "onion relay keys are kept in memory only (no keystore passphrase): lost on restart" }
                 }
-                val relay = OnionRelay(ring, config.relayLimits, clock, random)
+                // wave V0.10.0-J2: --onion-relay-lookup=false (or no sink) answers every lookup DISABLED
+                val lookupOn = config.relayLookup && config.relayLimits.lookupEnabled && lookupSink != null
+                val relay = OnionRelay(ring, config.relayLimits.copy(lookupEnabled = lookupOn), clock, random)
                 val svc =
                     OnionRelayService(
                         node,
@@ -358,8 +410,20 @@ class OnionRelayService private constructor(
                         clock,
                         directorySink,
                         mailboxSink,
+                        random,
                     )
                 service = svc
+                if (lookupOn) {
+                    svc.lookupService =
+                        OnionLookupService(
+                            checkNotNull(lookupSink),
+                            config.lookupService,
+                            reply = svc::replyLookupFragment,
+                            schedule = { delay, task -> links.schedule(delay, task) != null },
+                            clock = clock,
+                            random = random,
+                        )
+                }
                 links.addClosedSink { svc.onLinkClosed(it) }
                 links.hasCircuits = { relay.hasCircuitsOn(it) }
                 links.circuitKnown = { l, id -> relay.knowsCircuit(l, id) }

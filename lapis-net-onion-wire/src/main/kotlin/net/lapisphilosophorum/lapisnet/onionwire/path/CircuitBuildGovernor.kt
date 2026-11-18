@@ -37,6 +37,13 @@ class CircuitBuildGovernor(
      */
     private val serviceRendezvousPerMinute: Int = 60,
     private val serviceRendezvousBurst: Int = 10,
+    /**
+     * Wave V0.10.0-J2 (Q8): lookup circuits are pool circuits with an ADDITIONAL bucket of their own (on top of the
+     * general one), so that lookups can never use up the budget the node's publications need. At most
+     * [maxOpenLookupCircuits] lookup circuit is open (or being built) at a time; over the bucket a lookup is delayed.
+     */
+    val maxOpenLookupCircuits: Int = 1,
+    private val lookupBuildsPerMinute: Int = 2,
 ) {
     sealed interface Admission {
         data object Granted : Admission
@@ -63,6 +70,9 @@ class CircuitBuildGovernor(
     init {
         require(maxOpenClientCircuits > 0 && ratePerMinute > 0 && burst > 0) { "limits must be positive" }
         require(serviceRendezvousPerMinute > 0 && serviceRendezvousBurst > 0) { "limits must be positive" }
+        require(maxOpenLookupCircuits in 1..maxOpenClientCircuits && lookupBuildsPerMinute > 0) {
+            "lookup limits must be positive and fit the pool"
+        }
         require(lifetime.isPositive() && backoffMin.isPositive() && backoffMax >= backoffMin) { "times inconsistent" }
     }
 
@@ -74,6 +84,9 @@ class CircuitBuildGovernor(
     private var rendezvousTokens: Double = serviceRendezvousBurst.toDouble()
     private var rendezvousRefillMillis: Long = clock.millis()
     private var pendingPool = 0
+    private var pendingLookup = 0
+    private var lookupTokens: Double = lookupBuildsPerMinute.toDouble()
+    private var lookupRefillMillis: Long = clock.millis()
     private var locked = false
     private val open = ArrayList<Open>()
     private val counters = HashMap<CircuitPurpose?, LongArray>()
@@ -111,6 +124,7 @@ class CircuitBuildGovernor(
         purpose == null ||
             purpose == CircuitPurpose.DIRECTORY_PUBLISH ||
             purpose == CircuitPurpose.MAILBOX_PUBLISH ||
+            purpose == CircuitPurpose.LOOKUP ||
             purpose == CircuitPurpose.RENDEZVOUS_SENDER ||
             purpose == CircuitPurpose.INTRODUCE
 
@@ -118,6 +132,13 @@ class CircuitBuildGovernor(
         val elapsed = (now - lastRefillMillis).coerceAtLeast(0)
         lastRefillMillis = now
         tokens = minOf(burst.toDouble(), tokens + elapsed * ratePerMinute / 60_000.0)
+    }
+
+    private fun refillLookup(now: Long) {
+        val elapsed = (now - lookupRefillMillis).coerceAtLeast(0)
+        lookupRefillMillis = now
+        lookupTokens =
+            minOf(lookupBuildsPerMinute.toDouble(), lookupTokens + elapsed * lookupBuildsPerMinute / 60_000.0)
     }
 
     /** Asks to start building a circuit for [purpose] towards [targetKey]. A `Granted` must be answered by [onBuilt] or [onFailed]. */
@@ -167,12 +188,27 @@ class CircuitBuildGovernor(
         ) {
             return Admission.PoolFull
         }
+        val lookup = purpose == CircuitPurpose.LOOKUP
+        if (lookup) {
+            if (open.count { it.purpose == CircuitPurpose.LOOKUP } + pendingLookup >= maxOpenLookupCircuits) {
+                return Admission.PoolFull
+            }
+            refillLookup(now)
+            if (lookupTokens < 1.0) {
+                val ms = ((1.0 - lookupTokens) * 60_000.0 / lookupBuildsPerMinute).toLong().coerceAtLeast(1)
+                return Admission.Delayed(ms.milliseconds)
+            }
+        }
         refill(now)
         if (tokens < 1.0) {
             val ms = ((1.0 - tokens) * 60_000.0 / ratePerMinute).toLong().coerceAtLeast(1)
             return Admission.Delayed(ms.milliseconds)
         }
         tokens -= 1.0
+        if (lookup) {
+            lookupTokens -= 1.0
+            pendingLookup++
+        }
         if (pool) pendingPool++
         return Admission.Granted
     }
@@ -198,17 +234,25 @@ class CircuitBuildGovernor(
     /**
      * Changes the purpose and target of an open circuit (a warm circuit is handed to its one use). The slot is kept and
      * the age is NOT reset: the lifetime runs from the build. A purpose change inside the pool does not change the count.
+     * `false` (nothing changed) when the change would exceed [maxOpenLookupCircuits] (wave V0.10.0-J2).
      */
     fun retag(
         handle: Any,
         purpose: CircuitPurpose?,
         targetKey: String,
-    ) = synchronized(lock) {
-        open.firstOrNull { it.handle === handle }?.let {
-            it.purpose = purpose
-            it.targetKey = targetKey
+    ): Boolean =
+        synchronized(lock) {
+            val entry = open.firstOrNull { it.handle === handle } ?: return@synchronized true
+            if (purpose == CircuitPurpose.LOOKUP &&
+                entry.purpose != CircuitPurpose.LOOKUP &&
+                open.count { it.purpose == CircuitPurpose.LOOKUP } + pendingLookup >= maxOpenLookupCircuits
+            ) {
+                return@synchronized false
+            }
+            entry.purpose = purpose
+            entry.targetKey = targetKey
+            true
         }
-    }
 
     /** The circuit [handle] was built. Not registered if it is already [closed]. */
     fun onBuilt(
@@ -218,6 +262,7 @@ class CircuitBuildGovernor(
         closed: Boolean = false,
     ) = synchronized(lock) {
         if (isPool(purpose) && pendingPool > 0) pendingPool--
+        if (purpose == CircuitPurpose.LOOKUP && pendingLookup > 0) pendingLookup--
         if (!isServiceRendezvous(purpose)) {
             consecutiveFailures = 0
             blockedUntilMillis = 0
@@ -229,6 +274,7 @@ class CircuitBuildGovernor(
     fun onFailed(purpose: CircuitPurpose?) =
         synchronized(lock) {
             if (isPool(purpose) && pendingPool > 0) pendingPool--
+            if (purpose == CircuitPurpose.LOOKUP && pendingLookup > 0) pendingLookup--
             if (isServiceRendezvous(purpose)) return@synchronized
             count(purpose, 5)
             consecutiveFailures = (consecutiveFailures + 1).coerceAtMost(MAX_FAILURES)
@@ -258,6 +304,9 @@ class CircuitBuildGovernor(
     fun isLocked(): Boolean = synchronized(lock) { locked }
 
     fun openCount(): Int = synchronized(lock) { open.size }
+
+    /** Currently open lookup circuits (wave V0.10.0-J2). */
+    fun lookupOpenCount(): Int = synchronized(lock) { open.count { it.purpose == CircuitPurpose.LOOKUP } }
 
     /** Currently open pooled client circuits (without long-lived introduction circuits). */
     fun poolOpenCount(): Int = synchronized(lock) { open.count { isPool(it.purpose) } }

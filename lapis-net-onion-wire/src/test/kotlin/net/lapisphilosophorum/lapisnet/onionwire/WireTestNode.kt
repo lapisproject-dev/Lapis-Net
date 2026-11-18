@@ -57,6 +57,10 @@ class WireTestNode(
     mailboxSink: MailboxPublishSink? = null,
     /** Wave V0.10.0-J1b: a confined node as in production anonymity mode (no listener, per-run key, no mDNS). */
     val confinement: ConnectionConfinement? = null,
+    /** Wave V0.10.0-J2: the LOOKUP sink of a relay, built from this node's own storage. */
+    lookupSink: ((NabuStorage) -> net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupSink)? = null,
+    /** Wave V0.10.0-J2: the remote content source of a LOCAL_ONLY storage (confined nodes). */
+    remote: net.lapisphilosophorum.lapisnet.storage.RemoteContentSource? = null,
 ) : AutoCloseable {
     val node: LapisNode =
         if (confinement == null) {
@@ -74,6 +78,7 @@ class WireTestNode(
             node,
             dir.resolve("storage").also { Files.createDirectories(it) },
             networkMode = if (confinement == null) StorageNetworkMode.NETWORK else StorageNetworkMode.LOCAL_ONLY,
+            remote = remote,
         )
     val pubsub: GossipPubSub = GossipPubSub.attach(node, if (confinement == null) null else GossipAnonymityPolicy())
     val peerDirectory: PeerDirectoryGossip = PeerDirectoryGossip.attach(pubsub, storage)
@@ -93,6 +98,7 @@ class WireTestNode(
             directoryMode,
             directorySink,
             mailboxSinkOverride = mailboxSink,
+            lookupSink = lookupSink?.invoke(storage),
         )
 
     fun connectTo(other: WireTestNode) {

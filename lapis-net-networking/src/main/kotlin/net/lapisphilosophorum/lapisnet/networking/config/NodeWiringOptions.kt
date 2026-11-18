@@ -101,6 +101,14 @@ data class NodeWiringOptions(
     val anonymityAllowCallMedia: Boolean = false,
     /** V0.10.0-H: padding and timing protection in anonymity mode (`--anonymity-padding`). Without effect while anonymity is off. */
     val anonymityPadding: AnonymityPaddingMode = AnonymityPaddingMode.STANDARD,
+    /**
+     * V0.10.0-J2: the LOOKUP role of an onion relay (`--onion-relay-lookup`, on by default). Only effective with
+     * [onionRelay]: such a relay looks up content blocks and IPNS records for anonymous clients through its own
+     * storage. `false` answers every lookup with DISABLED.
+     */
+    val onionRelayLookup: Boolean = true,
+    /** Notices for the operator collected by [resolve] (an option that is valid but has no effect). */
+    val warnings: List<String> = emptyList(),
 ) {
     /**
      * The [RelayConfig] to create the node with. [NodeReachability.PRIVATE] is set only when [autoRelay] is on:
@@ -208,6 +216,7 @@ data class NodeWiringOptions(
         const val KEY_ANONYMITY = "anonymity"
         const val KEY_ANONYMITY_ALLOW_CALL_MEDIA = "anonymity-allow-call-media"
         const val KEY_ANONYMITY_PADDING = "anonymity-padding"
+        const val KEY_ONION_RELAY_LOOKUP = "onion-relay-lookup"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
@@ -223,6 +232,7 @@ data class NodeWiringOptions(
                 KEY_ANONYMITY,
                 KEY_ANONYMITY_ALLOW_CALL_MEDIA,
                 KEY_ANONYMITY_PADDING,
+                KEY_ONION_RELAY_LOOKUP,
             )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
@@ -251,6 +261,8 @@ data class NodeWiringOptions(
                 raw[KEY_ANONYMITY_ALLOW_CALL_MEDIA]?.let { parseBoolean(KEY_ANONYMITY_ALLOW_CALL_MEDIA, it) } ?: false
             val anonymityPadding =
                 raw[KEY_ANONYMITY_PADDING]?.let { parseAnonymityPadding(it) } ?: AnonymityPaddingMode.STANDARD
+            val relayLookupExplicit = raw[KEY_ONION_RELAY_LOOKUP]?.let { parseBoolean(KEY_ONION_RELAY_LOOKUP, it) }
+            val warnings = ArrayList<String>()
             if (allowCallMedia && anonymity != AnonymityMode.ON) {
                 throw InvalidWiringOptionException("--anonymity-allow-call-media requires --anonymity=on")
             }
@@ -273,6 +285,12 @@ data class NodeWiringOptions(
                 if (dhtFallbackExplicit == true) {
                     throw InvalidWiringOptionException("dht-fallback cannot be enabled while anonymity=on")
                 }
+                // wave V0.10.0-J2, analogous to --onion-relay (Q6): a node in anonymity mode is never a relay
+                if (relayLookupExplicit == true) {
+                    throw InvalidWiringOptionException("onion-relay-lookup cannot be enabled while anonymity=on")
+                }
+            } else if (relayLookupExplicit == true && !onionRelay) {
+                warnings += "--onion-relay-lookup=true has no effect without --onion-relay=true"
             }
             val anonymous = anonymity == AnonymityMode.ON
             val autoRelay = !anonymous && (autoRelayExplicit ?: (reachability == DeclaredReachability.PRIVATE))
@@ -290,6 +308,8 @@ data class NodeWiringOptions(
                 anonymity,
                 allowCallMedia,
                 anonymityPadding,
+                onionRelayLookup = relayLookupExplicit ?: true,
+                warnings = warnings,
             )
         }
 
@@ -306,6 +326,7 @@ data class NodeWiringOptions(
                     KEY_PUBLISH_RELAY_RELIABILITY,
                     KEY_ONION_RELAY,
                     KEY_ANONYMITY_ALLOW_CALL_MEDIA,
+                    KEY_ONION_RELAY_LOOKUP,
                     ->
                         parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
@@ -399,6 +420,12 @@ data class NodeWiringOptions(
             |        relay descriptor (gossip, and the DHT value when --dht-fallback is on) and answers circuit
             |        CREATE/EXTEND cells. NO user traffic is routed over circuits yet and nothing is anonymised;
             |        the descriptor makes this node's identity and address publicly known as a relay.
+            |  --onion-relay-lookup=true|false            [true]   (only with --onion-relay=true)
+            |        Look up content blocks and IPNS records for anonymous clients that ask through a circuit.
+            |        This relay then asks the DHT and Bitswap itself: providers and DHT peers see this relay, with
+            |        its address, as the one asking; the relay sees what is asked (CID or IPNS name), not who asks.
+            |        It keeps no content it fetched for others. false: every lookup is answered as disabled.
+            |        Refused with --anonymity=on.
             |  --anonymity=on|off   (experimental, default off) anonymises directory, direct messages, mail and call signals; call media is direct
             |        With on: the directory entry is published only through circuits (persistent guards, diverse
             |        paths), the transport key is fresh per run and never stored, mDNS, hole punching, the DHT,

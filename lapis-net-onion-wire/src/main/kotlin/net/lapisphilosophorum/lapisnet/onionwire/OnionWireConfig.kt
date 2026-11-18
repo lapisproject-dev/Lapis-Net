@@ -2,6 +2,7 @@ package net.lapisphilosophorum.lapisnet.onionwire
 
 import net.lapisphilosophorum.lapisnet.directory.OnionRelayDescriptor
 import net.lapisphilosophorum.lapisnet.onion.OnionRelayLimits
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupServiceConfig
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
@@ -49,6 +50,12 @@ data class OnionWireConfig(
     val dialThreads: Int = 8,
     val maxQueuedDials: Int = 512,
     val maxPendingDials: Int = 64,
+    /**
+     * Wave V0.10.0-J2: the LOOKUP role of a relay (`--onion-relay-lookup`, on by default, only with [relayMode]).
+     * `false`: every LOOKUP_REQUEST is answered DISABLED (the circuit survives, the client tries another relay).
+     */
+    val relayLookup: Boolean = true,
+    val lookupService: OnionLookupServiceConfig = OnionLookupServiceConfig(),
 ) {
     init {
         require(maxLinks > 0 && maxInboundLinksPerPeer > 0) { "link limits must be positive" }

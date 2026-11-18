@@ -84,6 +84,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
+import net.lapisphilosophorum.lapisnet.storage.DeferredRemoteContentSource
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
@@ -551,12 +552,15 @@ class BrowserServer private constructor(
                 }
 
                 val anonymousNode = wiring.anonymity == AnonymityMode.ON
-                // V0.10.0-J1a: in anonymity mode the node neither serves nor queries the DHT and content
+                // V0.10.0-J1a: in anonymity mode the node neither serves the DHT and content nor queries them directly;
+                // V0.10.0-J2: its misses go through circuits to LOOKUP relays (the source is bound after the runtime runs)
+                val remoteContent = if (anonymousNode) DeferredRemoteContentSource() else null
                 val storage =
                     NabuStorage.attach(
                         node,
                         dataDirectory,
                         networkMode = if (anonymousNode) StorageNetworkMode.LOCAL_ONLY else StorageNetworkMode.NETWORK,
+                        remote = remoteContent,
                     )
                 cleanupOnFailure += { runCatching { storage.stop() } }
                 // GossipPubSub must attach before any LapisNode.connect() call - see
@@ -960,6 +964,11 @@ class BrowserServer private constructor(
                     anonymityRuntime = started
                     cleanupOnFailure += { runCatching { started.close() } }
                     supervisor.register("anonymity") { started.close() }
+                    // V0.10.0-J2: bound after the start; unbound BEFORE the runtime closes (reverse order of both lists)
+                    val deferred = checkNotNull(remoteContent)
+                    deferred.bind(started.remoteContentSource())
+                    cleanupOnFailure += { deferred.unbind() }
+                    supervisor.register("anonymity-remote-content") { deferred.unbind() }
                     // Direct messages over circuits (wave V0.10.0-F1). The DM manager was attached before the runtime
                     // existed and refuses every send (anonymity-not-ready, no fallback) until the transport is
                     // installed here. Registered after the runtime, so the supervisor stops it FIRST.

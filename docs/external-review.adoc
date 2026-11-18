@@ -23,7 +23,7 @@ The purpose of this document is to let a reviewer start work without a guided to
 
 *Out of scope*
 
-* Wave J1b to J3 (connection confinement to the guards, relay directory snapshot, the relay role LOOKUP and its consumers): not implemented. Wave J1a (per-run transport key, no mDNS, no Bitswap and Kademlia, receive-only gossip, tombstone through a circuit) is in scope, see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
+* Wave J3 (the consumers of the lookups: timeline and rendezvous, status counters, the final warning text): not implemented. Waves J1a (per-run transport key, no mDNS, no Bitswap and Kademlia, receive-only gossip, tombstone through a circuit), J1b (connection confinement to the guards, relay directory snapshot) and J2 (the relay role LOOKUP, lookups through circuits) are implemented and in scope, see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
 * WebRTC call media. It is not anonymised and cannot be.
 * Trust (Veritas), Karma, Madli internals beyond their use as a path weight, LTR and the economy.
 * The browser UI.
@@ -189,9 +189,9 @@ Hop 1 is a persistent primary guard (two guards, lifetime 30 to 60 days, state e
 
 . (Wave J1a) Is a per-run transport key enough to keep the identity off the direct connections, given that the IP address, the topic set and the timing of the run remain visible to every gossip neighbour? Which link between runs or between a run and the identity remains that we have not listed?
 . (Wave J1b, implemented, not reviewed) Is confinement of all connections to the two guards the right trade-off against a receive-only mesh with arbitrary peers? Does the relay directory snapshot from bootstrap peers and guards create a partitioning or eclipse risk beyond the cases analysed in xref:anonymity.adoc#eclipse-analysis[Eclipse and partitioning analysis] (per-source budgets, provenance from distinct sources, the gate and the preference of the guard choice), in particular for middle hops?
-. (Wave J1b, Q9) Is not listening at all in anonymity mode (instead of listening and closing foreign connections after the Noise XX handshake, which reveals the PeerId of the run) the right choice, and does the node still have an inbound path we did not see (relayed inbound, a future transport)?
+. (Wave J1b, Q9, confirmed by the user on 2026-11-17) Is not listening at all in anonymity mode (instead of listening and closing foreign connections after the Noise XX handshake, which reveals the PeerId of the run) the right choice, and does the node still have an inbound path we did not see (relayed inbound, a future transport)?
 . (Wave J1b) Does a parameter-free snapshot request still mark the asking node as fresh or anonymous towards a bootstrap peer or guard more than stated, and is contacting the bootstrap peers at every start (descriptors are not persisted) acceptable for now?
-. (Wave J, planned) What does an exit relay of the planned LOOKUP role learn from the CIDs and IPNS names it is asked for, beyond what the stated mitigations (negative cache, attempt limit, size classes, pacing) hide?
+. (Wave J2, implemented, not reviewed) What does an exit relay of the LOOKUP role learn from the CIDs and IPNS names it is asked for, beyond what the stated mitigations (negative cache, attempt limit, size classes, pacing, minimum answer delay) hide? Is the timing oracle of the negative cache and the attempt limit (row 27 of the leak inventory) acceptable, and can a relay that withholds answers or serves an older IPNS record do more harm than stated?
 
 . Is the ntor variant, including the transcript binding of `ID`, `B`, `X`, `Y` and `PROTOID` and the added `hopIndex` byte, secure as a circuit handshake?
 . Does the anti-tagging rule (regenerating every byte outside the receiving hop's tag) suffice against tagging by colluding non-adjacent relays, including tagging through teardown behaviour?

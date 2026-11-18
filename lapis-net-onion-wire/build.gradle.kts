@@ -23,6 +23,9 @@ dependencies {
     api(project(":lapis-net-onion"))
     api(project(":lapis-net-networking"))
     api(project(":lapis-net-directory"))
+    // Wave V0.10.0-J2: the LOOKUP relay role (NabuLookupSink) and the circuit-backed RemoteContentSource use storage
+    // types in public signatures. No cycle: storage depends on core and networking only.
+    api(project(":lapis-net-storage"))
     implementation(rootProject.libs.bouncycastle.provider)
 
     // Test-only SLF4J backend: OnionWireLoggingHygieneTest captures log output.

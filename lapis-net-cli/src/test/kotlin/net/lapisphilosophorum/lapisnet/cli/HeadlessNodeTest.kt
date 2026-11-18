@@ -229,6 +229,43 @@ class HeadlessNodeTest :
         }
 
         test(
+            "V0.10.0-J2: an onion relay has the LOOKUP role by default; --onion-relay-lookup=false switches it off",
+        ).config(
+            timeout = 120.seconds,
+        ) {
+            val on = start(NodeWiringOptions.resolve(mapOf("onion-relay" to "true")))
+            try {
+                on.onionWire.relayService
+                    .shouldNotBeNull()
+                    .lookupRoleActive shouldBe true
+                on.storage.networkMode shouldBe net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode.NETWORK
+            } finally {
+                on.stop()
+            }
+            val off = start(NodeWiringOptions.resolve(mapOf("onion-relay" to "true", "onion-relay-lookup" to "false")))
+            try {
+                off.onionWire.relayService
+                    .shouldNotBeNull()
+                    .lookupRoleActive shouldBe false
+            } finally {
+                off.stop()
+            }
+        }
+
+        test("V0.10.0-J2: a normal node without relay mode has no lookup role and a network-mode storage").config(
+            timeout = 90.seconds,
+        ) {
+            val node = start(NodeWiringOptions.resolve(emptyMap()))
+            try {
+                node.onionWire.relayService.shouldBeNull()
+                node.anonymity.shouldBeNull()
+                node.storage.networkMode shouldBe net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode.NETWORK
+            } finally {
+                node.stop()
+            }
+        }
+
+        test(
             "onion relay on without a passphrase runs with in-memory keys and writes no file",
         ).config(timeout = 90.seconds) {
             val dir = Files.createTempDirectory("headless-onion-ephemeral")

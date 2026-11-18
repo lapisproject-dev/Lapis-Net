@@ -39,6 +39,9 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceHost
 import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceStreamRouter
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.SliceTimer
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.CircuitRemoteContentSource
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClient
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClientConfig
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
 import net.lapisphilosophorum.lapisnet.onionwire.path.EncryptedFileGuardStateStore
 import net.lapisphilosophorum.lapisnet.onionwire.path.GuardChoiceGate
@@ -51,6 +54,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.onionwire.path.SelectingOnionPathProvider
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
+import net.lapisphilosophorum.lapisnet.storage.RemoteContentSource
 import java.nio.file.Path
 import java.security.SecureRandom
 import java.time.Clock
@@ -110,6 +114,9 @@ class AnonymityRuntime private constructor(
     private val random: SecureRandom,
     /** Wave V0.10.0-J1b: the connection controller of a confined node, `null` without confinement. */
     private val connections: AnonymousConnectionController? = null,
+    /** Wave V0.10.0-J2: lookups through circuits and the storage source built on them. */
+    private val lookupClient: OnionLookupClient,
+    private val remoteSource: CircuitRemoteContentSource,
 ) : AutoCloseable {
     private val lifecycle = Any()
 
@@ -197,6 +204,17 @@ class AnonymityRuntime private constructor(
             snapshotRejectedEntries = connections?.snapshotRejectedEntries() ?: 0L,
         )
     }
+
+    /**
+     * Wave V0.10.0-J2: the content source for the node's LOCAL_ONLY storage. Every miss becomes a lookup through a
+     * circuit to a LOOKUP relay (which learns the CID or IPNS name and the time, not this node's address). Bind it to the
+     * storage's [net.lapisphilosophorum.lapisnet.storage.DeferredRemoteContentSource] after the start, unbind before
+     * [close].
+     */
+    fun remoteContentSource(): RemoteContentSource = remoteSource
+
+    /** The lookup client (tests only). */
+    internal fun lookupClientForTest(): OnionLookupClient = lookupClient
 
     /** The router that dispatches the streams reaching this node's onion service by application (wave V0.10.0-F1). */
     fun serviceRouter(): OnionServiceStreamRouter = router
@@ -329,6 +347,8 @@ class AnonymityRuntime private constructor(
             runCatching { router.close() }
             runCatching { rendezvousClient.close() }
             runCatching { mailboxPublisher.close() }
+            runCatching { remoteSource.close() }
+            runCatching { lookupClient.close() }
             runCatching { anonymousPublisher.close() }
             runCatching { host.close() }
             runCatching { channel.close() }
@@ -356,6 +376,7 @@ class AnonymityRuntime private constructor(
         const val CONNECTIONS_UNCONFINED = "unconfined"
         private const val INTRO_POINTS = 3
         private const val PUBLISH_CANDIDATES = 3
+        private const val LOOKUP_CANDIDATES = 3
         private const val RENDEZVOUS_ENDPOINT_TRIES = 3
 
         /** Rendezvous attempts of [connectToService]: the first and at most one retry (see [RendezvousRetry]). */
@@ -403,6 +424,8 @@ class AnonymityRuntime private constructor(
             bootstrapPeers: List<Multiaddr> = emptyList(),
             /** V0.10.0-J1b test seam: replaces the network side of the controller. */
             confinedNetwork: ConfinedNetwork? = null,
+            /** V0.10.0-J2: client bounds of lookups through circuits (tests shorten them). */
+            lookupConfig: OnionLookupClientConfig = OnionLookupClientConfig(),
         ): AnonymityRuntime {
             require(wire.directoryMode == DirectoryAnonymityMode.ON) { "the onion wire is not in anonymity mode" }
             val key = homeDir.toAbsolutePath().normalize()
@@ -524,6 +547,17 @@ class AnonymityRuntime private constructor(
                 val mailboxPublisher =
                     wire.mailboxPublisher(paths, { endpoints(PUBLISH_CANDIDATES) }, prebuilt = warm::take)
                 closers += { mailboxPublisher.close() }
+                // wave V0.10.0-J2: lookups through circuits; candidates are path-selector endpoints like the publishers'
+                val lookupClient =
+                    wire.lookupClient(
+                        paths,
+                        { endpoints(LOOKUP_CANDIDATES) },
+                        lookupConfig,
+                        prebuilt = warm::take,
+                    )
+                closers += { lookupClient.close() }
+                val remoteSource = CircuitRemoteContentSource(lookupClient)
+                closers += { remoteSource.close() }
                 val anonymousPublisher =
                     AnonymousDirectoryPublisher(
                         identity,
@@ -603,6 +637,8 @@ class AnonymityRuntime private constructor(
                         shaper,
                         random,
                         controller,
+                        lookupClient,
+                        remoteSource,
                     )
                 runtimeRef = runtime
 

@@ -70,11 +70,13 @@ private const val WARNING_PADDED =
 
 /**
  * What is still exposed. Wave V0.10.0-J1a replaced "the network mesh, DHT lookups and fetches still show ..."; wave
- * V0.10.0-J1b replaced "but it still meshes over direct connections that show your address".
+ * V0.10.0-J1b replaced "but it still meshes over direct connections that show your address"; wave V0.10.0-J2 replaced
+ * "neither serves nor queries the DHT or content" (lookups now go through circuits; the final text belongs to J3).
  */
 private const val WARNING_REMAINING =
-    "the transport key is fresh per run and the node neither serves nor queries the DHT or content, it connects only " +
-        "to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; " +
+    "the transport key is fresh per run and the node neither serves the DHT or content nor queries them directly " +
+        "(lookups go through circuits to relays that see what is asked), it connects only to its two guards, " +
+        "and to its bootstrap peers while it lacks relays or a guard connection; " +
         "each of them sees your address; posting, votes and trust grants are unavailable."
 private const val WARNING_CALLS_OFF_TAIL =
     "calls are off because call media would reveal your IP address; " + WARNING_REMAINING

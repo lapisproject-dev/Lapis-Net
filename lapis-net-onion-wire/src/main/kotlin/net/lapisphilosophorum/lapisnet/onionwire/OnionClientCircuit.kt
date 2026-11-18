@@ -67,8 +67,26 @@ internal class OnionClientCircuit(
     /** Messages from the LAST hop. */
     @Volatile var onInbound: (RelayMessage) -> Unit = {}
 
-    /** Invoked once when a BUILT circuit goes away (destroyed, link lost, closed locally). */
+    /**
+     * Invoked once when a BUILT circuit goes away (destroyed, link lost, closed locally), AFTER the circuit was taken out
+     * of the factory and the governor: a rebuild started from this callback is never counted against this circuit.
+     */
     @Volatile var onClosed: () -> Unit = {}
+
+    /** Why the circuit went away (set before [onClosed] runs); `null` while it is open. */
+    enum class CloseCause {
+        /** A DESTROY cell arrived (from any hop: the reason is not passed up). */
+        NETWORK_DESTROY,
+
+        /** The link to the first hop is gone, or refused a cell. */
+        LINK_LOST,
+
+        /** Closed, timed out or destroyed by this side. */
+        LOCAL,
+    }
+
+    @Volatile var closeCause: CloseCause? = null
+        private set
 
     /** `true` once the first hop answered the CREATE validly (a failure from then on is not a first-hop failure). */
     @Volatile var progressed: Boolean = false
@@ -112,7 +130,7 @@ internal class OnionClientCircuit(
             }
             is BuilderStep.Failed -> {
                 step.destroyCell?.let { links.send(link, it) }
-                finish(IllegalStateException("circuit build failed: ${step.reason}"), post)
+                finish(IllegalStateException("circuit build failed: ${step.reason}"), post, CloseCause.LOCAL)
             }
             BuilderStep.Ignored -> Unit
         }
@@ -126,7 +144,7 @@ internal class OnionClientCircuit(
         when (cell.command) {
             CellCommand.DESTROY -> {
                 DestroyBody.decode(cell.body)
-                finish(IllegalStateException("circuit destroyed by the network"), post)
+                finish(IllegalStateException("circuit destroyed by the network"), post, CloseCause.NETWORK_DESTROY)
             }
             CellCommand.RELAY ->
                 try {
@@ -154,7 +172,7 @@ internal class OnionClientCircuit(
                         return@synchronized false
                     }
                 if (!links.send(link, Cell(circuitId, CellCommand.RELAY, body))) {
-                    finish(IllegalStateException("link lost"), post)
+                    finish(IllegalStateException("link lost"), post, CloseCause.LINK_LOST)
                     return@synchronized false
                 }
                 true
@@ -182,7 +200,7 @@ internal class OnionClientCircuit(
                         return@synchronized false
                     }
                 if (!links.send(link, Cell(circuitId, CellCommand.RELAY, body))) {
-                    finish(IllegalStateException("link lost"), post)
+                    finish(IllegalStateException("link lost"), post, CloseCause.LINK_LOST)
                     return@synchronized false
                 }
                 true
@@ -196,7 +214,7 @@ internal class OnionClientCircuit(
         synchronized(lock) {
             if (state != State.BUILDING) return
             builder.abort()?.let { links.send(link, it) }
-            finish(IllegalStateException("circuit build timed out"), post)
+            finish(IllegalStateException("circuit build timed out"), post, CloseCause.LOCAL)
         }
         post.forEach { it() }
     }
@@ -206,7 +224,7 @@ internal class OnionClientCircuit(
         post: MutableList<() -> Unit>,
     ) {
         links.send(link, Cell(circuitId, CellCommand.DESTROY, DestroyBody.encode(reason, random)))
-        finish(IllegalStateException("circuit destroyed locally"), post)
+        finish(IllegalStateException("circuit destroyed locally"), post, CloseCause.LOCAL)
     }
 
     fun close() {
@@ -216,7 +234,7 @@ internal class OnionClientCircuit(
                 State.CLOSED -> Unit
                 State.BUILDING -> {
                     builder.abort()?.let { links.send(link, it) }
-                    finish(IllegalStateException("circuit closed"), post)
+                    finish(IllegalStateException("circuit closed"), post, CloseCause.LOCAL)
                 }
                 State.BUILT -> destroy(DestroyReason.FINISHED, post)
             }
@@ -227,23 +245,40 @@ internal class OnionClientCircuit(
     /** The link below the circuit is gone. */
     fun linkLost() {
         val post = ArrayList<() -> Unit>(1)
-        synchronized(lock) { if (state != State.CLOSED) finish(IllegalStateException("link lost"), post) }
+        synchronized(lock) {
+            if (state != State.CLOSED) finish(IllegalStateException("link lost"), post, CloseCause.LINK_LOST)
+        }
         post.forEach { it() }
     }
 
     private fun finish(
         cause: Throwable,
         post: MutableList<() -> Unit>,
+        closeCause: CloseCause,
     ) {
         if (state == State.CLOSED) return
         val wasBuilding = state == State.BUILDING
         state = State.CLOSED
+        this.closeCause = closeCause
         timeout?.cancel(false)
         circuit?.close()
         if (wasBuilding) builder.close()
-        post += {
-            if (wasBuilding) built.completeExceptionally(cause) else onClosed()
-            onDone(this)
+        post.add {
+            if (wasBuilding) {
+                try {
+                    built.completeExceptionally(cause)
+                } finally {
+                    onDone(this)
+                }
+            } else {
+                // deregister first (factory routes, governor slot): an onClosed that starts the next build on another
+                // thread must find the slot of this circuit already free
+                try {
+                    onDone(this)
+                } finally {
+                    onClosed()
+                }
+            }
         }
     }
 }

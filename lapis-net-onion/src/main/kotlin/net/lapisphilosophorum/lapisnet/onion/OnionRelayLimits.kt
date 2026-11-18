@@ -33,6 +33,11 @@ data class OnionRelayLimits(
     val mailboxPublishPerLinkPerMinute: Int = 10,
     val mailboxPublishGlobalPerMinute: Int = 60,
     val mailboxAssembleTimeout: Duration = 15.seconds,
+    // Lookups through circuits (wave V0.10.0-J2, Q8 and the additions documented in docs/anonymity.adoc).
+    val lookupEnabled: Boolean = true,
+    val lookupRequestsPerCircuit: Int = 4,
+    val lookupRequestsPerLinkPerMinute: Int = 60,
+    val lookupRequestsGlobalPerMinute: Int = 240,
 ) {
     init {
         require(maxCircuitsTotal > 0 && maxCircuitsPerLink > 0 && maxPendingExtends >= 0) { "limits must be positive" }
@@ -59,6 +64,9 @@ data class OnionRelayLimits(
                 mailboxPublishGlobalPerMinute >= 0 &&
                 mailboxAssembleTimeout.isPositive(),
         ) { "mailbox publish limits must not be negative (per-circuit limit and timeout must be positive)" }
+        require(
+            lookupRequestsPerCircuit > 0 && lookupRequestsPerLinkPerMinute >= 0 && lookupRequestsGlobalPerMinute >= 0,
+        ) { "lookup limits must not be negative (and the per-circuit limit must be positive)" }
         require(
             maxIntroPointsPerLink <= maxIntroPointsTotal && maxPendingRendezvousPerLink <= maxPendingRendezvousTotal,
         ) {

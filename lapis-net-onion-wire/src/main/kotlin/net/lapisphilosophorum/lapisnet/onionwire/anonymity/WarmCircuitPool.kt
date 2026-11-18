@@ -142,7 +142,16 @@ internal class WarmCircuitPool(
         val key =
             taken.lastHop.identity.bytes
                 .joinToString("") { "%02x".format(it) }
-        governor.retag(taken.circuit, purpose, key)
+        if (!governor.retag(taken.circuit, purpose, key)) {
+            // the purpose has no free slot (at most one lookup circuit, wave V0.10.0-J2): the circuit stays warm
+            val kept =
+                synchronized(lock) {
+                    if (!closed) idle += taken
+                    !closed
+                }
+            if (!kept) runCatching { taken.circuit.close() }
+            return null
+        }
         return taken
     }
 

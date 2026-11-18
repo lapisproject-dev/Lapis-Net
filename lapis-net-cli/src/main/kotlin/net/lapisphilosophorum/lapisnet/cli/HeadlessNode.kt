@@ -39,9 +39,11 @@ import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityRuntime
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.AnonymityStatus
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.TrafficPaddingConfig
 import net.lapisphilosophorum.lapisnet.onionwire.anonymity.anonymityIncompleteWarning
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.NabuLookupSink
 import net.lapisphilosophorum.lapisnet.onionwire.path.PeerDirectoryRelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
+import net.lapisphilosophorum.lapisnet.storage.DeferredRemoteContentSource
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
 import net.lapisphilosophorum.lapisnet.trust.VeritasGossip
@@ -120,7 +122,8 @@ internal class HeadlessNode private constructor(
             maintenanceInterval: Duration = 60.seconds,
             maintenanceInitialDelay: Duration = 5.seconds,
             selfRecordCheckInterval: Duration = 30.seconds,
-            onionWireConfig: OnionWireConfig = OnionWireConfig(relayMode = options.onionRelay),
+            onionWireConfig: OnionWireConfig =
+                OnionWireConfig(relayMode = options.onionRelay, relayLookup = options.onionRelayLookup),
             onionKeyPassphrase: () -> CharArray? = ::resolveKeystorePassphrase,
             /** Test seam: must return a `RelayNetworkLocator`; typed `Any` so the experimental onion type does not leak to callers. */
             anonymityLocator: ((PeerDirectoryGossip) -> Any)? = null,
@@ -151,12 +154,15 @@ internal class HeadlessNode private constructor(
                 node.start(bootstrapPeers = if (confinement != null) emptyList() else bootstrapPeers)
                 rollback += { runCatching { node.stop() } }
                 val anonymousNode = options.anonymity == AnonymityMode.ON
-                // V0.10.0-J1a: in anonymity mode the node neither serves nor queries the DHT and content
+                // V0.10.0-J1a: in anonymity mode the node neither serves the DHT and content nor queries them directly;
+                // V0.10.0-J2: its misses go through circuits to LOOKUP relays (the source is bound after the runtime runs)
+                val remoteContent = if (anonymousNode) DeferredRemoteContentSource() else null
                 val storage =
                     NabuStorage.attach(
                         node,
                         dataDirectory,
                         networkMode = if (anonymousNode) StorageNetworkMode.LOCAL_ONLY else StorageNetworkMode.NETWORK,
+                        remote = remoteContent,
                     )
                 rollback += { runCatching { storage.stop() } }
                 // GossipPubSub must attach before any connect(). Anonymity mode: receive and forward only.
@@ -193,6 +199,15 @@ internal class HeadlessNode private constructor(
                                     DirectoryAnonymityMode.OFF
                                 },
                             prekeys = prekeys,
+                            // V0.10.0-J2: the LOOKUP role answers from this relay's own (network-mode) storage
+                            lookupSink =
+                                if (onionWireConfig.relayMode &&
+                                    onionWireConfig.relayLookup
+                                ) {
+                                    NabuLookupSink(storage)
+                                } else {
+                                    null
+                                },
                         )
                     } finally {
                         passphrase?.fill('\u0000')
@@ -324,6 +339,11 @@ internal class HeadlessNode private constructor(
                     val started = anonymity
                     rollback += { started.close() }
                     supervisor.register("anonymity") { started.close() }
+                    // V0.10.0-J2: bound after the start; unbound BEFORE the runtime closes (reverse order of both lists)
+                    val deferred = checkNotNull(remoteContent)
+                    deferred.bind(started.remoteContentSource())
+                    rollback += { deferred.unbind() }
+                    supervisor.register("anonymity-remote-content") { deferred.unbind() }
                 }
 
                 // Layers below the supervised parts, stopped in reverse attach order after them.
