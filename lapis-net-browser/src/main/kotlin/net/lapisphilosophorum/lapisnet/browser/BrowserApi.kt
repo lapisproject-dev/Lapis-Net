@@ -77,6 +77,11 @@ data class TimelinePostResponse(
     val ltrRecordCount: Int,
     val karmaScore: Double,
     val karmaVoteCount: Int,
+    /**
+     * V0.10.0-J3: `"local"` (the body is here), `"fetching"` (looked up through circuits), `"not-found"` (two relays
+     * did not find it) or `"unavailable"`. Without the body [text] is [CONTENT_UNAVAILABLE_MARKER].
+     */
+    val contentState: String = CONTENT_STATE_LOCAL,
 )
 
 @Serializable
@@ -324,6 +329,16 @@ data class NodeStatusResponse(
     val anonymityNoBootstrapPeers: Boolean = false,
     /** V0.10.0-J1b: no bootstrap peer serves snapshots; the guard choice relies on the gossip view. */
     val anonymityGossipOnlyRelayView: Boolean = false,
+    /** V0.10.0-J3: lookups through circuits (numbers only, never a relay identity; all 0 while the mode is off). */
+    val anonymityLookupRequested: Long = 0,
+    val anonymityLookupFound: Long = 0,
+    val anonymityLookupNotFound: Long = 0,
+    val anonymityLookupNotFoundUnconfirmed: Long = 0,
+    val anonymityLookupFailed: Long = 0,
+    val anonymityLookupRejected: Long = 0,
+    val anonymityLookupRelaysAvailable: Int = 0,
+    val anonymityLookupRelaysKnown: Int = 0,
+    val anonymityLookupRelaysOnBackoff: Int = 0,
 )
 
 /** V0.9.20 - hole-punching state for the status panel: counters only, never addresses or peer ids. */
@@ -442,21 +457,17 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
                 )
             val visible = TimelineBuilder.visible(entries, includeFilteredContent = includeFiltered)
 
+            // A gossip-received post's body bytes might not be durably stored locally - e.g. past
+            // PostAnnouncementIndex's body- or wrapper-persistence caps, or a genuine local storage fault: the
+            // entry then gets the placeholder, never fails the whole response. In anonymity mode (wave V0.10.0-J3)
+            // a missing body is looked up through circuits in the background, never blocking this request.
+            val bodies = TimelineBodyResolver(deps.storage, deps.anonymityActive).resolve(visible)
             val response =
                 visible.map { entry ->
-                    // A gossip-received post's body bytes might not be durably stored locally -
-                    // e.g. past PostAnnouncementIndex's body- or wrapper-persistence caps, or a
-                    // genuine local storage fault. NabuStorage.get() documents that a real fault
-                    // (as opposed to a plain not-found) THROWS NabuStorageException rather than
-                    // returning null - runCatching here ensures one corrupted/faulty local block
-                    // degrades to the placeholder for that entry only, never fails the whole
-                    // response (and never leaks the raw exception message, which can include
-                    // local filesystem paths - see NabuStorage's doc comments).
-                    val text =
-                        runCatching { deps.storage.get(entry.cid) }
-                            .getOrNull()
-                            ?.toString(Charsets.UTF_8)
-                            ?: CONTENT_UNAVAILABLE_MARKER
+                    val body =
+                        bodies[entry.cid]
+                            ?: TimelineBodyResolver.Body(CONTENT_UNAVAILABLE_MARKER, CONTENT_STATE_UNAVAILABLE)
+                    val text = body.text
                     TimelinePostResponse(
                         cid = entry.cid.toString(),
                         author = entry.author.fingerprint(),
@@ -469,6 +480,7 @@ fun Application.installBrowserApi(deps: BrowserApiDependencies) {
                         ltrRecordCount = entry.ltrRecordCount,
                         karmaScore = entry.karmaScore,
                         karmaVoteCount = entry.karmaVoteCount,
+                        contentState = body.contentState,
                     )
                 }
             call.respond(response)

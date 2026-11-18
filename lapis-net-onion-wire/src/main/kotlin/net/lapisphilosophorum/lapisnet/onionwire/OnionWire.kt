@@ -237,6 +237,10 @@ class OnionWire private constructor(
         lookupRelays: () -> List<OnionRelayDescriptor>,
         config: OnionLookupClientConfig = OnionLookupClientConfig(),
         prebuilt: ((net.lapisphilosophorum.lapisnet.onion.CircuitPurpose) -> WarmCircuitPool.Prebuilt?)? = null,
+        /** Wave V0.10.0-J3: the relays counted for the status (side-effect free); `null` = [lookupRelays]. */
+        relayCensus: (() -> List<OnionRelayDescriptor>)? = null,
+        /** Test seam: the client's clock (defaults to the wire's). */
+        clientClock: Clock = clock,
     ): OnionLookupClient {
         check(!closed.get()) { "closed" }
         val client =
@@ -245,9 +249,10 @@ class OnionWire private constructor(
                 paths,
                 lookupRelays,
                 config,
-                clock,
+                clientClock,
                 prebuilt = prebuilt,
                 offLoop = links::submit,
+                relayCensus = relayCensus,
             )
         hidden += client
         client.onClosed = { hidden.remove(client) }

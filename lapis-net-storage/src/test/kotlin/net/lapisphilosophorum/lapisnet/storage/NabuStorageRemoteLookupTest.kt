@@ -38,6 +38,42 @@ private class FixedSource(
     ): ByteArray? = null
 }
 
+/** Wave V0.10.0-J3: a source answering [blockState] from a map; a miss with `schedule` becomes FETCHING once. */
+private class StateSource : RemoteContentSource {
+    val views = java.util.concurrent.ConcurrentHashMap<Cid, RemoteBlockView>()
+    val scheduled =
+        java.util.concurrent.ConcurrentHashMap
+            .newKeySet<Cid>()
+    val asked = AtomicInteger()
+    val fetches = AtomicInteger()
+
+    override fun fetchBlock(
+        cid: Cid,
+        maxBytes: Int,
+        timeout: Duration,
+    ): ByteArray? {
+        fetches.incrementAndGet()
+        return null
+    }
+
+    override fun resolveIpnsRecord(
+        name: ByteArray,
+        timeout: Duration,
+    ): ByteArray? = null
+
+    override fun blockState(
+        cid: Cid,
+        schedule: Boolean,
+    ): RemoteBlockView {
+        asked.incrementAndGet()
+        views[cid]?.let { return it }
+        if (cid in scheduled) return RemoteBlockView(RemoteBlockState.FETCHING, null, newlyScheduled = false)
+        if (!schedule) return RemoteBlockView.NONE
+        scheduled += cid
+        return RemoteBlockView(RemoteBlockState.FETCHING, null, newlyScheduled = true)
+    }
+}
+
 /** Wave V0.10.0-J2: the blocking circuit lookup of a LOCAL_ONLY storage, the deferred source and the verifier. */
 class NabuStorageRemoteLookupTest :
     FunSpec({
@@ -132,6 +168,66 @@ class NabuStorageRemoteLookupTest :
                 deferred.unbind()
                 deferred.fetchBlock(cid, 100, Duration.ofSeconds(1)).shouldBeNull()
                 storage.getThroughRemote(cid, Duration.ofSeconds(1)).shouldBeNull()
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("J3 localOrRemoteState: throws in network mode; a local hit asks no source") {
+            val node = LapisNode.create(DualKeyIdentity.generate(), mdnsEnabled = false).also { it.start() }
+            try {
+                val network = NabuStorage.attach(node, Files.createTempDirectory("j3-network"))
+                shouldThrow<IllegalStateException> { network.localOrRemoteState(rawCid(byteArrayOf(1)), true) }
+            } finally {
+                node.stop()
+            }
+            val source = StateSource()
+            val (n2, storage) = localOnly(source)
+            try {
+                val cid = storage.putUnserved("held locally".toByteArray())
+                val r = storage.localOrRemoteState(cid, schedule = true)
+                r.state shouldBe RemoteBlockState.CACHED
+                r.bytes shouldBe "held locally".toByteArray()
+                r.newlyScheduled shouldBe false
+                source.asked.get() shouldBe 0
+            } finally {
+                n2.stop()
+            }
+        }
+
+        test("J3 localOrRemoteState: a cached remote block is stored unserved; a wrong one is dropped; scheduling") {
+            val good = "fetched in the background".toByteArray()
+            val goodCid = rawCid(good)
+            val badCid = rawCid("what the CID names".toByteArray())
+            val pendingCid = rawCid("still fetching".toByteArray())
+            val source = StateSource()
+            source.views[goodCid] = RemoteBlockView(RemoteBlockState.CACHED, good, newlyScheduled = false)
+            source.views[badCid] =
+                RemoteBlockView(RemoteBlockState.CACHED, "forged".toByteArray(), newlyScheduled = false)
+            val (node, storage) = localOnly(source)
+            try {
+                storage.localOrRemoteState(goodCid, schedule = true).let {
+                    it.state shouldBe RemoteBlockState.CACHED
+                    it.bytes shouldBe good
+                }
+                storage.getLocal(goodCid) shouldBe good
+                storage.localOrRemoteState(badCid, schedule = true).let {
+                    it.state shouldBe RemoteBlockState.UNAVAILABLE
+                    it.bytes.shouldBeNull()
+                }
+                storage.getLocal(badCid).shouldBeNull()
+                // the source schedules only when asked to, and the storage passes on whether this call did
+                storage.localOrRemoteState(pendingCid, schedule = false).let {
+                    it.state shouldBe RemoteBlockState.NONE
+                    it.newlyScheduled shouldBe false
+                }
+                storage.localOrRemoteState(pendingCid, schedule = true).let {
+                    it.state shouldBe RemoteBlockState.FETCHING
+                    it.newlyScheduled shouldBe true
+                }
+                storage.localOrRemoteState(pendingCid, schedule = true).newlyScheduled shouldBe false
+                // never a blocking fetch
+                source.fetches.get() shouldBe 0
             } finally {
                 node.stop()
             }

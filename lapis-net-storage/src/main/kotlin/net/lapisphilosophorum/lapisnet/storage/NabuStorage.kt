@@ -214,6 +214,9 @@ class NabuStorage private constructor(
     /** Number of Bitswap requests actually sent by [get]; lets tests observe the repeat window. */
     internal val bitswapRequestsSent = AtomicInteger()
 
+    /** Bitswap requests this storage sent so far (tests and diagnostics of other modules; a number only). */
+    val bitswapRequestCount: Int get() = bitswapRequestsSent.get()
+
     private val recentFetches: MutableMap<Pair<String, PeerId>, Long> =
         Collections.synchronizedMap(
             object : LinkedHashMap<Pair<String, PeerId>, Long>(16, 0.75f, true) {
@@ -417,6 +420,46 @@ class NabuStorage private constructor(
         runCatching { putUnserved(bytes, timeout) }
             .onFailure { logger.debug { "could not store a remotely fetched block: ${it.javaClass.simpleName}" } }
         return bytes
+    }
+
+    /** Wave V0.10.0-J3: what [localOrRemoteState] found; [bytes] only when the block is here. */
+    class LocalOrRemote(
+        bytes: ByteArray?,
+        val state: RemoteBlockState,
+        /** `true` when this call started a background lookup at the remote source. */
+        val newlyScheduled: Boolean,
+    ) {
+        private val stored = bytes?.copyOf()
+        val bytes: ByteArray? get() = stored?.copyOf()
+    }
+
+    /**
+     * Wave V0.10.0-J3: [StorageNetworkMode.LOCAL_ONLY] only, never blocks on the network. The local stores first (a hit
+     * is [RemoteBlockState.CACHED] with the bytes), then the [RemoteContentSource]'s view of [cid]; with [schedule] a
+     * miss there starts one background lookup. A block the source has cached is checked against [cid] (a mismatch is
+     * dropped and reported [RemoteBlockState.UNAVAILABLE]) and stored unserved, like [get] does.
+     */
+    fun localOrRemoteState(
+        cid: Cid,
+        schedule: Boolean,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): LocalOrRemote {
+        check(networkMode == StorageNetworkMode.LOCAL_ONLY) { "localOrRemoteState is for anonymity mode only" }
+        requirePositive(timeout)
+        val local = localLookup(cid, timeout)
+        if (local.isPresent) return LocalOrRemote(local.get(), RemoteBlockState.CACHED, newlyScheduled = false)
+        if (stopped.get()) return LocalOrRemote(null, RemoteBlockState.NONE, newlyScheduled = false)
+        val source = remote ?: return LocalOrRemote(null, RemoteBlockState.NONE, newlyScheduled = false)
+        val view = runCatching { source.blockState(cid, schedule) }.getOrNull() ?: RemoteBlockView.NONE
+        if (view.state != RemoteBlockState.CACHED) return LocalOrRemote(null, view.state, view.newlyScheduled)
+        val bytes = view.bytes
+        if (bytes == null || bytes.size > LookupLimits.MAX_CONTENT || !matchesCid(cid, bytes)) {
+            logger.debug { "remote content source returned a block that does not match its CID - dropped" }
+            return LocalOrRemote(null, RemoteBlockState.UNAVAILABLE, view.newlyScheduled)
+        }
+        runCatching { putUnserved(bytes, timeout) }
+            .onFailure { logger.debug { "could not store a remotely fetched block: ${it.javaClass.simpleName}" } }
+        return LocalOrRemote(bytes, RemoteBlockState.CACHED, view.newlyScheduled)
     }
 
     private fun fetch(

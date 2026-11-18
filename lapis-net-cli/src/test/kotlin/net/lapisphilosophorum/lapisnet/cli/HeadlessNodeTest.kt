@@ -350,7 +350,7 @@ class HeadlessNodeTest :
                     demo = {},
                 ) shouldBe 0
                 out.toString() shouldContain "anonymity=on"
-                err.toString() shouldContain "Anonymity mode is incomplete"
+                err.toString() shouldContain "Anonymity mode is experimental and incomplete"
                 err.toString() shouldContain "would reveal your IP address"
                 // the CLI has no calls: --anonymity-allow-call-media=true must not change the warning
                 val out2 = java.io.ByteArrayOutputStream()
@@ -364,7 +364,7 @@ class HeadlessNodeTest :
                     demo = {},
                 ) shouldBe 0
                 err2.toString() shouldBe err.toString()
-                err2.toString() shouldContain "calls are off"
+                err2.toString() shouldContain "Calls are off"
             } finally {
                 node.stop()
             }

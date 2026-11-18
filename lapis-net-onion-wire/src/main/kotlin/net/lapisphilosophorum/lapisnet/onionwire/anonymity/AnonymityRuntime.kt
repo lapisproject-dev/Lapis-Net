@@ -40,6 +40,7 @@ import net.lapisphilosophorum.lapisnet.onionwire.OnionServiceStreamRouter
 import net.lapisphilosophorum.lapisnet.onionwire.OnionWire
 import net.lapisphilosophorum.lapisnet.onionwire.SliceTimer
 import net.lapisphilosophorum.lapisnet.onionwire.lookup.CircuitRemoteContentSource
+import net.lapisphilosophorum.lapisnet.onionwire.lookup.LookupStatusCounters
 import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClient
 import net.lapisphilosophorum.lapisnet.onionwire.lookup.OnionLookupClientConfig
 import net.lapisphilosophorum.lapisnet.onionwire.path.CircuitBuildGovernor
@@ -166,7 +167,7 @@ class AnonymityRuntime private constructor(
             singleDirectorySource = connections?.singleDirectorySource() ?: false,
             noBootstrapPeers = connections?.noBootstrapPeers() ?: false,
             gossipOnlyRelayView = connections?.gossipOnlyRelayView() ?: false,
-        )
+        ).withLookup(runCatching { lookupClient.statusCounters() }.getOrDefault(LookupStatusCounters.ZERO))
     }
 
     /** The identities of the persisted primary and backup guard (tests only). */
@@ -377,6 +378,9 @@ class AnonymityRuntime private constructor(
         private const val INTRO_POINTS = 3
         private const val PUBLISH_CANDIDATES = 3
         private const val LOOKUP_CANDIDATES = 3
+
+        /** Endpoints counted at most for the lookup status (wave V0.10.0-J3). */
+        private const val LOOKUP_CENSUS_MAX = 64
         private const val RENDEZVOUS_ENDPOINT_TRIES = 3
 
         /** Rendezvous attempts of [connectToService]: the first and at most one retry (see [RendezvousRetry]). */
@@ -426,6 +430,8 @@ class AnonymityRuntime private constructor(
             confinedNetwork: ConfinedNetwork? = null,
             /** V0.10.0-J2: client bounds of lookups through circuits (tests shorten them). */
             lookupConfig: OnionLookupClientConfig = OnionLookupClientConfig(),
+            /** V0.10.0-J3 test seam (never set in production): only relays passing it are lookup candidates. */
+            lookupRelayFilter: ((OnionRelayDescriptor) -> Boolean)? = null,
         ): AnonymityRuntime {
             require(wire.directoryMode == DirectoryAnonymityMode.ON) { "the onion wire is not in anonymity mode" }
             val key = homeDir.toAbsolutePath().normalize()
@@ -547,13 +553,47 @@ class AnonymityRuntime private constructor(
                 val mailboxPublisher =
                     wire.mailboxPublisher(paths, { endpoints(PUBLISH_CANDIDATES) }, prebuilt = warm::take)
                 closers += { mailboxPublisher.close() }
+
+                // wave V0.10.0-J3: every usable endpoint (side-effect free, bounded), for the status and the test seam
+                fun census(): List<OnionRelayDescriptor> {
+                    val picked = ArrayList<OnionRelayDescriptor>()
+                    val exclude = HashSet<Secp256k1PublicKey>()
+                    while (picked.size < LOOKUP_CENSUS_MAX) {
+                        val d = selector.selectEndpoint(exclude) ?: break
+                        picked += d
+                        exclude += d.identity
+                    }
+                    return lookupRelayFilter?.let { f -> picked.filter(f) } ?: picked
+                }
                 // wave V0.10.0-J2: lookups through circuits; candidates are path-selector endpoints like the publishers'
                 val lookupClient =
                     wire.lookupClient(
                         paths,
-                        { endpoints(LOOKUP_CANDIDATES) },
+                        {
+                            if (lookupRelayFilter == null) {
+                                endpoints(LOOKUP_CANDIDATES)
+                            } else {
+                                census().shuffled(random).take(LOOKUP_CANDIDATES)
+                            }
+                        },
                         lookupConfig,
-                        prebuilt = warm::take,
+                        prebuilt =
+                            if (lookupRelayFilter == null) {
+                                warm::take
+                            } else {
+                                // the test seam applies to warm circuits too: one ending elsewhere is closed
+                                { p ->
+                                    warm.take(p)?.let { w ->
+                                        if (lookupRelayFilter(w.lastHop)) {
+                                            w
+                                        } else {
+                                            runCatching { w.circuit.close() }
+                                            null
+                                        }
+                                    }
+                                }
+                            },
+                        relayCensus = ::census,
                     )
                 closers += { lookupClient.close() }
                 val remoteSource = CircuitRemoteContentSource(lookupClient)

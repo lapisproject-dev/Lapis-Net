@@ -34,4 +34,52 @@ interface RemoteContentSource {
 
     /** A block this source already fetched (never blocks); may schedule a background fetch. Default: none. */
     fun blockIfCached(cid: Cid): ByteArray? = null
+
+    /**
+     * Wave V0.10.0-J3: what this source knows about [cid], without blocking. With [schedule] a miss starts at most one
+     * background lookup ([RemoteBlockView.newlyScheduled] says whether this call started it); without it nothing is
+     * started. The default answers from [blockIfCached] only.
+     */
+    fun blockState(
+        cid: Cid,
+        schedule: Boolean,
+    ): RemoteBlockView =
+        (if (schedule) blockIfCached(cid) else null)
+            ?.let { RemoteBlockView(RemoteBlockState.CACHED, it, newlyScheduled = false) }
+            ?: RemoteBlockView.NONE
+}
+
+/** Wave V0.10.0-J3: the state of a block at a [RemoteContentSource]. */
+enum class RemoteBlockState {
+    /** Fetched and verified; the bytes are there. */
+    CACHED,
+
+    /** A lookup is running. */
+    FETCHING,
+
+    /** Two relays answered NOT_FOUND (confirmed). */
+    NOT_FOUND,
+
+    /** The last lookup failed or found nothing confirmed. */
+    UNAVAILABLE,
+
+    /** Nothing known and nothing started. */
+    NONE,
+}
+
+/** What [RemoteContentSource.blockState] answers; [bytes] only with [RemoteBlockState.CACHED]. */
+class RemoteBlockView(
+    val state: RemoteBlockState,
+    bytes: ByteArray?,
+    /** `true` when this very call started the background lookup. */
+    val newlyScheduled: Boolean,
+) {
+    private val stored = bytes?.copyOf()
+    val bytes: ByteArray? get() = stored?.copyOf()
+
+    override fun toString(): String = "RemoteBlockView($state, length=${stored?.size}, newlyScheduled=$newlyScheduled)"
+
+    companion object {
+        val NONE = RemoteBlockView(RemoteBlockState.NONE, null, newlyScheduled = false)
+    }
 }

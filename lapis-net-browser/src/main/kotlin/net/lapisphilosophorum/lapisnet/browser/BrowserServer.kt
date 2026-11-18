@@ -1086,6 +1086,8 @@ class BrowserServer private constructor(
                     )
 
                 val nodeStatus: () -> NodeStatusResponse = {
+                    // V0.10.0-J3: mode off has no runtime, so every lookup number is 0
+                    val lookup = anonymityRuntime?.status() ?: AnonymityStatus.OFF
                     NodeStatusResponse(
                         reachability = wiring.reachability.name.lowercase(),
                         autoRelay = wiring.autoRelay,
@@ -1124,6 +1126,15 @@ class BrowserServer private constructor(
                         anonymityGuardConnections = anonymityRuntime?.status()?.guardConnections ?: 0,
                         anonymityNoBootstrapPeers = anonymityRuntime?.status()?.noBootstrapPeers ?: false,
                         anonymityGossipOnlyRelayView = anonymityRuntime?.status()?.gossipOnlyRelayView ?: false,
+                        anonymityLookupRequested = lookup.lookupRequested,
+                        anonymityLookupFound = lookup.lookupFound,
+                        anonymityLookupNotFound = lookup.lookupNotFound,
+                        anonymityLookupNotFoundUnconfirmed = lookup.lookupNotFoundUnconfirmed,
+                        anonymityLookupFailed = lookup.lookupFailed,
+                        anonymityLookupRejected = lookup.lookupRejected,
+                        anonymityLookupRelaysAvailable = lookup.lookupRelaysAvailable,
+                        anonymityLookupRelaysKnown = lookup.lookupRelaysKnown,
+                        anonymityLookupRelaysOnBackoff = lookup.lookupRelaysOnBackoff,
                         callMedia = callMediaPolicy.wire,
                     )
                 }

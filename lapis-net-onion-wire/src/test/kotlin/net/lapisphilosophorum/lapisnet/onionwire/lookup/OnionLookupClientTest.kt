@@ -133,7 +133,7 @@ class OnionLookupClientTest :
             }
 
         test(
-            "exactly one request per circuit: every request arrives on a circuit of its own",
+            "mailbox lookups: one request per circuit; a NOT_FOUND is cross-checked on a circuit of its own",
         ).config(timeout = 120.seconds) {
             reset()
             val handles = ConcurrentHashMap<String, Int>()
@@ -145,9 +145,14 @@ class OnionLookupClientTest :
             }
             val c = client({ descriptors })
             try {
-                repeat(3) { wait(c.fetchBlock(rawCid(block(10)), 60.seconds)) shouldBe LookupResult.NotFound }
-                handles.size shouldBe 3
+                repeat(3) {
+                    wait(c.fetchBlock(rawCid(block(10)), 60.seconds)) shouldBe LookupResult.NotFound(confirmed = true)
+                }
+                // every lookup was answered NOT_FOUND by two different exits, each on a circuit of its own
+                handles.size shouldBe 6
                 handles.values.all { it == 1 } shouldBe true
+                c.statsForTest().crossChecks shouldBe 3
+                c.statsForTest().notFound shouldBe 3
                 c.openCircuits() shouldBe 0
             } finally {
                 c.close()
@@ -159,9 +164,9 @@ class OnionLookupClientTest :
             val c = client({ descriptors })
             try {
                 val cid = rawCid(block(10))
-                wait(c.fetchBlock(cid, 60.seconds)) shouldBe LookupResult.NotFound
+                wait(c.fetchBlock(cid, 60.seconds)) shouldBe LookupResult.NotFound(confirmed = true)
                 val built = c.statsForTest().circuitsBuilt
-                wait(c.fetchBlock(cid, 60.seconds)) shouldBe LookupResult.NotFound
+                wait(c.fetchBlock(cid, 60.seconds)) shouldBe LookupResult.NotFound(confirmed = true)
                 c.statsForTest().circuitsBuilt shouldBe built
                 c.statsForTest().negativeHits shouldBe 1
             } finally {

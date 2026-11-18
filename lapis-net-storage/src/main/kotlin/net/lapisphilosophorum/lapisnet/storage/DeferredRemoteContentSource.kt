@@ -34,4 +34,9 @@ class DeferredRemoteContentSource : RemoteContentSource {
     ): ByteArray? = target.get()?.resolveIpnsRecord(name, timeout)
 
     override fun blockIfCached(cid: Cid): ByteArray? = target.get()?.blockIfCached(cid)
+
+    override fun blockState(
+        cid: Cid,
+        schedule: Boolean,
+    ): RemoteBlockView = target.get()?.blockState(cid, schedule) ?: RemoteBlockView.NONE
 }

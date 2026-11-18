@@ -139,6 +139,6 @@ class AnonymityLoggingHygieneTest :
                 text.contains("IP address") shouldBe true
             }
             (texts[1].contains("--anonymity-allow-call-media=true")) shouldBe true
-            (texts[0].contains("calls are off")) shouldBe true
+            (texts[0].contains("Calls are off")) shouldBe true
         }
     })

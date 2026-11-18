@@ -132,16 +132,16 @@ async function loadIdentity() {
 // V0.10.0-E anonymity status. The warning is a fixed text (never taken from the server), shown whenever the mode is on,
 // not dismissible. Everything is written through textContent; the node only sends enums and numbers here.
 const ANONYMITY_WARNING_TEXT =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves the DHT or content nor queries them directly (lookups go through circuits to relays that see what is asked), it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends. Calls are off because call media would reveal your IP address. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; today such lookups usually find nothing, because nodes do not announce posts in the DHT. Attachments and inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable.";
 // Used instead when calls are allowed (--anonymity-allow-call-media=true), and for an unknown/missing callMedia value
 // (fail safe: show the more alarming text).
 const ANONYMITY_WARNING_TEXT_CALL_MEDIA_EXPOSED =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves the DHT or content nor queries them directly (lookups go through circuits to relays that see what is asked), it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends. Calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; today such lookups usually find nothing, because nodes do not announce posts in the DHT. Attachments and inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable.";
 // V0.10.0-H: the same two texts for --anonymity-padding=off (also the fail-safe for an unknown/missing padding value).
 const ANONYMITY_WARNING_TEXT_PADDING_OFF =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; calls are off because call media would reveal your IP address; the transport key is fresh per run and the node neither serves the DHT or content nor queries them directly (lookups go through circuits to relays that see what is asked), it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits. Padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection. Calls are off because call media would reveal your IP address. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; today such lookups usually find nothing, because nodes do not announce posts in the DHT. Attachments and inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable.";
 const ANONYMITY_WARNING_TEXT_PADDING_OFF_CALL_MEDIA_EXPOSED =
-  "Anonymity mode is incomplete: direct messages, mail and call signals travel over circuits; padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection; but calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers; the transport key is fresh per run and the node neither serves the DHT or content nor queries them directly (lookups go through circuits to relays that see what is asked), it connects only to its two guards, and to its bootstrap peers while it lacks relays or a guard connection; each of them sees your address; posting, votes and trust grants are unavailable.";
+  "Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits. Padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection. Calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; today such lookups usually find nothing, because nodes do not announce posts in the DHT. Attachments and inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable.";
 const ANONYMITY_ERROR_LABELS = {
   "insufficient-relays": "not enough different relays known yet",
   "build-failed": "a circuit could not be built",
@@ -157,7 +157,7 @@ const ANONYMITY_STATUS_LINES = [
   "Direct messages: over circuits (no attachments)",
   "Mail: over circuits (small mail also offline; up to 1 MiB with attachments only while both are online)",
   "Call signals: through circuits",
-  "Network mesh, DHT and fetches: direct, identity and address are visible",
+  "Network mesh: guards only (they see your address); missing posts are looked up through circuits",
 ];
 
 // The call media line depends on the node's callMedia status (V0.10.0-G); fixed texts only, never server text.
@@ -204,6 +204,25 @@ function anonymityConnectionLine(status) {
   return line;
 }
 
+// V0.10.0-J3: the lookup line; fixed text and numbers only (never a relay identity)
+function lookupNumber(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
+function anonymityLookupLine(status) {
+  return (
+    "Lookups: " + lookupNumber(status.anonymityLookupRequested) + " asked, " +
+    lookupNumber(status.anonymityLookupFound) + " found, " +
+    lookupNumber(status.anonymityLookupNotFound) + " not found (" +
+    lookupNumber(status.anonymityLookupNotFoundUnconfirmed) + " unconfirmed), " +
+    lookupNumber(status.anonymityLookupFailed) + " failed, " +
+    lookupNumber(status.anonymityLookupRejected) + " rejected; " +
+    lookupNumber(status.anonymityLookupRelaysAvailable) + " of " +
+    lookupNumber(status.anonymityLookupRelaysKnown) + " lookup relay(s) available, " +
+    lookupNumber(status.anonymityLookupRelaysOnBackoff) + " on backoff"
+  );
+}
+
 function renderAnonymityStatus(status) {
   const warning = document.getElementById("anonymity-warning");
   const line = document.getElementById("node-status-anonymity");
@@ -222,6 +241,7 @@ function renderAnonymityStatus(status) {
         "On (experimental): " + status.guards + " guard(s), " + status.activeCircuits + " active circuit(s)",
         anonymityPaddingLine(status),
         anonymityConnectionLine(status),
+        anonymityLookupLine(status),
       ])
     : ["off"];
   for (const text of lines) {
@@ -287,13 +307,24 @@ async function loadPeers() {
   }
 }
 
+// V0.10.0-J3: two fixed placeholders for a body that is not here in anonymity mode (never server text). No animation,
+// no automatic reload, no re-sorting.
+const TIMELINE_TEXT_FETCHING = "Fetching through circuits; reload to see it.";
+const TIMELINE_TEXT_NOT_FOUND = "Not found through two relays.";
+
+function timelineBodyText(post) {
+  if (post.contentState === "fetching") return TIMELINE_TEXT_FETCHING;
+  if (post.contentState === "not-found") return TIMELINE_TEXT_NOT_FOUND;
+  return post.text;
+}
+
 function renderTimelineItem(post) {
   const fragment = timelineItemTemplate.content.cloneNode(true);
   const li = fragment.querySelector(".timeline-item");
 
   li.querySelector(".timeline-author").textContent = shortFingerprint(post.author);
   li.querySelector(".timeline-timestamp").textContent = formatRelativeTime(post.publishedAtEpochSeconds);
-  li.querySelector(".timeline-text").textContent = post.text;
+  li.querySelector(".timeline-text").textContent = timelineBodyText(post);
   li.querySelector(".timeline-ltr").textContent = ltrWeightText(post);
 
   // Karma is visually and structurally its own row, separate from the credibility badge above -

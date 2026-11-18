@@ -50,6 +50,20 @@ class BrowserServerAnonymityTest :
                 parsed.guards shouldBe 0
                 parsed.activeCircuits shouldBe 0
                 parsed.lastAnonymityError shouldBe "none"
+                // V0.10.0-J3: no lookup client in mode off, every lookup number is 0
+                listOf(
+                    parsed.anonymityLookupRequested,
+                    parsed.anonymityLookupFound,
+                    parsed.anonymityLookupNotFound,
+                    parsed.anonymityLookupNotFoundUnconfirmed,
+                    parsed.anonymityLookupFailed,
+                    parsed.anonymityLookupRejected,
+                ).all { it == 0L } shouldBe true
+                listOf(
+                    parsed.anonymityLookupRelaysAvailable,
+                    parsed.anonymityLookupRelaysKnown,
+                    parsed.anonymityLookupRelaysOnBackoff,
+                ).all { it == 0 } shouldBe true
                 server.anonymityRuntimeForTesting.shouldBeNull()
                 // normal mode: the direct DM path with the own mailbox topic, exactly as before
                 server.mailboxGossipOrNullForTesting.shouldNotBeNull()
@@ -156,6 +170,13 @@ class BrowserServerAnonymityTest :
                 parsed.holePunching.mode shouldBe "off"
                 parsed.holePunching.active shouldBe false
                 for (leak in listOf("127.0.0.1", "/ip4", "/tcp", "12D3Koo", "/p2p/")) body shouldNotContain leak
+                // V0.10.0-J3: the lookup numbers come from the runtime (no relay known here), never an identity
+                body shouldContain "\"anonymityLookupRequested\""
+                body shouldContain "\"anonymityLookupRelaysKnown\""
+                val runtimeStatus = server.anonymityStatus()
+                parsed.anonymityLookupRelaysKnown shouldBe runtimeStatus.lookupRelaysKnown
+                parsed.anonymityLookupRelaysKnown shouldBe 0
+                parsed.anonymityLookupRequested shouldBe runtimeStatus.lookupRequested
 
                 // the connect code would hand out the node's address (leak #17)
                 for (path in listOf("/api/connect/qr.svg", "/api/connect/info")) {
