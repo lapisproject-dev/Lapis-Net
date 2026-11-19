@@ -201,3 +201,34 @@ internal fun publishAndConvergeMailboxPointer(
     }
     error("mailbox pointer for CID ${pointer.blobCid} did not converge on topic $topic within $timeout")
 }
+
+/** A TCP listener that accepts connections and never sends or reads a byte: a dial to it hangs until the dialler's
+ * own timeout. Close it in a `finally` block. */
+class BlackHoleListener internal constructor(
+    private val server: java.net.ServerSocket,
+) : AutoCloseable {
+    private val accepted = java.util.Collections.synchronizedList(mutableListOf<java.net.Socket>())
+    private val acceptor =
+        Thread({
+            while (!server.isClosed) {
+                val socket = runCatching { server.accept() }.getOrNull() ?: break
+                accepted.add(socket)
+            }
+        }, "black-hole-listener").apply {
+            isDaemon = true
+            start()
+        }
+
+    fun multiaddr(): io.libp2p.core.multiformats.Multiaddr =
+        io.libp2p.core.multiformats
+            .Multiaddr("/ip4/127.0.0.1/tcp/${server.localPort}")
+
+    override fun close() {
+        runCatching { server.close() }
+        synchronized(accepted) { accepted.forEach { runCatching { it.close() } } }
+        acceptor.join(5_000)
+    }
+}
+
+fun blackHoleListener(): BlackHoleListener =
+    BlackHoleListener(java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress()))

@@ -3284,6 +3284,51 @@ lifecycle per stream, no ongoing multi-frame backpressure bookkeeping to get wro
 this wave's "no delivery receipts, no typing indicators, not even as stubs" scope cut: no
 application-level response frame is ever written back on a DM stream.
 
+=== Two-phase send: state under the stripe lock, network in the per-peer outbound lane
+
+_DM lock fix wave (unreleased)._ Until this fix every `DmSessionManager` send held the peer's stripe
+lock (`withPeerLock`, a `synchronized` monitor over 2,048 stripes) for the whole send, including the
+dial-slot wait (up to 15 s), the stream open (up to 15 s), the offline deposit (`NabuStorage.put` and
+a pubsub publish) and, in anonymity mode, the circuit delivery (up to 30 s). Everything else that maps
+to the same stripe waited behind it: inbound envelopes from that peer (on a Netty event-loop thread),
+mailbox pickups, rejection handling, sends to any other peer whose key lands on the same stripe, and
+the re-send after a rejection (one dial per replayed message).
+
+Every send now runs in two phases:
+
+* *Phase A, under the stripe lock, no network:* the same checks in the same order as before
+  (directory lookup before any session work, reply-route resolution and anonymous refusals before
+  the ratchet step), then a ticket is reserved in the recipient's `OutboundLanes` lane, then the
+  envelope is built and the session persisted (rule 3, persist before any externally visible
+  effect). Reserving the ticket in the same critical section as the `encrypt` makes lane order equal
+  ratchet order. A full lane refuses the send before the ratchet step.
+* *Phase B, no stripe lock:* wait until the ticket is the head of its lane, then dial and write, or
+  deposit offline, or deliver over a circuit; the ticket is released in a `finally` block.
+
+The lane keeps the old per-peer ordering (message _n_ is completely written before _n+1_ dials, so an
+`X3DH_INITIAL` always precedes the `TEXT` messages of its chain) and the `sendAuto` invariant (one
+envelope, the same bytes for online and offline). A send to the same peer still waits for the head's
+dial - on purpose, for that ordering - but the wait is now interruptible and bounded by
+`LANE_WAIT_TIMEOUT` (60 s): `send` and `sendCallSignal` then fail with a `DmSessionException`,
+`sendAuto` and `sendOffline` deposit offline (the ratchet step is already persisted, nothing is
+lost). Single flight: when an online attempt fails, every `sendAuto` already queued behind it skips its
+own dial and deposits offline at once; `send` and `sendCallSignal` still dial individually. The re-send
+after a verified rejection builds all replay envelopes in one phase A, so no user send interleaves
+with the replay. Its phase B stops at the first failed dispatch; only the items not dispatched are kept
+for the next attempt (each replayed message is sent at most once per attempt chain, never re-sent
+after it was dispatched). The failure handling takes the stripe lock again and reloads the pending
+record: if a newer rejection was accepted in between, its record and snapshot win (only items that
+were never prepared are appended to that snapshot). `stop()` closes the lanes first: every waiting send fails with "dm session manager
+stopped".
+
+Lock order: stripe lock, then the lane map's bin lock, then a lane's own lock (innermost; no I/O and
+no callback under it). Remaining exception, counted in `DmDiagnostics.dialsUnderPeerLock` and logged
+once: listeners still run inside the sender's stripe lock (documented contract), so a listener that
+sends synchronously still dials under that stripe. Unchanged: a stream promise is not closed after a
+timeout (bounded by `MAX_STREAM_LIFETIME_SECONDS`); the `sendOffline` asymmetry (session persisted
+before `NabuStorage.put`); ordering between an offline message _n_ and an online _n+1_ across a
+fallback is not guaranteed.
+
 === `DmEnvelope`/`DmEnvelopeCodec`: the outer wire frame
 
 ```
@@ -3458,6 +3503,12 @@ for the structures below, closed during this wave's own review round:
   copy never loses durable state.
 * **`DmSessionManager.dialSemaphore`** (`MAX_CONCURRENT_OUTBOUND_DIALS`, 32) — bounds simultaneous
   in-flight `send()` dials.
+* **`DmSessionManager.outboundLanes`** (`OutboundLanes`: `MAX_QUEUED_SENDS_PER_PEER`, 64 tickets per
+  peer; `MAX_ACTIVE_LANES`, 4,096 lanes; `LANE_WAIT_TIMEOUT`, 60 s; DM lock fix wave) — per-peer FIFO
+  of sends whose envelope is built and waits for its turn on the wire (see "Two-phase send"). A lane
+  exists only while it holds a ticket and is created only by outbound sends, never by inbound data.
+  Since this fix no stripe lock is held across network I/O (one counted exception: a listener that
+  sends synchronously).
 * **`DmProtocolHandler.perPeerStreamCounts`** (`MAX_CONCURRENT_STREAMS_PER_PEER`, 8, per remote
   `PeerId`) — bounds concurrent, not-yet-completed streams one connection may hold open. Backed by a
   `ConcurrentHashMap<PeerId, Int>` mutated only via `compute`/`computeIfPresent`, self-cleaning: an
@@ -3783,7 +3834,8 @@ single publish that threw aborted the rest of that tick's pass at the same posit
 SUBSEQUENT tick too (iteration order is stable), permanently starving every pointer ordered after
 the failing one of re-announcement; holding the monitor for the whole loop (up to
 `MAX_PENDING_OUTBOUND_MAILBOX_SENDS` publishes, each up to a 10s timeout) also blocked `track`, which
-`sendOffline` calls while already holding a per-peer stripe lock. Fixed by snapshotting due entries
+`sendOffline` then called while holding a per-peer stripe lock (since the DM lock fix wave it runs in the
+send's phase B, outside any stripe lock). Fixed by snapshotting due entries
 under the lock, then publishing outside it with each publish independently `try`/`caught` (log and
 continue on failure).
 
@@ -4447,7 +4499,9 @@ choosing; see `CallSdpPolicy`'s own class doc comment and `validateCandidateLine
 INSIDE `DmSessionManager.withPeerLock(sender)` — a `synchronized` (reentrant) monitor. A listener that
 synchronously called `sendCallSignal` back to the SAME peer would not deadlock, but it would run a
 network dial (up to 15s) while holding that peer's stripe lock, blocking every OTHER DM operation
-(text messages, mailbox delivery) for that peer for the duration. `CallManager.onInboundCallSignal`
+(text messages, mailbox delivery) for that peer for the duration. This still holds after the DM lock
+fix wave (two-phase send): ordinary sends no longer dial under a stripe lock, but a listener-initiated
+synchronous send does, and is counted in `DmDiagnostics.dialsUnderPeerLock`. `CallManager.onInboundCallSignal`
 therefore does nothing but decode-free dispatch onto the state thread and returns immediately; every
 outbound send in `CallManager` runs on the media thread, never inline from a signal-handling callback.
 

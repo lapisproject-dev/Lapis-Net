@@ -237,6 +237,15 @@ enum class DmSendOutcome {
  *   two [DmSessionManager] instances ever legitimately point at the same [sessionStoreDirectory]
  *   from different processes) - stated explicitly as a scope reduction from the planning notes, not
  *   a silent omission.
+ *
+ * **Two-phase send: state under the stripe lock, network in the per-peer outbound lane** (DM lock fix
+ * wave). Every send builds its envelope, persists the session (rule 3) and reserves a ticket in the
+ * recipient's [OutboundLanes] lane inside ONE [withPeerLock] critical section (phase A, no network) -
+ * so lane order equals ratchet order. The dial/write, offline deposit or circuit delivery then runs
+ * WITHOUT any stripe lock, once the ticket is the head of its lane (phase B). Inbound processing,
+ * rejection handling and sends to other peers on the same stripe therefore never wait for a dial;
+ * a second send to the SAME peer still does (ordering), bounded by [LANE_WAIT_TIMEOUT] and
+ * interruptible. See `docs/architecture.adoc`, "Two-phase send".
  */
 class DmSessionManager private constructor(
     private val localIdentity: DualKeyIdentity,
@@ -368,45 +377,168 @@ class DmSessionManager private constructor(
         return transport to transport.resolve(recipient)
     }
 
-    private fun sendAnonymousAutoLocked(
+    /**
+     * Phase A of every "auto" send (online first, offline fallback) - [sendAuto], an anonymity-mode [send], and the
+     * re-send after a verified rejection. MUST run inside [withPeerLock] for [recipient]; never touches the network.
+     * Every refusal (anonymous resolve, full lane) happens BEFORE the ratchet step; the lane ticket is reserved in the
+     * same critical section as the `encrypt`, so lane order equals ratchet order.
+     */
+    private fun prepareAutoLocked(
         recipient: Secp256k1PublicKey,
         plaintext: ByteArray,
-    ): DmSendOutcome {
-        // Every refusal happens BEFORE prepareEnvelopeLocked: a failure here must not leave a session.
-        val (transport, target) = resolveAnonymousTarget(recipient, plaintext)
-        val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
-        if (target.online &&
-            transport.deliverOnline(target, envelopeBytes, Instant.now().plus(ANONYMOUS_SEND_DEADLINE))
-        ) {
-            return DmSendOutcome.SENT_ONLINE
+    ): PreparedAuto {
+        if (anonymous) {
+            val (transport, target) = resolveAnonymousTarget(recipient, plaintext)
+            val ticket = outboundLanes.reserve(recipient)
+            try {
+                val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+                return PreparedAuto(ticket, envelopeBytes, null, transport, target)
+            } catch (t: Throwable) {
+                outboundLanes.release(ticket)
+                throw t
+            }
         }
-        transport.depositOffline(target, envelopeBytes, Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS)
-        return DmSendOutcome.QUEUED_FOR_PICKUP
+        val ticket = outboundLanes.reserve(recipient)
+        try {
+            val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+            // In-memory index lookup only (no I/O); after the envelope is built, as sendAuto always did.
+            return PreparedAuto(ticket, envelopeBytes, peerDirectory.lookup(recipient), null, null)
+        } catch (t: Throwable) {
+            outboundLanes.release(ticket)
+            throw t
+        }
+    }
+
+    /** An envelope built (and its session persisted) in phase A, waiting for its turn in the outbound lane. */
+    private class PreparedAuto(
+        val ticket: OutboundLanes.Ticket,
+        val envelopeBytes: ByteArray,
+        val record: PeerRecord?,
+        val anonymousTransport: AnonymousDmTransport?,
+        val anonymousTarget: AnonymousDmTarget?,
+    )
+
+    /**
+     * Phase B of an "auto" send. MUST run WITHOUT any stripe lock: waits for the lane turn, tries online delivery, and
+     * falls back to an offline deposit of the SAME bytes. If an online attempt ahead of this one in the lane failed,
+     * the online attempt is skipped (single flight, no second dial timeout). If the lane wait itself times out, the
+     * bytes are deposited offline outside the lane (the ratchet step is already persisted, so nothing is lost).
+     */
+    private fun dispatchAuto(
+        recipient: Secp256k1PublicKey,
+        prepared: PreparedAuto,
+    ): DmSendOutcome {
+        val head =
+            try {
+                outboundLanes.awaitTurn(prepared.ticket, laneWaitTimeout)
+            } catch (e: DmLaneWaitTimeoutException) {
+                logger.debug { "lane wait for ${who(recipient)} timed out - depositing offline" }
+                depositAutoOffline(recipient, prepared)
+                return DmSendOutcome.QUEUED_FOR_PICKUP
+            }
+        var onlineFailed = false
+        try {
+            if (!head.previousDialFailed) {
+                when (tryAutoOnline(recipient, prepared)) {
+                    OnlineAttempt.DELIVERED -> return DmSendOutcome.SENT_ONLINE
+                    OnlineAttempt.FAILED -> onlineFailed = true
+                    OnlineAttempt.NOT_ATTEMPTED -> Unit
+                }
+            }
+            depositAutoOffline(recipient, prepared)
+            return DmSendOutcome.QUEUED_FOR_PICKUP
+        } finally {
+            outboundLanes.release(prepared.ticket, onlineFailed)
+        }
+    }
+
+    private enum class OnlineAttempt { DELIVERED, FAILED, NOT_ATTEMPTED }
+
+    private fun tryAutoOnline(
+        recipient: Secp256k1PublicKey,
+        prepared: PreparedAuto,
+    ): OnlineAttempt {
+        val transport = prepared.anonymousTransport
+        if (transport != null) {
+            val target = checkNotNull(prepared.anonymousTarget)
+            beforeDispatchForTest?.invoke(recipient, prepared.envelopeBytes)
+            if (!target.online) return OnlineAttempt.NOT_ATTEMPTED
+            val delivered =
+                transport.deliverOnline(target, prepared.envelopeBytes, Instant.now().plus(ANONYMOUS_SEND_DEADLINE))
+            return if (delivered) OnlineAttempt.DELIVERED else OnlineAttempt.FAILED
+        }
+        val record = prepared.record ?: return OnlineAttempt.NOT_ATTEMPTED
+        return try {
+            dispatchOnline(recipient, record, prepared.envelopeBytes)
+            OnlineAttempt.DELIVERED
+        } catch (e: DmSessionException) {
+            logger.debug(e) {
+                "online dial/send to ${who(recipient)} failed - falling back to an offline mailbox deposit of the " +
+                    "SAME already-built envelope (no re-encrypt)"
+            }
+            OnlineAttempt.FAILED
+        }
+    }
+
+    private fun depositAutoOffline(
+        recipient: Secp256k1PublicKey,
+        prepared: PreparedAuto,
+    ) {
+        val transport = prepared.anonymousTransport
+        if (transport != null) {
+            beforeDispatchForTest?.invoke(recipient, prepared.envelopeBytes)
+            transport.depositOffline(
+                checkNotNull(prepared.anonymousTarget),
+                prepared.envelopeBytes,
+                Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS,
+            )
+        } else {
+            depositOffline(
+                recipient,
+                prepared.envelopeBytes,
+                Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
+            )
+        }
     }
 
     /**
-     * V0.10.0-G: anonymity-mode call signal. Every refusal happens BEFORE the ratchet step; never deposited offline.
-     * All "not reachable anonymously" outcomes (offline target, failed delivery) surface as the same fixed error.
+     * Phase B of a send that must go online ([send] in direct mode, [sendCallSignal]). MUST run WITHOUT any stripe
+     * lock. A failed online attempt is passed on to the tickets already waiting behind it (see [dispatchAuto]); this
+     * path itself ignores that flag and always attempts its own delivery.
      */
-    private fun sendAnonymousCallSignalLocked(
-        recipient: Secp256k1PublicKey,
-        payload: ByteArray,
-        marksAcceptance: Boolean,
+    private inline fun dispatchOnlineInLane(
+        ticket: OutboundLanes.Ticket,
+        deliver: () -> Unit,
     ) {
-        // The sealed-mailbox size ceiling does not apply: a call signal never touches a mailbox, only the live
-        // circuit stream, whose own ceiling is DmEnvelopeCodec.MAX_ENVELOPE_BYTES (payload is capped far below it).
-        val transport =
-            anonymousTransport ?: throw DmAnonymousDeliveryException(DmAnonymousFailure.ANONYMITY_NOT_READY)
-        val target = transport.resolve(recipient)
-        if (!target.online) throw DmCallSignalPathLostException()
-        val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
-        if (!transport.deliverOnline(
-                target,
-                DmEnvelopeCodec.encode(envelope),
-                Instant.now().plus(ANONYMOUS_CALL_SIGNAL_DEADLINE),
-            )
-        ) {
-            throw DmCallSignalPathLostException()
+        var onlineFailed = false
+        try {
+            outboundLanes.awaitTurn(ticket, laneWaitTimeout)
+            try {
+                deliver()
+            } catch (e: DmSessionException) {
+                onlineFailed = true
+                throw e
+            }
+        } finally {
+            outboundLanes.release(ticket, onlineFailed)
+        }
+    }
+
+    /** Phase B of an offline-only deposit. MUST run WITHOUT any stripe lock. A lane wait timeout deposits anyway
+     * (outside the lane): an offline deposit never loses the already persisted ratchet step. */
+    private inline fun depositInLane(
+        ticket: OutboundLanes.Ticket,
+        deposit: () -> Unit,
+    ) {
+        try {
+            try {
+                outboundLanes.awaitTurn(ticket, laneWaitTimeout)
+            } catch (e: DmLaneWaitTimeoutException) {
+                logger.debug { "lane wait timed out - depositing outside the lane" }
+            }
+            deposit()
+        } finally {
+            outboundLanes.release(ticket)
         }
     }
 
@@ -473,6 +605,23 @@ class DmSessionManager private constructor(
 
     private val dialSemaphore = Semaphore(MAX_CONCURRENT_OUTBOUND_DIALS)
 
+    /** Per-peer FIFO send lanes of the two-phase send - see [OutboundLanes] and the class doc comment. */
+    private val outboundLanes = OutboundLanes(MAX_QUEUED_SENDS_PER_PEER, MAX_ACTIVE_LANES)
+
+    /** How long a send waits for earlier sends to the same peer; overridable for tests. */
+    @Volatile
+    internal var laneWaitTimeout: Duration = LANE_WAIT_TIMEOUT
+
+    private val ctrDialsUnderPeerLock = AtomicLong()
+    private val dialUnderPeerLockLogged = AtomicBoolean(false)
+
+    /** Test seam: every stream open attempt in [dispatchVia] (dials, reply-route streams, rejection streams). */
+    internal val dialAttemptsForTest = AtomicLong()
+
+    internal fun outboundLanesForTest(): OutboundLanes = outboundLanes
+
+    internal fun availableDialPermitsForTest(): Int = dialSemaphore.availablePermits()
+
     private class ReplyRouteEntry(
         val identity: Secp256k1PublicKey,
         val peerId: PeerId,
@@ -526,6 +675,7 @@ class DmSessionManager private constructor(
             rebootstrapsAfterRejection = ctrRebootstrapsAfterRejection.get(),
             rebootstrapsUnacked = ctrRebootstrapsUnacked.get(),
             textRejectedNoSession = ctrTextRejectedNoSession.get(),
+            dialsUnderPeerLock = ctrDialsUnderPeerLock.get(),
         )
 
     /**
@@ -646,7 +796,9 @@ class DmSessionManager private constructor(
      * the only cost is that two different peers landing on the same stripe serialize against each other
      * unnecessarily sometimes, never a correctness issue (a stripe lock is always a strict superset of
      * the per-peer mutual exclusion this class actually needs, so two DIFFERENT peers sharing a stripe
-     * only ever costs extra contention, never lets two operations on the SAME peer run concurrently). */
+     * only ever costs extra contention, never lets two operations on the SAME peer run concurrently).
+     * Since the two-phase send no stripe is held across network I/O (see the class doc comment), so
+     * that contention is short: session state and its disk persistence only. */
     private val peerLockStripes: Array<Any> = Array(PEER_LOCK_STRIPE_COUNT) { Any() }
 
     /** [Secp256k1PublicKey.hashCode] is cached and content-derived (see that class's own doc comment),
@@ -774,7 +926,9 @@ class DmSessionManager private constructor(
     /** Registers a listener invoked for every successfully decrypted inbound message, from within
      * the same [withPeerLock] critical section that persisted it - see
      * [handleInboundEnvelope]'s doc comment. A listener that throws is caught and logged; it never
-     * prevents delivery to other listeners or corrupts this manager's own state. */
+     * prevents delivery to other listeners or corrupts this manager's own state. A listener must not
+     * send synchronously: such a send dials while the sender's stripe lock is held (counted in
+     * [DmDiagnostics.dialsUnderPeerLock]) and may wait up to [LANE_WAIT_TIMEOUT] for its lane turn. */
     fun addInboundListener(listener: (DmInboundMessage) -> Unit) {
         inboundListeners.add(listener)
     }
@@ -869,7 +1023,8 @@ class DmSessionManager private constructor(
      * bootstraps a session (X3DH first contact, or reuse of an existing/persisted session), persists
      * the post-encrypt session state BEFORE putting the ciphertext on the wire (mirroring
      * [DoubleRatchetSession]'s own "persist and destroy ordering" rule 3), then dials [recipient]'s
-     * current address via [DmProtocol] and writes exactly one [DmEnvelope] frame.
+     * current address via [DmProtocol] and writes exactly one [DmEnvelope] frame. The dial runs
+     * outside the stripe lock, after earlier sends to [recipient] (two-phase send, see the class doc).
      *
      * **V0.8.6: takes a [DmContent], not a raw [ByteArray]** - the former `plaintext: ByteArray`
      * overload has been REMOVED, not kept as a convenience wrapper (a `ByteArray` -> `DmContent`
@@ -886,9 +1041,11 @@ class DmSessionManager private constructor(
      *   A refused `X3DH_INITIAL` is still reported as sent; recovery after an authenticated rejection is
      *   asynchronous (see `docs/architecture.adoc`, "One-time-prekey collisions and authenticated handshake
      *   rejection").
-     * @throws DmSessionException for a dial/send timeout or failure, or if the session cannot
-     *   currently send (should not happen for a caller-visible session - see
-     *   [DoubleRatchetSession.canSend]).
+     * @throws DmSessionException for a dial/send timeout or failure, if [MAX_QUEUED_SENDS_PER_PEER]
+     *   sends to [recipient] are already queued (thrown before the ratchet step), if earlier sends to
+     *   [recipient] did not finish within [LANE_WAIT_TIMEOUT], if the waiting thread is interrupted
+     *   (interrupt flag restored) or the manager stops, or if the session cannot currently send
+     *   (should not happen for a caller-visible session - see [DoubleRatchetSession.canSend]).
      */
     fun send(
         recipient: Secp256k1PublicKey,
@@ -896,26 +1053,35 @@ class DmSessionManager private constructor(
     ) {
         val plaintext = DmContentCodec.encode(content)
         if (anonymous) {
-            withPeerLock(recipient) { sendAnonymousAutoLocked(recipient, plaintext) }
+            val prepared = withPeerLock(recipient) { prepareAutoLocked(recipient, plaintext) }
+            dispatchAuto(recipient, prepared)
             return
         }
-        withPeerLock(recipient) {
-            // Directory lookup happens FIRST, before any X3DH/encrypt/persist work below - see this
-            // function's own doc comment and the CRITICAL review finding it fixes. PeerRecord and
-            // PrekeyBundle have independent TTL/propagation lifecycles, so it is realistic for the
-            // bundle lookup (inside prepareEnvelopeLocked) to succeed while this lookup fails; if
-            // that check ran AFTER a brand-new session was already persisted+cached, this recipient
-            // would end up with a durable phantom session here that the recipient never received the
-            // X3DH_INITIAL envelope to bootstrap their own side of - every subsequent send() would
-            // then silently reuse that phantom session forever. Failing here, before any session
-            // state exists yet, makes the whole first-contact attempt a no-op on failure.
-            val record =
-                peerDirectory.lookup(recipient)
-                    ?: throw DmUnknownRecipientException("no directory record for ${who(recipient)}")
-
-            val envelope = prepareEnvelopeLocked(recipient, plaintext)
-            dispatchOnlineLocked(recipient, record, DmEnvelopeCodec.encode(envelope))
-        }
+        // Phase A (stripe lock, no network) builds and persists the envelope and reserves the lane ticket; phase B
+        // (no stripe lock) waits for the turn and dials. See the class doc comment, "Two-phase send".
+        val (record, ticket, envelopeBytes) =
+            withPeerLock(recipient) {
+                // Directory lookup happens FIRST, before any X3DH/encrypt/persist work below - see this
+                // function's own doc comment and the CRITICAL review finding it fixes. PeerRecord and
+                // PrekeyBundle have independent TTL/propagation lifecycles, so it is realistic for the
+                // bundle lookup (inside prepareEnvelopeLocked) to succeed while this lookup fails; if
+                // that check ran AFTER a brand-new session was already persisted+cached, this recipient
+                // would end up with a durable phantom session here that the recipient never received the
+                // X3DH_INITIAL envelope to bootstrap their own side of - every subsequent send() would
+                // then silently reuse that phantom session forever. Failing here, before any session
+                // state exists yet, makes the whole first-contact attempt a no-op on failure.
+                val found =
+                    peerDirectory.lookup(recipient)
+                        ?: throw DmUnknownRecipientException("no directory record for ${who(recipient)}")
+                val reserved = outboundLanes.reserve(recipient)
+                try {
+                    Triple(found, reserved, DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext)))
+                } catch (t: Throwable) {
+                    outboundLanes.release(reserved)
+                    throw t
+                }
+            }
+        dispatchOnlineInLane(ticket) { dispatchOnline(recipient, record, envelopeBytes) }
     }
 
     /**
@@ -996,21 +1162,29 @@ class DmSessionManager private constructor(
     ) {
         val plaintext = DmContentCodec.encode(content)
         if (anonymous) {
-            withPeerLock(recipient) {
-                val (transport, target) = resolveAnonymousTarget(recipient, plaintext)
-                val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
-                transport.depositOffline(
+            val prepared = withPeerLock(recipient) { prepareAutoLocked(recipient, plaintext) }
+            val target = checkNotNull(prepared.anonymousTarget)
+            depositInLane(prepared.ticket) {
+                beforeDispatchForTest?.invoke(recipient, prepared.envelopeBytes)
+                checkNotNull(prepared.anonymousTransport).depositOffline(
                     target,
-                    envelopeBytes,
+                    prepared.envelopeBytes,
                     minOf(notValidAfterEpochSecond, Instant.now().epochSecond + ANONYMOUS_OFFLINE_TTL_SECONDS),
                 )
             }
             return
         }
-        withPeerLock(recipient) {
-            val envelope = prepareEnvelopeLocked(recipient, plaintext)
-            depositOfflineLocked(recipient, DmEnvelopeCodec.encode(envelope), notValidAfterEpochSecond)
-        }
+        val (ticket, envelopeBytes) =
+            withPeerLock(recipient) {
+                val reserved = outboundLanes.reserve(recipient)
+                try {
+                    reserved to DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
+                } catch (t: Throwable) {
+                    outboundLanes.release(reserved)
+                    throw t
+                }
+            }
+        depositInLane(ticket) { depositOffline(recipient, envelopeBytes, notValidAfterEpochSecond) }
     }
 
     /**
@@ -1033,36 +1207,18 @@ class DmSessionManager private constructor(
      *
      * Returns [DmSendOutcome.SENT_ONLINE] also for an `X3DH_INITIAL` the recipient later refuses (one-time-prekey
      * collision); the authenticated rejection and the re-bootstrap happen asynchronously. Throws as [send].
+     *
+     * Two-phase send: the envelope is built under the stripe lock; the online attempt and the offline fallback run
+     * outside it, in the recipient's lane. An online attempt that failed ahead of this call in the lane makes this
+     * call deposit offline at once (single flight); a lane wait longer than [LANE_WAIT_TIMEOUT] deposits offline too.
      */
     fun sendAuto(
         recipient: Secp256k1PublicKey,
         content: DmContent,
     ): DmSendOutcome {
         val plaintext = DmContentCodec.encode(content)
-        if (anonymous) return withPeerLock(recipient) { sendAnonymousAutoLocked(recipient, plaintext) }
-        return withPeerLock(recipient) {
-            val envelope = prepareEnvelopeLocked(recipient, plaintext)
-            val envelopeBytes = DmEnvelopeCodec.encode(envelope)
-
-            val record = peerDirectory.lookup(recipient)
-            if (record != null) {
-                try {
-                    dispatchOnlineLocked(recipient, record, envelopeBytes)
-                    return@withPeerLock DmSendOutcome.SENT_ONLINE
-                } catch (e: DmSessionException) {
-                    logger.debug(e) {
-                        "sendAuto: online dial/send to ${who(recipient)} failed - falling back to an " +
-                            "offline mailbox deposit of the SAME already-built envelope (no re-encrypt)"
-                    }
-                }
-            }
-            depositOfflineLocked(
-                recipient,
-                envelopeBytes,
-                Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS,
-            )
-            DmSendOutcome.QUEUED_FOR_PICKUP
-        }
+        val prepared = withPeerLock(recipient) { prepareAutoLocked(recipient, plaintext) }
+        return dispatchAuto(recipient, prepared)
     }
 
     /**
@@ -1126,24 +1282,84 @@ class DmSessionManager private constructor(
             )
         }
         if (anonymous) {
-            withPeerLock(recipient) { sendAnonymousCallSignalLocked(recipient, payload, marksAcceptance) }
+            sendAnonymousCallSignal(recipient, payload, marksAcceptance)
             return
         }
-        withPeerLock(recipient) {
-            // V0.9.19: resolve the target BEFORE advancing the ratchet - an unsendable signal must
-            // not consume a ratchet step. The directory always wins; the reply route is only an
-            // address fallback and never changes WHETHER a signal is sent.
-            val record = peerDirectory.lookup(recipient)
-            val connection = if (record == null) resolveReplyRouteLocked(recipient, replyRoute) else null
-            val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
-            val bytes = DmEnvelopeCodec.encode(envelope)
-            if (record != null) {
-                dispatchOnlineLocked(recipient, record, bytes)
+        val prepared =
+            withPeerLock(recipient) {
+                // V0.9.19: resolve the target BEFORE advancing the ratchet - an unsendable signal must
+                // not consume a ratchet step. The directory always wins; the reply route is only an
+                // address fallback and never changes WHETHER a signal is sent. Both are in-memory only.
+                val record = peerDirectory.lookup(recipient)
+                val connection = if (record == null) resolveReplyRouteLocked(recipient, replyRoute) else null
+                val ticket = outboundLanes.reserve(recipient)
+                try {
+                    val bytes = DmEnvelopeCodec.encode(prepareCallEnvelopeLocked(recipient, payload, marksAcceptance))
+                    PreparedCallSignal(ticket, bytes, record, connection)
+                } catch (t: Throwable) {
+                    outboundLanes.release(ticket)
+                    throw t
+                }
+            }
+        dispatchOnlineInLane(prepared.ticket) {
+            if (prepared.record != null) {
+                dispatchOnline(recipient, prepared.record, prepared.envelopeBytes)
             } else {
-                dispatchOnConnectionLocked(recipient, connection!!, bytes)
+                dispatchOnConnection(recipient, checkNotNull(prepared.connection), prepared.envelopeBytes)
                 callSignalsSentViaReplyRoute.incrementAndGet()
                 logger.debug { "call signal to ${who(recipient)} sent via reply route" }
             }
+        }
+    }
+
+    private class PreparedCallSignal(
+        val ticket: OutboundLanes.Ticket,
+        val envelopeBytes: ByteArray,
+        val record: PeerRecord?,
+        val connection: Connection?,
+    )
+
+    /**
+     * V0.10.0-G: anonymity-mode call signal. Every refusal happens BEFORE the ratchet step; never deposited offline.
+     * All "not reachable anonymously" outcomes (offline target, failed delivery, lane wait timeout) surface as the
+     * same fixed error. Phase A under the stripe lock, the circuit delivery in phase B without it.
+     */
+    private fun sendAnonymousCallSignal(
+        recipient: Secp256k1PublicKey,
+        payload: ByteArray,
+        marksAcceptance: Boolean,
+    ) {
+        val (target, ticket, bytes) =
+            withPeerLock(recipient) {
+                // The sealed-mailbox size ceiling does not apply: a call signal never touches a mailbox, only the live
+                // circuit stream, whose own ceiling is DmEnvelopeCodec.MAX_ENVELOPE_BYTES (payload is capped far below).
+                val transport =
+                    anonymousTransport ?: throw DmAnonymousDeliveryException(DmAnonymousFailure.ANONYMITY_NOT_READY)
+                val resolved = transport.resolve(recipient)
+                if (!resolved.online) throw DmCallSignalPathLostException()
+                val reserved = outboundLanes.reserve(recipient)
+                try {
+                    val envelope = prepareCallEnvelopeLocked(recipient, payload, marksAcceptance)
+                    Triple(transport to resolved, reserved, DmEnvelopeCodec.encode(envelope))
+                } catch (t: Throwable) {
+                    outboundLanes.release(reserved)
+                    throw t
+                }
+            }
+        var onlineFailed = false
+        try {
+            try {
+                outboundLanes.awaitTurn(ticket, laneWaitTimeout)
+            } catch (e: DmLaneWaitTimeoutException) {
+                throw DmCallSignalPathLostException()
+            }
+            beforeDispatchForTest?.invoke(recipient, bytes)
+            if (!target.first.deliverOnline(target.second, bytes, Instant.now().plus(ANONYMOUS_CALL_SIGNAL_DEADLINE))) {
+                onlineFailed = true
+                throw DmCallSignalPathLostException()
+            }
+        } finally {
+            outboundLanes.release(ticket, onlineFailed)
         }
     }
 
@@ -1222,13 +1438,13 @@ class DmSessionManager private constructor(
             )
     }
 
-    /** MUST run inside [withPeerLock]. Like [dispatchOnlineLocked] but opens the stream on an
-     * already-established [connection] - never dials. */
-    private fun dispatchOnConnectionLocked(
+    /** Phase B (no stripe lock). Like [dispatchOnline] but opens the stream on an already-established
+     * [connection] - never dials. */
+    private fun dispatchOnConnection(
         recipient: Secp256k1PublicKey,
         connection: Connection,
         envelopeBytes: ByteArray,
-    ) = dispatchViaLocked(recipient, envelopeBytes, "open stream to ${who(recipient)} for call signal") {
+    ) = dispatchVia(recipient, envelopeBytes, "open stream to ${who(recipient)} for call signal") {
         dmProtocol.openStreamOn(connection)
     }
 
@@ -1405,29 +1621,53 @@ class DmSessionManager private constructor(
         return envelope
     }
 
-    /** MUST be called from within a [withPeerLock] critical section for [recipient] - the online
-     * dial-and-write tail [send] and [sendAuto] share. */
-    private fun dispatchOnlineLocked(
+    /** Phase B (no stripe lock): the online dial-and-write tail [send], [sendAuto] and [sendCallSignal] share. */
+    private fun dispatchOnline(
         recipient: Secp256k1PublicKey,
         record: PeerRecord,
         envelopeBytes: ByteArray,
-    ) = dispatchViaLocked(recipient, envelopeBytes, "dial ${who(recipient)} for DM send") {
+    ) = dispatchVia(recipient, envelopeBytes, "dial ${who(recipient)} for DM send") {
         dmProtocol.dial(node, record.peerId, *record.addresses.toTypedArray())
     }
 
-    private fun dispatchViaLocked(
+    /**
+     * Dials (or opens a stream) and writes one frame. Waits up to [DIAL_TIMEOUT] for a dial slot and up to
+     * [DIAL_TIMEOUT] for the stream. Must be called WITHOUT the recipient's stripe lock - the whole point of the
+     * two-phase send. The one known caller that still holds a stripe lock here is a listener that sends synchronously
+     * from inside an inbound callback (a documented contract violation, see [addInboundListener]); that case is
+     * counted in [DmDiagnostics.dialsUnderPeerLock] and logged once, never thrown.
+     */
+    private fun dispatchVia(
         recipient: Secp256k1PublicKey,
         envelopeBytes: ByteArray,
         awaitDescription: String,
         openStream: () -> io.libp2p.core.StreamPromise<out DmStreamRole>,
     ) {
-        if (!dialSemaphore.tryAcquire(DIAL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+        if (Thread.holdsLock(stripeFor(recipient))) {
+            ctrDialsUnderPeerLock.incrementAndGet()
+            if (dialUnderPeerLockLogged.compareAndSet(false, true)) {
+                logger.warn {
+                    "a DM dial runs while the caller holds the peer's stripe lock (a listener sending " +
+                        "synchronously?) - inbound traffic on that stripe waits for it; send from another thread"
+                }
+            }
+        }
+        beforeDispatchForTest?.invoke(recipient, envelopeBytes)
+        val acquired =
+            try {
+                dialSemaphore.tryAcquire(DIAL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw DmSessionException("interrupted waiting for an outbound dial slot", e)
+            }
+        if (!acquired) {
             throw DmSessionException(
                 "timed out waiting for an available outbound dial slot " +
                     "(MAX_CONCURRENT_OUTBOUND_DIALS=$MAX_CONCURRENT_OUTBOUND_DIALS)",
             )
         }
         try {
+            dialAttemptsForTest.incrementAndGet()
             val promise =
                 try {
                     openStream()
@@ -1462,7 +1702,7 @@ class DmSessionManager private constructor(
     }
 
     /**
-     * MUST be called from within a [withPeerLock] critical section for [recipient] - the offline
+     * Phase B (no stripe lock needed: touches no session state) - the offline
      * Nabu-mailbox deposit tail [sendOffline] and [sendAuto] share: durably stores [envelopeBytes]
      * in Nabu ([NabuStorage.put]) BEFORE announcing a [MailboxPointer] referencing that blob's CID -
      * "persist then publish, publish strictly last": a fast-arriving pointer can never reference a
@@ -1479,11 +1719,12 @@ class DmSessionManager private constructor(
      * re-announcement [MailboxRedeliveryScheduler]'s own class doc establishes as the ONLY way an
      * offline recipient ever learns a pointer exists.
      */
-    private fun depositOfflineLocked(
+    private fun depositOffline(
         recipient: Secp256k1PublicKey,
         envelopeBytes: ByteArray,
         notValidAfterEpochSecond: Long,
     ) {
+        beforeDispatchForTest?.invoke(recipient, envelopeBytes)
         val blobCid: Cid = nabuStorage.put(envelopeBytes)
         val pointer =
             MailboxPointer.create(
@@ -2086,6 +2327,18 @@ class DmSessionManager private constructor(
     @Volatile
     internal var onDirectFrameSentForTest: ((ByteArray) -> Unit)? = null
 
+    /** Test seam: called right before a frame goes to the network or the mailbox (stream open, anonymous online
+     * delivery, offline deposit), with the recipient and the envelope bytes. */
+    @Volatile
+    internal var beforeDispatchForTest: ((recipient: Secp256k1PublicKey, envelopeBytes: ByteArray) -> Unit)? = null
+
+    /** Test seam: whether the calling thread holds [peer]'s stripe lock. */
+    internal fun holdsPeerLockForTest(peer: Secp256k1PublicKey): Boolean = Thread.holdsLock(stripeFor(peer))
+
+    /** Test seam: the stripe index [peer] maps to (stripe-collision tests). */
+    internal fun stripeIndexForTest(peer: Secp256k1PublicKey): Int =
+        (peer.hashCode() and Int.MAX_VALUE) % PEER_LOCK_STRIPE_COUNT
+
     /** Test seam: when set, re-send tasks are handed to it (delay in ms) instead of [rebootstrapScheduler]. */
     internal var scheduleForTest: ((delayMillis: Long, task: () -> Unit) -> Unit)? = null
 
@@ -2134,6 +2387,15 @@ class DmSessionManager private constructor(
         val items = ArrayDeque<ByteArray>()
         var bytes = 0
         var overflowLogged = false
+
+        /** Set when [takeReplayBuffer] turned this buffer into a rejection snapshot (not on a plain clear). */
+        private var takenAsSnapshot = false
+
+        fun markTakenAsSnapshot() {
+            takenAsSnapshot = true
+        }
+
+        fun takenAsSnapshot(): Boolean = synchronized(this) { takenAsSnapshot }
 
         fun clear() {
             items.forEach { it.fill(0) }
@@ -2223,12 +2485,12 @@ class DmSessionManager private constructor(
                     // without a live context (offline mailbox) the claimed sender's directory record is dialled.
                     val connection = onlinePeerId?.let { node.liveConnectionTo(it) }
                     if (connection != null) {
-                        dispatchViaLocked(claimedSender, bytes, "open stream for X3DH rejection") {
+                        dispatchVia(claimedSender, bytes, "open stream for X3DH rejection") {
                             dmProtocol.openStreamOn(connection)
                         }
                     } else {
                         val record = peerDirectory.lookup(claimedSender) ?: return
-                        dispatchOnlineLocked(claimedSender, record, bytes)
+                        dispatchOnline(claimedSender, record, bytes)
                     }
                     true
                 }
@@ -2380,39 +2642,68 @@ class DmSessionManager private constructor(
         attempt: Int,
     ) {
         try {
-            withPeerLock(peer) {
-                // No pending record any more = the new chain was acknowledged meanwhile: still replay the snapshot.
-                val pending = loadPendingInitiation(peer)
-                if (pending?.gaveUp == true) {
-                    pendingReplays.remove(peer)?.forEach { it.fill(0) }
-                    return@withPeerLock
-                }
-                // The snapshot taken when the rejection was accepted: exactly the messages sent under the refused
-                // initiation. Later user sends belong to the new chain and are not part of it (no duplicates).
-                val items = pendingReplays.remove(peer) ?: return@withPeerLock
-                if (items.isEmpty()) return@withPeerLock
-                var index = 0
-                try {
-                    while (index < items.size) {
-                        deliverAutoLocked(peer, items[index])
-                        index++
-                    }
-                    ctrRebootstrapsAfterRejection.incrementAndGet()
-                } catch (e: DmSessionException) {
-                    // Nothing sent yet: keep the snapshot for the next attempt. After a partial send the sent items are
-                    // buffered under the new chain already; the rest is dropped (reported via the log only).
-                    if (index == 0) pendingReplays[peer] = items.map { it.copyOf() }
-                    if (attempt >= MAX_RESEND_ATTEMPTS) {
-                        pending?.let { savePendingInitiation(peer, it.copy(gaveUp = true)) }
+            // Phase A: one stripe-lock hold builds (and persists) ALL replay envelopes, so no user send interleaves
+            // with the replay and lane order equals ratchet order. No network here.
+            val phaseA =
+                withPeerLock(peer) {
+                    // No pending record any more = the new chain was acknowledged meanwhile: still replay the snapshot.
+                    val pending = loadPendingInitiation(peer)
+                    if (pending?.gaveUp == true) {
                         pendingReplays.remove(peer)?.forEach { it.fill(0) }
-                        logger.info { "giving up re-initiation with ${who(peer)} (${e::class.simpleName})" }
-                    } else {
-                        logger.debug { "re-initiation with ${who(peer)} postponed (${e::class.simpleName})" }
-                        scheduleResend(peer, RESEND_RETRY_DELAY.toMillis() * attempt, attempt + 1)
+                        return@withPeerLock null
                     }
-                } finally {
-                    items.forEach { it.fill(0) }
+                    // The snapshot taken when the rejection was accepted: exactly the messages sent under the refused
+                    // initiation. Later user sends belong to the new chain and are not part of it (no duplicates).
+                    val items = pendingReplays.remove(peer) ?: return@withPeerLock null
+                    if (items.isEmpty()) return@withPeerLock null
+                    val prepared = ArrayList<PreparedAuto>(items.size)
+                    val replayEntries = ArrayList<ReplayEntry?>(items.size)
+                    var failure: DmSessionException? = null
+                    for (item in items) {
+                        try {
+                            val tailBefore = replayTail(peer)
+                            prepared += prepareAutoLocked(peer, item)
+                            replayEntries += newReplayEntry(peer, tailBefore)
+                        } catch (e: DmSessionException) {
+                            failure = e
+                            break
+                        } catch (t: Throwable) {
+                            // Unexpected: free the tickets already reserved, or they would block the lane for good.
+                            prepared.forEach { outboundLanes.release(it.ticket) }
+                            throw t
+                        }
+                    }
+                    // The record as phase A left it (a new initiation replaces it): the failure handling below compares
+                    // against it to see whether a newer rejection or initiation took over meanwhile.
+                    ResendBatch(items, prepared, replayEntries, failure, loadPendingInitiation(peer))
+                } ?: return
+            // Phase B: deliver what was prepared, in order, without the stripe lock. `dispatched` counts every
+            // successful dispatch, also after a prepare failure (those items are encrypted and buffered under the new
+            // chain already, so they are still delivered). The first dispatch failure ends the loop: what follows stays
+            // undispatched (its ticket is freed below) and is replayed on the next attempt, in order and exactly once.
+            // `prepared` is a prefix of `items` and the dispatched ones a prefix of `prepared`.
+            var dispatched = 0
+            var failure = phaseA.prepareFailure
+            try {
+                for (prepared in phaseA.prepared) {
+                    try {
+                        dispatchAuto(peer, prepared)
+                        dispatched++
+                    } catch (e: DmSessionException) {
+                        if (failure == null) failure = e
+                        break
+                    }
                 }
+                if (failure == null) {
+                    ctrRebootstrapsAfterRejection.incrementAndGet()
+                    return
+                }
+                val error = failure
+                withPeerLock(peer) { handleResendFailureLocked(peer, attempt, phaseA, dispatched, error) }
+            } finally {
+                // Idempotent: frees the tickets of items not dispatched because an unexpected exception ended the loop.
+                phaseA.prepared.forEach { outboundLanes.release(it.ticket) }
+                phaseA.items.forEach { it.fill(0) }
             }
         } catch (e: RuntimeException) {
             logger.warn { "unexpected failure re-initiating a session - ignored (${e::class.simpleName})" }
@@ -2421,26 +2712,175 @@ class DmSessionManager private constructor(
         }
     }
 
-    /** MUST run inside [withPeerLock]. Builds an envelope for [plaintext] and delivers it like [sendAuto]. */
-    private fun deliverAutoLocked(
-        recipient: Secp256k1PublicKey,
-        plaintext: ByteArray,
+    private class ResendBatch(
+        val items: List<ByteArray>,
+        val prepared: List<PreparedAuto>,
+        /**
+         * Parallel to [prepared]: where phase A put each item into the LIVE replay buffer (null = not buffered, e.g.
+         * the buffer was full or no pending record existed). Used to keep an item in at most one replay.
+         */
+        val replayEntries: List<ReplayEntry?>,
+        val prepareFailure: DmSessionException?,
+        /** The pending record at the END of phase A (after a new initiation of the first item, if any). */
+        val pendingAfterPrepare: DmPendingInitiation?,
+    )
+
+    /**
+     * MUST run inside [withPeerLock]. The failure path of [resendAfterRejection], after phase B ran WITHOUT the stripe
+     * lock: meanwhile [handleX3dhRejection] may have accepted a newer rejection (newer record, its own snapshot in
+     * [pendingReplays], its own scheduled re-send, which may even have run already), or a user send may have
+     * re-initiated. The record is therefore reloaded and only written while it is still the one phase A left behind;
+     * a newer snapshot is never replaced.
+     *
+     * Every body must end up in exactly one replay. The undispatched items fall into three groups:
+     * - never prepared: in no buffer and no snapshot, always carried forward;
+     * - prepared and still in the live buffer (no rejection, acknowledgement or fallback (a) since phase A): taken OUT
+     *   of the live buffer and carried forward, since the next attempt prepares and buffers them again;
+     * - prepared, but their live buffer was taken as the snapshot of a newer rejection: that snapshot (waiting or
+     *   already replayed) contains them, so they are NOT carried. If the buffer was only cleared (acknowledgement,
+     *   fallback (a)) or never held them, no snapshot has them and they are carried.
+     *
+     * Where the carried items go:
+     * - Changed record and a newer snapshot waiting: appended to it; its own scheduled re-send carries them.
+     * - Nothing to carry: done (a newer re-send covers everything).
+     * - Unchanged record at the attempt cap: the CURRENT record is marked [DmPendingInitiation.gaveUp] and the items
+     *   are dropped. Otherwise they become the snapshot of the next attempt (a changed record is not touched).
+     */
+    private fun handleResendFailureLocked(
+        peer: Secp256k1PublicKey,
+        attempt: Int,
+        batch: ResendBatch,
+        dispatched: Int,
+        error: DmSessionException,
     ) {
-        if (anonymous) {
-            sendAnonymousAutoLocked(recipient, plaintext)
+        val current = loadPendingInitiation(peer)
+        val superseded = !sameInitiationState(current, batch.pendingAfterPrepare)
+        val reason = error::class.simpleName
+        if (superseded && current?.gaveUp == true) {
+            logger.debug { "re-initiation with ${who(peer)} superseded by a give-up ($reason)" }
             return
         }
-        val envelopeBytes = DmEnvelopeCodec.encode(prepareEnvelopeLocked(recipient, plaintext))
-        val record = peerDirectory.lookup(recipient)
-        if (record != null) {
-            try {
-                dispatchOnlineLocked(recipient, record, envelopeBytes)
-                return
-            } catch (e: DmSessionException) {
-                logger.debug { "re-send to ${who(recipient)} online failed - depositing offline" }
+        val carried = ArrayList<ByteArray>(batch.items.size - dispatched)
+        val liveEntries = ArrayList<ReplayEntry>()
+        for (index in dispatched until batch.items.size) {
+            val entry = batch.replayEntries.getOrNull(index)
+            when {
+                entry == null -> carried += batch.items[index]
+                isLive(peer, entry) -> {
+                    carried += batch.items[index]
+                    liveEntries += entry
+                }
+                entry.buffer.takenAsSnapshot() -> Unit
+                else -> carried += batch.items[index]
             }
         }
-        depositOfflineLocked(recipient, envelopeBytes, Instant.now().epochSecond + MailboxPointer.DEFAULT_TTL_SECONDS)
+        if (superseded && pendingReplays.containsKey(peer)) {
+            if (carried.isNotEmpty()) {
+                removeFromLiveBuffer(liveEntries)
+                appendToPendingReplayLocked(peer, carried)
+            }
+            logger.debug { "re-initiation with ${who(peer)} superseded by a newer rejection ($reason)" }
+            return
+        }
+        if (carried.isEmpty()) {
+            logger.debug { "re-initiation with ${who(peer)} superseded, a newer re-send covers the rest ($reason)" }
+            return
+        }
+        if (attempt >= MAX_RESEND_ATTEMPTS) {
+            if (!superseded) {
+                current?.let { savePendingInitiation(peer, it.copy(gaveUp = true)) }
+                pendingReplays.remove(peer)?.forEach { it.fill(0) }
+            }
+            logger.info { "giving up re-initiation with ${who(peer)} ($reason)" }
+            return
+        }
+        removeFromLiveBuffer(liveEntries)
+        appendToPendingReplayLocked(peer, carried)
+        logger.debug { "re-initiation with ${who(peer)} postponed ($reason)" }
+        scheduleResend(peer, RESEND_RETRY_DELAY.toMillis() * attempt, attempt + 1)
+    }
+
+    /** One plaintext copy inside a live [ReplayBuffer], identified by reference (the buffer's own array). */
+    private class ReplayEntry(
+        val buffer: ReplayBuffer,
+        val array: ByteArray,
+    )
+
+    /** MUST run inside [withPeerLock]: the live buffer of [peer] and its newest entry, if any. */
+    private fun replayTail(peer: Secp256k1PublicKey): ReplayEntry? {
+        val buffer = replayBuffers[peer] ?: return null
+        return synchronized(buffer) { buffer.items.lastOrNull()?.let { ReplayEntry(buffer, it) } }
+    }
+
+    /**
+     * MUST run inside [withPeerLock], right after one [prepareAutoLocked] call: the entry that call appended to the live
+     * buffer, or null if it buffered nothing. Only [prepareEnvelopeLocked] appends, always under this lock, and every
+     * entry is a fresh copy, so a new tail by reference is exactly that call's entry.
+     */
+    private fun newReplayEntry(
+        peer: Secp256k1PublicKey,
+        tailBefore: ReplayEntry?,
+    ): ReplayEntry? {
+        val tailAfter = replayTail(peer) ?: return null
+        return if (tailBefore != null && tailAfter.array === tailBefore.array) null else tailAfter
+    }
+
+    /** MUST run inside [withPeerLock]: whether [entry] is still in the CURRENT live buffer of [peer]. */
+    private fun isLive(
+        peer: Secp256k1PublicKey,
+        entry: ReplayEntry,
+    ): Boolean {
+        if (replayBuffers[peer] !== entry.buffer) return false
+        return synchronized(entry.buffer) { entry.buffer.items.any { it === entry.array } }
+    }
+
+    /** MUST run inside [withPeerLock]: removes (and zeroes) exactly these entries from their live buffer. */
+    private fun removeFromLiveBuffer(entries: List<ReplayEntry>) {
+        for (entry in entries) {
+            synchronized(entry.buffer) {
+                if (entry.buffer.items.removeIf { it === entry.array }) {
+                    entry.buffer.bytes -= entry.array.size
+                    entry.array.fill(0)
+                }
+            }
+        }
+    }
+
+    /** Same initiation and the same rejection bookkeeping; [DmPendingInitiation.sendsSinceInitiation] may differ
+     * (user sends over the new chain update it, which does not make the record a newer one). */
+    private fun sameInitiationState(
+        a: DmPendingInitiation?,
+        b: DmPendingInitiation?,
+    ): Boolean {
+        if (a == null || b == null) return a == null && b == null
+        return a.ephemeralPublicKey.contentEquals(b.ephemeralPublicKey) &&
+            a.rejectionRebootstraps == b.rejectionRebootstraps &&
+            a.unackedRebootstraps == b.unackedRebootstraps &&
+            a.gaveUp == b.gaveUp &&
+            a.awaitBundleNewerThan == b.awaitBundleNewerThan &&
+            a.excludedIds == b.excludedIds
+    }
+
+    /**
+     * MUST run inside [withPeerLock]. Appends copies of [items] after any snapshot already waiting for [peer] (that one
+     * keeps its place and its arrays), bounded like [replayBuffers]; whatever does not fit is zeroed and dropped.
+     */
+    private fun appendToPendingReplayLocked(
+        peer: Secp256k1PublicKey,
+        items: List<ByteArray>,
+    ) {
+        val merged = (pendingReplays[peer] ?: emptyList()) + items.map { it.copyOf() }
+        val kept = ArrayList<ByteArray>(minOf(merged.size, MAX_UNACKED_REPLAY_MESSAGES))
+        var bytes = 0
+        for (item in merged) {
+            if (kept.size < MAX_UNACKED_REPLAY_MESSAGES && bytes + item.size <= MAX_UNACKED_REPLAY_BYTES) {
+                kept += item
+                bytes += item.size
+            } else {
+                item.fill(0)
+            }
+        }
+        if (kept.isEmpty()) pendingReplays.remove(peer) else pendingReplays[peer] = kept
     }
 
     private fun shouldRebootstrapUnacked(
@@ -2487,7 +2927,10 @@ class DmSessionManager private constructor(
     /** Removes and returns copies of [peer]'s buffered plaintexts (the buffer's own arrays are zeroed). */
     private fun takeReplayBuffer(peer: Secp256k1PublicKey): List<ByteArray> {
         val buffer = replayBuffers.remove(peer) ?: return emptyList()
-        return synchronized(buffer) { buffer.items.map { it.copyOf() }.also { buffer.clear() } }
+        return synchronized(buffer) {
+            buffer.markTakenAsSnapshot()
+            buffer.items.map { it.copyOf() }.also { buffer.clear() }
+        }
     }
 
     private fun clearReplayBuffer(peer: Secp256k1PublicKey) {
@@ -2924,6 +3367,8 @@ class DmSessionManager private constructor(
      * why this class's own `stop()` does not (and structurally cannot) call `mailboxGossip.stop()`
      * directly; the caller who constructed it remains responsible for stopping it. */
     fun stop() {
+        // First: wake every send waiting for its lane turn (they fail with "dm session manager stopped").
+        outboundLanes.close()
         synchronized(liveSessionCache) {
             liveSessionCache.values.forEach { it.destroy() }
             liveSessionCache.clear()
@@ -2950,6 +3395,19 @@ class DmSessionManager private constructor(
         /** Bounds simultaneous in-flight [send] dials - a caller sending to thousands of recipients
          * at once cannot exhaust this node's outbound connection/thread capacity unboundedly. */
         const val MAX_CONCURRENT_OUTBOUND_DIALS = 32
+
+        /** Two-phase send: at most this many sends to ONE peer may wait for their lane turn (built envelopes waiting
+         * behind a slow dial). A further send fails with a [DmSessionException] BEFORE its ratchet step. */
+        const val MAX_QUEUED_SENDS_PER_PEER = 64
+
+        /** Two-phase send: at most this many peers may have queued outbound sends at once (same magnitude as
+         * [MAX_LIVE_SESSIONS]). Lanes exist only while non-empty and only for outbound sends. */
+        const val MAX_ACTIVE_LANES = 4_096
+
+        /** Two-phase send: how long a send waits for earlier sends to the same peer before it gives up ([sendAuto] and
+         * the offline paths then deposit offline; [send] and [sendCallSignal] fail). Previously such a wait was
+         * unbounded and not interruptible. Provisional magnitude: four times [DIAL_TIMEOUT]. */
+        val LANE_WAIT_TIMEOUT: Duration = Duration.ofSeconds(60)
 
         /** Bounds simultaneous in-flight [PrekeyStore.consumeOneTimePrekey] calls - see
          * [prekeyConsumptionSemaphore]'s own doc comment for the DoS this closes. Deliberately small

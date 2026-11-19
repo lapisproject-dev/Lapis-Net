@@ -1532,7 +1532,7 @@ Still open:
 * The LOOKUP relays learn which posts the user views, at most 8 new lookups per timeline request, newest first.
 * The browser text _Not found through two relays._ appears only for a confirmed result; it says nothing about whether the post exists elsewhere.
 * Verified on loopback only, with unit and multi-node tests and a load series (numbers in the roadmap); no real network, no NAT.
-* Known, unchanged: `DmSessionManager.send` holds its per-peer lock while it dials (up to 15 s of queueing).
+* Known, unchanged: `DmSessionManager.send` holds its per-peer lock while it dials (up to 15 s of queueing). _Superseded by the DM lock fix wave (unreleased): sends, including `deliverOnline` over circuits, now run their I/O outside the stripe lock; see "Two-phase send" in `architecture.adoc`._
 * No external cryptographic or anonymity review has taken place.
 
 === Assumptions awaiting confirmation (wave J3)
