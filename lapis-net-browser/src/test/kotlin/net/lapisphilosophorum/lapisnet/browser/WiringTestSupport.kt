@@ -49,6 +49,9 @@ internal fun startWiredTestServer(
     listenAddress: Multiaddr = Multiaddr("/ip4/127.0.0.1/tcp/0"),
     httpPort: Int = 0,
     anonymityLocator: ((net.lapisphilosophorum.lapisnet.directory.PeerDirectoryGossip) -> Any)? = null,
+    postBodyProvideConfig: net.lapisphilosophorum.lapisnet.storage.BlockProvideConfig =
+        net.lapisphilosophorum.lapisnet.storage
+            .BlockProvideConfig(),
 ): BrowserServer =
     BrowserServer.start(
         identity = identity,
@@ -71,6 +74,7 @@ internal fun startWiredTestServer(
         autoRelayConfig = autoRelayConfig,
         karmaLookupOverride = karmaLookupOverride,
         anonymityLocator = anonymityLocator,
+        postBodyProvideConfig = postBodyProvideConfig,
     )
 
 /** A raw HTTP/1.1 exchange, because the JDK client forbids setting `Host`. Returns `(status, body)`. */

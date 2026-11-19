@@ -192,7 +192,8 @@ class AnonymityStaticAssetsTest :
                     // no lookup of mail or names is claimed (none is wired in this mode)
                     text shouldNotContain "mail and names are fetched"
                     text shouldContain "Attachments and inbox rendezvous records are not reachable in this mode."
-                    text shouldContain "nodes do not announce posts in the DHT"
+                    text shouldContain "which nodes do for the newest posts they hold"
+                    text shouldNotContain "nodes do not announce posts in the DHT"
                 }
             }
         }

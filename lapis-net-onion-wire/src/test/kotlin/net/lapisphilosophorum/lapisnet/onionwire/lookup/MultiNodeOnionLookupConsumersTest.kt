@@ -76,7 +76,8 @@ private class CountedSink(
 
 /**
  * Wave V0.10.0-J3 on real loopback nodes: the consumers of lookups through circuits. A holder in normal mode `provide`s
- * post bodies explicitly (in production nobody announces post bodies in the DHT, see docs/anonymity.adoc, Q20); five
+ * post bodies explicitly (since wave Q20 a browser node announces them through `BlockProvideScheduler`, covered by
+ * [MultiNodeOnionLookupProvidedBodiesTest]; the explicit call keeps this test independent of the scheduler); five
  * relays with the production sink; a confined client in anonymity mode. Covers the timeline code path
  * ([NabuStorage.localOrRemoteState], as the browser's `TimelineBodyResolver` uses it) with circuit reuse, the context
  * separation, the NOT_FOUND cross-check, the Bitswap gap behind a found mark, and a lying relay. All nodes sit on

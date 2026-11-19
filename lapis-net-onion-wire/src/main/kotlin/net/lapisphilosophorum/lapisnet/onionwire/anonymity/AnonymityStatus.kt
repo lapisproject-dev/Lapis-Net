@@ -104,16 +104,18 @@ private const val WARNING_PADDED =
  * V0.10.0-J1b replaced "but it still meshes over direct connections that show your address"; wave V0.10.0-J2 replaced
  * "neither serves nor queries the DHT or content"; wave V0.10.0-J3 replaced "the transport key is fresh per run and the
  * node neither serves the DHT or content nor queries them directly (lookups go through circuits to relays that see what
- * is asked), ..." by the final text below (no mail or name lookups are claimed: none is wired in this mode).
+ * is asked), ..." by the text below (no mail or name lookups are claimed: none is wired in this mode); wave Q20 replaced
+ * "today such lookups usually find nothing, because nodes do not announce posts in the DHT" (nodes in normal mode now
+ * announce the newest post bodies they hold).
  */
 private const val WARNING_REMAINING =
     "The transport key is fresh per run. The node connects only to its two guards, which see your address, " +
         "when you are online and which topics you receive. At every start, and while it lacks relays or a guard " +
         "connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up " +
         "through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four " +
-        "post lookups on one circuit are linked to each other; today such lookups usually find nothing, because " +
-        "nodes do not announce posts in the DHT. Attachments and inbox rendezvous records are not reachable in this " +
-        "mode. Posting, votes and trust grants are unavailable."
+        "post lookups on one circuit are linked to each other; such lookups find a post only if a node in normal " +
+        "mode announces it in the DHT, which nodes do for the newest posts they hold. Attachments and inbox " +
+        "rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable."
 private const val WARNING_CALLS_OFF_TAIL =
     "Calls are off because call media would reveal your IP address. " + WARNING_REMAINING
 private const val WARNING_CALLS_EXPOSED_TAIL =

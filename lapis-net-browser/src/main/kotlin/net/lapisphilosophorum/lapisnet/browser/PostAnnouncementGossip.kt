@@ -62,8 +62,11 @@ internal fun deriveBodyCid(bytes: ByteArray): Cid {
  * announcement/discovery did not work at all, so a bare [Cid] pointer gossiped without the
  * underlying bytes would have been undiscoverable by any other node - there was no reliable way
  * for a peer to ask "who has this Cid" and get a real answer. That gap is now closed at the
- * storage layer, but this module deliberately keeps its self-contained gossip design: migrating
- * it onto DHT-backed publication is a separate wave, and the property below holds either way.
+ * storage layer, but this module deliberately keeps its self-contained gossip design, and the
+ * property below holds either way. Since wave Q20 a node in normal mode additionally announces
+ * (DHT `provide`) the bodies it holds, the newest ones up to a cap, through the `onBodyStored`
+ * callback of [attach] - so a node that missed the gossip, or an anonymous client's lookup relay,
+ * can find a holder; the gossip still carries the full bytes.
  * Embedding the actual bytes in the gossiped announcement and having each node independently
  * re-derive the [Cid] closes that gap entirely - nothing here ever depends on DHT provider
  * discovery working. This mirrors
@@ -98,6 +101,7 @@ class PostAnnouncementGossip private constructor(
     private val storage: NabuStorage,
     private val index: PostAnnouncementIndex,
     private val subscription: PubsubSubscription,
+    private val onBodyStored: ((Cid) -> Unit)?,
 ) {
     /**
      * Derives the post body's [Cid] and persists it iff [PostAnnouncementIndex.tryReserveBodyPersistence]
@@ -113,7 +117,8 @@ class PostAnnouncementGossip private constructor(
     fun announce(announcement: PostAnnouncement): Cid {
         val cid = deriveBodyCid(announcement.bodyBytes)
         if (index.tryReserveBodyPersistence(cid)) {
-            storage.put(announcement.bodyBytes)
+            val stored = storage.put(announcement.bodyBytes)
+            notifyBodyStored(onBodyStored, stored)
         } else {
             logger.debug {
                 "body persistence cap reached - not durably storing own post body bytes (cid $cid, " +
@@ -158,17 +163,33 @@ class PostAnnouncementGossip private constructor(
          * [GossipPubSub.attach]-ed [pubsub] and an already-[NabuStorage.attach]-ed [storage].
          * Subscribes to [POST_ANNOUNCEMENT_GOSSIP_TOPIC] immediately - see [onGossipMessage] for
          * the validator.
+         *
+         * Wave Q20: [onBodyStored] is called with a body's [Cid] right after its bytes were stored successfully - for
+         * an own post ([announce]) and a gossiped one alike, on the same path and without telling them apart. It is
+         * not called when the body-persistence cap declines the write, the write fails or the message is a duplicate.
+         * It runs on the GossipSub validator thread: it must be O(1) and must not block. A throwing callback changes
+         * neither the validation result nor the outcome of [announce].
          */
         fun attach(
             pubsub: GossipPubSub,
             storage: NabuStorage,
+            onBodyStored: ((Cid) -> Unit)? = null,
         ): PostAnnouncementGossip {
             val index = PostAnnouncementIndex()
             val subscription =
                 pubsub.subscribe(POST_ANNOUNCEMENT_GOSSIP_TOPIC) { bytes, from ->
-                    onGossipMessage(bytes, from, storage, index)
+                    onGossipMessage(bytes, from, storage, index, onBodyStored)
                 }
-            return PostAnnouncementGossip(pubsub, storage, index, subscription)
+            return PostAnnouncementGossip(pubsub, storage, index, subscription, onBodyStored)
+        }
+
+        private fun notifyBodyStored(
+            callback: ((Cid) -> Unit)?,
+            cid: Cid,
+        ) {
+            if (callback == null) return
+            runCatching { callback(cid) }
+                .onFailure { logger.debug { "body-stored callback failed (${it.javaClass.simpleName})" } }
         }
 
         /**
@@ -190,6 +211,7 @@ class PostAnnouncementGossip private constructor(
             from: PeerId,
             storage: NabuStorage,
             index: PostAnnouncementIndex,
+            onBodyStored: ((Cid) -> Unit)? = null,
         ): ValidationResult {
             val announcement =
                 try {
@@ -220,9 +242,10 @@ class PostAnnouncementGossip private constructor(
             // WRITTEN to storage is a separate decision, gated by tryReserveBodyPersistence - see
             // that method's doc comment for the network-amplified disk-growth attack this closes.
             val cid = deriveBodyCid(announcement.bodyBytes)
+            var storedBody: Cid? = null
             if (index.tryReserveBodyPersistence(cid)) {
                 try {
-                    storage.put(announcement.bodyBytes)
+                    storedBody = storage.put(announcement.bodyBytes)
                 } catch (e: NabuStorageException) {
                     logger.warn(e) {
                         "failed to persist post body bytes from $from on $POST_ANNOUNCEMENT_GOSSIP_TOPIC - " +
@@ -272,6 +295,8 @@ class PostAnnouncementGossip private constructor(
                         "index race - propagating anyway"
                 }
             }
+            // wave Q20: only for a body that really is in the served store, and only for an accepted announcement
+            storedBody?.let { notifyBodyStored(onBodyStored, it) }
             return ValidationResult.Valid
         }
     }

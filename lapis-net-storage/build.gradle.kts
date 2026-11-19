@@ -29,4 +29,6 @@ dependencies {
         exclude(group = "com.github.peergos", module = "jvm-libp2p")
     }
     api(rootProject.libs.java.cid)
+    // wave Q20 - BlockProvideSchedulerTest attaches a logback ListAppender to prove no CID is logged.
+    testImplementation(rootProject.libs.logback.classic)
 }

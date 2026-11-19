@@ -329,4 +329,25 @@ class BrowserConfigTest :
                 BrowserConfig.load(listOf("--anonymity-allow-call-media=true"), emptyMap(), homeWith(null))
             }
         }
+
+        test("Q20 provide-post-bodies: file key providePostBodies, environment, arguments, anonymity conflict") {
+            BrowserConfig.load(emptyList(), emptyMap(), homeWith(null)).wiring.providePostBodies shouldBe true
+            val home = homeWith("providePostBodies=false\n")
+            BrowserConfig.load(emptyList(), emptyMap(), home).wiring.providePostBodies shouldBe false
+            BrowserConfig
+                .load(emptyList(), mapOf("LAPISNET_PROVIDE_POST_BODIES" to "true"), home)
+                .wiring.providePostBodies shouldBe true
+            BrowserConfig
+                .load(listOf("--provide-post-bodies=false"), mapOf("LAPISNET_PROVIDE_POST_BODIES" to "true"), home)
+                .wiring.providePostBodies shouldBe false
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(emptyList(), emptyMap(), homeWith("providePostBodies=1\n"))
+            }
+            shouldThrow<InvalidWiringOptionException> {
+                BrowserConfig.load(listOf("--anonymity=on", "--provide-post-bodies=true"), emptyMap(), homeWith(null))
+            }
+            BrowserConfig
+                .load(listOf("--anonymity=on"), emptyMap(), homeWith(null))
+                .wiring.providePostBodies shouldBe false
+        }
     })

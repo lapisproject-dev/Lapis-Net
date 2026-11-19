@@ -252,6 +252,22 @@ class HeadlessNodeTest :
             }
         }
 
+        test("Q20: --provide-post-bodies=true|false is accepted and ignored by the headless node").config(
+            timeout = 120.seconds,
+        ) {
+            for (value in listOf("true", "false")) {
+                val options =
+                    NodeWiringOptions.resolve(NodeWiringOptions.parseCliArgs(listOf("--provide-post-bodies=$value")))
+                options.providePostBodies shouldBe (value == "true")
+                val node = start(options)
+                try {
+                    node.storage.networkMode shouldBe net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode.NETWORK
+                } finally {
+                    node.stop()
+                }
+            }
+        }
+
         test("V0.10.0-J2: a normal node without relay mode has no lookup role and a network-mode storage").config(
             timeout = 90.seconds,
         ) {

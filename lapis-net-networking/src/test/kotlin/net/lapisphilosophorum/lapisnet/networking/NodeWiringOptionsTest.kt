@@ -159,4 +159,41 @@ class NodeWiringOptionsTest :
             // the other switches are unaffected by it
             resolve("--onion-relay=true").dhtFallback shouldBe true
         }
+
+        test(
+            "Q20 provide-post-bodies: default true, explicit values, invalid value, anonymity conflict, env and help",
+        ) {
+            resolve().providePostBodies shouldBe true
+            NodeWiringOptions().providePostBodies shouldBe true
+            resolve("--provide-post-bodies=false").providePostBodies shouldBe false
+            resolve("--provide-post-bodies=true").providePostBodies shouldBe true
+            shouldThrow<InvalidWiringOptionException> { resolve("--provide-post-bodies=yes") }
+            shouldThrow<InvalidWiringOptionException> {
+                NodeWiringOptions.validateValues(mapOf(NodeWiringOptions.KEY_PROVIDE_POST_BODIES to "maybe"))
+            }
+            val conflict =
+                shouldThrow<InvalidWiringOptionException> {
+                    resolve("--anonymity=on", "--provide-post-bodies=true")
+                }
+            conflict.message shouldContain "provide-post-bodies cannot be enabled while anonymity=on"
+            // a missing key resolves to false in anonymity mode; an explicit false is fine
+            resolve("--anonymity=on").providePostBodies shouldBe false
+            resolve("--anonymity=on", "--provide-post-bodies=false").providePostBodies shouldBe false
+            // effective() switches it off for options built directly in code
+            NodeWiringOptions(
+                anonymity = net.lapisphilosophorum.lapisnet.networking.config.AnonymityMode.ON,
+                providePostBodies = true,
+            ).effective().providePostBodies shouldBe false
+            NodeWiringOptions(providePostBodies = true).effective().providePostBodies shouldBe true
+            NodeWiringOptions.KEY_PROVIDE_POST_BODIES shouldBe "provide-post-bodies"
+            (NodeWiringOptions.KEY_PROVIDE_POST_BODIES in NodeWiringOptions.KNOWN_KEYS) shouldBe true
+            NodeWiringOptions.envNameOf(NodeWiringOptions.KEY_PROVIDE_POST_BODIES) shouldBe
+                "LAPISNET_PROVIDE_POST_BODIES"
+            NodeWiringOptions.fromEnvironment(mapOf("LAPISNET_PROVIDE_POST_BODIES" to "false")) shouldBe
+                mapOf("provide-post-bodies" to "false")
+            NodeWiringOptions.HELP_TEXT shouldContain "--provide-post-bodies=true|false"
+            NodeWiringOptions.HELP_TEXT shouldContain "METADATA: DHT peers learn that this node"
+            // independent of the DHT fallback switch (F1, not confirmed by the user)
+            resolve("--dht-fallback=false").providePostBodies shouldBe true
+        }
     })

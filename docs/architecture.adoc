@@ -547,6 +547,47 @@ reset at once. An initiator that never closes therefore cannot keep streams open
   apply.
 * **No republish.** Provider records are held in memory and are lost on restart; nothing re-announces.
 
+=== Post body provide scheduler (wave Q20)
+
+_Status: implemented, unreleased (version stays 0.12.0). The decision itself (Q20) is not confirmed by the user._
+
+`BlockProvideScheduler` (`lapis-net-storage`) announces a bounded set of blocks with `NabuStorage.provide` and
+re-announces them. The browser wires it for post bodies: `PostAnnouncementGossip.attach(.., onBodyStored)` calls
+`track(cid)` right after a body was stored, for an own post and a gossiped one on the same path.
+
+* *Structure.* A `LinkedHashMap<Cid, Entry(nextDue, failures)>` in insertion order under one lock. `track` is O(1),
+  idempotent, does no I/O and does not renew an entry's position (it runs on the GossipSub validator thread); beyond
+  `maxTracked` (256) the oldest-tracked entry is evicted. A new entry is due after a random 0..2 minutes.
+* *Cycle.* A supervisor job (`post-body-provider`, every 15 s +/- 3 s, first after 60 s) runs `runCycle`: it picks at
+  most 2 due entries at random (not by age), checks `NabuStorage.isServed` (the served blockstore only, never the
+  unserved one of `putUnserved`), then calls `provide(cid, 10 s, fanout = 10)` sequentially - one DHT permit of eight
+  at a time. No new announcement starts after a cycle budget of 20 s, so a supervisor thread is held at most about
+  30 s. The lock is never held during `provide`.
+* *Outcomes.* At least one `ADD_PROVIDER` sent: next due after 1 h +/- 10 %. None sent or a failure: backoff
+  `min(5 min * 2^(n-1), 1 h)`. `NabuStorageBusyException`: the cycle ends, the entry stays due, no failure is counted.
+  A stopped storage ends the cycle. A `NabuStorageException` that carried an interrupt becomes `InterruptedException`,
+  which ends the supervisor job (`stopAll` cancels jobs before the stop actions, so before `storage.stop()`).
+  `AnonymousStorageRefusedException` (cannot happen: no scheduler exists in anonymity mode) closes the scheduler. No
+  other exception leaves `runCycle`.
+* *Logging.* No CID is ever logged by the scheduler; one debug line per cycle and one info summary per hour, numbers
+  only. `NabuStorage.provide` logs its per-call line at debug since Q20 (up to about 480 calls an hour).
+* *Load and pressure.* At most about 480 announcements an hour per node (about 4,800 `ADD_PROVIDER` messages plus
+  the walks). Provider records do not age on the receiving peers (LRU of 1,024 keys, 8 providers per key, memory
+  only); the re-provide covers restarts and changing closest peers. Body keys share that LRU with the rendezvous
+  records of `DirectoryDht` (offline mail and DM, onion relays): with many distinct posts they can displace those
+  records on other nodes (open point F2). A gossip flood can push legitimate CIDs out of the 256 tracked ones; that
+  affects only findability.
+* *Not reloaded after a restart.* The tracked set and the post index live in memory.
+* *Bitswap gap, reported, not fixed.* `javap` on `nabu-v0.8.0.jar`: `BitswapEngine.recentBlocksSent` is a
+  `private final Map<PeerId, Map<Want, Boolean>>` without expiry, and `RefreshableBitswapEngine` cannot reach it, so a
+  holder does not send the same block to the same relay twice. With several holders the relay can fetch from another
+  one (`markRequested` skips the holder it just asked); with one holder the gap stays. A fix needs reflection or a new
+  `receiveMessage`, both on the responder path - a separate wave.
+* *Loopback observation (tests).* On loopback a holder's walk did not get past a hub peer (`sent ADD_PROVIDER to 1 of
+  1`), so the multi-node tests link the holder directly to the peers that must receive the record; and a relay that
+  has the holder in its routing table finds even an untracked body there, because Nabu's responder names itself for
+  blocks it holds. Neither is changed by Q20.
+
 == Trust: Veritas trust-edge grant (V0.1.5)
 
 `VeritasGrant` (in `lapis-net-trust`) is the signed, versioned data model for a single Veritas

@@ -84,6 +84,8 @@ import net.lapisphilosophorum.lapisnet.onionwire.path.RelayNetworkLocator
 import net.lapisphilosophorum.lapisnet.onionwire.path.RelayReputation
 import net.lapisphilosophorum.lapisnet.policy.KarmaScoreLookup
 import net.lapisphilosophorum.lapisnet.ratchet.PrekeyStore
+import net.lapisphilosophorum.lapisnet.storage.BlockProvideConfig
+import net.lapisphilosophorum.lapisnet.storage.BlockProvideScheduler
 import net.lapisphilosophorum.lapisnet.storage.DeferredRemoteContentSource
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import net.lapisphilosophorum.lapisnet.storage.StorageNetworkMode
@@ -234,7 +236,19 @@ class BrowserServer private constructor(
     /** The HTTP port actually bound, resolved after [httpEngine] started - may differ from the
      * `httpPort` passed to [start] when that was `0` (OS-assigned). */
     val boundPort: Int,
+    /** Wave Q20 - `null` in anonymity mode or with `provide-post-bodies=false`. Closed by the supervisor. */
+    private val postBodyProvider: BlockProvideScheduler? = null,
+    private val postBodyProviderJob: NodeServiceSupervisor.PeriodicJob? = null,
 ) {
+    /** `null` iff post bodies are not announced (anonymity mode or `provide-post-bodies=false`). */
+    internal val postBodyProviderForTesting: BlockProvideScheduler? get() = postBodyProvider
+
+    /** Test seam (wave Q20): the post gossip of this server. */
+    internal val postsForTesting: PostAnnouncementGossip get() = posts
+
+    /** The supervisor job of [postBodyProviderForTesting]; `null` together with it. */
+    internal val postBodyProviderJobForTesting: NodeServiceSupervisor.PeriodicJob? get() = postBodyProviderJob
+
     /** V0.8.7b - the URL that opens the call remote control, token in the fragment (never sent to a
      * server, never logged by one). Print it to the local console only; do not write it to log files. */
     val callRemoteControlUrl: String get() = "http://127.0.0.1:$boundPort/call.html#t=${callToken.hex}"
@@ -497,6 +511,8 @@ class BrowserServer private constructor(
              * not leak into every caller of this function.
              */
             anonymityLocator: ((PeerDirectoryGossip) -> Any)? = null,
+            /** Test seam (wave Q20): limits of the post body provide scheduler; production keeps the defaults. */
+            postBodyProvideConfig: BlockProvideConfig = BlockProvideConfig(),
         ): BrowserServer {
             require(httpHost == "127.0.0.1") {
                 "BrowserServer must bind 127.0.0.1 only - refusing to start on '$httpHost' " +
@@ -575,7 +591,23 @@ class BrowserServer private constructor(
                 cleanupOnFailure += { runCatching { virtus.stop() } }
                 val karma = KarmaGossip.attach(pubsub, storage)
                 cleanupOnFailure += { runCatching { karma.stop() } }
-                val posts = PostAnnouncementGossip.attach(pubsub, storage)
+                // Wave Q20: announce the newest post bodies this node holds (own and gossiped alike) in the DHT. Never in
+                // anonymity mode (wiring.effective() and anonymousNode both say so): no object, no job.
+                val postBodyProvider =
+                    if (!anonymousNode && wiring.providePostBodies) {
+                        BlockProvideScheduler(storage.asProvideTarget(), postBodyProvideConfig)
+                    } else {
+                        null
+                    }
+                cleanupOnFailure += { runCatching { postBodyProvider?.close() } }
+                val posts =
+                    PostAnnouncementGossip.attach(
+                        pubsub,
+                        storage,
+                        postBodyProvider?.let { p ->
+                            { cid -> p.track(cid) }
+                        },
+                    )
                 cleanupOnFailure += { runCatching { posts.stop() } }
                 val karmaAnchorCache = KarmaAnchorCache(karmaAnchorSource)
                 // V0.9.3 - InboxGossip.attach subscribes this identity's own inbox topic immediately,
@@ -894,6 +926,19 @@ class BrowserServer private constructor(
                     jitter = (selfRecordCheckInterval.inWholeMilliseconds / 10).milliseconds,
                     initialDelay = selfRecordCheckInterval,
                 ) { selfRecordRepublisher.tick() }
+                var postBodyProviderJob: NodeServiceSupervisor.PeriodicJob? = null
+                if (postBodyProvider != null) {
+                    // stopAll cancels (interrupts) this job first, then runs the stop actions - before storage.stop()
+                    supervisor.register("post-body-provider") { postBodyProvider.close() }
+                    val cfg = postBodyProvider.config
+                    postBodyProviderJob =
+                        supervisor.launchPeriodic(
+                            "post-body-provider",
+                            interval = cfg.cycleInterval,
+                            jitter = cfg.cycleJitter,
+                            initialDelay = cfg.initialDelay,
+                        ) { postBodyProvider.runCycle() }
+                }
 
                 // Madli: needed to rank relay candidates (read) and/or to publish relay reliability (write).
                 var madliGossip: MadliGossip? = null
@@ -1217,6 +1262,8 @@ class BrowserServer private constructor(
                     dmAcceptedContacts,
                     httpEngine,
                     boundPort,
+                    postBodyProvider = postBodyProvider,
+                    postBodyProviderJob = postBodyProviderJob,
                 )
             } catch (e: Exception) {
                 cleanupOnFailure.asReversed().forEach { action -> runCatching(action) }

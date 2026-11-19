@@ -107,6 +107,12 @@ data class NodeWiringOptions(
      * storage. `false` answers every lookup with DISABLED.
      */
     val onionRelayLookup: Boolean = true,
+    /**
+     * Wave Q20: announce the bodies of the newest posts this node holds (own and received alike) in the DHT
+     * (`--provide-post-bodies`, on by default, always off in anonymity mode). Consumed by the browser only; the CLI node
+     * has no post gossip and ignores it. METADATA: the DHT peers close to a post learn that this node holds it.
+     */
+    val providePostBodies: Boolean = true,
     /** Notices for the operator collected by [resolve] (an option that is valid but has no effect). */
     val warnings: List<String> = emptyList(),
 ) {
@@ -158,6 +164,7 @@ data class NodeWiringOptions(
                 dhtFallback = false,
                 publishRelayReliability = false,
                 holePunching = HolePunchMode.OFF,
+                providePostBodies = false,
             )
         } else {
             this
@@ -217,6 +224,7 @@ data class NodeWiringOptions(
         const val KEY_ANONYMITY_ALLOW_CALL_MEDIA = "anonymity-allow-call-media"
         const val KEY_ANONYMITY_PADDING = "anonymity-padding"
         const val KEY_ONION_RELAY_LOOKUP = "onion-relay-lookup"
+        const val KEY_PROVIDE_POST_BODIES = "provide-post-bodies"
 
         /** Environment variable prefix: `LAPISNET_REACHABILITY`, `LAPISNET_AUTO_RELAY`, ... */
         const val ENV_PREFIX = "LAPISNET_"
@@ -233,6 +241,7 @@ data class NodeWiringOptions(
                 KEY_ANONYMITY_ALLOW_CALL_MEDIA,
                 KEY_ANONYMITY_PADDING,
                 KEY_ONION_RELAY_LOOKUP,
+                KEY_PROVIDE_POST_BODIES,
             )
 
         /** The environment variable name of [key], e.g. `auto-relay` to `LAPISNET_AUTO_RELAY`. */
@@ -262,6 +271,8 @@ data class NodeWiringOptions(
             val anonymityPadding =
                 raw[KEY_ANONYMITY_PADDING]?.let { parseAnonymityPadding(it) } ?: AnonymityPaddingMode.STANDARD
             val relayLookupExplicit = raw[KEY_ONION_RELAY_LOOKUP]?.let { parseBoolean(KEY_ONION_RELAY_LOOKUP, it) }
+            val provideBodiesExplicit =
+                raw[KEY_PROVIDE_POST_BODIES]?.let { parseBoolean(KEY_PROVIDE_POST_BODIES, it) }
             val warnings = ArrayList<String>()
             if (allowCallMedia && anonymity != AnonymityMode.ON) {
                 throw InvalidWiringOptionException("--anonymity-allow-call-media requires --anonymity=on")
@@ -289,6 +300,10 @@ data class NodeWiringOptions(
                 if (relayLookupExplicit == true) {
                     throw InvalidWiringOptionException("onion-relay-lookup cannot be enabled while anonymity=on")
                 }
+                // wave Q20: a provider record names this node's PeerId and addresses as the holder of a post
+                if (provideBodiesExplicit == true) {
+                    throw InvalidWiringOptionException("provide-post-bodies cannot be enabled while anonymity=on")
+                }
             } else if (relayLookupExplicit == true && !onionRelay) {
                 warnings += "--onion-relay-lookup=true has no effect without --onion-relay=true"
             }
@@ -309,6 +324,7 @@ data class NodeWiringOptions(
                 allowCallMedia,
                 anonymityPadding,
                 onionRelayLookup = relayLookupExplicit ?: true,
+                providePostBodies = !anonymous && (provideBodiesExplicit ?: true),
                 warnings = warnings,
             )
         }
@@ -327,6 +343,7 @@ data class NodeWiringOptions(
                     KEY_ONION_RELAY,
                     KEY_ANONYMITY_ALLOW_CALL_MEDIA,
                     KEY_ONION_RELAY_LOOKUP,
+                    KEY_PROVIDE_POST_BODIES,
                     ->
                         parseBoolean(key, value)
                     KEY_HOLE_PUNCHING -> parseHolePunching(value)
@@ -425,6 +442,12 @@ data class NodeWiringOptions(
             |        This relay then asks the DHT and Bitswap itself: providers and DHT peers see this relay, with
             |        its address, as the one asking; the relay sees what is asked (CID or IPNS name), not who asks.
             |        It keeps no content it fetched for others. false: every lookup is answered as disabled.
+            |        Refused with --anonymity=on.
+            |  --provide-post-bodies=true|false           [true; false with --anonymity=on]
+            |        Announce the bodies of the newest (up to 256) posts this node holds (own and received) in
+            |        the DHT, re-announced hourly, so others (including anonymous clients' lookup relays) can
+            |        find them. METADATA: DHT peers learn that this node (PeerId and addresses) holds these
+            |        posts; own and received posts are treated alike. Browser only; `lapisnet node` ignores it.
             |        Refused with --anonymity=on.
             |  --anonymity=on|off   (experimental, default off) anonymises directory, direct messages, mail and call signals; call media is direct
             |        With on: the directory entry is published only through circuits (persistent guards, diverse

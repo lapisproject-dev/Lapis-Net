@@ -264,6 +264,36 @@ class NabuStorage private constructor(
     }
 
     /**
+     * Wave Q20: `true` iff [cid] is in the SERVED (public) blockstore - the one Bitswap and the DHT engine see. The
+     * unserved store of [putUnserved] is never consulted, so a block received over an anonymous path is never reported
+     * here and therefore never announced. No network I/O; a local fault throws like [getLocal].
+     */
+    fun isServed(
+        cid: Cid,
+        timeout: Duration = DEFAULT_TIMEOUT,
+    ): Boolean = awaitOrWrap("check local blockstore", timeout) { blockstore.get(cid) }.isPresent
+
+    /** `true` once [stop] ran. */
+    val isStopped: Boolean get() = stopped.get()
+
+    /**
+     * Wave Q20: this storage as the target of a [BlockProvideScheduler] ([provide] with a fanout, [isServed] for the
+     * served store only).
+     */
+    fun asProvideTarget(): BlockProvideTarget =
+        object : BlockProvideTarget {
+            override fun provide(
+                cid: Cid,
+                timeout: Duration,
+                fanout: Int,
+            ): Int = this@NabuStorage.provide(cid, timeout, fanout)
+
+            override fun isServed(cid: Cid): Boolean = this@NabuStorage.isServed(cid)
+
+            override fun isStopped(): Boolean = this@NabuStorage.isStopped
+        }
+
+    /**
      * Returns the bytes for [cid] from the LOCAL blockstore only - guaranteed no network I/O and
      * no [findProviders] call, unlike [get]. `null` if [cid] is not held locally.
      *
@@ -614,12 +644,15 @@ class NabuStorage private constructor(
     /**
      * Announces to the DHT that this node has [cid] available for retrieval: walks Kademlia's
      * keyspace towards [cid]'s key (the bare multihash) and sends an `ADD_PROVIDER` RPC naming this
-     * node to each of the [DhtLimits.provideFanout] closest peers it found. A later
+     * node to each of the [fanout] closest peers it found ([fanout] is clamped to
+     * `1..`[DhtLimits.provideFanout]; wave Q20). Since wave Q20 a browser node in normal mode also
+     * calls this for the newest post bodies it holds ([BlockProvideScheduler]); the provider record
+     * then tells the DHT peers near [cid] that this node (PeerId and addresses) holds it. A later
      * [findProviders] call for [cid] by any node that can reach one of those peers then resolves
      * back to this node. Peers that can't be dialled, or that time out, are skipped - the
      * announcement is best-effort by nature. Returns how many `ADD_PROVIDER` messages were SENT;
-     * **the protocol has no acknowledgement, so this is not a delivery count**. Returns 0 (and
-     * logs a warning) if no DHT peer is known.
+     * **the protocol has no acknowledgement, so this is not a delivery count**. Returns 0 if no DHT
+     * peer is known.
      *
      * [timeout] is an absolute deadline from the first line of this call: the walk gets the first
      * half, the announcement the rest. Throws [NabuStorageException] if the storage is stopped, if
@@ -647,9 +680,11 @@ class NabuStorage private constructor(
     fun provide(
         cid: Cid,
         timeout: Duration = DEFAULT_TIMEOUT,
+        fanout: Int = limits.provideFanout,
     ): Int {
         val start = System.nanoTime()
         requirePositive(timeout)
+        val peerCount = fanout.coerceIn(1, limits.provideFanout)
         val deadline = start + timeout.toNanos()
         val walkDeadline = start + timeout.toNanos() / 2
         requireNetwork("providing a block")
@@ -658,7 +693,7 @@ class NabuStorage private constructor(
         return withOperationPermit(deadline) {
             val closest =
                 try {
-                    walker.closestPeers(dhtKeyFor(cid), limits.provideFanout, walkDeadline)
+                    walker.closestPeers(dhtKeyFor(cid), peerCount, walkDeadline)
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
                     throw NabuStorageException("interrupted while finding DHT peers to announce to", e)
@@ -667,7 +702,9 @@ class NabuStorage private constructor(
                 }
             failIfStopped()
             if (closest.peers.isEmpty()) {
-                logger.warn { "provide: no DHT peers known - nothing announced" }
+                // debug since wave Q20 (the post body scheduler would repeat it every cycle on a peerless node);
+                // the return value 0 tells every caller
+                logger.debug { "provide: no DHT peers known - nothing announced" }
                 return@withOperationPermit 0
             }
             val sent =
@@ -679,7 +716,8 @@ class NabuStorage private constructor(
                 } catch (e: Exception) {
                     throw NabuStorageException("failed to announce", e)
                 }
-            logger.info {
+            // debug since wave Q20: the post body scheduler provides up to ~480 times an hour
+            logger.debug {
                 "provide: sent ADD_PROVIDER to $sent of ${closest.peers.size} candidate peers " +
                     "(delivery unconfirmed: the protocol has no acknowledgement)"
             }
@@ -1013,6 +1051,17 @@ class NabuStorage private constructor(
 
     /** Number of IPNS records this node's responder currently holds (tests). */
     internal fun heldIpnsRecords(): Int = engine.ipnsStore.size()
+
+    /**
+     * Wave Q20: the peers this node holds a provider record (`ADD_PROVIDER`) for [cid] from - local state only, no
+     * network. Lets multi-node tests in other modules tell a real announcement from Nabu's responder naming itself
+     * because it holds the block (loopback answers carry no addresses, see [findProviders]).
+     */
+    fun heldProviderRecords(cid: Cid): Set<PeerId> =
+        engine
+            .localProviders(cid.bareMultihash())
+            .mapNotNull { runCatching { PeerId(it.id.toByteArray()) }.getOrNull() }
+            .toSet()
 
     /** The provider records this node itself holds for [cid] (tests). */
     internal fun localProviderRecords(cid: Cid): List<Dht.Message.Peer> = engine.localProviders(cid.bareMultihash())

@@ -333,4 +333,166 @@ class PostAnnouncementGossipTest :
                 node.stop()
             }
         }
+
+        test("Q20: onBodyStored is called once after the body was stored, for an own and for a gossiped post") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("post-q20-callback"))
+                val seen = java.util.concurrent.CopyOnWriteArrayList<io.ipfs.cid.Cid>()
+                val gossip =
+                    PostAnnouncementGossip.attach(
+                        net.lapisphilosophorum.lapisnet.networking.GossipPubSub
+                            .attach(node),
+                        storage,
+                    ) { cid ->
+                        // at call time the body is already in the served store
+                        storage.isServed(cid) shouldBe true
+                        seen += cid
+                    }
+                val own = PostAnnouncement.create(identity.secp256k1KeyPair, testBody("own post"))
+                val ownCid = gossip.announce(own)
+                seen shouldBe listOf(ownCid)
+
+                // a gossiped post goes through the same callback (validator path)
+                val index = PostAnnouncementIndex()
+                val received = PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("received post"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val calls = java.util.concurrent.CopyOnWriteArrayList<io.ipfs.cid.Cid>()
+                PostAnnouncementGossip.onGossipMessage(
+                    PostAnnouncementCodec.encode(received),
+                    from,
+                    storage,
+                    index,
+                ) { calls += it } shouldBe ValidationResult.Valid
+                calls shouldBe listOf(deriveBodyCid(received.bodyBytes))
+                gossip.stop()
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("Q20: onBodyStored is not called for a capped body, a duplicate or an invalid signature") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("post-q20-nocall"))
+                val from = DualKeyIdentity.generate().deriveLibp2pPeerId()
+                val calls = java.util.concurrent.CopyOnWriteArrayList<io.ipfs.cid.Cid>()
+                val callback: (io.ipfs.cid.Cid) -> Unit = { calls += it }
+
+                // cap of 0 bodies: accepted and indexed, but the body is not stored, so no callback
+                val capped = PostAnnouncementIndex(maxTracked = 10, maxPersisted = 10, maxPersistedBodies = 0)
+                val a = PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("capped"))
+                PostAnnouncementGossip.onGossipMessage(
+                    PostAnnouncementCodec.encode(a),
+                    from,
+                    storage,
+                    capped,
+                    callback,
+                ) shouldBe
+                    ValidationResult.Valid
+                calls shouldBe emptyList()
+
+                // duplicate: the first delivery calls back, the second does not
+                val index = PostAnnouncementIndex()
+                val b =
+                    PostAnnouncementCodec.encode(
+                        PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("dup")),
+                    )
+                PostAnnouncementGossip.onGossipMessage(b, from, storage, index, callback) shouldBe
+                    ValidationResult.Valid
+                PostAnnouncementGossip.onGossipMessage(b, from, storage, index, callback) shouldBe
+                    ValidationResult.Invalid
+                calls shouldHaveSize 1
+
+                // invalid signature
+                val c =
+                    PostAnnouncementCodec.encode(
+                        PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("bad sig")),
+                    )
+                c[c.size - 1] = (c[c.size - 1] + 1).toByte()
+                PostAnnouncementGossip.onGossipMessage(c, from, storage, index, callback) shouldBe
+                    ValidationResult.Invalid
+                calls shouldHaveSize 1
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("Q20: a failing body write calls nothing back") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val dir = Files.createTempDirectory("post-q20-readonly")
+                val storage = NabuStorage.attach(node, dir)
+                val blocksDir = dir.resolve("blocks")
+                if ("posix" !in blocksDir.fileSystem.supportedFileAttributeViews()) return@test
+                val calls = java.util.concurrent.CopyOnWriteArrayList<io.ipfs.cid.Cid>()
+                java.nio.file.Files.setPosixFilePermissions(
+                    blocksDir,
+                    java.nio.file.attribute.PosixFilePermissions
+                        .fromString("r-xr-xr-x"),
+                )
+                try {
+                    val bytes =
+                        PostAnnouncementCodec.encode(
+                            PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("not writable")),
+                        )
+                    PostAnnouncementGossip.onGossipMessage(
+                        bytes,
+                        DualKeyIdentity.generate().deriveLibp2pPeerId(),
+                        storage,
+                        PostAnnouncementIndex(),
+                    ) { calls += it } shouldBe ValidationResult.Invalid
+                    calls shouldBe emptyList()
+                } finally {
+                    java.nio.file.Files.setPosixFilePermissions(
+                        blocksDir,
+                        java.nio.file.attribute.PosixFilePermissions
+                            .fromString("rwxr-xr-x"),
+                    )
+                }
+            } finally {
+                node.stop()
+            }
+        }
+
+        test("Q20: a throwing onBodyStored changes neither the validation result nor announce") {
+            val identity = DualKeyIdentity.generate()
+            val node = LapisNode.create(identity)
+            node.start(bootstrapPeers = emptyList())
+            try {
+                val storage = NabuStorage.attach(node, Files.createTempDirectory("post-q20-throw"))
+                val throwing: (io.ipfs.cid.Cid) -> Unit = { throw IllegalStateException("callback failed") }
+                val bytes =
+                    PostAnnouncementCodec.encode(PostAnnouncement.create(Secp256k1KeyPair.generate(), testBody("t")))
+                val index = PostAnnouncementIndex()
+                PostAnnouncementGossip.onGossipMessage(
+                    bytes,
+                    DualKeyIdentity.generate().deriveLibp2pPeerId(),
+                    storage,
+                    index,
+                    throwing,
+                ) shouldBe ValidationResult.Valid
+                index.all() shouldHaveSize 1
+                val gossip =
+                    PostAnnouncementGossip.attach(
+                        net.lapisphilosophorum.lapisnet.networking.GossipPubSub
+                            .attach(node),
+                        storage,
+                        throwing,
+                    )
+                val own = PostAnnouncement.create(identity.secp256k1KeyPair, testBody("own, throwing callback"))
+                val cid = gossip.announce(own)
+                storage.getLocal(cid).shouldNotBeNull()
+                gossip.currentPosts() shouldHaveSize 1
+                gossip.stop()
+            } finally {
+                node.stop()
+            }
+        }
     })
