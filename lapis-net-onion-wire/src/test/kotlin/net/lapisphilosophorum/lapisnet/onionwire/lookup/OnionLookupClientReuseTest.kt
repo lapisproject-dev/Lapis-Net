@@ -477,7 +477,8 @@ class OnionLookupClientReuseTest :
             } finally {
                 attacker.close()
             }
-            // the Bitswap gap: A can not get the block again (its holder does not resend)
+            // A can not get the block again (its holder went offline or is at its re-send limit; before fix wave F6
+            // also Nabu's responder that never resent a block to the same relay)
             sinks[0].override = LookupOutcome.NotFound
             val onlyA = client({ listOf(descriptors[0]) })
             try {

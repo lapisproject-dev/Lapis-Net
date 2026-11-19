@@ -1,9 +1,13 @@
 package net.lapisphilosophorum.lapisnet.storage
 
+import io.ipfs.cid.Cid
+import io.ipfs.multihash.Multihash
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
+import org.peergos.Hash
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -89,4 +93,74 @@ class BitswapRepeatWindowTest :
                 listOf(nodeA, nodeB).forEach { runCatching { it.stop() } }
             }
         }
+
+        test("a relay lookup inside the window waits for the running request instead of failing at once").config(
+            timeout = 90.seconds,
+        ) {
+            val holder = newNode()
+            val dht = newNode()
+            val relayNode = newNode()
+            try {
+                val storageA = storageOn(holder)
+                storageOn(dht)
+                val relay = storageOn(relayNode)
+                storageA.connectToDhtPeer(addressOf(dht)) shouldBe true
+                relay.connectToDhtPeer(addressOf(dht)) shouldBe true
+                val payload = "the holder gets it only after the first lookup".toByteArray()
+                // the CID of the payload, announced before the holder has the block
+                val cid = rawCid(payload)
+                storageA.provide(cid)
+
+                relay.fetchTransient(cid, Duration.ofSeconds(4)) shouldBe null
+                relay.bitswapRequestsSent.get() shouldBe 1
+
+                // the holder gets the block while the second lookup is already waiting
+                val putter =
+                    thread {
+                        Thread.sleep(1_000)
+                        storageA.put(payload)
+                    }
+                relay.fetchTransient(cid, Duration.ofSeconds(20)) shouldBe payload
+                putter.join()
+                // delivered by the re-send of the first request: no new request went out
+                relay.bitswapRequestsSent.get() shouldBe 1
+                relay.getLocal(cid) shouldBe null
+            } finally {
+                listOf(holder, dht, relayNode).forEach { runCatching { it.stop() } }
+            }
+        }
+
+        test("a stale mark (the want completed meanwhile) is dropped and the provider asked again").config(
+            timeout = 120.seconds,
+        ) {
+            val holder = newNode()
+            val dht = newNode()
+            val relayNode = newNode()
+            try {
+                val storageA = storageOn(holder)
+                storageOn(dht)
+                val relay = storageOn(relayNode)
+                storageA.connectToDhtPeer(addressOf(dht)) shouldBe true
+                relay.connectToDhtPeer(addressOf(dht)) shouldBe true
+                val payload = "delivered after the deadline, nobody waited".toByteArray()
+                val cid = rawCid(payload)
+                storageA.provide(cid)
+
+                relay.fetchTransient(cid, Duration.ofSeconds(4)) shouldBe null
+                relay.bitswapRequestsSent.get() shouldBe 1
+                // the block arrives through the re-send after the deadline: the want completes, the mark stays
+                storageA.put(payload)
+                awaitCondition(timeoutMs = 30_000) { !relay.isWantLiveFor(cid, holder.peerId) } shouldBe true
+
+                // Nabu alone would now stay silent (it sent the block to the relay already); F6 resends it
+                relay.fetchTransient(cid, Duration.ofSeconds(20)) shouldBe payload
+                relay.bitswapRequestsSent.get() shouldBe 2
+                storageA.bitswapResendStats().allowed shouldBe 1
+            } finally {
+                listOf(holder, dht, relayNode).forEach { runCatching { it.stop() } }
+            }
+        }
     })
+
+/** The CID [NabuStorage.put] gives [bytes] (CIDv1, raw, SHA-256), without storing them anywhere. */
+private fun rawCid(bytes: ByteArray): Cid = Cid.buildCidV1(Cid.Codec.Raw, Multihash.Type.sha2_256, Hash.sha256(bytes))

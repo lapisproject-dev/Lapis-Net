@@ -1,14 +1,23 @@
 package net.lapisphilosophorum.lapisnet.storage
 
+import io.github.oshai.kotlinlogging.KotlinLogging
+import io.ipfs.cid.Cid
 import io.libp2p.core.PeerId
+import io.libp2p.core.Stream
+import io.prometheus.client.Counter
 import org.peergos.BlockRequestAuthoriser
 import org.peergos.HashedBlock
 import org.peergos.Want
 import org.peergos.blockstore.Blockstore
 import org.peergos.protocol.bitswap.BitswapEngine
+import org.peergos.protocol.bitswap.pb.MessageOuterClass
+import org.peergos.util.ArrayOps
 import java.time.Duration
+import java.util.Optional
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+
+private val logger = KotlinLogging.logger {}
 
 /** How long a want keeps being re-sent to a single peer after it was last (re-)requested; Nabu's own limit. */
 internal val WANT_LIFETIME: Duration = Duration.ofMinutes(5)
@@ -45,14 +54,48 @@ internal const val MAX_TRACKED_PEERS_PER_WANT = 32
  * never answered stays registered in the base class (as it always has), but the tracking kept here for it
  * is small (at most [MAX_TRACKED_PEERS_PER_WANT] peers) and goes away with the block.
  *
+ * **Holder-side re-send (fix wave F6).** Nabu's responder (`BitswapEngine.receiveMessage`, v0.8.0, checked with
+ * `javap -c`) keeps `recentBlocksSent`: per requesting peer an LRU of 1000 wants (and an LRU of 100 peers), with no
+ * expiry. A WANT_BLOCK for a want in that map is skipped with a plain `continue` - no block and no DONT_HAVE - and
+ * the entry is put there after every block sent. So a block this node sent to a peer once is never sent to that
+ * peer again for the life of the process (unless the LRU evicts the entry): a relay that already fetched a block
+ * for one anonymous client could never fetch it again for the next. [receiveMessage] closes that gap before Nabu
+ * sees the message: for every WANT_BLOCK whose want is in that map, [BitswapResendPolicy] decides. If it allows a
+ * re-send, the want is removed from Nabu's map (Nabu then answers it as a first request); otherwise the entry is
+ * dropped from the message (silent, exactly what Nabu did anyway - the requester re-sends after five seconds).
+ * Nabu's map is READ through reflection once (the field is final and is never written); if that fails, nothing
+ * changes and Nabu's own behaviour remains ([resendWorkaroundActive] is then `false`, which a test watches).
+ *
  * [clock] returns nanoseconds and is injectable only so tests can age wants without sleeping.
  */
 internal class RefreshableBitswapEngine(
     blockstore: Blockstore,
     authoriser: BlockRequestAuthoriser,
     maxMessageSize: Int,
+    resendLimits: BitswapResendLimits = BitswapResendLimits(),
     private val clock: () -> Long = System::nanoTime,
 ) : BitswapEngine(blockstore, authoriser, maxMessageSize, false) {
+    private val resendPolicy = BitswapResendPolicy(resendLimits, clock)
+
+    /** Nabu's private `recentBlocksSent` (peer -> wants sent to it), read once; `null` if the field is not there. */
+    private val recentBlocksSent: Map<PeerId, MutableMap<Want, Boolean>>? =
+        runCatching {
+            @Suppress("UNCHECKED_CAST")
+            BitswapEngine::class.java
+                .getDeclaredField("recentBlocksSent")
+                .apply { isAccessible = true }
+                .get(this) as? Map<PeerId, MutableMap<Want, Boolean>>
+        }.getOrNull()
+
+    init {
+        if (recentBlocksSent == null) {
+            logger.warn { "Nabu's recentBlocksSent is not accessible - a block is never sent twice to a peer" }
+        }
+    }
+
+    /** `true` when the holder-side re-send works (Nabu's map could be read). */
+    internal val resendWorkaroundActive: Boolean get() = recentBlocksSent != null
+
     /** One peer a want was requested from: when that last happened, and when the want was last sent to it. */
     private class Target(
         var lastRequested: Long,
@@ -118,4 +161,86 @@ internal class RefreshableBitswapEngine(
         }
         return result
     }
+
+    override fun receiveMessage(
+        msg: MessageOuterClass.Message,
+        source: Stream,
+        sentBytes: Counter,
+    ) {
+        super.receiveMessage(prepareResends(msg, source.remotePeerId()), source, sentBytes)
+    }
+
+    /**
+     * The message Nabu gets to see: every WANT_BLOCK of [peer] for a block already sent to [peer] is either made a
+     * first request again (the want is removed from Nabu's map, if [BitswapResendPolicy] allows a re-send) or
+     * dropped. Everything else is passed on unchanged, and [msg] itself when nothing was dropped. No I/O.
+     */
+    internal fun prepareResends(
+        msg: MessageOuterClass.Message,
+        peer: PeerId,
+    ): MessageOuterClass.Message {
+        val sent = recentBlocksSent ?: return msg
+        if (!msg.hasWantlist()) return msg
+        val inner = sent[peer] ?: return msg
+        val entries = msg.wantlist.entriesList
+        val kept = ArrayList<MessageOuterClass.Message.Wantlist.Entry>(entries.size)
+        var dropped = false
+        for (entry in entries) {
+            // WANT_BLOCK by number, as Nabu checks it (an unknown type would be UNRECOGNIZED as an enum)
+            if (entry.wantTypeValue != 0 || entry.cancel) {
+                kept += entry
+                continue
+            }
+            val want = runCatching { wantOf(entry) }.getOrNull()
+            if (want == null || !inner.containsKey(want)) {
+                kept += entry // a malformed entry fails in Nabu exactly as before
+                continue
+            }
+            if (resendPolicy.decide(peer, want) == ResendDecision.ALLOWED) {
+                inner.remove(want)
+                kept += entry
+            } else {
+                dropped = true
+            }
+        }
+        if (!dropped) return msg
+        return msg
+            .toBuilder()
+            .setWantlist(
+                msg.wantlist
+                    .toBuilder()
+                    .clearEntries()
+                    .addAllEntries(kept),
+            ).build()
+    }
+
+    /** The [Want] exactly as Nabu builds it from a wantlist entry (`Want.equals` includes the auth hex). */
+    private fun wantOf(entry: MessageOuterClass.Message.Wantlist.Entry): Want {
+        val cid = Cid.cast(entry.block.toByteArray())
+        val auth =
+            if (entry.auth.isEmpty) {
+                Optional.empty()
+            } else {
+                Optional.of(
+                    ArrayOps.bytesToHex(entry.auth.toByteArray()),
+                )
+            }
+        return Want(cid, auth)
+    }
+
+    /** `true` while [want] is pending and was requested from [peer] within [WANT_LIFETIME] (its re-send runs). */
+    fun isRequestedFrom(
+        want: Want,
+        peer: PeerId,
+    ): Boolean {
+        val entry = tracked[want] ?: return false
+        val now = clock()
+        return synchronized(entry) {
+            val target = entry.targets[peer]
+            target != null && now - target.lastRequested <= WANT_LIFETIME.toNanos()
+        }
+    }
+
+    /** Counters of the holder-side re-send (numbers only). */
+    internal fun resendStats(): ResendStats = resendPolicy.stats()
 }

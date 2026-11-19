@@ -543,6 +543,15 @@ reset at once. An initiator that never closes therefore cannot keep streams open
   CID of a direct-message attachment (asked of its sender) into the wantlist of any provider the DHT
   named for another block, and would have kept every re-send thread alive for as long as any want
   anywhere was fresh. Here a want is sent only to the peers it was requested from, at most 32 per want.
+  *Stale marks and repeated lookups (fix wave F6).* A mark of the repeat window only suppresses a new
+  request while the want it belongs to is still pending and re-sent to that peer
+  (`RefreshableBitswapEngine.isRequestedFrom`). A mark whose want completed (for example a block that
+  arrived after the caller's deadline, not stored because the want was transient) or expired is dropped
+  and the request is sent again. While the earlier request is still re-sent, `get` returns `null` at
+  once - a block that arrives through the running re-send lands in the blockstore, and the timeline
+  (one sequential `get` per post) stays fast - but `fetchTransient` (the relay's lookup) waits for the
+  shared want up to its deadline instead, because nothing else would deliver the block to the waiting
+  anonymous client. The shared future is never cancelled and no per-call callback is attached to it.
 * **Decode before the caps.** A response is decoded by protobuf (up to 1 MiB) before the entry caps
   apply.
 * **No republish.** Provider records are held in memory and are lost on restart; nothing re-announces.
@@ -578,11 +587,31 @@ re-announces them. The browser wires it for post bodies: `PostAnnouncementGossip
   records on other nodes (open point F2). A gossip flood can push legitimate CIDs out of the 256 tracked ones; that
   affects only findability.
 * *Not reloaded after a restart.* The tracked set and the post index live in memory.
-* *Bitswap gap, reported, not fixed.* `javap` on `nabu-v0.8.0.jar`: `BitswapEngine.recentBlocksSent` is a
-  `private final Map<PeerId, Map<Want, Boolean>>` without expiry, and `RefreshableBitswapEngine` cannot reach it, so a
-  holder does not send the same block to the same relay twice. With several holders the relay can fetch from another
-  one (`markRequested` skips the holder it just asked); with one holder the gap stays. A fix needs reflection or a new
-  `receiveMessage`, both on the responder path - a separate wave.
+* *Bitswap resend (fix wave F6).* `javap -c` on `nabu-v0.8.0.jar`, `BitswapEngine.receiveMessage`:
+  `recentBlocksSent` is a `private final Map<PeerId, Map<Want, Boolean>>` (an LRU of 100 peers, each with an LRU of
+  1000 wants, no expiry). For a WANT_BLOCK whose want is in the peer's map the responder does a plain `continue` - no
+  block and no DONT_HAVE - and it puts the want there after every block sent. A requester that asks a single peer
+  (`NabuStorage.fetch` always does) sends WANT_BLOCK without `sendDontHave`, so the holder stayed silent for good:
+  a relay that had fetched a block once for one client could never fetch it from the same holder again (Q20
+  measurement (c): 12 of 12 second lookups through the same exit `Unavailable`, even with two holders). That was
+  also a censorship lever: fetch a block once through relay X, and X no longer gets it from its only holder.
+  `RefreshableBitswapEngine` now overrides `receiveMessage`: it READS Nabu's map once through reflection (the final
+  field is never written) and, for every WANT_BLOCK of a peer whose want is in that peer's map, asks
+  `BitswapResendPolicy`. Allowed: the want is removed from Nabu's (synchronized) map and Nabu answers the entry as a
+  first request. Denied: the entry is dropped from the message (silent, as before; the requester re-sends after five
+  seconds). WANT_HAVE, cancel and malformed entries pass unchanged. Bounds (`BitswapResendLimits`, provisional):
+  at most one re-send per (peer, want) per 5 s, a token bucket per peer (60/min, burst 20) and a global one
+  (1200/min, burst 200); pair stamps (keyed by SHA-256 over peer, CID and auth - no raw CID kept) and peer buckets
+  are LRU-bounded (16,384 pairs, 1,024 peers). No CID or peer is logged. Residual gaps: the workaround depends on a
+  private Nabu field (fail-safe: if reflection fails, Nabu's behaviour remains and a test turns red on a Nabu
+  upgrade); first sends stay unbounded as in Nabu; Sybil identities get past the per-peer bounds, but they get every
+  first send for free anyway; the global bucket is observable from outside and a lever - about 20 identities at
+  their per-peer burst can empty it, then re-sends are denied for everyone until it refills (they never block first
+  sends); Nabu's own LRU eviction (1000 other wants of a peer, 100 other peers) also re-enables a resend, outside
+  these bounds. A relay lookup that waits for a running request holds its lookup-pool slot up to the 20 s deadline
+  (bounded by the pool, the attempt limit and the negative cache of `OnionLookupService`). Not fixed here: Nabu's
+  `getWant` sets `persistBlocks` only when a want is created, so an own `get` of a block whose want a relay lookup
+  created first (transient) does not store it while that want lives.
 * *Loopback observation (tests).* On loopback a holder's walk did not get past a hub peer (`sent ADD_PROVIDER to 1 of
   1`), so the multi-node tests link the holder directly to the peers that must receive the record; and a relay that
   has the holder in its routing table finds even an untracked body there, because Nabu's responder names itself for

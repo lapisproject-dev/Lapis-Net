@@ -336,10 +336,14 @@ class NabuStorage private constructor(
      * it was asked of, and only until five minutes after the want was last requested FROM THAT PEER
      * ([RefreshableBitswapEngine] tracks wants per peer; activity for other peers or blocks does not
      * keep the thread alive). The dial it makes is bounded only by libp2p's own limits (TCP connect
-     * 15 s, Noise read 5 s). The same (block, peer) pair is not requested again within five minutes,
-     * so repeated `get` calls do not multiply those threads; once the five minutes are over, the next
+     * 15 s, Noise read 5 s). The same (block, peer) pair is not requested again within five minutes
+     * while that request is still being re-sent, so repeated `get` calls do not multiply those threads
+     * and return `null` at once (a block that arrives through the running re-send lands in the
+     * blockstore, the next `get` finds it locally). A mark whose want completed or expired meanwhile
+     * is dropped and the request is sent again (fix wave F6); once the five minutes are over, the next
      * `get` really sends the request again and renews the want's lifetime for that peer - Nabu alone
-     * would never send it again.
+     * would never send it again. Since F6 the holder answers such a re-send even for a block it already
+     * sent to this node once ([RefreshableBitswapEngine]).
      *
      * **Address book.** What a DHT response says about a provider's addresses is unverified. It is
      * used for this one fetch only; an address enters the address book only after a connection over
@@ -394,6 +398,11 @@ class NabuStorage private constructor(
      * `addToBlockstore = false` (Nabu then writes the received block nowhere), so the relay neither stores nor serves
      * nor announces what anonymous clients ask for; [provide] is never called. Exception: a want for the same block
      * that this node itself already registered (own [get]) keeps its own setting. `null` when not found in [timeout].
+     *
+     * **Repeated lookups (fix wave F6).** A provider asked within the repeat window is not asked again; if that
+     * request is still being re-sent, this call waits for it (up to [timeout]) instead of returning `null` at once. If
+     * it completed meanwhile, the provider is asked again - and since F6 a holder answers a block it already sent to
+     * this relay ([RefreshableBitswapEngine]), so the same relay can serve the same block to the next client.
      */
     fun fetchTransient(
         cid: Cid,
@@ -412,14 +421,9 @@ class NabuStorage private constructor(
             discovered.forEach { hints[it.peerId] = it.addresses }
             val targets = discovered.map { it.peerId }
             if (targets.isEmpty()) return null
-            val block = fetch(cid, targets, hints, deadline, persist = false)
-            // the want completed, so its re-send threads end: the next client may ask the same providers again
-            if (block !=
-                null
-            ) {
-                synchronized(recentFetches) { targets.forEach { recentFetches.remove(cid.toString() to it) } }
-            }
-            block
+            // a later lookup within the repeat window either waits for the still running request or, if that want
+            // completed meanwhile (stale mark), asks again - see fetch
+            fetch(cid, targets, hints, deadline, persist = false)
         } catch (e: NabuStorageException) {
             logger.debug { "transient fetch failed: ${e.javaClass.simpleName}" }
             null
@@ -502,8 +506,18 @@ class NabuStorage private constructor(
         // The want future is shared by every waiter for this block; it must never be cancelled here.
         val want = bitswapEngine.getWant(Want(cid), persist)
         var submitted = 0
+        // targets whose earlier request for this want is still being re-sent (fix wave F6)
+        var live = 0
         for (peer in targets) {
-            if (recentlyRequested(cid, peer)) continue
+            if (recentlyRequested(cid, peer)) {
+                // the request of the repeat window is still running its course: nothing new to send
+                if (bitswapEngine.isRequestedFrom(Want(cid), peer)) {
+                    live++
+                    continue
+                }
+                // a stale mark: that want completed (or expired) since - this call has to ask again
+                forgetRequested(cid, peer)
+            }
             try {
                 fetchExecutor.execute {
                     // a task that waited in the queue past this call's deadline has nobody left to serve
@@ -522,12 +536,15 @@ class NabuStorage private constructor(
                 submitted++
             } catch (_: RejectedExecutionException) {
                 logger.debug { "all bitswap fetch slots busy" }
-                if (submitted == 0) return null
+                if (submitted == 0 && (live == 0 || persist)) return null
                 break
             }
         }
-        // every target was asked recently: that request is already running its course, nothing to wait for
-        if (submitted == 0) return null
+        // Every target was asked recently and that request is still re-sent every five seconds. [get] returns at once:
+        // a block that arrives later lands in the blockstore, and the timeline (one sequential get per post) stays
+        // fast. A relay lookup (not persisted) waits for the shared want instead - the holder answers its re-send
+        // since fix wave F6 - because nothing else would deliver the block to the waiting client.
+        if (submitted == 0 && (live == 0 || persist)) return null
         val remaining = deadlineNanos - System.nanoTime()
         return try {
             want.get(maxOf(remaining, 0), TimeUnit.NANOSECONDS).block
@@ -621,6 +638,23 @@ class NabuStorage private constructor(
         val last = synchronized(recentFetches) { recentFetches[cid.toString() to peer] } ?: return false
         return clock() - last < FETCH_REPEAT_WINDOW.toNanos()
     }
+
+    /** Fix wave F6: drops the mark of a pair whose want is no longer re-sent (completed or expired). */
+    private fun forgetRequested(
+        cid: Cid,
+        peer: PeerId,
+    ) {
+        synchronized(recentFetches) { recentFetches.remove(cid.toString() to peer) }
+    }
+
+    /** Fix wave F6, tests only: is the want for [cid] still pending and re-sent to [peer]? */
+    internal fun isWantLiveFor(
+        cid: Cid,
+        peer: PeerId,
+    ): Boolean = bitswapEngine.isRequestedFrom(Want(cid), peer)
+
+    /** Fix wave F6, numbers only: how often this node, as a holder, re-sent or refused to re-send a block. */
+    internal fun bitswapResendStats(): ResendStats = bitswapEngine.resendStats()
 
     /**
      * Called only when a Bitswap request is about to be sent (a connection exists): records the pair
@@ -1210,6 +1244,7 @@ class NabuStorage private constructor(
             wallClock: () -> Instant = Instant::now,
             networkMode: StorageNetworkMode = StorageNetworkMode.NETWORK,
             remote: RemoteContentSource? = null,
+            resendLimits: BitswapResendLimits = BitswapResendLimits(),
         ): NabuStorage {
             val serving = networkMode == StorageNetworkMode.NETWORK
             val host = node.host
@@ -1219,7 +1254,8 @@ class NabuStorage private constructor(
                 .createDirectories(privateDir)
             val privateBlockstore = FileBlockstore(privateDir)
 
-            val bitswapEngine = RefreshableBitswapEngine(blockstore, allowAllReads, Bitswap.MAX_MESSAGE_SIZE, clock)
+            val bitswapEngine =
+                RefreshableBitswapEngine(blockstore, allowAllReads, Bitswap.MAX_MESSAGE_SIZE, resendLimits, clock)
             val bitswap = Bitswap(bitswapEngine)
             // Bitswap implements both ConnectionHandler and AddressBookConsumer - mirroring
             // org.peergos.HostBuilder.build()'s own wiring exactly. addProtocolHandler alone is

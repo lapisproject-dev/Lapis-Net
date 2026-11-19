@@ -80,7 +80,7 @@ private class CountedSink(
  * [MultiNodeOnionLookupProvidedBodiesTest]; the explicit call keeps this test independent of the scheduler); five
  * relays with the production sink; a confined client in anonymity mode. Covers the timeline code path
  * ([NabuStorage.localOrRemoteState], as the browser's `TimelineBodyResolver` uses it) with circuit reuse, the context
- * separation, the NOT_FOUND cross-check, the Bitswap gap behind a found mark, and a lying relay. All nodes sit on
+ * separation, the NOT_FOUND cross-check, a relay that delivers the same block again (fix wave F6), and a lying relay. All nodes sit on
  * 127.0.0.1 with an injected locator; network diversity is NOT verified over real networks here.
  */
 class MultiNodeOnionLookupConsumersTest :
@@ -301,7 +301,7 @@ class MultiNodeOnionLookupConsumersTest :
             holderSeesClient() shouldBe false
         }
 
-        test("(c) the Bitswap gap: a relay that already delivered X does not answer NOT_FOUND; a second relay delivers")
+        test("(c) a relay that already delivered X delivers it again; a second relay too")
             .config(timeout = 300.seconds) {
                 val (x, bytes) = publish(900)
                 val a = exitRelays()[0]
@@ -314,11 +314,11 @@ class MultiNodeOnionLookupConsumersTest :
                             120.seconds,
                         ).get(150, TimeUnit.SECONDS)
                         .shouldBeInstanceOf<LookupResult.Found>()
-                    // the same key again through A only (the client has no positive cache): never a NOT_FOUND
+                    // the same key again through A only (the client has no positive cache). Before fix wave F6 the
+                    // single holder never resent X to A (TIMEOUT behind the found mark); now A delivers it again
                     val again = lookup().fetchBlock(x, 120.seconds).get(150, TimeUnit.SECONDS)
-                    println("J3 measurement: second lookup of X through the same relay: $again")
-                    // the found mark: denied (TIMEOUT, then unavailable), never a NOT_FOUND that would be cached
-                    again.shouldBeInstanceOf<LookupResult.Unavailable>()
+                    println("F6 measurement: second lookup of X through the same relay: ${again.javaClass.simpleName}")
+                    again.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
                     allowedRef.set(setOf(a.key, b.key))
                     val third = lookup().fetchBlock(x, 120.seconds).get(150, TimeUnit.SECONDS)
                     third.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
@@ -330,7 +330,7 @@ class MultiNodeOnionLookupConsumersTest :
         test("(e) a lying relay: its answer is rejected, it goes on backoff, the next relay delivers the right block")
             .config(timeout = 300.seconds) {
                 val (cid, bytes) = publish(800)
-                // the exit of (c) may still be on its backoff: the third exit lies, the second one is honest
+                // the third exit lies, the second one is honest (no exit is on a backoff from (c) since fix wave F6)
                 val liar = exitRelays()[2]
                 val honest = exitRelays()[1]
                 allowedRef.set(setOf(liar.key))

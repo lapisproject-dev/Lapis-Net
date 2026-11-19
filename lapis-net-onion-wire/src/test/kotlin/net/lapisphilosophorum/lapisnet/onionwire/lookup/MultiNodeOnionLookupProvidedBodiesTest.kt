@@ -5,7 +5,6 @@ package net.lapisphilosophorum.lapisnet.onionwire.lookup
 import io.ipfs.cid.Cid
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
-import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import io.libp2p.core.multiformats.Multiaddr
 import net.lapisphilosophorum.lapisnet.directory.DirectoryAnonymityMode
@@ -235,12 +234,36 @@ class MultiNodeOnionLookupProvidedBodiesTest :
                 val first = lookup().fetchBlock(cid, 120.seconds).get(150, TimeUnit.SECONDS)
                 val second = lookup().fetchBlock(cid, 120.seconds).get(150, TimeUnit.SECONDS)
                 println(
-                    "Q20 measurement: (c) two holders, same exit: first=${first.javaClass.simpleName} " +
+                    "F6 measurement: (c) two holders, same exit: first=${first.javaClass.simpleName} " +
                         "second=${second.javaClass.simpleName}",
                 )
-                first.shouldBeInstanceOf<LookupResult.Found>()
-                // no assertion on the second result: it depends on which holder the exit asked first
-                second shouldNotBe null
+                first.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
+                // before fix wave F6 both holders stayed silent towards the exit that already got the block
+                second.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
+            } finally {
+                allowedRef.set(null)
+            }
+        }
+
+        test("(d) a single holder, two lookups through the same exit: both are found").config(timeout = 300.seconds) {
+            val bytes = ByteArray(850).also(random::nextBytes)
+            val cid = holder.storage.put(bytes)
+            scheduler.track(cid)
+            announceUntil(scheduler, holder, cid) shouldBe true
+            val exit = exitRelays()[0]
+            allowedRef.set(setOf(exit.key))
+            try {
+                val started = System.nanoTime()
+                val first = lookup().fetchBlock(cid, 120.seconds).get(150, TimeUnit.SECONDS)
+                val firstMs = (System.nanoTime() - started) / 1_000_000
+                val second = lookup().fetchBlock(cid, 120.seconds).get(150, TimeUnit.SECONDS)
+                val bothMs = (System.nanoTime() - started) / 1_000_000
+                println(
+                    "F6 measurement: (d) single holder, same exit: first=${first.javaClass.simpleName} " +
+                        "second=${second.javaClass.simpleName} firstMs=$firstMs bothMs=$bothMs",
+                )
+                first.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
+                second.shouldBeInstanceOf<LookupResult.Found>().bytes.toList() shouldBe bytes.toList()
             } finally {
                 allowedRef.set(null)
             }

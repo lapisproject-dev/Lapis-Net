@@ -51,12 +51,13 @@ data class OnionLookupServiceConfig(
     /**
      * How long a key stays marked as "found here" after this relay last FOUND it. While the mark lasts, a lookup of
      * that key that ends without content (NOT_FOUND, TIMEOUT, content that does not verify) is answered TIMEOUT,
-     * counts as no miss and writes no negative entry, and it extends the mark by this duration. Reason: Nabu's
-     * Bitswap responder does not resend a block to a peer it already sent it to (a per-peer LRU without expiry), and
-     * the storage does not re-ask a holder within its repeat window, so a second lookup of an existing block from
-     * the same holder misses for reasons that say nothing about the block. Without the mark, anyone could turn an
-     * existing key into a cached NOT_FOUND with three requests (security audit of wave J2, round 2); with it the
-     * client gets TIMEOUT and asks its next relay. Only a verified FOUND sets the mark, so a missing key never gets one.
+     * counts as no miss and writes no negative entry, and it extends the mark by this duration. Reason: a second
+     * lookup of an existing block can miss for reasons that say nothing about the block - its only holder went
+     * offline, or it is at its re-send limit (`BitswapResendLimits` in lapis-net-storage). Before fix wave F6 this
+     * was the normal case: Nabu's Bitswap responder never resent a block to a peer it already sent it to (a per-peer
+     * LRU without expiry); since F6 the holder resends within bounds. Without the mark, anyone could turn an existing
+     * key into a cached NOT_FOUND with three requests (security audit of wave J2, round 2); with it the client gets
+     * TIMEOUT and asks its next relay. Only a verified FOUND sets the mark, so a missing key never gets one.
      */
     val foundMarkTtl: Duration = 30.minutes,
     /** Bytes of answer (counted by size class) per minute over all clients; more is answered RATE_LIMITED. */

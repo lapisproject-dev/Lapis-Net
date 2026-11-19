@@ -228,8 +228,8 @@ class OnionLookupServiceTest :
         }
 
         test("a found key can not be pushed into NOT_FOUND: Found, Timeout, NotFound, later served") {
-            // the production sink after one FOUND: the holder does not resend (Timeout), then the storage skips the
-            // holder it asked recently (NotFound at once) - security audit of wave J2, round 2
+            // a sink that misses after one FOUND (a holder offline or at its re-send limit - before fix wave F6 also
+            // Nabu's responder that never resent a block): Timeout, then NotFound - security audit of wave J2, round 2
             val r = ServiceRig()
             val block = "post body held by one holder".toByteArray()
             val cid = rawCid(block)

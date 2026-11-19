@@ -37,9 +37,10 @@ class NabuStorageLookupRelayTest :
                 // not kept: neither in the served store nor anywhere else, and no provider record of its own
                 relay.getLocal(cid).shouldBeNull()
                 relay.localProviderRecords(cid).size shouldBe 0
-                // a second lookup does not store it either. (Whether it finds the block again depends on the holder:
-                // Nabu's responder does not resend a block it sent to the same peer recently - see docs/anonymity.adoc.)
-                relay.fetchTransient(cid, Duration.ofSeconds(5))
+                // fix wave F6: a second lookup through the same relay finds the block again (Nabu's responder alone
+                // never resends a block it already sent to the same peer), and it is not stored either
+                val again = relay.fetchTransient(cid, Duration.ofSeconds(20)).shouldNotBeNull()
+                again.toList() shouldBe payload.toList()
                 relay.getLocal(cid).shouldBeNull()
                 relay.localProviderRecords(cid).size shouldBe 0
             } finally {
