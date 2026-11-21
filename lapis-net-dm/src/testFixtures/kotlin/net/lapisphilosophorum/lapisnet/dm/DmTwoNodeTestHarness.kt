@@ -147,17 +147,70 @@ fun buildDmTestNode(
     )
 }
 
+/**
+ * Polls [condition] every [pollMs] until it holds or [timeout] (default 30 s) has passed; returns the last result.
+ * The shared wait of this module's tests (replaces the private copies that some test files had).
+ */
+fun awaitTrue(
+    timeout: Duration = Duration.ofSeconds(30),
+    pollMs: Long = 50,
+    condition: () -> Boolean,
+): Boolean {
+    val deadline = Instant.now().plus(timeout)
+    while (Instant.now().isBefore(deadline)) {
+        if (condition()) return true
+        Thread.sleep(pollMs)
+    }
+    return condition()
+}
+
+/** The two topics every [DmTestNode] publishes on in [DmTestNode.publishSelf]. */
+val DM_TEST_NODE_TOPICS: List<String> =
+    listOf(PeerDirectoryGossip.PEER_RECORD_GOSSIP_TOPIC, PrekeyBundleGossip.PREKEY_BUNDLE_GOSSIP_TOPIC)
+
+/**
+ * Waits until [publisher] can publish on every one of [topics] towards [receiver] without the router failing the
+ * publish: [publisher] has seen [receiver]'s SUBSCRIBE for each topic, and [receiver] has seen at least one SUBSCRIBE
+ * of [publisher] (that arrived over [publisher]'s outbound pubsub stream, so that stream is open).
+ *
+ * Without this wait a publish right after `connect` failed under CPU load with `SemiDuplexNoOutboundStreamException`
+ * ("No active outbound stream", wrapped in [net.lapisphilosophorum.lapisnet.networking.GossipPubSubException]): the
+ * peer was already known to the router, but the outbound stream to it was not open yet. A pure state wait, no retry.
+ */
+fun awaitGossipReady(
+    publisher: GossipPubSub,
+    publisherPeer: io.libp2p.core.PeerId,
+    receiver: GossipPubSub,
+    receiverPeer: io.libp2p.core.PeerId,
+    topics: Collection<String>,
+    timeout: Duration = Duration.ofSeconds(30),
+): Boolean {
+    fun ready(): Boolean {
+        val seenByPublisher = publisher.remotePeerTopics()[receiverPeer].orEmpty()
+        return seenByPublisher.containsAll(topics) && receiver.remotePeerTopics().containsKey(publisherPeer)
+    }
+    return awaitTrue(timeout) { ready() }
+}
+
 /** Connects [a] to [b] and republishes both nodes' directory records/prekey bundles until each side
  * can see the other's - GossipSub mesh formation (GRAFT) is asynchronous, so retrying the whole
  * publish, not just the assertion, mirrors `TwoNodePrekeyBundleGossipIntegrationTest`'s established
  * retry-the-whole-announce-call pattern. Bounded-polling-against-one-deadline, no fixed
- * `Thread.sleep` wait for the OUTCOME (only a short sleep between retries). */
+ * `Thread.sleep` wait for the OUTCOME (only a short sleep between retries). Before the first publish it
+ * waits (state-based, see [awaitGossipReady]) until both pubsub streams are open in both directions. */
 fun connectAndConverge(
     a: DmTestNode,
     b: DmTestNode,
     timeout: Duration = Duration.ofSeconds(30),
 ) {
     a.node.connect(PeerInfo(b.node.peerId, b.node.listenAddresses()))
+    check(
+        awaitGossipReady(a.pubsub, a.node.peerId, b.pubsub, b.node.peerId, DM_TEST_NODE_TOPICS, timeout) &&
+            awaitGossipReady(b.pubsub, b.node.peerId, a.pubsub, a.node.peerId, DM_TEST_NODE_TOPICS, timeout),
+    ) {
+        "pubsub streams between ${a.identity.secp256k1KeyPair.publicKey.fingerprint()} and " +
+            "${b.identity.secp256k1KeyPair.publicKey.fingerprint()} were not open within $timeout"
+    }
     val deadline = Instant.now().plus(timeout)
     while (Instant.now().isBefore(deadline)) {
         a.publishSelf()

@@ -184,6 +184,12 @@ internal class OnionLinkManager(
     /** Test seam (null in production): runs on the dial thread after the stream is open, before the tie-break. */
     @Volatile internal var beforeDialResultForTest: ((PeerId) -> Unit)? = null
 
+    /**
+     * Test seam (null in production): runs on the dial thread before the connection or stream is opened. Lets a test hold
+     * two dials until both `linkTo` calls are registered, so that neither caller can see the other's link yet.
+     */
+    @Volatile internal var beforeDialForTest: ((PeerId) -> Unit)? = null
+
     val protocolHandler = OnionProtocolHandler(this, config)
     val binding = OnionProtocolBinding(protocolHandler)
 
@@ -505,6 +511,7 @@ internal class OnionLinkManager(
             submit {
                 var linkId: LinkId? = null
                 var failure: Exception? = null
+                runCatching { beforeDialForTest?.invoke(peer) }
                 try {
                     val timeout = java.time.Duration.ofMillis(config.extendTimeout.inWholeMilliseconds)
                     val safe = addresses.filterNot { MultiaddrHygiene.isBlockedPrivateOrLocal(it) }

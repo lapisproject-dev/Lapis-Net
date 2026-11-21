@@ -30,18 +30,6 @@ import java.time.ZoneOffset
 import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 
-private fun awaitTrue(
-    timeout: Duration,
-    condition: () -> Boolean,
-): Boolean {
-    val deadline = Instant.now().plus(timeout)
-    while (Instant.now().isBefore(deadline)) {
-        if (condition()) return true
-        Thread.sleep(100)
-    }
-    return condition()
-}
-
 private class MutableClock(
     @Volatile var now: Instant,
 ) : Clock() {

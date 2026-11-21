@@ -74,7 +74,9 @@ class OnionMailboxPublisherTest :
                     receivedBy.size shouldBe 1
                     val got = receivedBy.single().items.toList()
                     got.size shouldBe 4
-                    got.zip(items).all { (a, b) -> a.contentEquals(b) } shouldBe true
+                    // The relay hands each item to the sink on its own pool task (OnionRelayService.deliverMailboxItem), so
+                    // the arrival order is not defined (it varied under CPU load); every item must arrive intact, once.
+                    got.map { it.toList() }.toSet() shouldBe items.map { it.toList() }.toSet()
                     publisher.openCircuits() shouldBe 0
                     publisher.publicationCount() shouldBe 1
                 } finally {

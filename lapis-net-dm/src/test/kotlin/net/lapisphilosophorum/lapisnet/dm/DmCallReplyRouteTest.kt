@@ -9,8 +9,6 @@ import io.libp2p.core.PeerInfo
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import java.nio.file.Files
 import java.nio.file.Path
-import java.time.Duration
-import java.time.Instant
 import java.util.Collections
 
 /**
@@ -32,18 +30,6 @@ private class Pair2(
         a.stop()
         b.stop()
     }
-}
-
-private fun awaitTrue(
-    timeout: Duration = Duration.ofSeconds(30),
-    condition: () -> Boolean,
-): Boolean {
-    val deadline = Instant.now().plus(timeout)
-    while (Instant.now().isBefore(deadline)) {
-        if (condition()) return true
-        Thread.sleep(100)
-    }
-    return condition()
 }
 
 /** A knows B (B published); B does NOT know A. A->B TEXT establishes the session, then A sends one

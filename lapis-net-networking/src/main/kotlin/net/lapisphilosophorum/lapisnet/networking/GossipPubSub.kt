@@ -174,6 +174,15 @@ class GossipPubSub private constructor(
     fun subscribedTopics(): Set<String> = synchronized(subscribed) { subscribed.keys.toSet() }
 
     /**
+     * A read-only snapshot of the remote peers this node knows to be subscribed to a topic, with those topics (tests,
+     * status). A peer appears here once its own SUBSCRIBE message has arrived, so an entry for a peer means that the
+     * peer's outbound pubsub stream to this node is open. Changes nothing.
+     */
+    fun remotePeerTopics(timeout: Duration = DEFAULT_TIMEOUT): Map<PeerId, Set<String>> =
+        awaitOrWrap("read the remote peer topics", timeout) { gossip.getPeerTopics() }
+            .mapValues { (_, topics) -> topics.map { it.topic }.toSet() }
+
+    /**
      * Test seam (wave V0.10.0-D): sees `(topic, bytes)` of every message THIS node publishes itself (not the ones it
      * merely forwards). `null` in production. The leak scanner of the anonymity tests uses it to prove that a node in
      * anonymity mode publishes nothing that contains its addresses or transport identity.

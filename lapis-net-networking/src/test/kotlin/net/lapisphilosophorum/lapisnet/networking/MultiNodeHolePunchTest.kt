@@ -81,7 +81,7 @@ class MultiNodeHolePunchTest :
                     .id()
                     .get(10, TimeUnit.SECONDS) shouldNotBe null
 
-                awaitTrue(Duration.ofSeconds(20)) { relayed.closeFuture().isDone } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { relayed.closeFuture().isDone } shouldBe true
                 nodeA.liveConnectionTo(nodeB.peerId)?.remoteAddress()?.has(Protocol.P2PCIRCUIT) shouldBe false
                 nodeB.holePunching!!.status().succeeded shouldBe 1L
             } finally {
@@ -139,7 +139,7 @@ class MultiNodeHolePunchTest :
                 nodeB.relayClient.reserve(relayInfo(relay))
                 val circuit = nodeB.listenAddresses().first { it.has(Protocol.P2PCIRCUIT) }
                 val relayed = connectDiagnosed(nodeA, PeerInfo(nodeB.peerId, listOf(circuit)), relay = relay)
-                awaitTrue(Duration.ofSeconds(20)) { nodeB.holePunching!!.status().failed == 1L } shouldBe true
+                awaitTrue(Duration.ofSeconds(30)) { nodeB.holePunching!!.status().failed == 1L } shouldBe true
                 nodeB.holePunching!!.status().succeeded shouldBe 0L
                 relayed.closeFuture().isDone shouldBe false
                 directConnectionTo(nodeA, nodeB.peerId) shouldBe null
@@ -154,7 +154,7 @@ class MultiNodeHolePunchTest :
 
         test("stopping the nodes leaves no hole-punch timer thread behind") {
             if (!ReusePortSupport.available) return@test
-            awaitTrue(Duration.ofSeconds(10)) {
+            awaitTrue(Duration.ofSeconds(30)) {
                 Thread.getAllStackTraces().keys.none { it.name == "lapis-holepunch" && it.isAlive }
             } shouldBe true
         }

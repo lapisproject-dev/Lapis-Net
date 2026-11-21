@@ -548,7 +548,7 @@ class DmStreamAbuseTest :
                 // underlying Netty channel has actually finished tearing down yet.
                 val s1 = dialRaw(attacker.host, victim.host.peerId, victim.listenAddresses())
                 s1.writeAndFlush(Unpooled.wrappedBuffer(bigEndian4(4) + byteArrayOf(1, 2, 3, 4)))
-                val afterS1Deadline = System.currentTimeMillis() + 10_000
+                val afterS1Deadline = System.currentTimeMillis() + 30_000
                 while (dmProtocol.streamCountForTest(peer) != 0 && System.currentTimeMillis() < afterS1Deadline) {
                     Thread.sleep(50)
                 }
@@ -558,7 +558,7 @@ class DmStreamAbuseTest :
                 // sent on it, so it can never trigger its own onMessage/onFinished. A genuinely
                 // concurrent second stream from the same peer.
                 val s2 = dialRaw(attacker.host, victim.host.peerId, victim.listenAddresses())
-                val afterS2Deadline = System.currentTimeMillis() + 10_000
+                val afterS2Deadline = System.currentTimeMillis() + 30_000
                 while (dmProtocol.streamCountForTest(peer) != 1 && System.currentTimeMillis() < afterS2Deadline) {
                     Thread.sleep(50)
                 }

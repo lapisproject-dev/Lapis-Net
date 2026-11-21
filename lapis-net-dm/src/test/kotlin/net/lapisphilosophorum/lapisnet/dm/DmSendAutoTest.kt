@@ -31,15 +31,11 @@ class DmSendAutoTest :
                 val received = Collections.synchronizedList(mutableListOf<DmInboundMessage>())
                 recipient.dmSessionManager.addInboundListener { received.add(it) }
 
-                var outcome: DmSendOutcome? = null
-                val deadline = Instant.now().plus(Duration.ofSeconds(30))
-                while (received.isEmpty() && Instant.now().isBefore(deadline)) {
-                    outcome =
-                        runCatching {
-                            sender.dmSessionManager.sendAuto(recipientPub, DmContent(body = "hello online"))
-                        }.getOrNull()
-                    if (received.isEmpty()) Thread.sleep(1000)
-                }
+                // Exactly ONE send: connectAndConverge already waited until both directory records and bundles are
+                // visible, so the recipient is reachable. (Repeating sendAuto until the listener fired sent a second
+                // message whenever the first one was delivered but seen by the listener only after the next attempt.)
+                val outcome = sender.dmSessionManager.sendAuto(recipientPub, DmContent(body = "hello online"))
+                awaitTrue(Duration.ofSeconds(30)) { received.isNotEmpty() } shouldBe true
 
                 outcome shouldBe DmSendOutcome.SENT_ONLINE
                 received.size shouldBe 1
@@ -71,6 +67,13 @@ class DmSendAutoTest :
             try {
                 recipientNode.connect(PeerInfo(sender.node.peerId, sender.node.listenAddresses()))
                 val recipientPub = recipientIdentity.secp256k1KeyPair.publicKey
+                awaitGossipReady(
+                    recipientPubsub,
+                    recipientNode.peerId,
+                    sender.pubsub,
+                    sender.node.peerId,
+                    listOf(PrekeyBundleGossip.PREKEY_BUNDLE_GOSSIP_TOPIC),
+                ) shouldBe true
 
                 // Only the BUNDLE converges (needed for X3DH first contact) - the directory record
                 // never does, since it is never announced here at all.
@@ -125,6 +128,20 @@ class DmSendAutoTest :
             try {
                 recipientNode.connect(PeerInfo(sender.node.peerId, sender.node.listenAddresses()))
                 val recipientPub = recipientIdentity.secp256k1KeyPair.publicKey
+                awaitGossipReady(
+                    recipientPubsub,
+                    recipientNode.peerId,
+                    sender.pubsub,
+                    sender.node.peerId,
+                    DM_TEST_NODE_TOPICS,
+                ) shouldBe true
+                awaitGossipReady(
+                    sender.pubsub,
+                    sender.node.peerId,
+                    recipientPubsub,
+                    recipientNode.peerId,
+                    DM_TEST_NODE_TOPICS,
+                ) shouldBe true
 
                 val convergeDeadline = Instant.now().plus(Duration.ofSeconds(30))
                 while (Instant.now().isBefore(convergeDeadline)) {
@@ -192,6 +209,20 @@ class DmSendAutoTest :
                     )
                 try {
                     recipientNode.connect(PeerInfo(sender.node.peerId, sender.node.listenAddresses()))
+                    awaitGossipReady(
+                        recipientPubsub,
+                        recipientNode.peerId,
+                        sender.pubsub,
+                        sender.node.peerId,
+                        DM_TEST_NODE_TOPICS,
+                    ) shouldBe true
+                    awaitGossipReady(
+                        sender.pubsub,
+                        sender.node.peerId,
+                        recipientPubsub,
+                        recipientNode.peerId,
+                        DM_TEST_NODE_TOPICS,
+                    ) shouldBe true
                     val reconvergeDeadline = Instant.now().plus(Duration.ofSeconds(30))
                     while (Instant.now().isBefore(reconvergeDeadline)) {
                         val notValidAfter = Instant.now().epochSecond + 3600
@@ -262,6 +293,13 @@ class DmSendAutoTest :
             try {
                 recipientNode.connect(PeerInfo(sender.node.peerId, sender.node.listenAddresses()))
                 val recipientPub = recipientIdentity.secp256k1KeyPair.publicKey
+                awaitGossipReady(
+                    recipientPubsub,
+                    recipientNode.peerId,
+                    sender.pubsub,
+                    sender.node.peerId,
+                    DM_TEST_NODE_TOPICS,
+                ) shouldBe true
 
                 // Bundle converges normally (needed for X3DH first contact), but the directory
                 // record sender caches for this peer advertises ONLY a /quic-v1 address - a

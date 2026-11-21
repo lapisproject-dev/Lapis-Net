@@ -178,19 +178,21 @@ class DmPolicyAuthorityTest :
         }
     })
 
+/**
+ * Sends exactly ONE message and waits for it. connectAndConverge already made both records and bundles visible, so
+ * the send needs no retry; repeating it until the listener fired delivered a second copy whenever the first one was
+ * seen by the listener only after the next attempt, which broke the exact counts and indices the tests assert.
+ */
 private fun sendAndAwaitReceived(
     from: DmTestNode,
     to: DmTestNode,
     recipientIdentity: net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey,
     received: MutableList<DmInboundMessage>,
     bodyText: String,
-    timeoutSeconds: Long = 20,
+    timeoutSeconds: Long = 30,
 ) {
     val before = received.size
-    val deadline = System.currentTimeMillis() + timeoutSeconds * 1000
-    while (received.size <= before && System.currentTimeMillis() < deadline) {
-        runCatching { from.dmSessionManager.send(recipientIdentity, DmContent(body = bodyText)) }
-        Thread.sleep(1000)
-    }
+    from.dmSessionManager.send(recipientIdentity, DmContent(body = bodyText))
+    awaitTrue(java.time.Duration.ofSeconds(timeoutSeconds)) { received.size > before }
     if (received.size <= before) error("expected at least ${before + 1} inbound message(s), got ${received.size}")
 }
