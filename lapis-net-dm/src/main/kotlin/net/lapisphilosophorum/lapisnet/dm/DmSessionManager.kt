@@ -246,6 +246,13 @@ enum class DmSendOutcome {
  * rejection handling and sends to other peers on the same stripe therefore never wait for a dial;
  * a second send to the SAME peer still does (ordering), bounded by [LANE_WAIT_TIMEOUT] and
  * interruptible. See `docs/architecture.adoc`, "Two-phase send".
+ *
+ * **Inbound delivery outside the stripe lock.** An inbound envelope is deduplicated, decrypted, persisted and marked
+ * under the sender's stripe lock; its listener notification is only enqueued there ([InboundDeliveryQueue]) and runs
+ * after the lock, per peer in ratchet order. A slow listener therefore delays only later deliveries of the same peer,
+ * never a send, rejection handling or traffic of other peers on the same stripe. Disk persistence and the Argon2id
+ * one-time-prekey consumption stay under the lock (persist-before-deliver, consume-before-respond). See
+ * `docs/architecture.adoc`, "Inbound delivery outside the stripe lock".
  */
 class DmSessionManager private constructor(
     private val localIdentity: DualKeyIdentity,
@@ -771,7 +778,8 @@ class DmSessionManager private constructor(
      * [DoubleRatchetSession.destroy] the evicted entry's in-memory copy, since the durable copy on
      * disk is unaffected. Access always wrapped in `synchronized(liveSessionCache)`, itself always
      * called from within a [withPeerLock] critical section (consistent lock ordering: per-peer lock
-     * first, cache lock second, released immediately - no deadlock risk). */
+     * first, cache lock second, released immediately - no deadlock risk). Inbound listeners never run under
+     * either lock ([InboundDeliveryQueue]); the test accessor [liveSessionForTest] reads without the peer lock. */
     private val liveSessionCache =
         object : LinkedHashMap<Secp256k1PublicKey, DoubleRatchetSession>(16, 0.75f, true) {
             override fun removeEldestEntry(
@@ -865,6 +873,12 @@ class DmSessionManager private constructor(
 
     private val inboundListeners = CopyOnWriteArrayList<(DmInboundMessage) -> Unit>()
 
+    /** Listener notifications per peer, in ratchet order, run after the stripe lock - see [InboundDeliveryQueue]. */
+    private val inboundDelivery = InboundDeliveryQueue()
+
+    /** Test seam: the inbound delivery queue (bound checks). */
+    internal fun inboundDeliveryQueueForTest(): InboundDeliveryQueue = inboundDelivery
+
     /** V0.8.7 - see [addCallSignalListener]/[DmInboundCallSignal]'s own doc comments. A completely
      * separate list from [inboundListeners]: a `CALL_SIGNAL` envelope is NEVER also handed to
      * [inboundListeners] - see [processInboundDmEnvelope]'s own doc comment on why calling never
@@ -923,19 +937,21 @@ class DmSessionManager private constructor(
         synchronized(recentlyDeliveredDedupKeys) { recentlyDeliveredDedupKeys[DedupKeyId(key)] = true }
     }
 
-    /** Registers a listener invoked for every successfully decrypted inbound message, from within
-     * the same [withPeerLock] critical section that persisted it - see
-     * [handleInboundEnvelope]'s doc comment. A listener that throws is caught and logged; it never
-     * prevents delivery to other listeners or corrupts this manager's own state. A listener must not
-     * send synchronously: such a send dials while the sender's stripe lock is held (counted in
-     * [DmDiagnostics.dialsUnderPeerLock]) and may wait up to [LANE_WAIT_TIMEOUT] for its lane turn. */
+    /** Registers a listener invoked for every successfully decrypted inbound message, AFTER the message was
+     * persisted and the sender's stripe lock released ([InboundDeliveryQueue]): per sender in ratchet order, on the
+     * receiving thread (or on the thread currently delivering that sender's earlier messages), and before the
+     * receiving call returns. A slow listener delays only later deliveries of the same sender. A listener that throws
+     * is caught and logged; it never prevents delivery to other listeners or corrupts this manager's own state. On the
+     * direct path the receiving thread is a Netty event-loop thread: a listener should not block or send
+     * synchronously there (the send's stream needs that same event loop), but such a send no longer dials under the
+     * stripe lock ([DmDiagnostics.dialsUnderPeerLock] stays 0). */
     fun addInboundListener(listener: (DmInboundMessage) -> Unit) {
         inboundListeners.add(listener)
     }
 
     /** V0.8.7 - registers a listener invoked for every successfully decrypted inbound
-     * [DmInboundCallSignal], from within the same [withPeerLock] critical section that persisted the
-     * underlying session - mirrors [addInboundListener]'s exact contract. A listener that throws is
+     * [DmInboundCallSignal], after the underlying session was persisted and the sender's stripe lock released, in
+     * the same per-sender order as (and interleaved with) [addInboundListener]'s - mirrors its exact contract. A listener that throws is
      * caught and logged; it never prevents delivery to other listeners or corrupts this manager's
      * own state. The intended (today, sole expected) caller is
      * `net.lapisphilosophorum.lapisnet.call.DmCallSignalTransport`. */
@@ -1233,10 +1249,10 @@ class DmSessionManager private constructor(
      * The intended (today, sole expected) caller is
      * `net.lapisphilosophorum.lapisnet.call.DmCallSignalTransport`, itself called only from
      * `CallManager`'s own dedicated media thread - NEVER synchronously from a
-     * [addCallSignalListener] callback, which runs inside [withPeerLock] for the SAME peer and would
-     * otherwise deadlock-adjacently block that peer's entire DM traffic for the duration of this
-     * call's dial (see `CallManager`'s own class doc comment on its three-executor concurrency model
-     * for why this is load-bearing, not merely a style preference).
+     * [addCallSignalListener] callback. That callback no longer runs under the stripe lock, but on the
+     * direct path it runs on the Netty event-loop thread that delivered the signal, which the dial here may
+     * need, and it holds back that peer's later deliveries for the duration of the dial (see `CallManager`'s
+     * own class doc comment on its three-executor concurrency model).
      *
      * [marksAcceptance] MUST be `true` only for a signal [CallManager] sends in direct response to a
      * LOCAL user decision to COMMUNICATE with [recipient] - an outgoing INVITE from `placeCall`, an
@@ -1633,9 +1649,9 @@ class DmSessionManager private constructor(
     /**
      * Dials (or opens a stream) and writes one frame. Waits up to [DIAL_TIMEOUT] for a dial slot and up to
      * [DIAL_TIMEOUT] for the stream. Must be called WITHOUT the recipient's stripe lock - the whole point of the
-     * two-phase send. The one known caller that still holds a stripe lock here is a listener that sends synchronously
-     * from inside an inbound callback (a documented contract violation, see [addInboundListener]); that case is
-     * counted in [DmDiagnostics.dialsUnderPeerLock] and logged once, never thrown.
+     * two-phase send. Since inbound listeners run after the stripe lock ([InboundDeliveryQueue]) no known caller holds
+     * one here any more; the check below stays as a guard: such a case is counted in
+     * [DmDiagnostics.dialsUnderPeerLock] and logged once, never thrown.
      */
     private fun dispatchVia(
         recipient: Secp256k1PublicKey,
@@ -1647,8 +1663,8 @@ class DmSessionManager private constructor(
             ctrDialsUnderPeerLock.incrementAndGet()
             if (dialUnderPeerLockLogged.compareAndSet(false, true)) {
                 logger.warn {
-                    "a DM dial runs while the caller holds the peer's stripe lock (a listener sending " +
-                        "synchronously?) - inbound traffic on that stripe waits for it; send from another thread"
+                    "a DM dial runs while the caller holds the peer's stripe lock - inbound traffic on that " +
+                        "stripe waits for it (no known caller does this any more)"
                 }
             }
         }
@@ -1877,420 +1893,11 @@ class DmSessionManager private constructor(
     ): Boolean {
         val claimedSender = envelope.senderIdentity
         return try {
-            withPeerLock(claimedSender) {
-                val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
-                if (isRecentlyDelivered(dedupKey)) {
-                    logger.debug {
-                        "skipping envelope from $sourceDescription claimed sender ${who(claimedSender)} " +
-                            "- already delivered (dedup key match)"
-                    }
-                    return@withPeerLock true
-                }
-
-                // Set ONLY inside the X3DH_INITIAL branch below, to the accepted header's ephemeral
-                // key - recorded into the durable per-peer registry AFTER decrypt succeeds (commit-
-                // only-after-AEAD-verifies, same discipline as persistSession's own call sites below).
-                // See recordAcceptedX3dhInitialEphemeralKey's own doc comment.
-                var freshX3dhInitialEphemeralKeyToRecord: ByteArray? = null
-                val (session, isFreshHandshake) =
-                    when (envelope.messageType) {
-                        DmMessageType.X3DH_INITIAL -> {
-                            val header =
-                                envelope.x3dhInitialHeader
-                                    ?: error(
-                                        "DmEnvelope's own init already guarantees x3dhInitialHeader is non-null here",
-                                    )
-                            // Cheap, stateless authenticity check BEFORE ever touching
-                            // localPrekeyStore.consumeOneTimePrekey below - see this function's own
-                            // doc comment section on why. X3dh.respond performs this SAME check
-                            // itself (its own check 2), but only AFTER a one-time prekey would
-                            // already have been durably consumed if this guard were absent. Without
-                            // it, an attacker holding NO private key material at all could mint
-                            // structurally-valid-but-garbage-signed X3DH_INITIAL envelopes naming
-                            // sequential one-time-prekey ids and durably burn through this node's
-                            // entire one-time-prekey pool for zero cryptographic cost -
-                            // EncryptionKeyBinding's own constructor performs only a 64-byte size
-                            // check on the signature, never a cryptographic one. This is the
-                            // SAME (initiatorIdentity, initiatorEncryptionBinding) pair X3dh.respond
-                            // itself verifies further down - duplicated here deliberately, not
-                            // routed through respond() first, because respond() also needs the
-                            // ALREADY-consumed prekey as an argument (see PrekeyConsumptionException
-                            // - the consume-before-respond ordering [X3dh]'s own class doc comment
-                            // mandates for replay protection).
-                            val headerBindingVerifies =
-                                EncryptionKeyBinding.verify(header.initiatorIdentity, header.initiatorEncryptionBinding)
-                            if (!headerBindingVerifies) {
-                                logger.debug {
-                                    "X3DH_INITIAL from claimed sender ${who(claimedSender)} carries an " +
-                                        "encryption key binding that does not verify against the claimed identity " +
-                                        "- rejecting BEFORE any one-time prekey consumption"
-                                }
-                                return@withPeerLock true // garbage/tamper - these exact bytes will never verify
-                            }
-                            // **Security audit round 1 fix (2026-08-27): DURABLE, per-peer replay guard
-                            // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
-                            // the full story of the gap this closes, PROVEN exploitable by a restart
-                            // (which empties that in-memory-only cache) via an executable probe.**
-                            // Checked here - BEFORE any one-time-prekey consumption, BEFORE X3dh.respond,
-                            // BEFORE a new session is ever built - because [X3dh.initiate] mints a FRESH
-                            // ephemeral X25519 keypair on EVERY call (see that function's own body), so a
-                            // genuinely repeated, legitimate handshake from the same peer (the accepted
-                            // residual "no session registry" gap this class's own doc comment discloses)
-                            // always carries a DIFFERENT [X3dhPreKeyMessageHeader.ephemeralPublicKey] -
-                            // only a literal byte-for-byte replay of an ALREADY-ACCEPTED handshake ever
-                            // collides here. Loaded fresh from disk on every attempt (not cached in
-                            // memory) specifically so this survives this manager's own restart -
-                            // [loadAcceptedX3dhInitialEphemeralKeys]'s own doc comment.
-                            if (loadAcceptedX3dhInitialEphemeralKeys(claimedSender).any {
-                                    it.contentEquals(header.ephemeralPublicKey.bytes)
-                                }
-                            ) {
-                                logger.debug {
-                                    "rejecting X3DH_INITIAL from claimed sender ${who(claimedSender)} - " +
-                                        "this exact ephemeral key was already accepted for a prior handshake " +
-                                        "(durable, survives a restart) - replay, not a legitimate re-handshake"
-                                }
-                                return@withPeerLock true // this exact handshake will never become acceptable again
-                            }
-                            // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
-                            // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
-                            // null` (a "signed-prekey-only" X3DH_INITIAL, no one-time prekey named) -
-                            // deliberately, not an oversight. Traced, not assumed:
-                            // [prekeyConsumptionRateLimiter]/[prekeyConsumptionSemaphore] exist to
-                            // bound ONE SPECIFIC expensive operation - [PrekeyStore.consumeOneTimePrekey]'s
-                            // Argon2id derivation (64 MiB/3 passes) behind [PrekeyStore]'s single
-                            // shared per-file lock (see [prekeyConsumptionSemaphore]'s own doc comment).
-                            // When `oneTimePrekeyId` is null, this `?.let` block never runs AT ALL -
-                            // `consumeOneTimePrekey` is never called, so that specific expensive,
-                            // lock-contending operation these two mitigations exist to protect is
-                            // categorically untouched by this path, not merely under-protected.
-                            //
-                            // What a no-OTPK X3DH_INITIAL costs INSTEAD (traced through
-                            // [X3dh.respond] and [DoubleRatchetSession.initializeReceiver]): the SAME
-                            // [EncryptionKeyBinding.create] self-sign this class always performs one
-                            // line below regardless of this branch, 3 X25519 Diffie-Hellman agreements
-                            // plus one HKDF derivation (`dh4`/the one-time-prekey DH term is simply
-                            // never computed), and one AES-GCM ratchet-message decrypt attempt further
-                            // down - ordinary constant-time symmetric/EC-curve arithmetic, microseconds
-                            // each, NO Argon2id anywhere in that chain. This is the SAME order of
-                            // magnitude of per-envelope work every OTHER inbound envelope already
-                            // costs unconditionally (e.g. a `TEXT` envelope's own ratchet decrypt) -
-                            // not a novel unbounded-resource-per-request the way Argon2id-guarded
-                            // [PrekeyStore] access is, so reusing (or duplicating) either mitigation
-                            // here would bound a resource that was never actually at risk.
-                            //
-                            // **Also the one wire shape a genuinely LEGITIMATE initiator produces**:
-                            // [X3dh.initiate]'s own `oneTimePrekey` selection (see that function) is
-                            // `null` exactly when the RESPONDER's own currently-published
-                            // [net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle] has an EMPTY
-                            // `oneTimePrekeys` list - i.e. this exact node's own pool was already
-                            // exhausted (transiently, between [replenishOneTimePrekeysIfLow] triggering
-                            // and the republished bundle propagating). Applying the OTPK-consumption
-                            // rate limit here too would throttle honest first-contact attempts reacting
-                            // to THIS node's own degraded-but-still-working fallback, on top of a
-                            // resource ([PrekeyStore]) that fallback doesn't even touch.
-                            //
-                            // Residual risk this leaves accepted, not eliminated: a flood of
-                            // structurally-valid, genuinely self-signed (real ECDSA sign, one throwaway
-                            // identity per attempt - the same "costs an attacker microseconds of local
-                            // CPU" cost [prekeyConsumptionSemaphore]'s own doc comment already accepts
-                            // as unavoidable at this layer) no-OTPK X3DH_INITIAL envelopes could still
-                            // force many cheap-but-nonzero handshake attempts. That volume is bounded
-                            // by the connection/stream-level defenses ABOVE this layer instead -
-                            // [MAX_CONCURRENT_STREAMS_PER_PEER], [DmProtocolHandler]'s frame-size cap
-                            // and slowloris/absolute-lifetime timeouts, and [MAX_LIVE_SESSIONS]'s
-                            // LRU-eviction cap on how many resulting sessions can pile up in
-                            // [liveSessionCache] - plus a global connection cap at the [LapisNode] level
-                            // (see [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]'s own
-                            // `MAX_CONCURRENT_CONNECTIONS`, follow-up hardening item 5, same 2026-08-11
-                            // wave), none of which are specific to the one-time-prekey resource these
-                            // two fields guard.
-                            val consumed =
-                                header.oneTimePrekeyId?.let { id ->
-                                    // See prekeyConsumptionRateLimiter's own doc comment for why a
-                                    // RATE bound is needed in addition to prekeyConsumptionSemaphore's
-                                    // concurrency bound. Checked FIRST - cheaper than the semaphore,
-                                    // and rejects a sustained flood without even touching the
-                                    // concurrency-bounded resource below.
-                                    if (!prekeyConsumptionRateLimiter.tryAcquire()) {
-                                        logger.debug {
-                                            "rejecting X3DH_INITIAL from claimed sender " +
-                                                "${who(claimedSender)} - " +
-                                                "MAX_PREKEY_CONSUMPTIONS_PER_WINDOW " +
-                                                "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
-                                                "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
-                                        }
-                                        return@withPeerLock true
-                                    }
-                                    // See prekeyConsumptionSemaphore's own doc comment for why this
-                                    // gate exists and why it never blocks.
-                                    if (!prekeyConsumptionSemaphore.tryAcquire()) {
-                                        logger.debug {
-                                            "rejecting X3DH_INITIAL from claimed sender " +
-                                                "${who(claimedSender)} - " +
-                                                "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
-                                                "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
-                                        }
-                                        return@withPeerLock true
-                                    }
-                                    try {
-                                        val result = localPrekeyStore.consumeOneTimePrekey(id)
-                                        // Self-healing half of this fix - see that function's own
-                                        // doc comment. Never blocks this Netty thread.
-                                        replenishOneTimePrekeysIfLow()
-                                        result
-                                    } catch (e: PrekeyConsumptionException) {
-                                        val reason =
-                                            if (e.reason == PrekeyConsumptionFailure.ALREADY_CONSUMED) {
-                                                ctrRejectedOtkConsumed.incrementAndGet()
-                                                DmX3dhRejectionReason.ONE_TIME_PREKEY_CONSUMED
-                                            } else {
-                                                ctrRejectedOtkUnknown.incrementAndGet()
-                                                DmX3dhRejectionReason.ONE_TIME_PREKEY_UNKNOWN
-                                            }
-                                        // The OTK stays consumed; no SPK-only retry. Only an enqueue here.
-                                        scheduleX3dhRejection(claimedSender, header, reason, onlinePeerId)
-                                        logger.debug(e) {
-                                            "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
-                                                "${who(claimedSender)} - rejecting"
-                                        }
-                                        // this specific one-time-prekey id will never become valid again
-                                        return@withPeerLock true
-                                    } finally {
-                                        prekeyConsumptionSemaphore.release()
-                                    }
-                                }
-                            val ownBinding =
-                                EncryptionKeyBinding.create(
-                                    localIdentity.secp256k1KeyPair,
-                                    localPrekeyStore.x25519IdentityPublicKey,
-                                )
-                            val ownX25519Private = localPrekeyStore.x25519IdentityPrivateKey()
-                            // ONE fetch, reused for BOTH X3dh.respond's own argument AND the Double
-                            // Ratchet receiver's `ourRatchetKeyPair` below - no second, independent
-                            // PrekeyStore.signedPrekeyPrivateKey() call. PrekeyStore.rotateSignedPrekey()
-                            // swaps its whole state object atomically, but signedPrekeyId/
-                            // signedPrekeyPublicKey/signedPrekeyPrivateKey() are plain reads of that
-                            // @Volatile field, not a group-atomic snapshot; two independent fetches
-                            // straddling a concurrent rotation could otherwise bootstrap a session whose
-                            // ratchet keypair is inconsistent with the X3DH-derived shared secret,
-                            // silently failing to decrypt the genuine first message with no diagnostic
-                            // pointing at the real cause.
-                            val signedPrekeyPrivate = localPrekeyStore.signedPrekeyPrivateKey()
-                            val newSession =
-                                try {
-                                    val sharedSecret =
-                                        try {
-                                            X3dh.respond(
-                                                responderIdentity = localIdentity.secp256k1KeyPair.publicKey,
-                                                responderEncryptionBinding = ownBinding,
-                                                responderX25519IdentityPrivateKey = ownX25519Private,
-                                                responderSignedPrekeyId = localPrekeyStore.signedPrekeyId,
-                                                responderSignedPrekeyPublicKey = localPrekeyStore.signedPrekeyPublicKey,
-                                                responderSignedPrekeyPrivateKey = signedPrekeyPrivate,
-                                                header = header,
-                                                consumedOneTimePrekey = consumed,
-                                            )
-                                        } catch (e: X3dhException) {
-                                            if (header.signedPrekeyId != localPrekeyStore.signedPrekeyId) {
-                                                ctrRejectedSpkMismatch.incrementAndGet()
-                                                scheduleX3dhRejection(
-                                                    claimedSender,
-                                                    header,
-                                                    DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH,
-                                                    onlinePeerId,
-                                                )
-                                            }
-                                            logger.debug(e) {
-                                                "X3DH respond failed for claimed sender " +
-                                                    "${who(
-                                                        claimedSender,
-                                                    )} - rejecting, never falls back to trusting the claim"
-                                            }
-                                            // crypto verification failure - these exact bytes will never verify
-                                            return@withPeerLock true
-                                        } finally {
-                                            ownX25519Private.destroy()
-                                        }
-                                    val ourRatchetKeyPair = X25519KeyPair.fromPrivateKeyBytes(signedPrekeyPrivate.bytes)
-                                    val session =
-                                        DoubleRatchetSession.initializeReceiver(
-                                            sharedSecret,
-                                            ourRatchetKeyPair,
-                                            random,
-                                        )
-                                    sharedSecret.destroy()
-                                    session
-                                } finally {
-                                    signedPrekeyPrivate.destroy()
-                                }
-                            freshX3dhInitialEphemeralKeyToRecord = header.ephemeralPublicKey.bytes
-                            newSession to true
-                        }
-                        DmMessageType.TEXT -> {
-                            val existing = getCachedOrLoad(claimedSender)
-                            if (existing == null) {
-                                // NOT foreclosed with `true` (see this function's own doc comment on the
-                                // return value) - a session for claimed_sender may simply not exist YET on
-                                // THIS node. Concretely, via MailboxPoller: a sender who calls sendOffline()
-                                // twice to the same still-offline recipient produces one X3DH_INITIAL pointer
-                                // (bootstraps the session) and one TEXT pointer (reuses it) - MailboxPoller's
-                                // pending() iteration order tracks gossip arrival order, not send order, so
-                                // the TEXT pointer can easily be fetched+attempted first. Returning `false`
-                                // leaves its mailbox pointer pending so a later poll pass - after the
-                                // X3DH_INITIAL pointer has been processed and installed a session - can
-                                // deliver it, instead of permanently losing a genuinely valid message.
-                                ctrTextRejectedNoSession.incrementAndGet()
-                                logger.debug {
-                                    "no session for claimed sender ${who(claimedSender)} - rejecting TEXT " +
-                                        "envelope for now, not marking permanently resolved"
-                                }
-                                return@withPeerLock false
-                            }
-                            existing to false
-                        }
-                        // V0.8.7: a CALL_SIGNAL resolves an EXISTING session only - just like TEXT
-                        // above - but, unlike TEXT, a missing session is FORECLOSED with `true`, not
-                        // retried with `false`. There is no X3DH_INITIAL-carrying "other pointer" that
-                        // could ever arrive later to establish one for this exact path: sendCallSignal
-                        // never deposits offline (handleOfflineEnvelope already rejects CALL_SIGNAL
-                        // before this function is ever reached for that transport - see that
-                        // function's own doc comment), so the only way this branch is ever reached at
-                        // all is via the ONLINE path, where "no session yet" can never self-resolve by
-                        // waiting for a second delivery attempt the way an out-of-order mailbox pointer
-                        // pair can for TEXT.
-                        DmMessageType.CALL_SIGNAL -> {
-                            val existing =
-                                getCachedOrLoad(claimedSender)
-                                    ?: run {
-                                        logger.debug {
-                                            "call signal from ${who(claimedSender)} without an " +
-                                                "established session - rejected (a call never begins a " +
-                                                "first contact)"
-                                        }
-                                        return@withPeerLock true
-                                    }
-                            existing to false
-                        }
-                        DmMessageType.RECEIPT, DmMessageType.X3DH_REJECTED -> {
-                            // X3DH_REJECTED never forms a DmEnvelope (DmEnvelope.init); defence in depth only.
-                            logger.debug { "messageType ${envelope.messageType} rejected outright" }
-                            return@withPeerLock true // never accepted, regardless of node state
-                        }
-                    }
-
-                // THE ONLY MOMENT `claimedSender` BECOMES TRUSTWORTHY - see this function's own doc
-                // comment.
-                val plaintext =
-                    try {
-                        session.decrypt(envelope.ratchetMessage)
-                    } catch (e: DoubleRatchetException) {
-                        logger.debug(e) {
-                            "ratchet decrypt failed under session claimed for ${who(claimedSender)} - " +
-                                "rejecting; the claimed field alone is never trusted"
-                        }
-                        if (isFreshHandshake) session.destroy()
-                        return@withPeerLock true // tamper/garbage against this exact session state - not retryable
-                    } catch (e: RatchetMessageRejectedException) {
-                        logger.debug(e) { "message rejected on public-data grounds: ${e.message}" }
-                        if (isFreshHandshake) session.destroy()
-                        return@withPeerLock true // public-data rejection (e.g. replay) - not retryable
-                    }
-
-                persistSession(claimedSender, session)
-                putCached(claimedSender, session)
-                // Any decrypted inbound message of this peer acknowledges an own pending initiation (also the glare
-                // case: the peer's own X3DH_INITIAL just replaced our unacknowledged session).
-                acknowledgeInitiationLocked(claimedSender)
-                // Durable X3DH_INITIAL replay guard commit - see recordAcceptedX3dhInitialEphemeralKey's
-                // own doc comment. Only set (non-null) on the X3DH_INITIAL branch above, and only
-                // reached here after session.decrypt already succeeded - never burns the durable
-                // registry on a tampered/garbage attempt.
-                freshX3dhInitialEphemeralKeyToRecord?.let { recordAcceptedX3dhInitialEphemeralKey(claimedSender, it) }
-
-                // V0.8.7: a CALL_SIGNAL's ratchet plaintext is NOT a DmContentCodec frame - see
-                // DmInboundCallSignal's own doc comment for why this module never even imports the
-                // codec that DOES decode it (net.lapisphilosophorum.lapisnet.call.CallSignalCodec,
-                // lives in a downstream module). Branches off here, AFTER the ratchet state is
-                // already committed above (same "commit never depends on this branch's outcome"
-                // ordering DmContentCodec.decode's own placement below follows), and BEFORE ever
-                // reaching DmContentCodec.decode - a CALL_SIGNAL payload is never handed to that
-                // codec, which has no idea what shape it is. Routed to callSignalListeners ONLY -
-                // NEVER to inboundListeners, NEVER through DmContentCodec, so a call signal can never
-                // reach DmStore or a browser's DM history (see this class's own doc comment on
-                // lapis-net-dm staying WebRTC-free). Always `true` (final) - processInboundDmEnvelope's
-                // own doc comment on the return value's "false means later retryable" case does not
-                // apply here: this branch is reached only via the online path (handleOfflineEnvelope
-                // already rejects CALL_SIGNAL before this function ever runs for that transport), and
-                // a live delivery that already decrypted successfully has nothing left to retry.
-                if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
-                    val quarantined = classifyQuarantinedSender(claimedSender)
-                    markRecentlyDelivered(dedupKey)
-                    val route = onlinePeerId?.let { issueCallReplyRoute(claimedSender, it) }
-                    val signal =
-                        DmInboundCallSignal(claimedSender, plaintext, quarantined, Instant.now().epochSecond, route)
-                    callSignalListeners.forEach { listener ->
-                        try {
-                            listener(signal)
-                        } catch (e: RuntimeException) {
-                            logger.warn(e) { "inbound call signal listener threw - other listeners still notified" }
-                        }
-                    }
-                    return@withPeerLock true
-                }
-
-                // V0.8.6: decode the DmContent framing the ratchet plaintext now carries - AFTER the
-                // ratchet state has already been committed above (persistSession/putCached), since
-                // that commit must never depend on this decode's outcome (a malformed DmContent is a
-                // property of THIS message, not of the session). The Ratchet's own bytes never
-                // change, so a decode failure here is permanent for these exact envelope bytes.
-                val content =
-                    try {
-                        DmContentCodec.decode(plaintext)
-                    } catch (e: MalformedDmContentException) {
-                        logger.debug(e) {
-                            "authenticated peer ${who(claimedSender)} sent an unparseable DmContent - dropping"
-                        }
-                        return@withPeerLock true // final - the bytes never change
-                    }
-
-                // V0.8.6: acceptance-policy classification wires in DmAcceptanceCheck (see
-                // updateAcceptanceCheck) - `quarantined` becomes non-false once that is attached.
-                // depositBinding is only constructible for a FIRST-CONTACT (X3DH_INITIAL) message -
-                // see DmFirstContactDepositVerifier's own class doc comment for why the binding is
-                // keyed to the session's X3DH ephemeral key, not to a per-message value: a TEXT
-                // message reusing an already-established session has no fresh ephemeral key to bind
-                // to, so a deposit riding on it (an odd, off-label shape DmContent's own field never
-                // rules out structurally) simply cannot verify - `null` here, not a special case.
-                val depositBinding =
-                    envelope.x3dhInitialHeader?.let { header ->
-                        DmDepositBinding(
-                            x3dhEphemeralPublicKey = header.ephemeralPublicKey,
-                            initiatorIdentity = claimedSender,
-                            recipientIdentity = localIdentity.secp256k1KeyPair.publicKey,
-                        )
-                    }
-                val quarantined = classifyQuarantined(claimedSender, content, depositBinding)
-
-                markRecentlyDelivered(dedupKey)
-                val message =
-                    DmInboundMessage(
-                        claimedSender,
-                        plaintext,
-                        content,
-                        quarantined,
-                        dedupKey,
-                        Instant.now().epochSecond,
-                    )
-                inboundListeners.forEach { listener ->
-                    try {
-                        listener(message)
-                    } catch (e: RuntimeException) {
-                        logger.warn(e) { "inbound DM listener threw - other listeners still notified" }
-                    }
-                }
-                true // delivered - final
-            }
+            val outcome = processInboundLocked(envelope, claimedSender, sourceDescription, onlinePeerId)
+            // After the stripe lock: the listeners of this peer run in ratchet order, and this call returns only once
+            // its own message was delivered (unless this is a reentrant call from a listener of the same peer).
+            outcome.delivery?.let { inboundDelivery.deliver(it) }
+            outcome.final
         } catch (e: RuntimeException) {
             // Final defense-in-depth catch: every known failure mode above already funnels itself
             // into a logged `return@withPeerLock`, so nothing should reach here today - but
@@ -2309,6 +1916,460 @@ class DmSessionManager private constructor(
             false
         }
     }
+
+    /** The result of the locked part of [processInboundDmEnvelope]: [final] is its return value, [delivery] the
+     * listener notification still to run after the stripe lock (null when nothing is delivered). */
+    private class InboundOutcome(
+        val final: Boolean,
+        val delivery: InboundDeliveryQueue.Ticket?,
+    ) {
+        companion object {
+            val FINAL = InboundOutcome(true, null)
+            val RETRY = InboundOutcome(false, null)
+        }
+    }
+
+    /**
+     * The part of [processInboundDmEnvelope] that runs under [claimedSender]'s stripe lock: dedup check, X3DH and
+     * one-time-prekey consumption, decrypt, persist, acknowledgement, replay registry, acceptance classification and
+     * dedup mark - unchanged in order. Listeners are not called here: their notification is enqueued (so its order is
+     * the decrypt order) and returned in [InboundOutcome.delivery].
+     */
+    private fun processInboundLocked(
+        envelope: DmEnvelope,
+        claimedSender: Secp256k1PublicKey,
+        sourceDescription: String,
+        onlinePeerId: PeerId?,
+    ): InboundOutcome =
+        withPeerLock(claimedSender) {
+            val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
+            if (isRecentlyDelivered(dedupKey)) {
+                logger.debug {
+                    "skipping envelope from $sourceDescription claimed sender ${who(claimedSender)} " +
+                        "- already delivered (dedup key match)"
+                }
+                return@withPeerLock InboundOutcome.FINAL
+            }
+
+            // Set ONLY inside the X3DH_INITIAL branch below, to the accepted header's ephemeral
+            // key - recorded into the durable per-peer registry AFTER decrypt succeeds (commit-
+            // only-after-AEAD-verifies, same discipline as persistSession's own call sites below).
+            // See recordAcceptedX3dhInitialEphemeralKey's own doc comment.
+            var freshX3dhInitialEphemeralKeyToRecord: ByteArray? = null
+            val (session, isFreshHandshake) =
+                when (envelope.messageType) {
+                    DmMessageType.X3DH_INITIAL -> {
+                        val header =
+                            envelope.x3dhInitialHeader
+                                ?: error(
+                                    "DmEnvelope's own init already guarantees x3dhInitialHeader is non-null here",
+                                )
+                        // Cheap, stateless authenticity check BEFORE ever touching
+                        // localPrekeyStore.consumeOneTimePrekey below - see this function's own
+                        // doc comment section on why. X3dh.respond performs this SAME check
+                        // itself (its own check 2), but only AFTER a one-time prekey would
+                        // already have been durably consumed if this guard were absent. Without
+                        // it, an attacker holding NO private key material at all could mint
+                        // structurally-valid-but-garbage-signed X3DH_INITIAL envelopes naming
+                        // sequential one-time-prekey ids and durably burn through this node's
+                        // entire one-time-prekey pool for zero cryptographic cost -
+                        // EncryptionKeyBinding's own constructor performs only a 64-byte size
+                        // check on the signature, never a cryptographic one. This is the
+                        // SAME (initiatorIdentity, initiatorEncryptionBinding) pair X3dh.respond
+                        // itself verifies further down - duplicated here deliberately, not
+                        // routed through respond() first, because respond() also needs the
+                        // ALREADY-consumed prekey as an argument (see PrekeyConsumptionException
+                        // - the consume-before-respond ordering [X3dh]'s own class doc comment
+                        // mandates for replay protection).
+                        val headerBindingVerifies =
+                            EncryptionKeyBinding.verify(header.initiatorIdentity, header.initiatorEncryptionBinding)
+                        if (!headerBindingVerifies) {
+                            logger.debug {
+                                "X3DH_INITIAL from claimed sender ${who(claimedSender)} carries an " +
+                                    "encryption key binding that does not verify against the claimed identity " +
+                                    "- rejecting BEFORE any one-time prekey consumption"
+                            }
+                            // garbage/tamper - these exact bytes will never verify
+                            return@withPeerLock InboundOutcome.FINAL
+                        }
+                        // **Security audit round 1 fix (2026-08-27): DURABLE, per-peer replay guard
+                        // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
+                        // the full story of the gap this closes, PROVEN exploitable by a restart
+                        // (which empties that in-memory-only cache) via an executable probe.**
+                        // Checked here - BEFORE any one-time-prekey consumption, BEFORE X3dh.respond,
+                        // BEFORE a new session is ever built - because [X3dh.initiate] mints a FRESH
+                        // ephemeral X25519 keypair on EVERY call (see that function's own body), so a
+                        // genuinely repeated, legitimate handshake from the same peer (the accepted
+                        // residual "no session registry" gap this class's own doc comment discloses)
+                        // always carries a DIFFERENT [X3dhPreKeyMessageHeader.ephemeralPublicKey] -
+                        // only a literal byte-for-byte replay of an ALREADY-ACCEPTED handshake ever
+                        // collides here. Loaded fresh from disk on every attempt (not cached in
+                        // memory) specifically so this survives this manager's own restart -
+                        // [loadAcceptedX3dhInitialEphemeralKeys]'s own doc comment.
+                        if (loadAcceptedX3dhInitialEphemeralKeys(claimedSender).any {
+                                it.contentEquals(header.ephemeralPublicKey.bytes)
+                            }
+                        ) {
+                            logger.debug {
+                                "rejecting X3DH_INITIAL from claimed sender ${who(claimedSender)} - " +
+                                    "this exact ephemeral key was already accepted for a prior handshake " +
+                                    "(durable, survives a restart) - replay, not a legitimate re-handshake"
+                            }
+                            // this exact handshake will never become acceptable again
+                            return@withPeerLock InboundOutcome.FINAL
+                        }
+                        // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
+                        // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
+                        // null` (a "signed-prekey-only" X3DH_INITIAL, no one-time prekey named) -
+                        // deliberately, not an oversight. Traced, not assumed:
+                        // [prekeyConsumptionRateLimiter]/[prekeyConsumptionSemaphore] exist to
+                        // bound ONE SPECIFIC expensive operation - [PrekeyStore.consumeOneTimePrekey]'s
+                        // Argon2id derivation (64 MiB/3 passes) behind [PrekeyStore]'s single
+                        // shared per-file lock (see [prekeyConsumptionSemaphore]'s own doc comment).
+                        // When `oneTimePrekeyId` is null, this `?.let` block never runs AT ALL -
+                        // `consumeOneTimePrekey` is never called, so that specific expensive,
+                        // lock-contending operation these two mitigations exist to protect is
+                        // categorically untouched by this path, not merely under-protected.
+                        //
+                        // What a no-OTPK X3DH_INITIAL costs INSTEAD (traced through
+                        // [X3dh.respond] and [DoubleRatchetSession.initializeReceiver]): the SAME
+                        // [EncryptionKeyBinding.create] self-sign this class always performs one
+                        // line below regardless of this branch, 3 X25519 Diffie-Hellman agreements
+                        // plus one HKDF derivation (`dh4`/the one-time-prekey DH term is simply
+                        // never computed), and one AES-GCM ratchet-message decrypt attempt further
+                        // down - ordinary constant-time symmetric/EC-curve arithmetic, microseconds
+                        // each, NO Argon2id anywhere in that chain. This is the SAME order of
+                        // magnitude of per-envelope work every OTHER inbound envelope already
+                        // costs unconditionally (e.g. a `TEXT` envelope's own ratchet decrypt) -
+                        // not a novel unbounded-resource-per-request the way Argon2id-guarded
+                        // [PrekeyStore] access is, so reusing (or duplicating) either mitigation
+                        // here would bound a resource that was never actually at risk.
+                        //
+                        // **Also the one wire shape a genuinely LEGITIMATE initiator produces**:
+                        // [X3dh.initiate]'s own `oneTimePrekey` selection (see that function) is
+                        // `null` exactly when the RESPONDER's own currently-published
+                        // [net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle] has an EMPTY
+                        // `oneTimePrekeys` list - i.e. this exact node's own pool was already
+                        // exhausted (transiently, between [replenishOneTimePrekeysIfLow] triggering
+                        // and the republished bundle propagating). Applying the OTPK-consumption
+                        // rate limit here too would throttle honest first-contact attempts reacting
+                        // to THIS node's own degraded-but-still-working fallback, on top of a
+                        // resource ([PrekeyStore]) that fallback doesn't even touch.
+                        //
+                        // Residual risk this leaves accepted, not eliminated: a flood of
+                        // structurally-valid, genuinely self-signed (real ECDSA sign, one throwaway
+                        // identity per attempt - the same "costs an attacker microseconds of local
+                        // CPU" cost [prekeyConsumptionSemaphore]'s own doc comment already accepts
+                        // as unavoidable at this layer) no-OTPK X3DH_INITIAL envelopes could still
+                        // force many cheap-but-nonzero handshake attempts. That volume is bounded
+                        // by the connection/stream-level defenses ABOVE this layer instead -
+                        // [MAX_CONCURRENT_STREAMS_PER_PEER], [DmProtocolHandler]'s frame-size cap
+                        // and slowloris/absolute-lifetime timeouts, and [MAX_LIVE_SESSIONS]'s
+                        // LRU-eviction cap on how many resulting sessions can pile up in
+                        // [liveSessionCache] - plus a global connection cap at the [LapisNode] level
+                        // (see [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]'s own
+                        // `MAX_CONCURRENT_CONNECTIONS`, follow-up hardening item 5, same 2026-08-11
+                        // wave), none of which are specific to the one-time-prekey resource these
+                        // two fields guard.
+                        val consumed =
+                            header.oneTimePrekeyId?.let { id ->
+                                // See prekeyConsumptionRateLimiter's own doc comment for why a
+                                // RATE bound is needed in addition to prekeyConsumptionSemaphore's
+                                // concurrency bound. Checked FIRST - cheaper than the semaphore,
+                                // and rejects a sustained flood without even touching the
+                                // concurrency-bounded resource below.
+                                if (!prekeyConsumptionRateLimiter.tryAcquire()) {
+                                    logger.debug {
+                                        "rejecting X3DH_INITIAL from claimed sender " +
+                                            "${who(claimedSender)} - " +
+                                            "MAX_PREKEY_CONSUMPTIONS_PER_WINDOW " +
+                                            "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
+                                            "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
+                                    }
+                                    return@withPeerLock InboundOutcome.FINAL
+                                }
+                                // See prekeyConsumptionSemaphore's own doc comment for why this
+                                // gate exists and why it never blocks.
+                                if (!prekeyConsumptionSemaphore.tryAcquire()) {
+                                    logger.debug {
+                                        "rejecting X3DH_INITIAL from claimed sender " +
+                                            "${who(claimedSender)} - " +
+                                            "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
+                                            "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
+                                    }
+                                    return@withPeerLock InboundOutcome.FINAL
+                                }
+                                try {
+                                    val result = localPrekeyStore.consumeOneTimePrekey(id)
+                                    // Self-healing half of this fix - see that function's own
+                                    // doc comment. Never blocks this Netty thread.
+                                    replenishOneTimePrekeysIfLow()
+                                    result
+                                } catch (e: PrekeyConsumptionException) {
+                                    val reason =
+                                        if (e.reason == PrekeyConsumptionFailure.ALREADY_CONSUMED) {
+                                            ctrRejectedOtkConsumed.incrementAndGet()
+                                            DmX3dhRejectionReason.ONE_TIME_PREKEY_CONSUMED
+                                        } else {
+                                            ctrRejectedOtkUnknown.incrementAndGet()
+                                            DmX3dhRejectionReason.ONE_TIME_PREKEY_UNKNOWN
+                                        }
+                                    // The OTK stays consumed; no SPK-only retry. Only an enqueue here.
+                                    scheduleX3dhRejection(claimedSender, header, reason, onlinePeerId)
+                                    logger.debug(e) {
+                                        "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
+                                            "${who(claimedSender)} - rejecting"
+                                    }
+                                    // this specific one-time-prekey id will never become valid again
+                                    return@withPeerLock InboundOutcome.FINAL
+                                } finally {
+                                    prekeyConsumptionSemaphore.release()
+                                }
+                            }
+                        val ownBinding =
+                            EncryptionKeyBinding.create(
+                                localIdentity.secp256k1KeyPair,
+                                localPrekeyStore.x25519IdentityPublicKey,
+                            )
+                        val ownX25519Private = localPrekeyStore.x25519IdentityPrivateKey()
+                        // ONE fetch, reused for BOTH X3dh.respond's own argument AND the Double
+                        // Ratchet receiver's `ourRatchetKeyPair` below - no second, independent
+                        // PrekeyStore.signedPrekeyPrivateKey() call. PrekeyStore.rotateSignedPrekey()
+                        // swaps its whole state object atomically, but signedPrekeyId/
+                        // signedPrekeyPublicKey/signedPrekeyPrivateKey() are plain reads of that
+                        // @Volatile field, not a group-atomic snapshot; two independent fetches
+                        // straddling a concurrent rotation could otherwise bootstrap a session whose
+                        // ratchet keypair is inconsistent with the X3DH-derived shared secret,
+                        // silently failing to decrypt the genuine first message with no diagnostic
+                        // pointing at the real cause.
+                        val signedPrekeyPrivate = localPrekeyStore.signedPrekeyPrivateKey()
+                        val newSession =
+                            try {
+                                val sharedSecret =
+                                    try {
+                                        X3dh.respond(
+                                            responderIdentity = localIdentity.secp256k1KeyPair.publicKey,
+                                            responderEncryptionBinding = ownBinding,
+                                            responderX25519IdentityPrivateKey = ownX25519Private,
+                                            responderSignedPrekeyId = localPrekeyStore.signedPrekeyId,
+                                            responderSignedPrekeyPublicKey = localPrekeyStore.signedPrekeyPublicKey,
+                                            responderSignedPrekeyPrivateKey = signedPrekeyPrivate,
+                                            header = header,
+                                            consumedOneTimePrekey = consumed,
+                                        )
+                                    } catch (e: X3dhException) {
+                                        if (header.signedPrekeyId != localPrekeyStore.signedPrekeyId) {
+                                            ctrRejectedSpkMismatch.incrementAndGet()
+                                            scheduleX3dhRejection(
+                                                claimedSender,
+                                                header,
+                                                DmX3dhRejectionReason.SIGNED_PREKEY_MISMATCH,
+                                                onlinePeerId,
+                                            )
+                                        }
+                                        logger.debug(e) {
+                                            "X3DH respond failed for claimed sender " +
+                                                "${who(
+                                                    claimedSender,
+                                                )} - rejecting, never falls back to trusting the claim"
+                                        }
+                                        // crypto verification failure - these exact bytes will never verify
+                                        return@withPeerLock InboundOutcome.FINAL
+                                    } finally {
+                                        ownX25519Private.destroy()
+                                    }
+                                val ourRatchetKeyPair = X25519KeyPair.fromPrivateKeyBytes(signedPrekeyPrivate.bytes)
+                                val session =
+                                    DoubleRatchetSession.initializeReceiver(
+                                        sharedSecret,
+                                        ourRatchetKeyPair,
+                                        random,
+                                    )
+                                sharedSecret.destroy()
+                                session
+                            } finally {
+                                signedPrekeyPrivate.destroy()
+                            }
+                        freshX3dhInitialEphemeralKeyToRecord = header.ephemeralPublicKey.bytes
+                        newSession to true
+                    }
+                    DmMessageType.TEXT -> {
+                        val existing = getCachedOrLoad(claimedSender)
+                        if (existing == null) {
+                            // NOT foreclosed with `true` (see this function's own doc comment on the
+                            // return value) - a session for claimed_sender may simply not exist YET on
+                            // THIS node. Concretely, via MailboxPoller: a sender who calls sendOffline()
+                            // twice to the same still-offline recipient produces one X3DH_INITIAL pointer
+                            // (bootstraps the session) and one TEXT pointer (reuses it) - MailboxPoller's
+                            // pending() iteration order tracks gossip arrival order, not send order, so
+                            // the TEXT pointer can easily be fetched+attempted first. Returning `false`
+                            // leaves its mailbox pointer pending so a later poll pass - after the
+                            // X3DH_INITIAL pointer has been processed and installed a session - can
+                            // deliver it, instead of permanently losing a genuinely valid message.
+                            ctrTextRejectedNoSession.incrementAndGet()
+                            logger.debug {
+                                "no session for claimed sender ${who(claimedSender)} - rejecting TEXT " +
+                                    "envelope for now, not marking permanently resolved"
+                            }
+                            return@withPeerLock InboundOutcome.RETRY
+                        }
+                        existing to false
+                    }
+                    // V0.8.7: a CALL_SIGNAL resolves an EXISTING session only - just like TEXT
+                    // above - but, unlike TEXT, a missing session is FORECLOSED with `true`, not
+                    // retried with `false`. There is no X3DH_INITIAL-carrying "other pointer" that
+                    // could ever arrive later to establish one for this exact path: sendCallSignal
+                    // never deposits offline (handleOfflineEnvelope already rejects CALL_SIGNAL
+                    // before this function is ever reached for that transport - see that
+                    // function's own doc comment), so the only way this branch is ever reached at
+                    // all is via the ONLINE path, where "no session yet" can never self-resolve by
+                    // waiting for a second delivery attempt the way an out-of-order mailbox pointer
+                    // pair can for TEXT.
+                    DmMessageType.CALL_SIGNAL -> {
+                        val existing =
+                            getCachedOrLoad(claimedSender)
+                                ?: run {
+                                    logger.debug {
+                                        "call signal from ${who(claimedSender)} without an " +
+                                            "established session - rejected (a call never begins a " +
+                                            "first contact)"
+                                    }
+                                    return@withPeerLock InboundOutcome.FINAL
+                                }
+                        existing to false
+                    }
+                    DmMessageType.RECEIPT, DmMessageType.X3DH_REJECTED -> {
+                        // X3DH_REJECTED never forms a DmEnvelope (DmEnvelope.init); defence in depth only.
+                        logger.debug { "messageType ${envelope.messageType} rejected outright" }
+                        return@withPeerLock InboundOutcome.FINAL // never accepted, regardless of node state
+                    }
+                }
+
+            // THE ONLY MOMENT `claimedSender` BECOMES TRUSTWORTHY - see this function's own doc
+            // comment.
+            val plaintext =
+                try {
+                    session.decrypt(envelope.ratchetMessage)
+                } catch (e: DoubleRatchetException) {
+                    logger.debug(e) {
+                        "ratchet decrypt failed under session claimed for ${who(claimedSender)} - " +
+                            "rejecting; the claimed field alone is never trusted"
+                    }
+                    if (isFreshHandshake) session.destroy()
+                    // tamper/garbage against this exact session state - not retryable
+                    return@withPeerLock InboundOutcome.FINAL
+                } catch (e: RatchetMessageRejectedException) {
+                    logger.debug(e) { "message rejected on public-data grounds: ${e.message}" }
+                    if (isFreshHandshake) session.destroy()
+                    return@withPeerLock InboundOutcome.FINAL // public-data rejection (e.g. replay) - not retryable
+                }
+
+            persistSession(claimedSender, session)
+            putCached(claimedSender, session)
+            // Any decrypted inbound message of this peer acknowledges an own pending initiation (also the glare
+            // case: the peer's own X3DH_INITIAL just replaced our unacknowledged session).
+            acknowledgeInitiationLocked(claimedSender)
+            // Durable X3DH_INITIAL replay guard commit - see recordAcceptedX3dhInitialEphemeralKey's
+            // own doc comment. Only set (non-null) on the X3DH_INITIAL branch above, and only
+            // reached here after session.decrypt already succeeded - never burns the durable
+            // registry on a tampered/garbage attempt.
+            freshX3dhInitialEphemeralKeyToRecord?.let { recordAcceptedX3dhInitialEphemeralKey(claimedSender, it) }
+
+            // V0.8.7: a CALL_SIGNAL's ratchet plaintext is NOT a DmContentCodec frame - see
+            // DmInboundCallSignal's own doc comment for why this module never even imports the
+            // codec that DOES decode it (net.lapisphilosophorum.lapisnet.call.CallSignalCodec,
+            // lives in a downstream module). Branches off here, AFTER the ratchet state is
+            // already committed above (same "commit never depends on this branch's outcome"
+            // ordering DmContentCodec.decode's own placement below follows), and BEFORE ever
+            // reaching DmContentCodec.decode - a CALL_SIGNAL payload is never handed to that
+            // codec, which has no idea what shape it is. Routed to callSignalListeners ONLY -
+            // NEVER to inboundListeners, NEVER through DmContentCodec, so a call signal can never
+            // reach DmStore or a browser's DM history (see this class's own doc comment on
+            // lapis-net-dm staying WebRTC-free). Always `true` (final) - processInboundDmEnvelope's
+            // own doc comment on the return value's "false means later retryable" case does not
+            // apply here: this branch is reached only via the online path (handleOfflineEnvelope
+            // already rejects CALL_SIGNAL before this function ever runs for that transport), and
+            // a live delivery that already decrypted successfully has nothing left to retry.
+            if (envelope.messageType == DmMessageType.CALL_SIGNAL) {
+                val quarantined = classifyQuarantinedSender(claimedSender)
+                markRecentlyDelivered(dedupKey)
+                val route = onlinePeerId?.let { issueCallReplyRoute(claimedSender, it) }
+                val signal =
+                    DmInboundCallSignal(claimedSender, plaintext, quarantined, Instant.now().epochSecond, route)
+                onInboundCommittedForTest?.invoke(claimedSender, plaintext)
+                // Enqueued under the lock (fixes ratchet order), run after it - see InboundDeliveryQueue.
+                val delivery =
+                    inboundDelivery.enqueue(claimedSender) {
+                        callSignalListeners.forEach { listener ->
+                            try {
+                                listener(signal)
+                            } catch (e: RuntimeException) {
+                                logger.warn(e) {
+                                    "inbound call signal listener threw - other listeners still notified"
+                                }
+                            }
+                        }
+                    }
+                return@withPeerLock InboundOutcome(true, delivery)
+            }
+
+            // V0.8.6: decode the DmContent framing the ratchet plaintext now carries - AFTER the
+            // ratchet state has already been committed above (persistSession/putCached), since
+            // that commit must never depend on this decode's outcome (a malformed DmContent is a
+            // property of THIS message, not of the session). The Ratchet's own bytes never
+            // change, so a decode failure here is permanent for these exact envelope bytes.
+            val content =
+                try {
+                    DmContentCodec.decode(plaintext)
+                } catch (e: MalformedDmContentException) {
+                    logger.debug(e) {
+                        "authenticated peer ${who(claimedSender)} sent an unparseable DmContent - dropping"
+                    }
+                    return@withPeerLock InboundOutcome.FINAL // final - the bytes never change
+                }
+
+            // V0.8.6: acceptance-policy classification wires in DmAcceptanceCheck (see
+            // updateAcceptanceCheck) - `quarantined` becomes non-false once that is attached.
+            // depositBinding is only constructible for a FIRST-CONTACT (X3DH_INITIAL) message -
+            // see DmFirstContactDepositVerifier's own class doc comment for why the binding is
+            // keyed to the session's X3DH ephemeral key, not to a per-message value: a TEXT
+            // message reusing an already-established session has no fresh ephemeral key to bind
+            // to, so a deposit riding on it (an odd, off-label shape DmContent's own field never
+            // rules out structurally) simply cannot verify - `null` here, not a special case.
+            val depositBinding =
+                envelope.x3dhInitialHeader?.let { header ->
+                    DmDepositBinding(
+                        x3dhEphemeralPublicKey = header.ephemeralPublicKey,
+                        initiatorIdentity = claimedSender,
+                        recipientIdentity = localIdentity.secp256k1KeyPair.publicKey,
+                    )
+                }
+            val quarantined = classifyQuarantined(claimedSender, content, depositBinding)
+
+            markRecentlyDelivered(dedupKey)
+            val message =
+                DmInboundMessage(
+                    claimedSender,
+                    plaintext,
+                    content,
+                    quarantined,
+                    dedupKey,
+                    Instant.now().epochSecond,
+                )
+            onInboundCommittedForTest?.invoke(claimedSender, plaintext)
+            // Enqueued under the lock (fixes ratchet order), run after it - see InboundDeliveryQueue.
+            val delivery =
+                inboundDelivery.enqueue(claimedSender) {
+                    inboundListeners.forEach { listener ->
+                        try {
+                            listener(message)
+                        } catch (e: RuntimeException) {
+                            logger.warn(e) { "inbound DM listener threw - other listeners still notified" }
+                        }
+                    }
+                }
+            InboundOutcome(true, delivery) // delivered (once the delivery has run) - final
+        }
 
     // ---------------------------------------------------------------------------------------------------------------
     // One-time-prekey collisions: authenticated X3DH_REJECTED (responder side), pending initiations, verified
@@ -2331,6 +2392,11 @@ class DmSessionManager private constructor(
      * delivery, offline deposit), with the recipient and the envelope bytes. */
     @Volatile
     internal var beforeDispatchForTest: ((recipient: Secp256k1PublicKey, envelopeBytes: ByteArray) -> Unit)? = null
+
+    /** Test seam: called under [peer]'s stripe lock right after an inbound message was decrypted and committed, in
+     * decrypt (ratchet) order, before its listeners are notified. */
+    @Volatile
+    internal var onInboundCommittedForTest: ((peer: Secp256k1PublicKey, plaintext: ByteArray) -> Unit)? = null
 
     /** Test seam: whether the calling thread holds [peer]'s stripe lock. */
     internal fun holdsPeerLockForTest(peer: Secp256k1PublicKey): Boolean = Thread.holdsLock(stripeFor(peer))
@@ -2692,6 +2758,17 @@ class DmSessionManager private constructor(
                     } catch (e: DmSessionException) {
                         if (failure == null) failure = e
                         break
+                    } catch (e: Exception) {
+                        // Any other failure of this dispatch (e.g. a storage or pubsub exception of the offline deposit,
+                        // a transport bug, an I/O error) is a dispatch failure of THIS item too: without this the item
+                        // and everything after it left through the outer catch, past the failure handling, and were
+                        // silently lost. Exception, not Throwable: an Error still propagates. An interrupt never gets
+                        // here as InterruptedException (awaitTurn wraps it in a DmSessionException and restores the
+                        // flag).
+                        if (failure == null) {
+                            failure = DmSessionException("unexpected failure dispatching a replayed message", e)
+                        }
+                        break
                     }
                 }
                 if (failure == null) {
@@ -2745,6 +2822,14 @@ class DmSessionManager private constructor(
      * - Nothing to carry: done (a newer re-send covers everything).
      * - Unchanged record at the attempt cap: the CURRENT record is marked [DmPendingInitiation.gaveUp] and the items
      *   are dropped. Otherwise they become the snapshot of the next attempt (a changed record is not touched).
+     *
+     * Failures inside this function lose nothing: the classification above is computed in memory before any I/O,
+     * [loadPendingInitiation] never throws (an unreadable record reads as "changed", which carries the items to a
+     * waiting snapshot or re-schedules them, or at the attempt cap gives up as for any changed record), and a failing
+     * write of the give-up mark is logged while the give-up itself (dropping the items) still happens.
+     * [appendToPendingReplayLocked] stores copies, so the caller zeroing [ResendBatch.items] afterwards is safe. Hence
+     * every body is in exactly one replay: in the live buffer (taken as a newer snapshot), in [pendingReplays], or
+     * dropped only by the documented give-up.
      */
     private fun handleResendFailureLocked(
         peer: Secp256k1PublicKey,
@@ -2753,13 +2838,7 @@ class DmSessionManager private constructor(
         dispatched: Int,
         error: DmSessionException,
     ) {
-        val current = loadPendingInitiation(peer)
-        val superseded = !sameInitiationState(current, batch.pendingAfterPrepare)
-        val reason = error::class.simpleName
-        if (superseded && current?.gaveUp == true) {
-            logger.debug { "re-initiation with ${who(peer)} superseded by a give-up ($reason)" }
-            return
-        }
+        // Classification first, in memory only (no I/O), so that no later I/O failure can lose it.
         val carried = ArrayList<ByteArray>(batch.items.size - dispatched)
         val liveEntries = ArrayList<ReplayEntry>()
         for (index in dispatched until batch.items.size) {
@@ -2773,6 +2852,15 @@ class DmSessionManager private constructor(
                 entry.buffer.takenAsSnapshot() -> Unit
                 else -> carried += batch.items[index]
             }
+        }
+        // Never throws on I/O: an unreadable record reads as null, i.e. "changed" (superseded), handled below like a
+        // newer initiation: carried to a waiting snapshot, re-scheduled, or at the attempt cap given up.
+        val current = loadPendingInitiation(peer)
+        val superseded = !sameInitiationState(current, batch.pendingAfterPrepare)
+        val reason = error::class.simpleName
+        if (superseded && current?.gaveUp == true) {
+            logger.debug { "re-initiation with ${who(peer)} superseded by a give-up ($reason)" }
+            return
         }
         if (superseded && pendingReplays.containsKey(peer)) {
             if (carried.isNotEmpty()) {
@@ -2788,7 +2876,14 @@ class DmSessionManager private constructor(
         }
         if (attempt >= MAX_RESEND_ATTEMPTS) {
             if (!superseded) {
-                current?.let { savePendingInitiation(peer, it.copy(gaveUp = true)) }
+                // Giving up is intended: if the give-up mark cannot be stored (full disk, permissions), the items are
+                // still dropped and the snapshot cleared; only the durable mark is missing (the next user send then
+                // re-initiates as usual).
+                try {
+                    current?.let { savePendingInitiation(peer, it.copy(gaveUp = true)) }
+                } catch (e: java.io.IOException) {
+                    logger.warn { "could not store the give-up mark for ${who(peer)} (${e::class.simpleName})" }
+                }
                 pendingReplays.remove(peer)?.forEach { it.fill(0) }
             }
             logger.info { "giving up re-initiation with ${who(peer)} ($reason)" }
@@ -2939,6 +3034,9 @@ class DmSessionManager private constructor(
 
     internal fun replayBufferSizeForTest(peer: Secp256k1PublicKey): Int =
         replayBuffers[peer]?.let { synchronized(it) { it.items.size } } ?: 0
+
+    /** Test seam: how many plaintexts wait in [peer]'s re-send snapshot ([pendingReplays]). */
+    internal fun pendingReplayCountForTest(peer: Secp256k1PublicKey): Int = pendingReplays[peer]?.size ?: 0
 
     internal fun hasPendingInitiationForTest(peer: Secp256k1PublicKey): Boolean = loadPendingInitiation(peer) != null
 

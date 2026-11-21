@@ -81,16 +81,16 @@ private fun CallMediaSession.closeQuietly() {
  *    would have fired anyway.
  *
  * **Why inbound signal handling posts to the state thread instead of acting inline - the single most
- * important rule in this class.** [onInboundCallSignal] is invoked by `DmSessionManager` from
- * WITHIN `DmSessionManager.withPeerLock(sender)` - see `DmSessionManager.addCallSignalListener`'s own
- * doc comment. `withPeerLock` is `synchronized` (reentrant), so a listener that synchronously called
- * `DmSessionManager.sendCallSignal` for the SAME peer would not deadlock, but it WOULD run a
- * network dial that can take up to 15 seconds while holding that peer's stripe lock, blocking every
- * OTHER DM operation (text messages, mailbox delivery) for that peer for the duration. Every send in
- * this class ([sendSignalAsync], and every send inside [runOutgoingMediaSetup]/
- * [runIncomingMediaSetup]) therefore runs on the media thread, never inline from a signal-handling
- * callback - and [onInboundCallSignal] itself does nothing but decode-free dispatch onto the state
- * thread, returning to the Netty/`withPeerLock` caller immediately.
+ * important rule in this class.** [onInboundCallSignal] is invoked by `DmSessionManager` after the
+ * sender's stripe lock was released, per sender in ratchet order (so INVITE still arrives before the
+ * ICE candidates that follow it) and on the receiving thread - on the direct path a Netty event-loop
+ * thread; see `DmSessionManager.addCallSignalListener`'s own doc comment. A listener that synchronously
+ * called `DmSessionManager.sendCallSignal` would run a network dial that can take up to 15 seconds on
+ * that event-loop thread (whose stream it may itself need) and hold back every later delivery from
+ * that peer (text messages, call signals) for the duration. Every send in this class ([sendSignalAsync],
+ * and every send inside [runOutgoingMediaSetup]/[runIncomingMediaSetup]) therefore runs on the media
+ * thread, never inline from a signal-handling callback - and [onInboundCallSignal] itself does nothing
+ * but decode-free dispatch onto the state thread, returning to the Netty caller immediately.
  */
 class CallManager private constructor(
     private val transport: CallSignalTransport,

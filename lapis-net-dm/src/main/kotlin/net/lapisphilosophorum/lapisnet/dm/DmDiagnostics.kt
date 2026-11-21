@@ -29,7 +29,7 @@ data class DmDiagnostics(
     val rebootstrapsAfterRejection: Long,
     val rebootstrapsUnacked: Long,
     val textRejectedNoSession: Long,
-    /** Dials that ran while the caller held the peer's stripe lock - only a listener that sends synchronously from
-     * inside an inbound callback does that (documented contract violation); `0` in a correct deployment. */
+    /** Dials that ran while the caller held the peer's stripe lock. A guard counter: since inbound listeners run after
+     * the stripe lock (not even a listener that sends synchronously dials under it any more), it stays `0`. */
     val dialsUnderPeerLock: Long = 0,
 )

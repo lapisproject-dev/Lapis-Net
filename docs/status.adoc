@@ -106,6 +106,10 @@ link:architecture.adoc[architecture.adoc].
 | v0.12.0 (V0.9.20)
 | DCUtR TCP hole punching with a reuse-port transport, `--hole-punching=auto|on|off`. Verified on Linux loopback only, never behind a real router or CGNAT
 | ✅
+
+| unreleased (DM lock fixes)
+| DM sends do the network I/O outside the per-peer lock (two-phase send), and inbound listeners run outside it, per peer in ratchet order. The Argon2id one-time-prekey consumption of a first contact still runs under that lock. Verified on loopback only
+| ✅
 |===
 
 Known, deliberate gaps — not oversights, each documented at the point it was cut:

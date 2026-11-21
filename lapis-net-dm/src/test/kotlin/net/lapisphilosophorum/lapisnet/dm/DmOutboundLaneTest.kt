@@ -3,7 +3,6 @@ package net.lapisphilosophorum.lapisnet.dm
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldHaveSize
-import io.kotest.matchers.longs.shouldBeGreaterThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
@@ -380,11 +379,12 @@ class DmOutboundLaneTest :
             }
         }
 
-        test("k) a listener that sends synchronously is counted as a dial under the stripe lock, without a deadlock") {
-            // Documented contract: listeners must not send synchronously. On the direct path such a send runs on the
-            // Netty thread that delivers the inbound message and may time out (the stream it opens needs that same
-            // event loop) - exactly as before this fix. What must hold: no deadlock, the case is counted, and the
-            // peer is usable again afterwards.
+        test("k) a listener that sends synchronously no longer dials under the stripe lock, and does not deadlock") {
+            // Listeners run after the stripe lock (InboundDeliveryQueue), so even a listener that sends synchronously
+            // cannot dial under it any more: the guard counter stays 0 (before the inbound fix it was > 0 here). On the
+            // direct path such a send still runs on the Netty thread that delivers the inbound message and may time
+            // out (the stream it opens needs that same event loop). What must hold: no deadlock, no dial under the
+            // stripe lock, and the peer is usable again afterwards.
             val a = buildDmTestNode()
             val b = buildDmTestNode()
             try {
@@ -404,7 +404,7 @@ class DmOutboundLaneTest :
                         .plusSeconds(15)
                         .seconds
                 listenerDone.await(bound, TimeUnit.SECONDS) shouldBe true
-                a.dmSessionManager.diagnostics().dialsUnderPeerLock shouldBeGreaterThan 0L
+                a.dmSessionManager.diagnostics().dialsUnderPeerLock shouldBe 0L
                 a.dmSessionManager.outboundLanesForTest().laneCountForTest() shouldBe 0
                 val atB = LinkedBlockingQueue<String>()
                 b.dmSessionManager.addInboundListener { atB += it.content.body }

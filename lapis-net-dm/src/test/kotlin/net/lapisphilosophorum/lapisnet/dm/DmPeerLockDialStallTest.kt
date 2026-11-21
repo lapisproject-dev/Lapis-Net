@@ -3,7 +3,6 @@ package net.lapisphilosophorum.lapisnet.dm
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
-import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import java.security.SecureRandom
@@ -354,17 +353,4 @@ private fun announceUnreachableRecord(
             notValidAfterEpochSecond = Instant.now().epochSecond + 3600,
         )
     a.peerDirectory.announce(record)
-}
-
-/** A fresh identity whose key maps to the same stripe of [manager] as [peer] (bounded search). */
-private fun identityOnStripeOf(
-    manager: DmSessionManager,
-    peer: Secp256k1PublicKey,
-): DualKeyIdentity {
-    val wanted = manager.stripeIndexForTest(peer)
-    repeat(200_000) {
-        val candidate = DualKeyIdentity.generate()
-        if (manager.stripeIndexForTest(candidate.secp256k1KeyPair.publicKey) == wanted) return candidate
-    }
-    error("no identity on stripe $wanted within 200000 attempts")
 }

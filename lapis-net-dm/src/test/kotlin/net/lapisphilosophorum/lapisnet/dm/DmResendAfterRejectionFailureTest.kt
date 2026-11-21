@@ -5,8 +5,10 @@ import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.shouldBe
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.identity.X25519PublicKey
+import java.nio.file.Files
 import java.time.Duration
 import java.time.Instant
+import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -35,6 +37,11 @@ private class FlakyAnonymousTransport(
     private val failNextDeposit = AtomicBoolean(false)
     val onlineCalls = AtomicInteger()
     val depositCalls = AtomicInteger()
+
+    /** What the failing deposit throws; by default the transport's own documented failure. */
+    @Volatile var depositFailure: () -> RuntimeException = {
+        DmAnonymousDeliveryException(DmAnonymousFailure.RECIPIENT_NOT_REACHABLE_ANONYMOUSLY)
+    }
 
     override fun resolve(recipient: Secp256k1PublicKey): AnonymousDmTarget {
         val node = nodes().first { it.identity.secp256k1KeyPair.publicKey == recipient }
@@ -65,7 +72,7 @@ private class FlakyAnonymousTransport(
     ) {
         depositCalls.incrementAndGet()
         if (failNextDeposit.getAndSet(false)) {
-            throw DmAnonymousDeliveryException(DmAnonymousFailure.RECIPIENT_NOT_REACHABLE_ANONYMOUSLY)
+            throw depositFailure()
         }
         deliver(target, envelopeBytes)
     }
@@ -345,6 +352,130 @@ class DmResendAfterRejectionFailureTest :
                 received.count { it.sender == cKey && it.content.body == "m1" } shouldBe 2
                 received.count { it.sender == cKey && it.content.body == "m2" } shouldBe 2
                 cm.replayBufferSizeForTest(bKey) shouldBe 3
+            } finally {
+                b.stop()
+                c.stop()
+            }
+        }
+
+        test(
+            "unexpected dispatch exception at item 1 (not a DmSessionException): items 1 and 2 are still retried once",
+        ) {
+            val b = buildDmTestNode(oneTimePrekeyCount = 50, anonymous = true)
+            val c = buildDmTestNode(anonymous = true)
+            try {
+                connectAndConverge(c, b)
+                val all = listOf(b, c)
+                val transport = FlakyAnonymousTransport { all }
+                transport.depositFailure = { IllegalStateException("simulated unexpected deposit failure") }
+                all.forEach { it.dmSessionManager.installAnonymousTransport(transport) }
+                val bKey = b.identity.secp256k1KeyPair.publicKey
+                val cKey = c.identity.secp256k1KeyPair.publicKey
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
+                b.dmSessionManager.addInboundListener { received.add(it) }
+                val cm = c.dmSessionManager
+                val scheduled = CopyOnWriteArrayList<Pair<Long, () -> Unit>>()
+                cm.scheduleForTest = { delay, task -> scheduled += delay to task }
+                BODIES.forEach { cm.send(bKey, DmContent(body = it)) }
+                awaitCondition(Duration.ofSeconds(30)) { received.count { it.sender == cKey } == 3 } shouldBe true
+
+                cm.handleX3dhRejectionForTest(rejectionOfCurrentInitiation(b, c))
+                scheduled.size shouldBe 1
+                transport.succeedThenFailOnline.set(1) // item 0 goes through, item 1 fails online, its deposit throws
+                scheduled[0].second()
+                // Before the fix the unexpected exception left the loop past the failure handling: m1 and m2 were lost.
+                scheduled.size shouldBe 2
+                scheduled[1].second()
+                awaitCondition(Duration.ofSeconds(30)) {
+                    BODIES.all { body -> received.count { it.sender == cKey && it.content.body == body } == 2 }
+                } shouldBe true
+                Thread.sleep(1_000)
+                BODIES.forEach { body -> received.count { it.sender == cKey && it.content.body == body } shouldBe 2 }
+                scheduled.size shouldBe 2
+                cm.diagnostics().rebootstrapsAfterRejection shouldBe 1L
+            } finally {
+                b.stop()
+                c.stop()
+            }
+        }
+
+        test(
+            "give-up whose pending record cannot be written: no exception escapes, nothing more is scheduled or sent",
+        ) {
+            val b = buildDmTestNode(oneTimePrekeyCount = 50, anonymous = true)
+            val cDir = Files.createTempDirectory("dm-resend-unwritable")
+            val c = buildDmTestNode(sessionStoreDirectory = cDir, anonymous = true)
+            try {
+                connectAndConverge(c, b)
+                val all = listOf(b, c)
+                val transport = FlakyAnonymousTransport { all }
+                all.forEach { it.dmSessionManager.installAnonymousTransport(transport) }
+                val bKey = b.identity.secp256k1KeyPair.publicKey
+                val cKey = c.identity.secp256k1KeyPair.publicKey
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
+                b.dmSessionManager.addInboundListener { received.add(it) }
+                val cm = c.dmSessionManager
+                val scheduled = CopyOnWriteArrayList<Pair<Long, () -> Unit>>()
+                cm.scheduleForTest = { delay, task -> scheduled += delay to task }
+                BODIES.forEach { cm.send(bKey, DmContent(body = it)) }
+                awaitCondition(Duration.ofSeconds(30)) { received.count { it.sender == cKey } == 3 } shouldBe true
+
+                cm.handleX3dhRejectionForTest(rejectionOfCurrentInitiation(b, c))
+                for (attempt in 1..DmSessionManager.MAX_RESEND_ATTEMPTS) {
+                    scheduled.size shouldBe attempt
+                    transport.succeedThenFailOnline.set(0) // item 0 fails online and offline
+                    if (attempt == DmSessionManager.MAX_RESEND_ATTEMPTS) {
+                        // Phase B of the last attempt (no stripe lock): the session directory becomes read-only, so
+                        // the give-up record cannot be stored.
+                        cm.beforeDispatchForTest = { _, _ -> cDir.toFile().setWritable(false) }
+                    }
+                    scheduled[attempt - 1].second()
+                }
+                cm.beforeDispatchForTest = null
+                cDir.toFile().setWritable(true)
+                Thread.sleep(1_000)
+                scheduled.size shouldBe DmSessionManager.MAX_RESEND_ATTEMPTS
+                BODIES.forEach { body -> received.count { it.sender == cKey && it.content.body == body } shouldBe 1 }
+                cm.pendingReplayCountForTest(bKey) shouldBe 0
+            } finally {
+                cDir.toFile().setWritable(true)
+                b.stop()
+                c.stop()
+            }
+        }
+
+        test("no listener holds the sender's stripe lock while a replay is delivered and its failure is handled") {
+            val b = buildDmTestNode(oneTimePrekeyCount = 50, anonymous = true)
+            val c = buildDmTestNode(anonymous = true)
+            try {
+                connectAndConverge(c, b)
+                val all = listOf(b, c)
+                val transport = FlakyAnonymousTransport { all }
+                all.forEach { it.dmSessionManager.installAnonymousTransport(transport) }
+                val bKey = b.identity.secp256k1KeyPair.publicKey
+                val cKey = c.identity.secp256k1KeyPair.publicKey
+                val received = CopyOnWriteArrayList<DmInboundMessage>()
+                val lockHeldInListener = Collections.synchronizedList(mutableListOf<Boolean>())
+                b.dmSessionManager.addInboundListener {
+                    lockHeldInListener += b.dmSessionManager.holdsPeerLockForTest(it.sender)
+                    received.add(it)
+                }
+                val cm = c.dmSessionManager
+                val scheduled = CopyOnWriteArrayList<Pair<Long, () -> Unit>>()
+                cm.scheduleForTest = { delay, task -> scheduled += delay to task }
+                BODIES.forEach { cm.send(bKey, DmContent(body = it)) }
+                awaitCondition(Duration.ofSeconds(30)) { received.count { it.sender == cKey } == 3 } shouldBe true
+
+                cm.handleX3dhRejectionForTest(rejectionOfCurrentInitiation(b, c))
+                transport.succeedThenFailOnline.set(1) // m0 is replayed on this thread, m1 fails: failure handling
+                scheduled[0].second()
+                scheduled.size shouldBe 2
+                scheduled[1].second()
+                awaitCondition(Duration.ofSeconds(30)) {
+                    BODIES.all { body -> received.count { it.sender == cKey && it.content.body == body } == 2 }
+                } shouldBe true
+                lockHeldInListener.size shouldBe 6
+                lockHeldInListener.toList() shouldBe List(6) { false }
             } finally {
                 b.stop()
                 c.stop()

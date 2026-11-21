@@ -3391,13 +3391,80 @@ record: if a newer rejection was accepted in between, its record and snapshot wi
 were never prepared are appended to that snapshot). `stop()` closes the lanes first: every waiting send fails with "dm session manager
 stopped".
 
+Failure handling of that re-send (DM receive-path fix wave, unreleased): any `Exception` of a
+dispatch in phase B (not only a `DmSessionException`; for example a storage or pubsub exception of
+the offline deposit, a transport bug or an I/O error) counts as a dispatch failure of that item, so
+it and the items after it are kept for the next attempt instead of leaving through the outer catch
+unnoticed; an `Error` still propagates. The failure handling classifies the undispatched items in
+memory before any I/O; an unreadable pending record reads as "changed" (as before) and is handled
+like a newer initiation; at the attempt cap a failing write of the give-up mark is logged and the
+give-up (dropping the items, clearing the snapshot) still happens. Each body therefore ends up in
+exactly one replay or is dropped only by the documented give-up. If the exception came from a
+pubsub publish after the pointer was already registered for re-announcement, the receiver can get
+that body twice (a duplicate rather than a loss).
+
 Lock order: stripe lock, then the lane map's bin lock, then a lane's own lock (innermost; no I/O and
-no callback under it). Remaining exception, counted in `DmDiagnostics.dialsUnderPeerLock` and logged
-once: listeners still run inside the sender's stripe lock (documented contract), so a listener that
-sends synchronously still dials under that stripe. Unchanged: a stream promise is not closed after a
+no callback under it). `DmDiagnostics.dialsUnderPeerLock` remains as a guard counter (logged once);
+since inbound listeners run outside the stripe lock (next section) it stays 0, even for a listener
+that sends synchronously. Unchanged: a stream promise is not closed after a
 timeout (bounded by `MAX_STREAM_LIFETIME_SECONDS`); the `sendOffline` asymmetry (session persisted
 before `NabuStorage.put`); ordering between an offline message _n_ and an online _n+1_ across a
 fallback is not guaranteed.
+
+=== Inbound delivery outside the stripe lock
+
+_DM receive-path fix wave (unreleased)._ Until this fix `processInboundDmEnvelope` called the
+inbound listeners (`addInboundListener`, `addCallSignalListener`) inside the sender's stripe lock.
+A listener is arbitrary code; one that blocked held the stripe, so phase A of every send to that
+peer, `handleX3dhRejection`, mailbox pickups and all sends and inbound envelopes of other peers on
+the same stripe waited for it, and a listener that sent synchronously dialled under the lock.
+
+Now the inbound path has two parts:
+
+* *Under the stripe lock, unchanged in order:* dedup check, X3DH including the one-time-prekey
+  consumption and the X3DH response, decrypt, `persistSession`, cache update, acknowledgement of a
+  pending initiation, the durable X3DH replay registry, acceptance classification, the dedup mark,
+  the call reply route and the construction of the message. Then the listener notification is
+  *enqueued* in `InboundDeliveryQueue` for that peer. Because the stripe lock serialises the
+  decrypts of one peer, the queue order of a peer equals its decrypt (ratchet) order.
+* *After the stripe lock:* the receiving thread calls `deliver` with its ticket. If no other thread
+  is delivering that peer's messages, it runs that peer's queued notifications FIFO on its own
+  thread up to and including its own, then hands the rest over to their callers (so a Netty thread
+  never runs an unbounded stream of later deliveries); otherwise it waits (without timeout, as it
+  waited at the lock before, but without holding it) until its own notification has run. So the receiving call still returns only after its own
+  message reached the listeners: the return value for `MailboxPoller` (`false` means retry) and
+  every test that expects synchronous delivery stay valid. A slow listener delays only later
+  deliveries of the same peer.
+
+Reentrancy: a listener that synchronously causes another inbound delivery from the same peer on the
+delivering thread gets an immediate return; that notification runs right after the current one.
+Two listeners of different peers that synchronously feed each other's inbound envelopes would wait
+on each other (as nested stripe locks did before); no listener does this.
+
+Bound: a ticket is created only after a successful AEAD decrypt (an authenticated sender), and every
+ticket belongs to a caller that waits for it. The queue therefore holds at most as many entries as
+threads deliver inbound envelopes, not one per identity an attacker can mint; an empty peer queue is
+removed at once. No thread pool and no unbounded buffer were added. Lock order: stripe lock, then
+the queue map's bin lock (enqueue only, briefly); listeners and I/O never run under the bin lock. If
+a listener throws an `Error`, the delivering thread gives up its role and wakes the waiting callers,
+one of which takes over; a `RuntimeException` of a listener is logged as before.
+
+What stays under the stripe lock on purpose:
+
+* Disk I/O of the session state (`persistSession`, the replay registry, the pending-initiation file):
+  persist before deliver, symmetric to phase A of a send.
+* The one-time-prekey consumption, `PrekeyStore.consumeOneTimePrekey` (`@Synchronized`, a file lock
+  and Argon2id with 64 MiB and 3 passes for an encrypted store), including the wait at the
+  `PrekeyStore` monitor when several first contacts arrive at once (at most
+  `MAX_CONCURRENT_PREKEY_CONSUMPTIONS` = 4). Consume before respond is the replay protection of
+  X3DH; moving it out of the lock would change the outcome of two simultaneous identical replays.
+  *Known residual gap*, measured once on the development machine (16 cores, unloaded, encrypted
+  prekey store with 50 one-time prekeys, anonymity-mode test nodes): an `X3DH_INITIAL` with a
+  one-time prekey held the stripe for 434 ms, and a parallel `sendAuto` to a peer on the same stripe
+  waited 431 ms; four simultaneous first contacts took 809, 1,711, 1,711 and 1,711 ms. Test nodes
+  without a passphrase do no Argon2id there (about 9 ms).
+* Short in-memory steps (call reply route, enqueueing an X3DH rejection or a prekey replenishment,
+  the acceptance classification with its cached trust path and Karma lookup).
 
 === `DmEnvelope`/`DmEnvelopeCodec`: the outer wire frame
 

@@ -120,3 +120,16 @@ internal fun mailboxPointerWithUncappedTtl(
         signature = sender.sign(digest),
     )
 }
+
+/** A fresh identity whose key maps to the same stripe of [manager] as [peer] (bounded search). */
+internal fun identityOnStripeOf(
+    manager: DmSessionManager,
+    peer: Secp256k1PublicKey,
+): DualKeyIdentity {
+    val wanted = manager.stripeIndexForTest(peer)
+    repeat(200_000) {
+        val candidate = DualKeyIdentity.generate()
+        if (manager.stripeIndexForTest(candidate.secp256k1KeyPair.publicKey) == wanted) return candidate
+    }
+    error("no identity on stripe $wanted within 200000 attempts")
+}
