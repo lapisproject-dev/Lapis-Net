@@ -3421,8 +3421,11 @@ the same stripe waited for it, and a listener that sent synchronously dialled un
 
 Now the inbound path has two parts:
 
-* *Under the stripe lock, unchanged in order:* dedup check, X3DH including the one-time-prekey
-  consumption and the X3DH response, decrypt, `persistSession`, cache update, acknowledgement of a
+* *Before the stripe lock, for an `X3DH_INITIAL` only* (Argon2 peer-lock fix, unreleased; see the
+  next section): dedup check, binding check, durable ephemeral replay registry, rate and
+  concurrency bound and the one-time-prekey consumption, under the sender's inbound admission lock.
+* *Under the stripe lock, unchanged in order:* dedup check, the X3DH response (with the one-time
+  prekey already consumed), decrypt, `persistSession`, cache update, acknowledgement of a
   pending initiation, the durable X3DH replay registry, acceptance classification, the dedup mark,
   the call reply route and the construction of the message. Then the listener notification is
   *enqueued* in `InboundDeliveryQueue` for that peer. Because the stripe lock serialises the
@@ -3453,18 +3456,47 @@ What stays under the stripe lock on purpose:
 
 * Disk I/O of the session state (`persistSession`, the replay registry, the pending-initiation file):
   persist before deliver, symmetric to phase A of a send.
-* The one-time-prekey consumption, `PrekeyStore.consumeOneTimePrekey` (`@Synchronized`, a file lock
-  and Argon2id with 64 MiB and 3 passes for an encrypted store), including the wait at the
-  `PrekeyStore` monitor when several first contacts arrive at once (at most
-  `MAX_CONCURRENT_PREKEY_CONSUMPTIONS` = 4). Consume before respond is the replay protection of
-  X3DH; moving it out of the lock would change the outcome of two simultaneous identical replays.
-  *Known residual gap*, measured once on the development machine (16 cores, unloaded, encrypted
-  prekey store with 50 one-time prekeys, anonymity-mode test nodes): an `X3DH_INITIAL` with a
-  one-time prekey held the stripe for 434 ms, and a parallel `sendAuto` to a peer on the same stripe
-  waited 431 ms; four simultaneous first contacts took 809, 1,711, 1,711 and 1,711 ms. Test nodes
-  without a passphrase do no Argon2id there (about 9 ms).
 * Short in-memory steps (call reply route, enqueueing an X3DH rejection or a prekey replenishment,
   the acceptance classification with its cached trust path and Karma lookup).
+
+=== One-time-prekey consumption outside the stripe lock
+
+_Argon2 peer-lock fix (unreleased)._ The receive-path fix left one expensive step under the stripe
+lock: `PrekeyStore.consumeOneTimePrekey` (`@Synchronized`, a file lock and Argon2id with 64 MiB and
+3 passes for an encrypted store, once to read and once to write the store), including the wait at
+the `PrekeyStore` monitor when several first contacts arrive at once (at most
+`MAX_CONCURRENT_PREKEY_CONSUMPTIONS` = 4). Measured once on the development machine (16 cores,
+unloaded, encrypted prekey store with 50 one-time prekeys, anonymity-mode test nodes): an
+`X3DH_INITIAL` with a one-time prekey held the stripe for 434 ms, and a parallel `sendAuto` to a
+peer on the same stripe waited 431 ms; four simultaneous first contacts took 809, 1,711, 1,711 and
+1,711 ms.
+
+`processInboundDmEnvelope` now takes a second lock first, the sender's *inbound admission lock*
+(2,048 stripes indexed like the stripe locks, bounded for the same reason), and holds it around the
+whole processing of one envelope, not around its listener delivery. Under it, before the stripe lock,
+`admitInbound` runs for an `X3DH_INITIAL` exactly the checks that ran first under the stripe lock
+before, in the same order and with the same outcomes: dedup check, binding check, durable ephemeral
+replay registry, rate limit, concurrency bound, consumption (or the scheduled rejection for an
+unknown or consumed id). Then the stripe lock is taken for the rest, unchanged; the consumed key is
+handed to `X3dh.respond` there and destroyed after the locked part.
+
+Why the outcome stays the same: the state these checks read (the in-memory dedup marks and the
+per-peer ephemeral registry) is written only by inbound processing of the same sender, which the
+admission lock serialises, so nothing can change it between the checks and the locked part. Inbound
+envelopes of one sender are still processed one after another: two identical copies of a first
+contact give one consumption, one delivery and no `ONE_TIME_PREKEY_CONSUMED` rejection, and a later
+`TEXT` of the same sender waits for the first contact instead of finding no session. Consume before
+respond, the replay protection of X3DH, is unchanged.
+
+Lock order: admission lock, then stripe lock. Nothing that holds a stripe lock processes an inbound
+envelope (listeners run after both locks), so the order cannot invert.
+
+What still waits: inbound envelopes of the same sender, and of another sender on the same admission
+stripe (rare), wait for a consumption, as they waited at the stripe lock before. Sends to that peer,
+rejection handling, mailbox pickups of other peers and all traffic of other peers on the stripe do
+not. The cost of a consumption itself is unchanged (no crypto, on-disk or wire change). Test:
+`DmPrekeyConsumptionLockTest` (a: red before the fix, `sendAuto` stalled for the 5 s budget; b and c
+pin the unchanged per-sender semantics). Verified on loopback only; no external review.
 
 === `DmEnvelope`/`DmEnvelopeCodec`: the outer wire frame
 

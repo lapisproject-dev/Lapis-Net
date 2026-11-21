@@ -20,6 +20,7 @@ import net.lapisphilosophorum.lapisnet.identity.X25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.X25519PublicKey
 import net.lapisphilosophorum.lapisnet.networking.GossipPubSub
 import net.lapisphilosophorum.lapisnet.networking.LapisNode
+import net.lapisphilosophorum.lapisnet.ratchet.ConsumedOneTimePrekey
 import net.lapisphilosophorum.lapisnet.ratchet.CorruptedRatchetSessionException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetException
 import net.lapisphilosophorum.lapisnet.ratchet.DoubleRatchetSession
@@ -821,6 +822,29 @@ class DmSessionManager private constructor(
         peer: Secp256k1PublicKey,
         block: () -> T,
     ): T = synchronized(stripeFor(peer)) { block() }
+
+    /**
+     * Inbound admission locks ("Argon2 peer-lock" fix, unreleased): a second, separate set of [PEER_LOCK_STRIPE_COUNT]
+     * stripes, indexed like [peerLockStripes], taken ONLY by [processInboundDmEnvelope], around the whole inbound
+     * processing of one envelope (not around its listener delivery). It keeps the inbound processing of one claimed
+     * sender serialized, as the stripe lock alone did before, while the one-time-prekey consumption of an
+     * `X3DH_INITIAL` ([admitInbound]) runs outside the stripe lock: sends to that peer, rejection handling and all
+     * traffic of other peers on the stripe no longer wait for it. Only inbound processing of the same sender (and of
+     * the rare other sender on the same admission stripe) still waits, as before.
+     *
+     * Lock order: admission lock, then the stripe lock. Nothing that holds a stripe lock ever processes an inbound
+     * envelope (listeners run after both locks, [InboundDeliveryQueue]), so the order cannot invert. Bounded for the
+     * same reason as [peerLockStripes] (the key is an unauthenticated claim).
+     */
+    private val inboundAdmissionStripes: Array<Any> = Array(PEER_LOCK_STRIPE_COUNT) { Any() }
+
+    private fun admissionStripeFor(peer: Secp256k1PublicKey): Any =
+        inboundAdmissionStripes[(peer.hashCode() and Int.MAX_VALUE) % PEER_LOCK_STRIPE_COUNT]
+
+    private inline fun <T> withInboundAdmission(
+        peer: Secp256k1PublicKey,
+        block: () -> T,
+    ): T = synchronized(admissionStripeFor(peer)) { block() }
 
     private fun getCached(peer: Secp256k1PublicKey): DoubleRatchetSession? =
         synchronized(liveSessionCache) {
@@ -1893,7 +1917,25 @@ class DmSessionManager private constructor(
     ): Boolean {
         val claimedSender = envelope.senderIdentity
         return try {
-            val outcome = processInboundLocked(envelope, claimedSender, sourceDescription, onlinePeerId)
+            val outcome =
+                withInboundAdmission(claimedSender) {
+                    when (val admission = admitInbound(envelope, claimedSender, onlinePeerId)) {
+                        is InboundAdmission.Refused -> admission.outcome
+                        is InboundAdmission.Admitted ->
+                            try {
+                                processInboundLocked(
+                                    envelope,
+                                    claimedSender,
+                                    sourceDescription,
+                                    onlinePeerId,
+                                    admission.consumed,
+                                )
+                            } finally {
+                                // Only X3dh.respond reads it, inside processInboundLocked; never kept afterwards.
+                                admission.consumed?.privateKey?.destroy()
+                            }
+                    }
+                }
             // After the stripe lock: the listeners of this peer run in ratchet order, and this call returns only once
             // its own message was delivered (unless this is a reentrant call from a listener of the same peer).
             outcome.delivery?.let { inboundDelivery.deliver(it) }
@@ -1929,17 +1971,234 @@ class DmSessionManager private constructor(
         }
     }
 
+    /** Result of [admitInbound]: either a final outcome (nothing more to do), or the go-ahead for the locked part with
+     * the one-time prekey already consumed for an `X3DH_INITIAL` that names one ([consumed], otherwise null). */
+    private sealed class InboundAdmission {
+        class Refused(
+            val outcome: InboundOutcome,
+        ) : InboundAdmission()
+
+        class Admitted(
+            val consumed: ConsumedOneTimePrekey?,
+        ) : InboundAdmission()
+
+        companion object {
+            val NOTHING_CONSUMED = Admitted(null)
+        }
+    }
+
     /**
-     * The part of [processInboundDmEnvelope] that runs under [claimedSender]'s stripe lock: dedup check, X3DH and
-     * one-time-prekey consumption, decrypt, persist, acknowledgement, replay registry, acceptance classification and
-     * dedup mark - unchanged in order. Listeners are not called here: their notification is enqueued (so its order is
-     * the decrypt order) and returned in [InboundOutcome.delivery].
+     * The part of an inbound `X3DH_INITIAL` that runs BEFORE the stripe lock, under [claimedSender]'s inbound
+     * admission lock only ([withInboundAdmission]): dedup check, binding check, durable ephemeral replay registry,
+     * rate and concurrency bound, and the one-time-prekey consumption itself ([PrekeyStore.consumeOneTimePrekey]:
+     * Argon2id twice for an encrypted store, plus the wait at the store's monitor). Same checks, same order and same
+     * outcomes as before ("Argon2 peer-lock" fix, unreleased); only the lock they run under changed. Every other
+     * message type is admitted here without any check (its checks stay in [processInboundLocked]).
+     *
+     * Why this is equivalent to running it under the stripe lock: every state these checks read is only written by
+     * inbound processing of the SAME claimed sender ([recentlyDeliveredDedupKeys] marks, the per-peer ephemeral
+     * registry), and all of that runs under the same admission lock, so it cannot change between these checks and the
+     * locked part. Sends, rejection handling and other peers on the stripe do not touch it. Consume before respond -
+     * the X3DH replay protection - is unchanged: [processInboundLocked] gets the already consumed key. Two identical
+     * copies of one `X3DH_INITIAL` are still fully serialized: the second one sees the dedup mark or the registry entry
+     * of the first and is skipped silently, as before (no `ONE_TIME_PREKEY_CONSUMED` rejection).
+     */
+    private fun admitInbound(
+        envelope: DmEnvelope,
+        claimedSender: Secp256k1PublicKey,
+        onlinePeerId: PeerId?,
+    ): InboundAdmission {
+        if (envelope.messageType != DmMessageType.X3DH_INITIAL) return InboundAdmission.NOTHING_CONSUMED
+        val header =
+            envelope.x3dhInitialHeader
+                ?: error(
+                    "DmEnvelope's own init already guarantees x3dhInitialHeader is non-null here",
+                )
+        // Checked here (not only in processInboundLocked) because it must come before the consumption below.
+        if (isRecentlyDelivered(DmDedupKey.of(claimedSender, envelope.ratchetMessage))) {
+            logger.debug {
+                "skipping X3DH_INITIAL from claimed sender ${who(claimedSender)} - already delivered (dedup key match)"
+            }
+            return InboundAdmission.Refused(InboundOutcome.FINAL)
+        }
+        // Cheap, stateless authenticity check BEFORE ever touching
+        // localPrekeyStore.consumeOneTimePrekey below - see this function's own
+        // doc comment section on why. X3dh.respond performs this SAME check
+        // itself (its own check 2), but only AFTER a one-time prekey would
+        // already have been durably consumed if this guard were absent. Without
+        // it, an attacker holding NO private key material at all could mint
+        // structurally-valid-but-garbage-signed X3DH_INITIAL envelopes naming
+        // sequential one-time-prekey ids and durably burn through this node's
+        // entire one-time-prekey pool for zero cryptographic cost -
+        // EncryptionKeyBinding's own constructor performs only a 64-byte size
+        // check on the signature, never a cryptographic one. This is the
+        // SAME (initiatorIdentity, initiatorEncryptionBinding) pair X3dh.respond
+        // itself verifies further down - duplicated here deliberately, not
+        // routed through respond() first, because respond() also needs the
+        // ALREADY-consumed prekey as an argument (see PrekeyConsumptionException
+        // - the consume-before-respond ordering [X3dh]'s own class doc comment
+        // mandates for replay protection).
+        val headerBindingVerifies =
+            EncryptionKeyBinding.verify(header.initiatorIdentity, header.initiatorEncryptionBinding)
+        if (!headerBindingVerifies) {
+            logger.debug {
+                "X3DH_INITIAL from claimed sender ${who(claimedSender)} carries an " +
+                    "encryption key binding that does not verify against the claimed identity " +
+                    "- rejecting BEFORE any one-time prekey consumption"
+            }
+            // garbage/tamper - these exact bytes will never verify
+            return InboundAdmission.Refused(InboundOutcome.FINAL)
+        }
+        // **Security audit round 1 fix (2026-08-27): DURABLE, per-peer replay guard
+        // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
+        // the full story of the gap this closes, PROVEN exploitable by a restart
+        // (which empties that in-memory-only cache) via an executable probe.**
+        // Checked here - BEFORE any one-time-prekey consumption, BEFORE X3dh.respond,
+        // BEFORE a new session is ever built - because [X3dh.initiate] mints a FRESH
+        // ephemeral X25519 keypair on EVERY call (see that function's own body), so a
+        // genuinely repeated, legitimate handshake from the same peer (the accepted
+        // residual "no session registry" gap this class's own doc comment discloses)
+        // always carries a DIFFERENT [X3dhPreKeyMessageHeader.ephemeralPublicKey] -
+        // only a literal byte-for-byte replay of an ALREADY-ACCEPTED handshake ever
+        // collides here. Loaded fresh from disk on every attempt (not cached in
+        // memory) specifically so this survives this manager's own restart -
+        // [loadAcceptedX3dhInitialEphemeralKeys]'s own doc comment.
+        if (loadAcceptedX3dhInitialEphemeralKeys(claimedSender).any {
+                it.contentEquals(header.ephemeralPublicKey.bytes)
+            }
+        ) {
+            logger.debug {
+                "rejecting X3DH_INITIAL from claimed sender ${who(claimedSender)} - " +
+                    "this exact ephemeral key was already accepted for a prior handshake " +
+                    "(durable, survives a restart) - replay, not a legitimate re-handshake"
+            }
+            // this exact handshake will never become acceptable again
+            return InboundAdmission.Refused(InboundOutcome.FINAL)
+        }
+        // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
+        // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
+        // null` (a "signed-prekey-only" X3DH_INITIAL, no one-time prekey named) -
+        // deliberately, not an oversight. Traced, not assumed:
+        // [prekeyConsumptionRateLimiter]/[prekeyConsumptionSemaphore] exist to
+        // bound ONE SPECIFIC expensive operation - [PrekeyStore.consumeOneTimePrekey]'s
+        // Argon2id derivation (64 MiB/3 passes) behind [PrekeyStore]'s single
+        // shared per-file lock (see [prekeyConsumptionSemaphore]'s own doc comment).
+        // When `oneTimePrekeyId` is null, this `?.let` block never runs AT ALL -
+        // `consumeOneTimePrekey` is never called, so that specific expensive,
+        // lock-contending operation these two mitigations exist to protect is
+        // categorically untouched by this path, not merely under-protected.
+        //
+        // What a no-OTPK X3DH_INITIAL costs INSTEAD (traced through
+        // [X3dh.respond] and [DoubleRatchetSession.initializeReceiver]): the SAME
+        // [EncryptionKeyBinding.create] self-sign this class always performs one
+        // line below regardless of this branch, 3 X25519 Diffie-Hellman agreements
+        // plus one HKDF derivation (`dh4`/the one-time-prekey DH term is simply
+        // never computed), and one AES-GCM ratchet-message decrypt attempt further
+        // down - ordinary constant-time symmetric/EC-curve arithmetic, microseconds
+        // each, NO Argon2id anywhere in that chain. This is the SAME order of
+        // magnitude of per-envelope work every OTHER inbound envelope already
+        // costs unconditionally (e.g. a `TEXT` envelope's own ratchet decrypt) -
+        // not a novel unbounded-resource-per-request the way Argon2id-guarded
+        // [PrekeyStore] access is, so reusing (or duplicating) either mitigation
+        // here would bound a resource that was never actually at risk.
+        //
+        // **Also the one wire shape a genuinely LEGITIMATE initiator produces**:
+        // [X3dh.initiate]'s own `oneTimePrekey` selection (see that function) is
+        // `null` exactly when the RESPONDER's own currently-published
+        // [net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle] has an EMPTY
+        // `oneTimePrekeys` list - i.e. this exact node's own pool was already
+        // exhausted (transiently, between [replenishOneTimePrekeysIfLow] triggering
+        // and the republished bundle propagating). Applying the OTPK-consumption
+        // rate limit here too would throttle honest first-contact attempts reacting
+        // to THIS node's own degraded-but-still-working fallback, on top of a
+        // resource ([PrekeyStore]) that fallback doesn't even touch.
+        //
+        // Residual risk this leaves accepted, not eliminated: a flood of
+        // structurally-valid, genuinely self-signed (real ECDSA sign, one throwaway
+        // identity per attempt - the same "costs an attacker microseconds of local
+        // CPU" cost [prekeyConsumptionSemaphore]'s own doc comment already accepts
+        // as unavoidable at this layer) no-OTPK X3DH_INITIAL envelopes could still
+        // force many cheap-but-nonzero handshake attempts. That volume is bounded
+        // by the connection/stream-level defenses ABOVE this layer instead -
+        // [MAX_CONCURRENT_STREAMS_PER_PEER], [DmProtocolHandler]'s frame-size cap
+        // and slowloris/absolute-lifetime timeouts, and [MAX_LIVE_SESSIONS]'s
+        // LRU-eviction cap on how many resulting sessions can pile up in
+        // [liveSessionCache] - plus a global connection cap at the [LapisNode] level
+        // (see [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]'s own
+        // `MAX_CONCURRENT_CONNECTIONS`, follow-up hardening item 5, same 2026-08-11
+        // wave), none of which are specific to the one-time-prekey resource these
+        // two fields guard.
+        val consumed =
+            header.oneTimePrekeyId?.let { id ->
+                // See prekeyConsumptionRateLimiter's own doc comment for why a
+                // RATE bound is needed in addition to prekeyConsumptionSemaphore's
+                // concurrency bound. Checked FIRST - cheaper than the semaphore,
+                // and rejects a sustained flood without even touching the
+                // concurrency-bounded resource below.
+                if (!prekeyConsumptionRateLimiter.tryAcquire()) {
+                    logger.debug {
+                        "rejecting X3DH_INITIAL from claimed sender " +
+                            "${who(claimedSender)} - " +
+                            "MAX_PREKEY_CONSUMPTIONS_PER_WINDOW " +
+                            "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
+                            "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
+                    }
+                    return InboundAdmission.Refused(InboundOutcome.FINAL)
+                }
+                // See prekeyConsumptionSemaphore's own doc comment for why this
+                // gate exists and why it never blocks.
+                if (!prekeyConsumptionSemaphore.tryAcquire()) {
+                    logger.debug {
+                        "rejecting X3DH_INITIAL from claimed sender " +
+                            "${who(claimedSender)} - " +
+                            "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
+                            "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
+                    }
+                    return InboundAdmission.Refused(InboundOutcome.FINAL)
+                }
+                try {
+                    beforePrekeyConsumptionForTest?.invoke(claimedSender)
+                    val result = localPrekeyStore.consumeOneTimePrekey(id)
+                    // Self-healing half of this fix - see that function's own
+                    // doc comment. Never blocks this Netty thread.
+                    replenishOneTimePrekeysIfLow()
+                    result
+                } catch (e: PrekeyConsumptionException) {
+                    val reason =
+                        if (e.reason == PrekeyConsumptionFailure.ALREADY_CONSUMED) {
+                            ctrRejectedOtkConsumed.incrementAndGet()
+                            DmX3dhRejectionReason.ONE_TIME_PREKEY_CONSUMED
+                        } else {
+                            ctrRejectedOtkUnknown.incrementAndGet()
+                            DmX3dhRejectionReason.ONE_TIME_PREKEY_UNKNOWN
+                        }
+                    // The OTK stays consumed; no SPK-only retry. Only an enqueue here.
+                    scheduleX3dhRejection(claimedSender, header, reason, onlinePeerId)
+                    logger.debug(e) {
+                        "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
+                            "${who(claimedSender)} - rejecting"
+                    }
+                    // this specific one-time-prekey id will never become valid again
+                    return InboundAdmission.Refused(InboundOutcome.FINAL)
+                } finally {
+                    prekeyConsumptionSemaphore.release()
+                }
+            }
+        return InboundAdmission.Admitted(consumed)
+    }
+
+    /**
+     * The part of [processInboundDmEnvelope] that runs under [claimedSender]'s stripe lock: dedup check, X3DH (with
+     * the one-time prekey [admitInbound] already consumed, [consumed]), decrypt, persist, acknowledgement, replay
+     * registry, acceptance classification and dedup mark - unchanged in order. Listeners are not called here: their
+     * notification is enqueued (so its order is the decrypt order) and returned in [InboundOutcome.delivery].
      */
     private fun processInboundLocked(
         envelope: DmEnvelope,
         claimedSender: Secp256k1PublicKey,
         sourceDescription: String,
         onlinePeerId: PeerId?,
+        consumed: ConsumedOneTimePrekey?,
     ): InboundOutcome =
         withPeerLock(claimedSender) {
             val dedupKey = DmDedupKey.of(claimedSender, envelope.ratchetMessage)
@@ -1964,168 +2223,8 @@ class DmSessionManager private constructor(
                                 ?: error(
                                     "DmEnvelope's own init already guarantees x3dhInitialHeader is non-null here",
                                 )
-                        // Cheap, stateless authenticity check BEFORE ever touching
-                        // localPrekeyStore.consumeOneTimePrekey below - see this function's own
-                        // doc comment section on why. X3dh.respond performs this SAME check
-                        // itself (its own check 2), but only AFTER a one-time prekey would
-                        // already have been durably consumed if this guard were absent. Without
-                        // it, an attacker holding NO private key material at all could mint
-                        // structurally-valid-but-garbage-signed X3DH_INITIAL envelopes naming
-                        // sequential one-time-prekey ids and durably burn through this node's
-                        // entire one-time-prekey pool for zero cryptographic cost -
-                        // EncryptionKeyBinding's own constructor performs only a 64-byte size
-                        // check on the signature, never a cryptographic one. This is the
-                        // SAME (initiatorIdentity, initiatorEncryptionBinding) pair X3dh.respond
-                        // itself verifies further down - duplicated here deliberately, not
-                        // routed through respond() first, because respond() also needs the
-                        // ALREADY-consumed prekey as an argument (see PrekeyConsumptionException
-                        // - the consume-before-respond ordering [X3dh]'s own class doc comment
-                        // mandates for replay protection).
-                        val headerBindingVerifies =
-                            EncryptionKeyBinding.verify(header.initiatorIdentity, header.initiatorEncryptionBinding)
-                        if (!headerBindingVerifies) {
-                            logger.debug {
-                                "X3DH_INITIAL from claimed sender ${who(claimedSender)} carries an " +
-                                    "encryption key binding that does not verify against the claimed identity " +
-                                    "- rejecting BEFORE any one-time prekey consumption"
-                            }
-                            // garbage/tamper - these exact bytes will never verify
-                            return@withPeerLock InboundOutcome.FINAL
-                        }
-                        // **Security audit round 1 fix (2026-08-27): DURABLE, per-peer replay guard
-                        // for X3DH_INITIAL - see [recentlyDeliveredDedupKeys]'s own doc comment for
-                        // the full story of the gap this closes, PROVEN exploitable by a restart
-                        // (which empties that in-memory-only cache) via an executable probe.**
-                        // Checked here - BEFORE any one-time-prekey consumption, BEFORE X3dh.respond,
-                        // BEFORE a new session is ever built - because [X3dh.initiate] mints a FRESH
-                        // ephemeral X25519 keypair on EVERY call (see that function's own body), so a
-                        // genuinely repeated, legitimate handshake from the same peer (the accepted
-                        // residual "no session registry" gap this class's own doc comment discloses)
-                        // always carries a DIFFERENT [X3dhPreKeyMessageHeader.ephemeralPublicKey] -
-                        // only a literal byte-for-byte replay of an ALREADY-ACCEPTED handshake ever
-                        // collides here. Loaded fresh from disk on every attempt (not cached in
-                        // memory) specifically so this survives this manager's own restart -
-                        // [loadAcceptedX3dhInitialEphemeralKeys]'s own doc comment.
-                        if (loadAcceptedX3dhInitialEphemeralKeys(claimedSender).any {
-                                it.contentEquals(header.ephemeralPublicKey.bytes)
-                            }
-                        ) {
-                            logger.debug {
-                                "rejecting X3DH_INITIAL from claimed sender ${who(claimedSender)} - " +
-                                    "this exact ephemeral key was already accepted for a prior handshake " +
-                                    "(durable, survives a restart) - replay, not a legitimate re-handshake"
-                            }
-                            // this exact handshake will never become acceptable again
-                            return@withPeerLock InboundOutcome.FINAL
-                        }
-                        // **Follow-up hardening item 3 (2026-08-11), judgment call: NO equivalent
-                        // rate/concurrency bound is added for the case `header.oneTimePrekeyId ==
-                        // null` (a "signed-prekey-only" X3DH_INITIAL, no one-time prekey named) -
-                        // deliberately, not an oversight. Traced, not assumed:
-                        // [prekeyConsumptionRateLimiter]/[prekeyConsumptionSemaphore] exist to
-                        // bound ONE SPECIFIC expensive operation - [PrekeyStore.consumeOneTimePrekey]'s
-                        // Argon2id derivation (64 MiB/3 passes) behind [PrekeyStore]'s single
-                        // shared per-file lock (see [prekeyConsumptionSemaphore]'s own doc comment).
-                        // When `oneTimePrekeyId` is null, this `?.let` block never runs AT ALL -
-                        // `consumeOneTimePrekey` is never called, so that specific expensive,
-                        // lock-contending operation these two mitigations exist to protect is
-                        // categorically untouched by this path, not merely under-protected.
-                        //
-                        // What a no-OTPK X3DH_INITIAL costs INSTEAD (traced through
-                        // [X3dh.respond] and [DoubleRatchetSession.initializeReceiver]): the SAME
-                        // [EncryptionKeyBinding.create] self-sign this class always performs one
-                        // line below regardless of this branch, 3 X25519 Diffie-Hellman agreements
-                        // plus one HKDF derivation (`dh4`/the one-time-prekey DH term is simply
-                        // never computed), and one AES-GCM ratchet-message decrypt attempt further
-                        // down - ordinary constant-time symmetric/EC-curve arithmetic, microseconds
-                        // each, NO Argon2id anywhere in that chain. This is the SAME order of
-                        // magnitude of per-envelope work every OTHER inbound envelope already
-                        // costs unconditionally (e.g. a `TEXT` envelope's own ratchet decrypt) -
-                        // not a novel unbounded-resource-per-request the way Argon2id-guarded
-                        // [PrekeyStore] access is, so reusing (or duplicating) either mitigation
-                        // here would bound a resource that was never actually at risk.
-                        //
-                        // **Also the one wire shape a genuinely LEGITIMATE initiator produces**:
-                        // [X3dh.initiate]'s own `oneTimePrekey` selection (see that function) is
-                        // `null` exactly when the RESPONDER's own currently-published
-                        // [net.lapisphilosophorum.lapisnet.ratchet.PrekeyBundle] has an EMPTY
-                        // `oneTimePrekeys` list - i.e. this exact node's own pool was already
-                        // exhausted (transiently, between [replenishOneTimePrekeysIfLow] triggering
-                        // and the republished bundle propagating). Applying the OTPK-consumption
-                        // rate limit here too would throttle honest first-contact attempts reacting
-                        // to THIS node's own degraded-but-still-working fallback, on top of a
-                        // resource ([PrekeyStore]) that fallback doesn't even touch.
-                        //
-                        // Residual risk this leaves accepted, not eliminated: a flood of
-                        // structurally-valid, genuinely self-signed (real ECDSA sign, one throwaway
-                        // identity per attempt - the same "costs an attacker microseconds of local
-                        // CPU" cost [prekeyConsumptionSemaphore]'s own doc comment already accepts
-                        // as unavoidable at this layer) no-OTPK X3DH_INITIAL envelopes could still
-                        // force many cheap-but-nonzero handshake attempts. That volume is bounded
-                        // by the connection/stream-level defenses ABOVE this layer instead -
-                        // [MAX_CONCURRENT_STREAMS_PER_PEER], [DmProtocolHandler]'s frame-size cap
-                        // and slowloris/absolute-lifetime timeouts, and [MAX_LIVE_SESSIONS]'s
-                        // LRU-eviction cap on how many resulting sessions can pile up in
-                        // [liveSessionCache] - plus a global connection cap at the [LapisNode] level
-                        // (see [net.lapisphilosophorum.lapisnet.networking.LapisNode.create]'s own
-                        // `MAX_CONCURRENT_CONNECTIONS`, follow-up hardening item 5, same 2026-08-11
-                        // wave), none of which are specific to the one-time-prekey resource these
-                        // two fields guard.
-                        val consumed =
-                            header.oneTimePrekeyId?.let { id ->
-                                // See prekeyConsumptionRateLimiter's own doc comment for why a
-                                // RATE bound is needed in addition to prekeyConsumptionSemaphore's
-                                // concurrency bound. Checked FIRST - cheaper than the semaphore,
-                                // and rejects a sustained flood without even touching the
-                                // concurrency-bounded resource below.
-                                if (!prekeyConsumptionRateLimiter.tryAcquire()) {
-                                    logger.debug {
-                                        "rejecting X3DH_INITIAL from claimed sender " +
-                                            "${who(claimedSender)} - " +
-                                            "MAX_PREKEY_CONSUMPTIONS_PER_WINDOW " +
-                                            "($MAX_PREKEY_CONSUMPTIONS_PER_WINDOW per " +
-                                            "$PREKEY_CONSUMPTION_RATE_WINDOW) exceeded"
-                                    }
-                                    return@withPeerLock InboundOutcome.FINAL
-                                }
-                                // See prekeyConsumptionSemaphore's own doc comment for why this
-                                // gate exists and why it never blocks.
-                                if (!prekeyConsumptionSemaphore.tryAcquire()) {
-                                    logger.debug {
-                                        "rejecting X3DH_INITIAL from claimed sender " +
-                                            "${who(claimedSender)} - " +
-                                            "MAX_CONCURRENT_PREKEY_CONSUMPTIONS " +
-                                            "($MAX_CONCURRENT_PREKEY_CONSUMPTIONS) already in flight"
-                                    }
-                                    return@withPeerLock InboundOutcome.FINAL
-                                }
-                                try {
-                                    val result = localPrekeyStore.consumeOneTimePrekey(id)
-                                    // Self-healing half of this fix - see that function's own
-                                    // doc comment. Never blocks this Netty thread.
-                                    replenishOneTimePrekeysIfLow()
-                                    result
-                                } catch (e: PrekeyConsumptionException) {
-                                    val reason =
-                                        if (e.reason == PrekeyConsumptionFailure.ALREADY_CONSUMED) {
-                                            ctrRejectedOtkConsumed.incrementAndGet()
-                                            DmX3dhRejectionReason.ONE_TIME_PREKEY_CONSUMED
-                                        } else {
-                                            ctrRejectedOtkUnknown.incrementAndGet()
-                                            DmX3dhRejectionReason.ONE_TIME_PREKEY_UNKNOWN
-                                        }
-                                    // The OTK stays consumed; no SPK-only retry. Only an enqueue here.
-                                    scheduleX3dhRejection(claimedSender, header, reason, onlinePeerId)
-                                    logger.debug(e) {
-                                        "cannot consume one-time prekey $id for claimed X3DH_INITIAL from " +
-                                            "${who(claimedSender)} - rejecting"
-                                    }
-                                    // this specific one-time-prekey id will never become valid again
-                                    return@withPeerLock InboundOutcome.FINAL
-                                } finally {
-                                    prekeyConsumptionSemaphore.release()
-                                }
-                            }
+                        // Binding check, replay registry, rate/concurrency bound and the one-time-prekey
+                        // consumption ran in admitInbound, before this lock (see its doc comment).
                         val ownBinding =
                             EncryptionKeyBinding.create(
                                 localIdentity.secp256k1KeyPair,
@@ -2397,6 +2496,11 @@ class DmSessionManager private constructor(
      * decrypt (ratchet) order, before its listeners are notified. */
     @Volatile
     internal var onInboundCommittedForTest: ((peer: Secp256k1PublicKey, plaintext: ByteArray) -> Unit)? = null
+
+    /** Test seam: called right before [PrekeyStore.consumeOneTimePrekey] for an inbound `X3DH_INITIAL` of [peer]
+     * (stands in for the Argon2id cost of an encrypted store, which the test nodes do not have). */
+    @Volatile
+    internal var beforePrekeyConsumptionForTest: ((peer: Secp256k1PublicKey) -> Unit)? = null
 
     /** Test seam: whether the calling thread holds [peer]'s stripe lock. */
     internal fun holdsPeerLockForTest(peer: Secp256k1PublicKey): Boolean = Thread.holdsLock(stripeFor(peer))

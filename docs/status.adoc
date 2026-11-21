@@ -108,7 +108,7 @@ link:architecture.adoc[architecture.adoc].
 | ✅
 
 | unreleased (DM lock fixes)
-| DM sends do the network I/O outside the per-peer lock (two-phase send), and inbound listeners run outside it, per peer in ratchet order. The Argon2id one-time-prekey consumption of a first contact still runs under that lock. Verified on loopback only
+| DM sends do the network I/O outside the per-peer lock (two-phase send), and inbound listeners run outside it, per peer in ratchet order. The Argon2id one-time-prekey consumption of a first contact runs before that lock, under a per-sender admission lock (inbound of one sender stays serialised). Verified on loopback only
 | ✅
 |===
 
