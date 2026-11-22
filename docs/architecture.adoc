@@ -111,9 +111,9 @@ Virtus, Karma, and Madli are tools for views, not a protocol requirement.
   `PrekeyBundleCodec`/`PrekeyStore` and the `X3dh` handshake itself. Deliberately ZERO network/
   libp2p/Nabu dependencies — publication over GossipSub lives in `lapis-net-directory` instead (see
   above)
-* `lapis-net-onion` — traffic-anonymisation foundation (wave V0.10.0-A, unreleased): cell format, ntor-style handshake, onion layers, a pure relay state machine, and (V0.10.0-B) the onion key ring for rotation; (V0.10.0-C) hidden-service roles and splice in the relay, onion addresses and descriptors, the HPKE introduction, the end-to-end layer and the two pure hidden-service state machines. Deliberately ZERO network/libp2p/Nabu dependencies; see `link:anonymity.adoc[anonymity.adoc]`
-* `lapis-net-onion-wire` — wire integration of the onion foundation (wave V0.10.0-B, unreleased): stream protocol `/lapis/onion/1.0.0`, link management, onion key file and rotation, relay service, quality tracker, diagnostic circuit client, and (V0.10.0-C) the onion service host, the rendezvous client and the rendezvous stream. Opt-in relay mode (`lapisnet node --onion-relay=true`) in the CLI only. Since wave V0.10.0-E the package `path` (selector, guards, circuit governor) and `anonymity` (`AnonymityRuntime`) add the experimental `--anonymity=on`, wired into the CLI node and the browser; this adds the dependency edge `lapis-net-browser` to `lapis-net-onion-wire` and `lapis-net-onion` (no cycle: onion-wire depends on core, identity, onion, networking and directory only). DM, mail and call are not wired and no user traffic is anonymised. Wave V0.10.0-J1b (unreleased) adds `anonymity/AnonymousConnectionController` (keeps a node in anonymity mode connected to its two guards only, with the bootstrap peers allowed while it lacks relays or a guard connection), the gate of the guard choice (`path/GuardChoiceGate`), and, in `lapis-net-networking`, the package `confinement` (`ConnectionConfinement`, `ConfiningTransport`, `ConnectionConfinementHandler`: no listener, dials outside the allowed set refused before TCP); in `lapis-net-directory` the stream protocol `/lapis/onion-relay-directory/1.0.0` (`OnionRelayDirectoryCodec`, `OnionRelayDirectoryServer` registered on every node in normal mode, `OnionRelayDirectoryClient` opening its stream on an existing connection without host registration, `RelayDirectorySnapshotIngest`). No new module edge. Wave V0.10.0-H (unreleased) adds, without a new module edge, the egress shaper hooked into `OnionLinkManager.send` (installed only by `AnonymityRuntime`, never on a relay node), the cover scheduler and the warm circuit pool; `lapis-net-dm-onion` adds `FrameSizeClasses` and the padding phase of the frame reader. No persistent state and no migration.
-* `lapis-net-dm-onion` — direct messages over circuits (wave V0.10.0-F1, unreleased): the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed mailbox item format) and `lapis-net-onion-wire` (which knows nothing about direct messages). Contains `OnionDmTransport`, the rendezvous framing with a constant acknowledgement, the receiving handler, the re-announcement queue of sealed items and the subscriber of the shared mailbox topic. Neither of the two modules it joins may depend on the other, hence this module.
+* `lapis-net-onion` — traffic-anonymisation foundation (wave V0.10.0-A, released in `v0.13.0`): cell format, ntor-style handshake, onion layers, a pure relay state machine, and (V0.10.0-B) the onion key ring for rotation; (V0.10.0-C) hidden-service roles and splice in the relay, onion addresses and descriptors, the HPKE introduction, the end-to-end layer and the two pure hidden-service state machines. Deliberately ZERO network/libp2p/Nabu dependencies; see `link:anonymity.adoc[anonymity.adoc]`
+* `lapis-net-onion-wire` — wire integration of the onion foundation (wave V0.10.0-B, released in `v0.13.0`): stream protocol `/lapis/onion/1.0.0`, link management, onion key file and rotation, relay service, quality tracker, diagnostic circuit client, and (V0.10.0-C) the onion service host, the rendezvous client and the rendezvous stream. Opt-in relay mode (`lapisnet node --onion-relay=true`) in the CLI only. Since wave V0.10.0-E the package `path` (selector, guards, circuit governor) and `anonymity` (`AnonymityRuntime`) add the experimental `--anonymity=on`, wired into the CLI node and the browser; this adds the dependency edge `lapis-net-browser` to `lapis-net-onion-wire` and `lapis-net-onion` (no cycle: onion-wire depends on core, identity, onion, networking and directory only). DM, mail and call are not wired and no user traffic is anonymised. Wave V0.10.0-J1b (released in `v0.13.0`) adds `anonymity/AnonymousConnectionController` (keeps a node in anonymity mode connected to its two guards only, with the bootstrap peers allowed while it lacks relays or a guard connection), the gate of the guard choice (`path/GuardChoiceGate`), and, in `lapis-net-networking`, the package `confinement` (`ConnectionConfinement`, `ConfiningTransport`, `ConnectionConfinementHandler`: no listener, dials outside the allowed set refused before TCP); in `lapis-net-directory` the stream protocol `/lapis/onion-relay-directory/1.0.0` (`OnionRelayDirectoryCodec`, `OnionRelayDirectoryServer` registered on every node in normal mode, `OnionRelayDirectoryClient` opening its stream on an existing connection without host registration, `RelayDirectorySnapshotIngest`). No new module edge. Wave V0.10.0-H (released in `v0.13.0`) adds, without a new module edge, the egress shaper hooked into `OnionLinkManager.send` (installed only by `AnonymityRuntime`, never on a relay node), the cover scheduler and the warm circuit pool; `lapis-net-dm-onion` adds `FrameSizeClasses` and the padding phase of the frame reader. No persistent state and no migration.
+* `lapis-net-dm-onion` — direct messages over circuits (wave V0.10.0-F1, released in `v0.13.0`): the adapter between `lapis-net-dm` (which knows only the `AnonymousDmTransport` interface and the sealed mailbox item format) and `lapis-net-onion-wire` (which knows nothing about direct messages). Contains `OnionDmTransport`, the rendezvous framing with a constant acknowledgement, the receiving handler, the re-announcement queue of sealed items and the subscriber of the shared mailbox topic. Neither of the two modules it joins may depend on the other, hence this module.
 * `lapis-net-networking` — libp2p node bootstrap (V0.1.3) and GossipSub pub/sub (V0.1.7, see below),
   now with operator-configurable bootstrap peers and listen address (V0.4, see below)
 * `lapis-net-cli` — entry point / demo harness, including the multi-node trust-propagation demo
@@ -558,7 +558,7 @@ reset at once. An initiator that never closes therefore cannot keep streams open
 
 === Post body provide scheduler (wave Q20)
 
-_Status: implemented, unreleased (version stays 0.12.0). The decision itself (Q20) is confirmed by the user (2026-11-22); its open points F1 to F6 are not._
+_Status: implemented, released in `v0.13.0`. The decision itself (Q20) is confirmed by the user (2026-11-22); its open points F1 to F6 are not._
 
 `BlockProvideScheduler` (`lapis-net-storage`) announces a bounded set of blocks with `NabuStorage.provide` and
 re-announces them. The browser wires it for post bodies: `PostAnnouncementGossip.attach(.., onBodyStored)` calls
@@ -3356,7 +3356,7 @@ application-level response frame is ever written back on a DM stream.
 
 === Two-phase send: state under the stripe lock, network in the per-peer outbound lane
 
-_DM lock fix wave (unreleased)._ Until this fix every `DmSessionManager` send held the peer's stripe
+_DM lock fix wave (released in `v0.13.0`)._ Until this fix every `DmSessionManager` send held the peer's stripe
 lock (`withPeerLock`, a `synchronized` monitor over 2,048 stripes) for the whole send, including the
 dial-slot wait (up to 15 s), the stream open (up to 15 s), the offline deposit (`NabuStorage.put` and
 a pubsub publish) and, in anonymity mode, the circuit delivery (up to 30 s). Everything else that maps
@@ -3391,7 +3391,7 @@ record: if a newer rejection was accepted in between, its record and snapshot wi
 were never prepared are appended to that snapshot). `stop()` closes the lanes first: every waiting send fails with "dm session manager
 stopped".
 
-Failure handling of that re-send (DM receive-path fix wave, unreleased): any `Exception` of a
+Failure handling of that re-send (DM receive-path fix wave, released in `v0.13.0`): any `Exception` of a
 dispatch in phase B (not only a `DmSessionException`; for example a storage or pubsub exception of
 the offline deposit, a transport bug or an I/O error) counts as a dispatch failure of that item, so
 it and the items after it are kept for the next attempt instead of leaving through the outer catch
@@ -3413,7 +3413,7 @@ fallback is not guaranteed.
 
 === Inbound delivery outside the stripe lock
 
-_DM receive-path fix wave (unreleased)._ Until this fix `processInboundDmEnvelope` called the
+_DM receive-path fix wave (released in `v0.13.0`)._ Until this fix `processInboundDmEnvelope` called the
 inbound listeners (`addInboundListener`, `addCallSignalListener`) inside the sender's stripe lock.
 A listener is arbitrary code; one that blocked held the stripe, so phase A of every send to that
 peer, `handleX3dhRejection`, mailbox pickups and all sends and inbound envelopes of other peers on
@@ -3421,7 +3421,7 @@ the same stripe waited for it, and a listener that sent synchronously dialled un
 
 Now the inbound path has two parts:
 
-* *Before the stripe lock, for an `X3DH_INITIAL` only* (Argon2 peer-lock fix, unreleased; see the
+* *Before the stripe lock, for an `X3DH_INITIAL` only* (Argon2 peer-lock fix, released in `v0.13.0`; see the
   next section): dedup check, binding check, durable ephemeral replay registry, rate and
   concurrency bound and the one-time-prekey consumption, under the sender's inbound admission lock.
 * *Under the stripe lock, unchanged in order:* dedup check, the X3DH response (with the one-time
@@ -3461,7 +3461,7 @@ What stays under the stripe lock on purpose:
 
 === One-time-prekey consumption outside the stripe lock
 
-_Argon2 peer-lock fix (unreleased)._ The receive-path fix left one expensive step under the stripe
+_Argon2 peer-lock fix (released in `v0.13.0`)._ The receive-path fix left one expensive step under the stripe
 lock: `PrekeyStore.consumeOneTimePrekey` (`@Synchronized`, a file lock and Argon2id with 64 MiB and
 3 passes for an encrypted store, once to read and once to write the store), including the wait at
 the `PrekeyStore` monitor when several first contacts arrive at once (at most
@@ -4143,7 +4143,7 @@ DIFFERENT ephemeral key and is never blocked by this registry.
 
 === One-time-prekey collisions and authenticated handshake rejection
 
-_Unreleased fix on top of V0.10.0-I._
+_Fix on top of V0.10.0-I, released in `v0.13.0`._
 
 ==== Problem
 
@@ -5958,19 +5958,19 @@ calls block.
 Editable settings page, a quarantine or sender list for blocked mail, a reported "deposit missing" reason, and a default change of the
 relay-reliability publisher.
 
-== Traffic anonymisation foundation (V0.10.0-A, unreleased)
+== Traffic anonymisation foundation (V0.10.0-A, released in `v0.13.0`)
 
 The module `lapis-net-onion` holds the cryptographic and state-machine foundation of onion circuits. Its module boundary is a security property: it depends on `lapis-net-core`, `lapis-net-identity` and BouncyCastle only, never on networking, GossipSub, Nabu or any node class, and no running component calls it. The relay logic (`OnionRelay`) consumes cells and returns actions; the host will perform the I/O in a later wave. Design, threat model, known leaks and the wave plan: link:anonymity.adoc[anonymity.adoc]. The leaks listed there (addresses in `PeerRecord`, the per-recipient mail topic) are unchanged by this wave.
 
-=== Wire integration (V0.10.0-B, unreleased)
+=== Wire integration (V0.10.0-B, released in `v0.13.0`)
 
 The boundary of `lapis-net-onion` is kept: the new network code lives in `lapis-net-onion-wire`. `lapis-net-directory` gained an `api` dependency on `lapis-net-onion` for `OnionRelayDescriptor` (no cycle: onion depends on core and identity only), and `lapis-net-onion-wire` depends on onion, networking, directory and identity. The protocol lives in a module of its own because `lapis-net-networking` cannot depend on onion and directory (directory already depends on networking), mirroring `lapis-net-dm`. Every cell on `/lapis/onion/1.0.0` is a fixed 1024-byte frame without a length field. The relay descriptor travels over its own GossipSub topic and, for DHT fallback, as an optional part (flag `0x08`) of the directory value; that flag extends the format published in v0.12.0 in place, which older readers answer by rejecting a relay node's whole DHT value. Details, assumptions awaiting confirmation and honest limits: link:anonymity.adoc[anonymity.adoc], section Wire integration.
 
-=== Receiver side (V0.10.0-C, unreleased)
+=== Receiver side (V0.10.0-C, released in `v0.13.0`)
 
 The hidden-service work follows the module boundary rule: everything that needs no network lives in `lapis-net-onion` (the descriptor type `OnionServiceDescriptor` and its codec are there because they contain no peer id, plus the relay roles, the HPKE introduction, the end-to-end layer and the two pure state machines, which return commands instead of performing I/O). The index, the gossip topic `LapisNet:onion-service-descriptor-gossip:v1` and the DHT publish/resolve API live in `lapis-net-directory`, next to the relay descriptor equivalents. Hosting and connecting over real circuits (`OnionServiceHost`, `OnionRendezvousClient`, `OnionRendezvousStream`, `OnionClientCircuit`) live in `lapis-net-onion-wire`. *DHT decision:* a service descriptor is published as an IPNS record under the *service key's own IPNS name* with the value `LNHS | version | descriptor`, not as a new flag of the node's `DirectoryDhtValue`. That keeps the value free of any link to the node's peer id and Lapis identity and avoids a second writer for the node's single directory name; the dedicated validator requires publisher = service key = address. The relay's `OnionRelay` performs the splice without ever holding two circuit locks: work for another circuit is collected while a lock is held and executed by the public entry points after all locks were released. The DHT publish/resolve API is not wired into any node. See link:anonymity.adoc[anonymity.adoc], section Receiver side and rendezvous.
 
-=== Directory anonymity (V0.10.0-D, unreleased)
+=== Directory anonymity (V0.10.0-D, released in `v0.13.0`)
 
 `lapis-net-directory` gained a second, address-free entry type, `AnonymousPeerRecord` (248 bytes, no address, no peer ID, no binding; identity plus onion service key with a possession proof), with its own index, its own GossipSub topic `LapisNet:anonymous-peer-record-gossip:v1` (older nodes never subscribe to it) and `DirectoryAnonymityMode` (`OFF` by default). `IdentitySupersession` keeps the address-bearing `PeerRecord` and the anonymous entry of one identity from coexisting and refuses replayed address records, for gossip and for the DHT ingest alike; the gossip validators of `PeerRecord` and the formats `LNPR`, `DirectoryDhtValue` and `PrekeyBundle` are unchanged. In mode `ON` the publishers fail closed (`PeerPresenceAnnouncer`, `DirectoryDht.publishOwn`, the browser and CLI republishers) and the entry, the prekey bundle and the service descriptor go through a circuit (`DIRECTORY_PUBLISH`, `OnionDirectoryPublisher`, `AnonymousDirectoryPublisher`). The DHT fallback section above applies only in mode `OFF`; in mode `ON` the one permitted DHT write is `DirectoryDht.publishTombstone`. Details, leak inventory and limits: link:anonymity.adoc[anonymity.adoc], section Directory anonymity. This is not anonymity: the transport key is still the identity key.
 
@@ -5990,26 +5990,26 @@ sequenceDiagram(name = "Directory mode transition OFF to ON to OFF") {
 }
 ----
 
-=== Direct messages over circuits (V0.10.0-F1, unreleased)
+=== Direct messages over circuits (V0.10.0-F1, released in `v0.13.0`)
 
 Module boundary: `lapis-net-dm` has no dependency on any onion module; it owns the `AnonymousDmTransport` interface, `DmInboundSink` and `SealedMailboxItemCodec` (built only from identity and JCE primitives). `lapis-net-dm-onion` depends on `lapis-net-dm` and `lapis-net-onion-wire`. `lapis-net-onion` gained the `MAILBOX_PUBLISH` relay role (a pure state machine with a codec), `lapis-net-directory` the shared topic with its validator (`AnonymousMailboxGossip`) and `OnionRelayDescriptorIndex.byPeerId`, `lapis-net-onion-wire` the `MailboxPublishSink`, `OnionMailboxPublisher`, `OnionServiceStreamRouter` and the new `AnonymityRuntime` methods (`serviceRouter`, `resolveIdentity`, `connectToService`, `publishMailboxItems`, `ready`). The browser attaches `DmSessionManager` before the anonymity runtime exists, so the transport is installed afterwards and sends fail with `anonymity-not-ready` until then. Design, formats, limits and honest limits: `anonymity.adoc`, section "Direct messages over circuits".
 
-Wave F2 (mail over circuits, unreleased) follows the same module boundary: `lapis-net-mail` owns the `AnonymousMailTransport` and `AnonymousMailInboundSink` interfaces and the anonymous modes of `MailSender` and `InboxGossip` and depends on no onion code; the new adapter module `lapis-net-mail-onion` depends on `lapis-net-mail`, `lapis-net-dm-onion` (stream framing, re-announcement queue) and `lapis-net-onion-wire`. The sealed mailbox item is now the generic `SealedMailboxBox` in `lapis-net-directory` (kinds DM and MAIL), shared by both adapters. Design, formats, limits and honest limits: `anonymity.adoc`, section "Mail over circuits".
+Wave F2 (mail over circuits, released in `v0.13.0`) follows the same module boundary: `lapis-net-mail` owns the `AnonymousMailTransport` and `AnonymousMailInboundSink` interfaces and the anonymous modes of `MailSender` and `InboxGossip` and depends on no onion code; the new adapter module `lapis-net-mail-onion` depends on `lapis-net-mail`, `lapis-net-dm-onion` (stream framing, re-announcement queue) and `lapis-net-onion-wire`. The sealed mailbox item is now the generic `SealedMailboxBox` in `lapis-net-directory` (kinds DM and MAIL), shared by both adapters. Design, formats, limits and honest limits: `anonymity.adoc`, section "Mail over circuits".
 
-=== Transport hygiene in anonymity mode (V0.10.0-J1a, unreleased)
+=== Transport hygiene in anonymity mode (V0.10.0-J1a, released in `v0.13.0`)
 
 `lapis-net-networking`: `TransportKeyPolicy` (identity-derived or fresh per run) and the `mdnsEnabled` switch of `LapisNode.create`; `GossipAnonymityPolicy` with `ANONYMITY_GOSSIP_ALLOWLIST` for `GossipPubSub.attach` (subscriptions restricted, own publications refused); `NodeWiringOptions.transportKeyPolicy()`, `mdnsEnabled()` and `effective()`. `lapis-net-storage`: `StorageNetworkMode` (`NETWORK`, `LOCAL_ONLY`) and the interface `RemoteContentSource` for `NabuStorage.attach` (kept in this module so the storage does not depend on the onion layer; the circuit-backed implementation followed in wave J2, see below). `lapis-net-onion`: directory object type `TOMBSTONE_PEER_RECORD` (4); `lapis-net-directory`: `DirectoryPublicationChannel.publishTombstone` and `PeerDirectoryGossip.relayTombstone`; `lapis-net-onion-wire`: the relay sink publishes relayed tombstones, `AnonymityRuntime` sends the tombstone through its publisher. The module graph is unchanged. Connection confinement and the relay role LOOKUP are not implemented; see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
 
-=== Lookups through circuits (V0.10.0-J2, unreleased)
+=== Lookups through circuits (V0.10.0-J2, released in `v0.13.0`)
 
 Relay roles of `OnionRelay` (each accepted only at the last hop of a circuit without another role): introduction point, introducing, rendezvous (waves C), `DIRECTORY_PUBLISH`/`DIRECTORY_PUBLISHED` (16/17, wave D), `MAILBOX_PUBLISH`/`MAILBOX_PUBLISHED` (18/19, wave F1) and, new in J2, `LOOKUP_REQUEST`/`LOOKUP_RESPONSE` (20/21, role `LOOKUP`). `lapis-net-onion` holds the wire format (`LookupMessages.kt`: 720-byte request and fragment bodies, four size classes of 2, 8, 32 and 128 KiB) and the pure state machine part (last hop only, 4 requests per circuit, one outstanding, per-link and global limits, `DISABLED` and unsupported versions answered without a lookup, the test seam `legacyNoLookup` for a relay of the old version). `lapis-net-storage` gained `RemoteContentVerifier` (the checks both ends share: raw/SHA-256 CIDs checked by hand before `Cid.cast`, canonical Ed25519 IPNS keys, record validation), `DeferredRemoteContentSource` (late binding, fail closed), `NabuStorage.getThroughRemote` (anonymity mode, blocking) and, for the relay side in network mode, `fetchTransient` (a Bitswap want with `addToBlockstore = false`, never `provide`, never the unserved store) and `resolveIpnsRecordRaw`. `lapis-net-onion-wire` gained the package `lookup`: `OnionLookupSink`/`NabuLookupSink`, `OnionLookupService` (relay host: caches keyed by SHA-256, attempt limit, own bounded pool, byte budget, pacing, minimum answer delay), `OnionLookupClient` (single flight, one request per circuit, strict reassembly, verification, backoff) and `CircuitRemoteContentSource`; `CircuitPurpose.LOOKUP` with its own bucket in `CircuitBuildGovernor`; `OnionWireConfig.relayLookup` and the option `--onion-relay-lookup` (CLI relays only; the browser has no relay mode). Module graph: `lapis-net-onion-wire` now depends on `lapis-net-storage` explicitly (`api`, it was already on the classpath through `lapis-net-directory`); no cycle, storage depends on core and networking only. No persisted format changed (descriptor, key file and guard state are unchanged; no capability flag). Details and honest limits: `anonymity.adoc`, section "Lookups through circuits".
 
 Wave V0.10.0-J3 changed the client flow described above: `OnionLookupClient` no longer uses one circuit per request for every lookup. It separates three contexts (`LookupContext`: timeline, mailbox, IPNS; a circuit carries one context only), reuses a timeline circuit for up to four sequential requests while the next timeline lookup is already queued (no idle hold), and cross-checks a `NOT_FOUND` at a second relay. `RemoteContentSource.blockState` and `NabuStorage.localOrRemoteState` give the browser timeline a non-blocking view (`TimelineBodyResolver`). No wire or persisted format changed. Details: `anonymity.adoc`, section "Lookup consumers and circuit reuse (wave J3)".
 
 
-=== Attachments over circuits (wave Q21, unreleased)
+=== Attachments over circuits (wave Q21, released in `v0.13.0`)
 
-_Status: implemented, unreleased (version stays 0.12.0); design Q21-A to Q21-I confirmed by the user (2026-11-22)._ The recipient of an attachment it does not hold fetches the encrypted blob from the *sender's* onion service, over the new service application `OnionServiceApp.ATTACHMENT(3)`; the HELLO version stays 1 and no persisted or signed format changes.
+_Status: implemented, released in `v0.13.0`; design Q21-A to Q21-I confirmed by the user (2026-11-22)._ The recipient of an attachment it does not hold fetches the encrypted blob from the *sender's* onion service, over the new service application `OnionServiceApp.ATTACHMENT(3)`; the HELLO version stays 1 and no persisted or signed format changes.
 
 * `lapis-net-dm-onion`, package `attachment`: `AttachmentFetchCodec` (request frame type 6, answer chunk frame type 7 inside `DmCircuitFraming`; transfer classes from `LookupSizeClass`, which is unchanged), `AttachmentFetchToken` (HKDF-SHA256 token key from the attachment key and the CID, HMAC-SHA256 over a label and the CID, constant-time compare; wave Q21-Token), `OnionAttachmentServer` (registered with the service stream router; slots, request and byte rates, reservation before loading, minimum answer delay, pacing, one request per stream) and `OnionAttachmentClient` (directory-only resolution, `AnonymityRuntime.connectToService` only, strict incremental reassembly, SHA-256 against the CID). `OnionAttachmentRuntimePortImpl` is the only production port. Timers run on one `AttachmentScheduler` thread each (a seam for virtual-time tests).
 * Module boundary: `lapis-net-dm` stays free of onion code; it only gained the pure `DmAttachmentFetcher.decryptVerified` (the normal-mode `fetchAndDecrypt` calls it) and `EncryptedDmAttachmentBlobCodec.OVERHEAD_BYTES` (mail: `EncryptedAttachmentBlobCodec.OVERHEAD_BYTES`). `lapis-net-dm-onion` knows nothing of the browser's stores; it asks an `OutboundAttachmentSource`.

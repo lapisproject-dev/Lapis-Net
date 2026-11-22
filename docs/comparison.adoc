@@ -39,5 +39,5 @@ methodology and sources at https://net.lapisproject.dev/comparison[net.lapisproj
 
 Honest caveat: Nostr, Mastodon, Bluesky and Farcaster each already have millions of users
 and mature client ecosystems. Lapis Net is, as of this comparison, a working multi-wave
-prototype (V0.1–V0.9 implemented) without a public network yet — a real trade-off against
+prototype (V0.1 to V0.9 and the experimental anonymity waves implemented; current release `v0.13.0`) without a public network yet — a real trade-off against
 the table above, not a detail to gloss over. One clarification on the first row: Lapis Net can use volunteer relays to reach nodes behind home routers; they forward only end-to-end-encrypted traffic and are never required for a node that is directly reachable.

@@ -1,0 +1,53 @@
+Feature and fix release. Its largest part is an **experimental and incomplete anonymity mode** (`--anonymity=on|off`, **off by default**): onion routing with hidden services, through which direct messages, mail, call signals, timeline post bodies and attachments travel. **No external cryptographic or anonymity review has taken place**, and everything was verified on loopback only, not on real networks, behind NATs or under real load. Do not rely on it for anonymity. The release also contains wave Q20 (post bodies announced in the DHT, **on by default**), wave F6 (Bitswap resend) and several fixes in the direct-message path.
+
+**What changes for a node that does not switch anonymity mode on.**
+
+* Browser nodes announce the bodies of the newest posts they hold in the DHT (wave Q20, `--provide-post-bodies`, **default `true`**). The DHT peers close to a post learn that this node (PeerId and addresses) holds it. Switch it off with `--provide-post-bodies=false`.
+* A holder resends a Bitswap block to the same peer within bounds (fix wave F6), and the DM path has the fixes listed below.
+* Every `lapisnet node` in normal mode serves the relay directory snapshot protocol `/lapis/onion-relay-directory/1.0.0` (descriptor plus peer record per known relay), from which nodes in anonymity mode learn relays. A browser node attaches the onion wire only in anonymity mode and does not serve it, so a browser node used as a bootstrap peer answers `Unsupported`.
+* The attachment download routes of the browser refuse cross-site requests (`Sec-Fetch-Site`, `Origin`) in every mode.
+* Apart from these and the fixes, the normal mode is unchanged.
+
+**Anonymity mode (waves V0.10.0-A to V0.10.0-J3).**
+
+* Foundation and wire layer: fixed-size cells, an ntor-style handshake over X25519, ChaCha20-Poly1305 onion layers, a relay state machine with resource limits (`lapis-net-onion`); the link protocol `/lapis/onion/1.0.0`, an encrypted onion key file with rotation, signed relay descriptors and the relay service (`lapis-net-onion-wire`). Relay operation is opt-in: `lapisnet node --onion-relay=true`.
+* Hidden services and rendezvous: introduction points, rendezvous points and signed onion service descriptors. An address-free directory entry (`AnonymousPeerRecord`) is published through circuits.
+* Path selection with two persistent guards, network diversity on self-declared relay addresses (IPv4 /16, IPv6 /48), a circuit build governor and `AnonymityRuntime`; `--anonymity=on` in the CLI node and the browser.
+* Direct messages (online and offline, module `lapis-net-dm-onion`), mail (module `lapis-net-mail-onion`) and call signals over circuits. Both ends must be in anonymity mode; there is no fallback to a direct connection; the recipient learns the sender.
+* Call media is **not** anonymised and can not be: calls are off in the mode unless `--anonymity-allow-call-media=true`, with a confirmation before every call, and a call then reveals your IP address to the other party and to network observers.
+* Padding and timing protection against a local observer of the guard connection (size classes, cover cells, 50 ms time slices, pre-built circuits; `--anonymity-padding=standard|off`, default `standard`). This is no protection against a global passive observer.
+* Transport hygiene and confinement: a transport key that is fresh per run and never stored, no mDNS, no own DHT or Bitswap, gossip receive-only on a topic allowlist, no listening socket, and connections only to the two guards (plus the bootstrap peers at every start and while relays or a guard connection are missing). Own posts, votes, trust grants, self-links, LTR records and manual connections are refused with 409.
+* Relay role LOOKUP (`--onion-relay-lookup`, default `true`, only effective with `--onion-relay=true`): the last relay of a circuit fetches content blocks and IPNS records for anonymous clients; answers are verified by hash or signature. The browser looks up missing timeline post bodies this way, at most 8 new lookups per request, up to 4 sequential lookups per circuit.
+* Multi-node tests on loopback, a Sybil simulation of the path selection and the review package `docs/external-review.adoc`. Fixes found along the way: the service descriptor is republished as a fresh signed version, a rendezvous retry after a guard failover, a reachability fallback for a dead primary guard, an onion link reuse race and a race when closing the mailbox redelivery.
+
+**Attachments in anonymity mode (waves Q21, Q21-Token).**
+
+* A blob that is not held locally is fetched from the sender's onion service through a rendezvous circuit (service application `ATTACHMENT`), never over a direct connection. Answers are padded to nine transfer classes, the blob is checked against its CID and stored unserved.
+* At most 4,193,984 bytes per blob; a direct-message attachment at most 4,193,946 bytes (16 MiB in normal mode). A sender hands out only attachments it sent itself, with a key.
+* The fetch token is an HMAC-SHA256 under a key derived by HKDF-SHA256 from the attachment key and the CID, so the attachment key is never used directly as an HMAC key. This is a new construction from existing primitives and has not been reviewed externally.
+
+**Direct-message fixes.**
+
+* One-time-prekey collisions: two first-contact senders that pick the same one-time prekey no longer leave the second with a dead session. The responder answers with an authenticated `X3DH_REJECTED` frame and the initiator re-bootstraps; older nodes drop the new frame silently.
+* Two-phase send: the network I/O of a send runs outside the per-peer lock, in a per-peer FIFO lane (64 queued sends per peer, 60 s lane wait).
+* Inbound listeners run outside the per-peer lock, in decrypt order per peer.
+* The Argon2id one-time-prekey consumption of a first contact runs before that lock, under a per-sender admission lock.
+
+**Storage and other fixes.**
+
+* Post bodies in the DHT (wave Q20): at most 256 tracked bodies per node, re-announced every hour, at most 2 announcements per 15 seconds, fanout 10. These numbers are provisional, not measured in a pilot. After a restart only newly arriving posts are announced.
+* Bitswap resend (fix wave F6): Nabu's responder did not send a block to the same peer again. A holder now resends within bounds (one re-send per peer and want per 5 s, token buckets per peer and globally). The workaround reads a private Nabu field through reflection; if that fails, Nabu's old behaviour remains.
+* A lost GossipSub stream after a successful hole punch is fixed: the direct connection is announced whichever side closes the relayed one.
+* Flaky networking, DM and onion tests were stabilised under CPU load. The browser shows the Lapis Net logo and favicons.
+
+**Known limits.**
+
+* Anonymity mode is experimental and incomplete. No external cryptographic or anonymity review has taken place. Verified on loopback only, with an injected network locator.
+* The guards see the address, online times and topics. The bootstrap peers see the address at every start (relay descriptors are not persisted).
+* A single LOOKUP relay can withhold an answer or serve an older, still valid IPNS record. The LOOKUP relays see which CIDs and IPNS names are asked, and when; up to 4 timeline lookups on one circuit are linkable for the exit relay.
+* Inbox rendezvous records and relay provider records are unreachable in the mode (LOOKUP has no FIND_PROVIDERS). No IPNS consumer is wired in the mode (Q18 deferred), and there is no batch lookup (Q16 deferred).
+* Attachments can be fetched only while the sender is online. Forwarding a mail with an attachment reference that is not local is refused. The attachment limits are provisional, not measured in a pilot. The server limits are global, so a third party that resolves the sender's descriptor can occupy them and push recipients onto the MAILBOX fallback, which shows the exit relay the CID and the time. That fallback finds practically nothing in a real network.
+* The cross-site guard of the attachment routes relies on `Sec-Fetch-Site` and `Origin`; a browser that sends neither (for example Safari before 16.4) is not covered.
+* Network diversity of paths rests on self-declared relay addresses. By design, a relay node's DHT value is unreadable for `v0.12.0` nodes (not tested against real `v0.12.0` nodes), and older nodes serve no relay directory snapshots.
+* Rollback: `v0.12.0` refuses every option that is new in `v0.13.0` (`onion-relay`, `onion-relay-lookup`, `anonymity`, `anonymity-allow-call-media`, `anonymity-padding`, `provide-post-bodies`) on the command line, in `LAPISNET_*` variables and in `browser.properties` (camelCase keys), and does not start; remove them before downgrading.
+* The downloads are not signed. The new waves had only the pipeline's own AI-assisted review and security loops (the small fixes `02ab7c7` and `df7f47a` and the logo change had none; test-only commits are not counted), no independent professional audit.

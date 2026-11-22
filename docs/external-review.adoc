@@ -7,7 +7,7 @@ Back to the link:../README.adoc[README]. Normative design source: link:anonymity
 
 *No external cryptographic or anonymity review has taken place. This document prepares one; it does not report one.*
 
-The traffic anonymisation arc (waves V0.10.0-A to V0.10.0-I) is unreleased. No release tag contains it; the wave identifiers are not release numbers. Everything below describes the code as it stands at the commit the maintainers hand over (see <<what-a-review-needs>>). The experimental option `--anonymity=on` is off by default and every start warns that it is incomplete.
+The traffic anonymisation arc (waves V0.10.0-A to V0.10.0-J, with the follow-up waves Q20 and Q21) is released in `v0.13.0`, as an experimental option; the wave identifiers are not release numbers. Everything below describes the code as it stands at the commit the maintainers hand over (see <<what-a-review-needs>>). The experimental option `--anonymity=on` is off by default and every start warns that it is incomplete.
 
 The purpose of this document is to let a reviewer start work without a guided tour: what is in scope, what the claims are, where each protocol lives, what is already known to be weak, which questions the authors cannot answer themselves, and how to run the tests that pin the behaviour. Statements about security properties here are claims of the authors, checked by their own tests, not findings of an independent party.
 
@@ -23,14 +23,14 @@ The purpose of this document is to let a reviewer start work without a guided to
 
 *Out of scope*
 
-* Wave J3 (the consumers of the lookups: timeline and rendezvous, status counters, the final warning text): not implemented. Waves J1a (per-run transport key, no mDNS, no Bitswap and Kademlia, receive-only gossip, tombstone through a circuit), J1b (connection confinement to the guards, relay directory snapshot) and J2 (the relay role LOOKUP, lookups through circuits) are implemented and in scope, see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
+* Wave J3 (the consumers of the lookups: timeline bodies over circuits, status counters, the final warning text; rendezvous records stay unreachable, Q18), wave Q20 and wave Q21 with Q21-Token (attachments from the sender's onion service: package `lapis-net-dm-onion/.../attachment`, `AttachmentFetchCodec` with the HKDF-derived HMAC fetch token, the loopback guard of the browser routes) are implemented and in scope, as are waves J1a (per-run transport key, no mDNS, no Bitswap and Kademlia, receive-only gossip, tombstone through a circuit), J1b (connection confinement to the guards, relay directory snapshot) and J2 (the relay role LOOKUP, lookups through circuits), see `anonymity.adoc`, section "GossipSub, DHT and content fetches".
 * WebRTC call media. It is not anonymised and cannot be.
 * Trust (Veritas), Karma, Madli internals beyond their use as a path weight, LTR and the economy.
 * The browser UI.
 
 == Threat model
 
-The full table is in xref:anonymity.adoc#threat-model[the threat model of anonymity.adoc]. In short: a local observer, a single malicious relay, colluding relays and Sybil identities, a malicious receiver and a global passive observer are considered. *A global passive observer is not defended*, and neither is an observer who sees both ends of a circuit. Call media, the libp2p mesh, DHT lookups and content fetches still show identity and IP address. The recipient of a message learns the sender's identity; only the network is blinded.
+The full table is in xref:anonymity.adoc#threat-model[the threat model of anonymity.adoc]. In short: a local observer, a single malicious relay, colluding relays and Sybil identities, a malicious receiver and a global passive observer are considered. *A global passive observer is not defended*, and neither is an observer who sees both ends of a circuit. Call media, the libp2p mesh, In normal mode, DHT lookups and content fetches show identity and IP address; in anonymity mode lookups go through the LOOKUP relays, which see which content is asked for, and when, but not by whom. The recipient of a message learns the sender's identity; only the network is blinded.
 
 == Module map
 
@@ -178,7 +178,7 @@ Hop 1 is a persistent primary guard (two guards, lifetime 30 to 60 days, state e
 
 * Leak inventory: xref:anonymity.adoc#known-leaks[Known leaks today] and the per-wave inventories ("Leak inventory after wave F1", "F2", "G", "H").
 * Honest limits per wave: the sections "Honest limits of wave B", "C", "D", "E", "F1", "F2", "G", "H" and the multi-node section of wave I in `anonymity.adoc`.
-* Since wave J1a the libp2p transport key of a node in anonymity mode is fresh per run and the node runs neither Bitswap nor Kademlia nor mDNS. Since wave J1b (unreleased) it does not listen and connects only to its two guards, and to its bootstrap peers while it lacks a relay view or a guard connection; each of these sees its IP address, the PeerId of the run and (the guards) its topic set and gossip control messages (known leaks 9 to 26 in `anonymity.adoc`). In normal mode the transport key is still the identity key.
+* Since wave J1a the libp2p transport key of a node in anonymity mode is fresh per run and the node runs neither Bitswap nor Kademlia nor mDNS. Since wave J1b (released in `v0.13.0`) it does not listen and connects only to its two guards, and to its bootstrap peers while it lacks a relay view or a guard connection; each of these sees its IP address, the PeerId of the run and (the guards) its topic set and gossip control messages (known leaks 9 to 26 in `anonymity.adoc`). In normal mode the transport key is still the identity key.
 * The handshake test vector is generated by the authors (one cross-check against an independent script); there is no external known-answer test.
 * Zeroisation of key material on the JVM is best effort: the garbage collector may have copied arrays before they are overwritten.
 * The service descriptor index and gossip have a documented Sybil limit: a valid descriptor costs nothing, and about 61 per minute exhaust the global budget. The fresh-version republication of wave I does not change any receiver limit.
