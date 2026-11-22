@@ -63,7 +63,7 @@ class LapisNetCliArgsTest :
                     .trim()
                     .lines()
                     .size shouldBe 1
-                s.errText shouldContain "lapisnet node:"
+                s.errText shouldContain "lapis-net-cli node:"
                 s.errText shouldNotContain "Exception"
             }
         }

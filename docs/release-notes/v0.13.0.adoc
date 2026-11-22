@@ -4,13 +4,13 @@ Feature and fix release. Its largest part is an **experimental and incomplete an
 
 * Browser nodes announce the bodies of the newest posts they hold in the DHT (wave Q20, `--provide-post-bodies`, **default `true`**). The DHT peers close to a post learn that this node (PeerId and addresses) holds it. Switch it off with `--provide-post-bodies=false`.
 * A holder resends a Bitswap block to the same peer within bounds (fix wave F6), and the DM path has the fixes listed below.
-* Every `lapisnet node` in normal mode serves the relay directory snapshot protocol `/lapis/onion-relay-directory/1.0.0` (descriptor plus peer record per known relay), from which nodes in anonymity mode learn relays. A browser node attaches the onion wire only in anonymity mode and does not serve it, so a browser node used as a bootstrap peer answers `Unsupported`.
+* Every `lapis-net-cli node` in normal mode serves the relay directory snapshot protocol `/lapis/onion-relay-directory/1.0.0` (descriptor plus peer record per known relay), from which nodes in anonymity mode learn relays. A browser node attaches the onion wire only in anonymity mode and does not serve it, so a browser node used as a bootstrap peer answers `Unsupported`.
 * The attachment download routes of the browser refuse cross-site requests (`Sec-Fetch-Site`, `Origin`) in every mode.
 * Apart from these and the fixes, the normal mode is unchanged.
 
 **Anonymity mode (waves V0.10.0-A to V0.10.0-J3).**
 
-* Foundation and wire layer: fixed-size cells, an ntor-style handshake over X25519, ChaCha20-Poly1305 onion layers, a relay state machine with resource limits (`lapis-net-onion`); the link protocol `/lapis/onion/1.0.0`, an encrypted onion key file with rotation, signed relay descriptors and the relay service (`lapis-net-onion-wire`). Relay operation is opt-in: `lapisnet node --onion-relay=true`.
+* Foundation and wire layer: fixed-size cells, an ntor-style handshake over X25519, ChaCha20-Poly1305 onion layers, a relay state machine with resource limits (`lapis-net-onion`); the link protocol `/lapis/onion/1.0.0`, an encrypted onion key file with rotation, signed relay descriptors and the relay service (`lapis-net-onion-wire`). Relay operation is opt-in: `lapis-net-cli node --onion-relay=true`.
 * Hidden services and rendezvous: introduction points, rendezvous points and signed onion service descriptors. An address-free directory entry (`AnonymousPeerRecord`) is published through circuits.
 * Path selection with two persistent guards, network diversity on self-declared relay addresses (IPv4 /16, IPv6 /48), a circuit build governor and `AnonymityRuntime`; `--anonymity=on` in the CLI node and the browser.
 * Direct messages (online and offline, module `lapis-net-dm-onion`), mail (module `lapis-net-mail-onion`) and call signals over circuits. Both ends must be in anonymity mode; there is no fallback to a direct connection; the recipient learns the sender.

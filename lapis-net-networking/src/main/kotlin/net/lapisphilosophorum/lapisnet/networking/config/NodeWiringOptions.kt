@@ -85,8 +85,9 @@ data class NodeWiringOptions(
     val publishRelayReliability: Boolean = false,
     val holePunching: HolePunchMode = HolePunchMode.AUTO,
     /**
-     * V0.10.0-B: serve as an onion relay (`--onion-relay`). Off by default. Infrastructure only: no user traffic is
-     * routed over circuits yet and nothing is anonymised. The switch is consumed by the CLI node; the browser ignores it.
+     * V0.10.0-B: serve as an onion relay (`--onion-relay`). Off by default. Infrastructure for others: it anonymises
+     * nothing for its own operator; nodes in anonymity mode route their traffic over such relays. The switch is
+     * consumed by the CLI node; the browser ignores it.
      */
     val onionRelay: Boolean = false,
     /**
@@ -435,8 +436,10 @@ data class NodeWiringOptions(
             |        Serve as an onion relay (infrastructure only). Creates a rotating onion key (kept
             |        encrypted with the keystore passphrase, in memory only without one), announces a signed
             |        relay descriptor (gossip, and the DHT value when --dht-fallback is on) and answers circuit
-            |        CREATE/EXTEND cells. NO user traffic is routed over circuits yet and nothing is anonymised;
-            |        the descriptor makes this node's identity and address publicly known as a relay.
+            |        CREATE/EXTEND cells. A relay anonymises nothing for its own operator; nodes in --anonymity=on
+            |        route their traffic over circuits of relays like this one. The descriptor makes this node's
+            |        identity and address publicly known as a relay. Wired in `lapis-net-cli node` only; the
+            |        browser accepts the option and ignores it.
             |  --onion-relay-lookup=true|false            [true]   (only with --onion-relay=true)
             |        Look up content blocks and IPNS records for anonymous clients that ask through a circuit.
             |        This relay then asks the DHT and Bitswap itself: providers and DHT peers see this relay, with
@@ -447,9 +450,9 @@ data class NodeWiringOptions(
             |        Announce the bodies of the newest (up to 256) posts this node holds (own and received) in
             |        the DHT, re-announced hourly, so others (including anonymous clients' lookup relays) can
             |        find them. METADATA: DHT peers learn that this node (PeerId and addresses) holds these
-            |        posts; own and received posts are treated alike. Browser only; `lapisnet node` ignores it.
+            |        posts; own and received posts are treated alike. Browser only; `lapis-net-cli node` ignores it.
             |        Refused with --anonymity=on.
-            |  --anonymity=on|off   (experimental, default off) anonymises directory, direct messages, mail and call signals; call media is direct
+            |  --anonymity=on|off   (experimental, incomplete, default off, no external review) routes directory, direct messages, mail, call signals, timeline post bodies and attachments over circuits; call media is direct
             |        With on: the directory entry is published only through circuits (persistent guards, diverse
             |        paths), the transport key is fresh per run and never stored, mDNS, hole punching, the DHT,
             |        auto-relay and content serving are off, and nothing is published from the node itself. The

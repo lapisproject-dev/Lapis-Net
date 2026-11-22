@@ -70,9 +70,9 @@ internal const val EXIT_USAGE = 2
 private val CLI_USAGE =
     """
     |Usage:
-    |  lapisnet                      run the multi-node demo (no network egress beyond localhost)
-    |  lapisnet node [options]       run a headless node (relay selection, DHT directory, Madli); no DM, no mail
-    |  lapisnet --help
+    |  lapis-net-cli                 run the multi-node demo (no network egress beyond localhost)
+    |  lapis-net-cli node [options]  run a headless node (relay selection, DHT directory, Madli); no DM, no mail
+    |  lapis-net-cli --help
     |
     """.trimMargin()
 
@@ -102,7 +102,7 @@ internal fun runCli(
         return 0
     }
     if (args[0] != "node") {
-        err.println("lapisnet: unknown command '${args[0]}'")
+        err.println("lapis-net-cli: unknown command '${args[0]}'")
         err.println(CLI_USAGE)
         return EXIT_USAGE
     }
@@ -115,7 +115,7 @@ internal fun runCli(
         try {
             NodeWiringOptions.resolve(NodeWiringOptions.parseCliArgs(rest))
         } catch (e: InvalidWiringOptionException) {
-            err.println("lapisnet node: ${e.message}")
+            err.println("lapis-net-cli node: ${e.message}")
             return EXIT_USAGE
         }
     val headless = startNode(options)
@@ -143,7 +143,7 @@ internal fun runCli(
                 )
             }
         }
-        options.warnings.forEach { err.println("lapisnet node: warning: $it") }
+        options.warnings.forEach { err.println("lapis-net-cli node: warning: $it") }
         if (options.anonymity == AnonymityMode.ON) {
             out.println("  anonymity: experimental and incomplete (see the warning on stderr)")
             if (options.anonymityAllowCallMedia) {

@@ -64,9 +64,9 @@ link:docs/status.adoc[docs/status.adoc]; the release history is in link:docs/roa
 [source,bash]
 ----
 # headless node behind a NAT: reserves relays, uses the DHT directory (no DM, no mail)
-lapisnet node --reachability=private
+lapis-net-cli node --reachability=private
 # browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
-lapisnet-browser --reachability=private --dm-veritas-gate=true
+lapis-net-browser --reachability=private --dm-veritas-gate=true
 ----
 
 An invalid option aborts the start. All options, the mail gates and the onion relay switch are in

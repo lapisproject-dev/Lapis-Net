@@ -88,7 +88,7 @@ not by version number. Every row below is an annotated git tag on `master`.
 | the release commit
 
 | `v0.11.0`
-| Feature release. Contains the waves V0.9.12 (Madli relay reliability metric, usage-based relay priority, automatic relay selection), V0.9.13 and V0.9.14 (DHT fallback for the peer directory, prekey bundles, mail and direct messages) and V0.8.7b (browser call remote control). Since V0.9.15 `BrowserServer` and the new `lapisnet node` wire it behind operator options
+| Feature release. Contains the waves V0.9.12 (Madli relay reliability metric, usage-based relay priority, automatic relay selection), V0.9.13 and V0.9.14 (DHT fallback for the peer directory, prekey bundles, mail and direct messages) and V0.8.7b (browser call remote control). Since V0.9.15 `BrowserServer` and the new `lapis-net-cli node` wire it behind operator options
 | 2026-10-20
 | the release commit
 
@@ -1958,7 +1958,7 @@ for measurement, see "What is not proven"):
 
 == V0.9.12 — Madli relay reliability metric and automatic relay selection
 
-_Released in `v0.11.0`. Wired into the browser node and `lapisnet node` by V0.9.15 behind operator options (see the V0.9.15 section)._
+_Released in `v0.11.0`. Wired into the browser node and `lapis-net-cli node` by V0.9.15 behind operator options (see the V0.9.15 section)._
 
 === Progress
 
@@ -1995,7 +1995,7 @@ hostile candidates, non-public addresses), reachability heuristic, and real-node
 
 **What remains:**
 
-* Wiring (done in V0.9.15): the browser node and `lapisnet node` start `startAutoRelay` and the ranker when
+* Wiring (done in V0.9.15): the browser node and `lapis-net-cli node` start `startAutoRelay` and the ranker when
   `reachability=private`; the publisher runs only with `publish-relay-reliability=true`, so nothing writes v2
   vectors unless an operator asks for it.
 * The ledger is memory-only and a new `PeerId` starts at 0, so debt can be shed by changing identity.
@@ -2026,7 +2026,7 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 
 **What remains (part 2 and open points):**
 
-* Part 2: consumers - done in V0.9.14 below. Wired into `BrowserServer` and `lapisnet node` by V0.9.15
+* Part 2: consumers - done in V0.9.14 below. Wired into `BrowserServer` and `lapis-net-cli node` by V0.9.15
   (on by default, switch off with `--dht-fallback=false`; the metadata exposure is documented there).
 * A lookup needs the owner's Ed25519 peer ID as a hint; a bare secp256k1 identity cannot be resolved.
 * Both artefacts at their maximum do not fit one record (4800 byte value budget); DHT readers may get used
@@ -2074,7 +2074,7 @@ _Released in `v0.11.0`. This is an internal wave identifier, so the release card
 
 _Done, part of `v0.11.0`. Internal wave identifier._
 
-* **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapisnet node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
+* **Done:** shared operator options (`NodeWiringOptions`, `BrowserConfig`, `browser.properties`), `NodeServiceSupervisor`, one acceptance instance for gossip, DHT and calls, call block reasons, read-only status panel, `SelfRecordRepublisher`, `lapis-net-cli node`, `MailboxGossip.updateAcceptanceCheck`, `AcceptanceGateEvaluator.failedGates`.
 * **Security-audit remainder:** recomputing the observer weight on every grant change was named as a remaining gap; _resolved in V0.9.18, released in `v0.12.0`_. The remaining bound: the weight lags the grants by at most two windows plus tick jitter and one run (one window plus a run while readers keep asking).
 * **Open:** wire the mail acceptance (_done in V0.9.17, released in `v0.12.0`_); editable settings page; Karma per identity as a library notion; a distinct "deposit missing" block reason (the deposit is a bypass, not a gate); switching the relay-reliability publisher on by default once the v2 decoder is widespread; the defaults chosen here are provisional.
 
@@ -2140,7 +2140,7 @@ Follow-up waves (same wording as in `anonymity.adoc`):
 
 _Released in `v0.13.0`. Internal wave identifier._
 
-* *Done:* module `lapis-net-onion-wire` (stream protocol `/lapis/onion/1.0.0` with fixed 1024-byte frames, link manager with caps, rate and write-queue limits, relay service, encrypted onion key file with rotation overlap, local relay quality tracker, diagnostic circuit client marked `ExperimentalOnionApi`); `OnionKeyRing` in `lapis-net-onion`; `OnionRelayDescriptor` with codec, bounded index and gossip in `lapis-net-directory`; DHT value flag `0x08` and relay discovery through a rendezvous provider key; `--onion-relay=true|false` (default off) in `lapisnet node`. Tested with real multi-node loopback tests (three-hop circuit, rotation, limits, abuse, lifecycle, logging hygiene).
+* *Done:* module `lapis-net-onion-wire` (stream protocol `/lapis/onion/1.0.0` with fixed 1024-byte frames, link manager with caps, rate and write-queue limits, relay service, encrypted onion key file with rotation overlap, local relay quality tracker, diagnostic circuit client marked `ExperimentalOnionApi`); `OnionKeyRing` in `lapis-net-onion`; `OnionRelayDescriptor` with codec, bounded index and gossip in `lapis-net-directory`; DHT value flag `0x08` and relay discovery through a rendezvous provider key; `--onion-relay=true|false` (default off) in `lapis-net-cli node`. Tested with real multi-node loopback tests (three-hop circuit, rotation, limits, abuse, lifecycle, logging hygiene).
 * *Open:* no path selection, no user traffic over circuits, browser/DM/mail/call not wired; nothing verified behind real NATs or against real v0.12.0 nodes (the DHT flag makes a relay's DHT value unreadable for them); no external cryptographic review; the quality tracker is local and link-level only; relay descriptors make relays enumerable.
 * *Decisions pending:* see "Assumptions awaiting confirmation" in `anonymity.adoc` (DHT flag compatibility, relay without keystore passphrase, index on all CLI nodes, time constants, public relay rendezvous key).
 
@@ -2274,7 +2274,7 @@ _Released in `v0.13.0`. Internal wave identifier._
 
 _Released in `v0.13.0`. Internal wave identifier. The decision Q20 itself is confirmed by the user (2026-11-22); F1 to F6 remain open._
 
-* *Done:* `BlockProvideScheduler` in `lapis-net-storage` (bounded set of at most 256 CIDs, re-provide every hour +/- 10 %, random first delay 0 to 2 minutes, at most 2 announcements per 15-second cycle, fanout 10, cycle budget 20 s, backoff 5 minutes doubling up to 1 hour, busy DHT is not a failure, interrupt ends the supervisor job, no CID in any log line of the scheduler); `NabuStorage.isServed` (served blockstore only), `provide(.., fanout)`, `asProvideTarget`, `heldProviderRecords`; the per-call `provide` log lines moved to debug. `PostAnnouncementGossip.attach(.., onBodyStored)` reports a body after it was stored, own and gossiped alike; the browser wires the scheduler as supervisor job `post-body-provider` in normal mode only. New option `--provide-post-bodies` (default `true`, `false` and refused as `true` with `--anonymity=on`; `LAPISNET_PROVIDE_POST_BODIES`, file key `providePostBodies`; `lapisnet node` ignores it). The start warning of anonymity mode no longer says that lookups usually find nothing. Leak 29 (holder sets per post) in `anonymity.adoc`; design in `architecture.adoc` ("Post body provide scheduler").
+* *Done:* `BlockProvideScheduler` in `lapis-net-storage` (bounded set of at most 256 CIDs, re-provide every hour +/- 10 %, random first delay 0 to 2 minutes, at most 2 announcements per 15-second cycle, fanout 10, cycle budget 20 s, backoff 5 minutes doubling up to 1 hour, busy DHT is not a failure, interrupt ends the supervisor job, no CID in any log line of the scheduler); `NabuStorage.isServed` (served blockstore only), `provide(.., fanout)`, `asProvideTarget`, `heldProviderRecords`; the per-call `provide` log lines moved to debug. `PostAnnouncementGossip.attach(.., onBodyStored)` reports a body after it was stored, own and gossiped alike; the browser wires the scheduler as supervisor job `post-body-provider` in normal mode only. New option `--provide-post-bodies` (default `true`, `false` and refused as `true` with `--anonymity=on`; `LAPISNET_PROVIDE_POST_BODIES`, file key `providePostBodies`; `lapis-net-cli node` ignores it). The start warning of anonymity mode no longer says that lookups usually find nothing. Leak 29 (holder sets per post) in `anonymity.adoc`; design in `architecture.adoc` ("Post body provide scheduler").
 * *Verified on loopback only:* unit tests with fake clock and fake target, multi-node tests in `lapis-net-storage` (real `ADD_PROVIDER` records), `lapis-net-onion-wire` (an anonymous client receives a body that the holder only tracked) and `lapis-net-browser` (C holds provider records from the author A and the receiver B). Measured on loopback: an untracked body was found too (the relays know the holder directly and Nabu's responder names itself); two holders behind the same exit relay did not avoid the Bitswap gap. Load series (12 busy loops and Gradle pinned to 2 CPUs, the three multi-node classes per run): 12/12 runs green (13 tests per run, 0 failures, 0 skipped, 315 to 608 s per run); measured per run: (a) the tracked body was CACHED at the anonymous client after 427 to 20,358 ms (12/12); (b) the untracked control body was `Found` in 12/12; (c) second lookup through the same exit with two holders was `Unavailable` in 12/12 (addressed in fix wave F6).
 * *Open (F1 to F6, not confirmed by the user):* F1 coupling to `--dht-fallback`; F2 pressure of body keys on the shared provider-store LRU (1,024 keys) of other nodes, possibly a separate partition for rendezvous keys; F3 the provisional numbers; F4 own posts are not held longer; F5 the start-warning wording; F6 the Bitswap resend gap (`recentBlocksSent` without expiry), addressed in fix wave F6 (below). Also open: no reload of tracked bodies after a restart; holder sets remain visible metadata in normal mode.
 

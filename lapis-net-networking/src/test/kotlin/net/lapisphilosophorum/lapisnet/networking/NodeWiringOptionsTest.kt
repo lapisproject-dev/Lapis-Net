@@ -4,6 +4,7 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import net.lapisphilosophorum.lapisnet.networking.config.DeclaredReachability
 import net.lapisphilosophorum.lapisnet.networking.config.InvalidWiringOptionException
 import net.lapisphilosophorum.lapisnet.networking.config.NodeWiringOptions
@@ -155,7 +156,9 @@ class NodeWiringOptionsTest :
             NodeWiringOptions.fromEnvironment(mapOf("LAPISNET_ONION_RELAY" to "true")) shouldBe
                 mapOf("onion-relay" to "true")
             NodeWiringOptions.HELP_TEXT shouldContain "--onion-relay"
-            NodeWiringOptions.HELP_TEXT shouldContain "NO user traffic"
+            // the help must not claim that no traffic is routed over circuits (it is, in anonymity mode)
+            NodeWiringOptions.HELP_TEXT shouldNotContain "NO user traffic"
+            NodeWiringOptions.HELP_TEXT shouldContain "ignores it"
             // the other switches are unaffected by it
             resolve("--onion-relay=true").dhtFallback shouldBe true
         }

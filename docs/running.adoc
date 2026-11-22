@@ -8,16 +8,16 @@ Back to the link:../README.adoc[README].
 [source,bash]
 ----
 # headless node behind a NAT: reserves relays, uses the DHT directory (no DM, no mail)
-lapisnet node --reachability=private
+lapis-net-cli node --reachability=private
 # headless node that also serves as an onion relay (infrastructure only, nothing is anonymised)
-lapisnet node --onion-relay=true
+lapis-net-cli node --onion-relay=true
 # EXPERIMENTAL and incomplete (since v0.13.0): anonymity mode, off by default; no external review
-lapisnet node --anonymity=on
-lapisnet-browser --anonymity=on
+lapis-net-cli node --anonymity=on
+lapis-net-browser --anonymity=on
 # browser node: same switches as arguments, LAPISNET_* variables or $LAPISNET_HOME/browser.properties
-lapisnet-browser --reachability=private --dm-veritas-gate=true
+lapis-net-browser --reachability=private --dm-veritas-gate=true
 # mail gates (since v0.12.0, V0.9.17): off by default; mail from a sender who passes none of them is discarded
-lapisnet-browser --mail-veritas-gate=true --mail-karma-min-score=2
+lapis-net-browser --mail-veritas-gate=true --mail-karma-min-score=2
 ----
 
 Mail acceptance is wired in the browser node (since `v0.12.0`). Keys: `--mail-veritas-gate` (`LAPISNET_MAIL_VERITAS_GATE`, file key `mailAcceptance.veritasGate`), `--mail-karma-min-score` (`LAPISNET_MAIL_KARMA_MIN_SCORE`, `mailAcceptance.karmaMinScore`), `--mail-min-deposit-msat` (`LAPISNET_MAIL_MIN_DEPOSIT_MSAT`, `mailAcceptance.minDepositMsat`, no effect yet). All gates are off by default. Accepted contacts are always let through; blocked mail is discarded without reply and only counted in the status panel.
@@ -26,9 +26,9 @@ Mail acceptance is wired in the browser node (since `v0.12.0`). Keys: `--mail-ve
 
 `--anonymity-padding=standard|off` (since `v0.13.0`, wave V0.10.0-H; default `standard`, `LAPISNET_ANONYMITY_PADDING`, browser file key `anonymityPadding`; only the exact words are accepted, anything else aborts the start; valid but without effect while `--anonymity=off`; restart required). With `standard` a node in anonymity mode pads direct messages, call signals and mail bundles to size classes (inside the end-to-end encrypted stream), sends cover cells to the middle hop of its circuits (about 256 B/s on average, at most 1 KiB/s; about 21 MiB per day expected, at most about 84 MiB per day at the guard link, twice that in the network), lets outgoing cells leave in 50 ms time slices (up to 50 ms more latency per send step) and keeps up to two circuits ready. With `off` none of this is done and an observer of your connection sees message sizes and timing; the start line, the CLI's stderr and the browser's status panel say so. Both ends of a stream must run this wave. It does not protect against an observer who sees both ends of a circuit. The CLI start line shows `anonymity=on padding=standard`; the browser status shows four numbers (padding mode, warm circuits, cover cells sent, how often the cover budget was spent). Details: `docs/anonymity.adoc`, section "Padding and timing protection".
 
-`--provide-post-bodies=true|false` (since `v0.13.0`, wave Q20; default `true`, always `false` with `--anonymity=on`, where an explicit `true` refuses the start; `LAPISNET_PROVIDE_POST_BODIES`, browser file key `providePostBodies`) announces the bodies of the newest posts this browser node holds, at most 256, own and received alike, in the DHT and re-announces them hourly, so other nodes and the lookup relays of anonymous clients can find a holder. *Metadata:* the DHT peers closest to a post learn that this node (PeerId and addresses) holds it. Browser node only; `lapisnet node` accepts the option and ignores it. Rollback: older versions refuse the unknown key and do not start, so remove it before downgrading.
+`--provide-post-bodies=true|false` (since `v0.13.0`, wave Q20; default `true`, always `false` with `--anonymity=on`, where an explicit `true` refuses the start; `LAPISNET_PROVIDE_POST_BODIES`, browser file key `providePostBodies`) announces the bodies of the newest posts this browser node holds, at most 256, own and received alike, in the DHT and re-announces them hourly, so other nodes and the lookup relays of anonymous clients can find a holder. *Metadata:* the DHT peers closest to a post learn that this node (PeerId and addresses) holds it. Browser node only; `lapis-net-cli node` accepts the option and ignores it. Rollback: older versions refuse the unknown key and do not start, so remove it before downgrading.
 
-`--onion-relay=true|false` (since `v0.13.0`, wave V0.10.0-B; default `false`, `LAPISNET_ONION_RELAY`; wired in `lapisnet node` only: the browser accepts the option and ignores it in normal mode, and `--anonymity=on` with it is refused) lets the node act as an onion relay for others: it publishes a signed relay descriptor, which makes it enumerable as a relay, and forwards cells it can not read. It is infrastructure only and anonymises nothing for the relay operator. A relay node's DHT value carries a new flag that `v0.12.0` nodes can not read (they reject that value; gossip is unaffected). `--onion-relay-lookup=true|false` (since `v0.13.0`, wave V0.10.0-J2; default `true`, `LAPISNET_ONION_RELAY_LOOKUP`, only effective with `--onion-relay=true`, otherwise a warning) gives such a relay the role LOOKUP: as the last hop of a circuit it fetches content blocks and IPNS records for anonymous clients and sees which CIDs and names are asked, and when, but not by whom; with `false` it answers every lookup with DISABLED.
+`--onion-relay=true|false` (since `v0.13.0`, wave V0.10.0-B; default `false`, `LAPISNET_ONION_RELAY`; wired in `lapis-net-cli node` only: the browser accepts the option and ignores it in normal mode, and `--anonymity=on` with it is refused) lets the node act as an onion relay for others: it publishes a signed relay descriptor, which makes it enumerable as a relay, and forwards cells it can not read. It is infrastructure only and anonymises nothing for the relay operator. A relay node's DHT value carries a new flag that `v0.12.0` nodes can not read (they reject that value; gossip is unaffected). `--onion-relay-lookup=true|false` (since `v0.13.0`, wave V0.10.0-J2; default `true`, `LAPISNET_ONION_RELAY_LOOKUP`, only effective with `--onion-relay=true`, otherwise a warning) gives such a relay the role LOOKUP: as the last hop of a circuit it fetches content blocks and IPNS records for anonymous clients and sees which CIDs and names are asked, and when, but not by whom; with `false` it answers every lookup with DISABLED.
 
 An invalid option aborts the start. See `docs/release-notes/v0.11.0.adoc`, `docs/release-notes/v0.12.0.adoc` and `docs/release-notes/v0.13.0.adoc` for all options, defaults and the metadata warning about the DHT fallback.
 

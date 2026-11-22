@@ -70,7 +70,7 @@ private const val DIRECTORY_MODE_FILE = "directory-mode.state"
 private const val HEADLESS_RECORD_TTL_SECONDS = 24L * 3600
 
 /**
- * The lean long-running node behind `lapisnet node` (V0.9.15): a [LapisNode] with the switches of
+ * The lean long-running node behind `lapis-net-cli node` (V0.9.15): a [LapisNode] with the switches of
  * [NodeWiringOptions] - automatic relay selection (Madli-ranked), the DHT fallback for the peer directory and the
  * publication of relay reliability. **No DM, no mail**: the CLI has no inbox and no session store, so there is no
  * `InboxDhtFetcher` and no outbox consumer here, and the node's own record advertises NO capability (in particular

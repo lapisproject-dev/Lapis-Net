@@ -66,7 +66,7 @@ internal fun runBrowserMain(
     startServer: (BrowserConfig) -> Unit = ::runBrowserServer,
 ): Int {
     if ("--help" in args || "-h" in args) {
-        out.println("Usage: lapisnet-browser [--key=value ...]")
+        out.println("Usage: lapis-net-browser [--key=value ...]")
         out.println(NodeWiringOptions.HELP_TEXT)
         out.println(BrowserConfig.HELP_TEXT)
         return 0
@@ -75,7 +75,7 @@ internal fun runBrowserMain(
         try {
             BrowserConfig.load(args, env)
         } catch (e: InvalidWiringOptionException) {
-            err.println("lapisnet-browser: ${e.message}")
+            err.println("lapis-net-browser: ${e.message}")
             return EXIT_INVALID_CONFIGURATION
         }
     startServer(config)

@@ -28,7 +28,7 @@ class BrowserMainExitCodeTest :
             val code = runBrowserMain(listOf("--auto-relay=true"), env, captured.out, captured.err) { started = true }
             code shouldBe 2
             started shouldBe false
-            captured.errText.trim() shouldBe "lapisnet-browser: --auto-relay requires --reachability=private"
+            captured.errText.trim() shouldBe "lapis-net-browser: --auto-relay requires --reachability=private"
             captured.errText shouldNotContain "Exception"
             captured.errText shouldNotContain "\tat "
         }
