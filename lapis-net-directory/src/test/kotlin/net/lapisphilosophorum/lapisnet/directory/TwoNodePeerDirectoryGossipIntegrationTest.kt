@@ -60,7 +60,9 @@ class TwoNodePeerDirectoryGossipIntegrationTest :
                 val deadline = Instant.now().plus(Duration.ofSeconds(20))
                 var lookedUp = directoryB.lookup(identityA.secp256k1KeyPair.publicKey)
                 while (lookedUp == null && Instant.now().isBefore(deadline)) {
-                    directoryA.announce(record)
+                    // before the mesh stream to B exists, publish fails (for example "no outbound stream"):
+                    // that is exactly the case this loop retries
+                    runCatching { directoryA.announce(record) }
                     Thread.sleep(500)
                     lookedUp = directoryB.lookup(identityA.secp256k1KeyPair.publicKey)
                 }
