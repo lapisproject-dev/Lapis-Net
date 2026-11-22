@@ -52,11 +52,12 @@ class NabuAttachmentBlobStore(
 }
 
 /**
- * The anonymity-mode download of an attachment blob that is not local (wave Q21, unreleased, design not confirmed by
- * the user). Order: the local stores; then the sender's onion service ([AttachmentFetchClient], only with an attachment
- * key, because the key makes the fetch token); then, only when the sender's service was not reachable and the blob fits
- * one lookup ([LookupLimits.MAX_CONTENT]), one MAILBOX lookup through a circuit (decision Q21-B: best effort, it finds
- * only what a node in normal mode happens to announce; the exit relay sees the CID of the encrypted blob and the time).
+ * The anonymity-mode download of an attachment blob that is not local (wave Q21, unreleased, design confirmed by the
+ * user (2026-11-22)). Order: the local stores; then the sender's onion service ([AttachmentFetchClient], only with an
+ * attachment key, because the key makes the fetch token); then, only when the sender's service was not reachable and
+ * the blob fits one lookup ([LookupLimits.MAX_CONTENT]), one MAILBOX lookup through a circuit (decision Q21-B: best
+ * effort, it finds only what a node in normal mode happens to announce; the exit relay sees the CID of the encrypted
+ * blob and the time).
  *
  * At most [maxConcurrent] fetches run at once (more: [Outcome.Busy], answered `rate-limited`). A verified blob is stored
  * unserved, so a second download is local and the blob is never provided, not even after a switch to normal mode.

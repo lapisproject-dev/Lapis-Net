@@ -21,6 +21,8 @@ dependencies {
     api(project(":lapis-net-identity"))
     api(project(":lapis-net-ratchet"))
     api(project(":lapis-net-networking"))
+    // Q21-Token: HKDF-SHA256 (HKDFBytesGenerator) for the fetch-token key, same pattern as DmX3dhRejectionCodec.
+    implementation(rootProject.libs.bouncycastle.provider)
 
     testImplementation(testFixtures(project(":lapis-net-dm")))
     testImplementation(project(":lapis-net-trust"))

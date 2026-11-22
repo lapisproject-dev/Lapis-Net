@@ -10,6 +10,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldNotContain
 import net.lapisphilosophorum.lapisnet.onion.LookupSizeClass
+import net.lapisphilosophorum.lapisnet.storage.RemoteContentVerifier
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 
@@ -212,5 +213,41 @@ class AttachmentFetchTokenTest :
                     pool.shutdownNow()
                 }
             results.all { it.contentEquals(expected) } shouldBe true
+        }
+
+        test("reference vector (computed independently, Python hashlib/hmac, RFC 5869)") {
+            val cidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(cid))
+            hex(cidBytes) shouldBe "015512202d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+            hex(AttachmentFetchToken.deriveTokenKey(key, cidBytes)) shouldBe
+                "eea260785ae4310effcf029d08303def1523d2b3655cfa3ac5274398d9771239"
+            hex(AttachmentFetchToken.compute(key, cid)) shouldBe
+                "bf4a1c2214577ce47b5080763f2e8a9071e04cec329879e8b1483465f0718639"
+            // for orientation: the former direct HMAC under the attachment key for the same inputs
+            hex(legacyDirectToken(key, cid)) shouldBe "f7c8359dc567ea6d40071f6377ef8fee4a6b2d56ded69b31b6a4960a51518e62"
+        }
+
+        test("the token is not the direct HMAC under the attachment key") {
+            val token = AttachmentFetchToken.compute(key, cid)
+            val legacy = legacyDirectToken(key, cid)
+            legacy.size shouldBe AttachmentFetchToken.SIZE
+            legacy shouldNotBe token
+            AttachmentFetchToken.matches(token, legacy) shouldBe false
+        }
+
+        test("the token key differs from the attachment key and per CID and per key") {
+            val cidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(cid))
+            val otherCidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(rawCid("y".toByteArray())))
+            val k = AttachmentFetchToken.deriveTokenKey(key, cidBytes)
+            k.size shouldBe 32
+            k shouldNotBe key
+            AttachmentFetchToken.deriveTokenKey(key, cidBytes) shouldBe k
+            AttachmentFetchToken.deriveTokenKey(key, otherCidBytes) shouldNotBe k
+            AttachmentFetchToken.deriveTokenKey(ByteArray(32) { 6 }, cidBytes) shouldNotBe k
+        }
+
+        test("an empty key and a foreign CID shape are refused") {
+            shouldThrow<IllegalArgumentException> { AttachmentFetchToken.compute(ByteArray(0), cid) }
+            val dagCbor = Cid.buildCidV1(Cid.Codec.DagCbor, Multihash.Type.sha2_256, sha256("x".toByteArray()))
+            shouldThrow<IllegalArgumentException> { AttachmentFetchToken.compute(key, dagCbor) }
         }
     })

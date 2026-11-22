@@ -4,15 +4,18 @@ import io.ipfs.cid.Cid
 import net.lapisphilosophorum.lapisnet.dmonion.DmCircuitFraming
 import net.lapisphilosophorum.lapisnet.onion.LookupSizeClass
 import net.lapisphilosophorum.lapisnet.storage.RemoteContentVerifier
+import org.bouncycastle.crypto.digests.SHA256Digest
+import org.bouncycastle.crypto.generators.HKDFBytesGenerator
+import org.bouncycastle.crypto.macs.HMac
+import org.bouncycastle.crypto.params.HKDFParameters
+import org.bouncycastle.crypto.params.KeyParameter
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 /**
- * Bounds of attachment fetches over circuits (wave Q21, unreleased; the values are provisional, not measured, and the
- * design Q21-A to Q21-I is not yet confirmed by the user).
+ * Bounds of attachment fetches over circuits (wave Q21, unreleased; the values are provisional, not measured in a
+ * pilot; the design Q21-A to Q21-I is confirmed by the user (2026-11-22)).
  */
 object AnonymousAttachmentLimits {
     /** `status(1) | classIndex(1) | chunkIndex(2) | chunkCount(2) | totalLength(4)`. */
@@ -95,14 +98,19 @@ object AttachmentTransferClass {
 }
 
 /**
- * The fetch authorisation (wave Q21, decision Q21-D, not externally reviewed): `HMAC-SHA256(key = attachment key,
- * msg = "LapisNet:attachment-fetch:v1" || cid bytes)`. Only someone who holds the attachment's encryption key (from the
- * message that carried the reference) can compute it; the sender recomputes and compares in constant time. A new
- * construction from existing primitives: no primitive is changed. A new [Mac] instance per call.
+ * The fetch authorisation (wave Q21, decision Q21-D, confirmed by the user (2026-11-22), not externally reviewed): a
+ * token key `K_t = HKDF-SHA256(ikm = attachment key, salt = empty, info = "LapisNet:attachment-fetch-token-key:v1" ||
+ * cid bytes)`, then `HMAC-SHA256(K_t, "LapisNet:attachment-fetch:v1" || cid bytes)`. The attachment key itself is used
+ * only for AES-GCM and as HKDF input, never directly as an HMAC key (wave Q21-Token). Only someone who holds the
+ * attachment's encryption key (from the message that carried the reference) can compute the token; the sender
+ * recomputes and compares in constant time. New [HKDFBytesGenerator]/[HMac] per call; the derived key is zeroed after
+ * use. A new construction from existing primitives.
  */
 object AttachmentFetchToken {
     const val SIZE = 32
     private val LABEL = "LapisNet:attachment-fetch:v1".toByteArray(Charsets.US_ASCII)
+    private val KEY_INFO_LABEL = "LapisNet:attachment-fetch-token-key:v1".toByteArray(Charsets.US_ASCII)
+    private const val TOKEN_KEY_SIZE = 32
 
     /** @throws IllegalArgumentException for a CID that is not CIDv1/raw/SHA-256 or an empty key. */
     fun compute(
@@ -111,10 +119,37 @@ object AttachmentFetchToken {
     ): ByteArray {
         require(attachmentKey.isNotEmpty()) { "attachment key must not be empty" }
         val cidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(cid)) { "unsupported CID shape" }
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(attachmentKey, "HmacSHA256"))
-        mac.update(LABEL)
-        return mac.doFinal(cidBytes)
+        val tokenKey = deriveTokenKey(attachmentKey, cidBytes)
+        try {
+            val mac = HMac(SHA256Digest())
+            mac.init(KeyParameter(tokenKey))
+            mac.update(LABEL, 0, LABEL.size)
+            mac.update(cidBytes, 0, cidBytes.size)
+            val out = ByteArray(mac.macSize)
+            mac.doFinal(out, 0)
+            return out
+        } finally {
+            tokenKey.fill(0)
+        }
+    }
+
+    /**
+     * The token key `K_t` for [attachmentKey] and the CID's raw bytes [cidBytes] (visible for the reference-vector
+     * test). A caller outside [compute] zeroes the result itself.
+     *
+     * Salt `null`: BouncyCastle then uses HashLen (32) zero bytes, which RFC 5869 defines as the value for "salt not
+     * provided"; an empty array would give the same PRK (HMAC pads a short key with zeros). `null` states the intent;
+     * the reference vector in the test pins the result.
+     */
+    internal fun deriveTokenKey(
+        attachmentKey: ByteArray,
+        cidBytes: ByteArray,
+    ): ByteArray {
+        val hkdf = HKDFBytesGenerator(SHA256Digest())
+        hkdf.init(HKDFParameters(attachmentKey, null, KEY_INFO_LABEL + cidBytes))
+        val out = ByteArray(TOKEN_KEY_SIZE)
+        hkdf.generateBytes(out, 0, TOKEN_KEY_SIZE)
+        return out
     }
 
     /** Constant-time comparison; `false` for any length other than [SIZE]. */

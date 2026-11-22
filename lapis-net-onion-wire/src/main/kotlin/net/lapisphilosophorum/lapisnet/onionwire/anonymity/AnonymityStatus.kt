@@ -107,8 +107,8 @@ private const val WARNING_PADDED =
  * is asked), ..." by the text below (no mail or name lookups are claimed: none is wired in this mode); wave Q20 replaced
  * "today such lookups usually find nothing, because nodes do not announce posts in the DHT" (nodes in normal mode now
  * announce the newest post bodies they hold); wave Q21 replaced "Attachments and inbox rendezvous records are not reachable in
- * this mode." (attachments are now fetched from the sender's onion service; that wording, Q21-F, is not yet confirmed by
- * the user).
+ * this mode." (attachments are now fetched from the sender's onion service; that wording, Q21-F, is confirmed by
+ * the user (2026-11-22)).
  */
 private const val WARNING_REMAINING =
     "The transport key is fresh per run. The node connects only to its two guards, which see your address, " +

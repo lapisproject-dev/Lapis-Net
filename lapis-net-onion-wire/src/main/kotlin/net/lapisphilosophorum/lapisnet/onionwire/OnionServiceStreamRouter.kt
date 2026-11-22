@@ -21,10 +21,10 @@ enum class OnionServiceApp(
     MAIL(2),
 
     /**
-     * Wave Q21 (unreleased, design not confirmed by the user): a recipient in anonymity mode fetches the encrypted blob
-     * of an attachment that this node sent from this node's onion service. One request per stream; the answer is padded
-     * to lookup size classes. The HELLO version stays 1: an older node does not know the id and closes the stream after
-     * its HELLO timeout, which the fetching side treats as "not reachable".
+     * Wave Q21 (unreleased, design confirmed by the user (2026-11-22)): a recipient in anonymity mode fetches the
+     * encrypted blob of an attachment that this node sent from this node's onion service. One request per stream; the
+     * answer is padded to lookup size classes. The HELLO version stays 1: an older node does not know the id and closes
+     * the stream after its HELLO timeout, which the fetching side treats as "not reachable".
      */
     ATTACHMENT(3),
     ;

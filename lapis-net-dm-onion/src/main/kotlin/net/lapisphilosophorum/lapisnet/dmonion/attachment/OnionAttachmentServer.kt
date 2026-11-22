@@ -101,8 +101,9 @@ private class SchedulerClock(
 }
 
 /**
- * The serving end of attachment fetches over circuits (wave Q21, unreleased, design not confirmed by the user):
- * registered with the node's service stream router for [net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp.ATTACHMENT].
+ * The serving end of attachment fetches over circuits (wave Q21, unreleased, design confirmed by the user
+ * (2026-11-22)): registered with the node's service stream router for
+ * [net.lapisphilosophorum.lapisnet.onionwire.OnionServiceApp.ATTACHMENT].
  *
  * One request per stream. The answer comes no earlier than [AttachmentServerConfig.minAnswerDelay] plus a random jitter
  * after the request, as lookup-class sized chunks ([AttachmentFetchCodec]), paced to
@@ -116,7 +117,8 @@ private class SchedulerClock(
  * reserved from the transfer class BEFORE the blob is loaded (not enough left: RATE_LIMITED), a request within
  * [AttachmentServerConfig.requestTimeout], a stream at most [AttachmentServerConfig.streamLifetime]. With two streams at
  * most two blobs of at most [AnonymousAttachmentLimits.MAX_BLOB_BYTES] are in memory. Nothing logged names a CID, an
- * identity, a descriptor or a token; no timer or counter is tied to one.
+ * identity, a descriptor, a token or a derived key; no timer or counter is tied to one. The token is checked with
+ * [AttachmentFetchToken] (an HMAC under a key derived by HKDF from the attachment key and the CID, wave Q21-Token).
  */
 class OnionAttachmentServer(
     private val source: OutboundAttachmentSource,

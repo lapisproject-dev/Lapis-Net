@@ -9,12 +9,15 @@ import net.lapisphilosophorum.lapisnet.dmonion.FrameChannel
 import net.lapisphilosophorum.lapisnet.dmonion.Peer
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.onion.OnionServiceDescriptor
+import net.lapisphilosophorum.lapisnet.storage.RemoteContentVerifier
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.PriorityQueue
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /** Virtual time: tasks run only when the test advances the clock, in order of their due time. */
 class ManualScheduler(
@@ -138,6 +141,23 @@ fun hiddenPeer(): Pair<Peer, DirectoryReachability.Hidden> {
 fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
 
 fun rawCid(bytes: ByteArray): Cid = Cid.buildCidV1(Cid.Codec.Raw, Multihash.Type.sha2_256, sha256(bytes))
+
+fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
+
+/**
+ * The fetch token as wave Q21 computed it before wave Q21-Token: HMAC-SHA256 directly under the attachment key. Used
+ * only to show that such a token is refused now. A new [Mac] instance per call.
+ */
+fun legacyDirectToken(
+    attachmentKey: ByteArray,
+    cid: Cid,
+): ByteArray {
+    val cidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(cid))
+    val mac = Mac.getInstance("HmacSHA256")
+    mac.init(SecretKeySpec(attachmentKey, "HmacSHA256"))
+    mac.update("LapisNet:attachment-fetch:v1".toByteArray(Charsets.US_ASCII))
+    return mac.doFinal(cidBytes)
+}
 
 /** One decoded answer frame: the declared payload length and the payload. */
 class AnswerFrame(

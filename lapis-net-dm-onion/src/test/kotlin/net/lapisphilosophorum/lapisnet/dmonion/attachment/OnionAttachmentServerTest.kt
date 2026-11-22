@@ -10,6 +10,7 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldNotContain
 import net.lapisphilosophorum.lapisnet.dmonion.FakeChannel
+import net.lapisphilosophorum.lapisnet.storage.RemoteContentVerifier
 import org.slf4j.LoggerFactory
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -121,6 +122,26 @@ class OnionAttachmentServerTest :
             hit.request(tiny.cid, tiny.token())
             s.advance(10_000)
             hit.received.map { it.size } shouldBe unknown.received.map { it.size }
+        }
+
+        test("an old direct-HMAC token is refused: NOT_FOUND, byte-identical to a wrong token, same delay") {
+            val s = ManualScheduler()
+            val source = OneBlobSource(ByteArray(100) { 1 })
+            val server = OnionAttachmentServer(source, noJitter(), s)
+            val legacy = Probe(s, server)
+            val zero = Probe(s, server)
+            legacy.request(source.cid, legacyDirectToken(source.key, source.cid))
+            zero.request(source.cid, ByteArray(32))
+            val start = s.nowMillis()
+            s.advance(10_000)
+            legacy.times.first() - start shouldBe 1_500L
+            zero.times.first() - start shouldBe 1_500L
+            legacy.received.map { it.size } shouldBe zero.received.map { it.size }
+            val a = answerFrames(legacy.received)
+            val b = answerFrames(zero.received)
+            a.map { it.payload.toList() } shouldBe b.map { it.payload.toList() }
+            a.single().header.status shouldBe AttachmentFetchStatus.NOT_FOUND
+            source.loads.get() shouldBe 0
         }
 
         test("a blob above the maximum is TOO_LARGE without loading; a missing local blob is NOT_FOUND") {
@@ -283,6 +304,8 @@ class OnionAttachmentServerTest :
                 text shouldNotContain source.cid.toString()
                 text shouldNotContain tokenHex
                 text shouldNotContain keyHex
+                val cidBytes = requireNotNull(RemoteContentVerifier.rawSha256CidBytes(source.cid))
+                text shouldNotContain hex(AttachmentFetchToken.deriveTokenKey(source.key, cidBytes))
             } finally {
                 logRoot.detachAppender(appender)
                 logRoot.level = oldLevel

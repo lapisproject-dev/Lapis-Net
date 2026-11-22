@@ -107,9 +107,10 @@ data class AttachmentClientConfig(
 }
 
 /**
- * The fetching end of attachments over circuits (wave Q21, unreleased, design not confirmed by the user). Resolves the
- * sender in the local anonymous directory only (never the DHT), opens one rendezvous stream to the sender's onion
- * service (never a direct connection), sends one request with the fetch token and reassembles the answer.
+ * The fetching end of attachments over circuits (wave Q21, unreleased, design confirmed by the user (2026-11-22)).
+ * Resolves the sender in the local anonymous directory only (never the DHT), opens one rendezvous stream to the
+ * sender's onion service (never a direct connection), sends one request with the fetch token ([AttachmentFetchToken],
+ * an HMAC under a key derived by HKDF from the attachment key and the CID) and reassembles the answer.
  *
  * Every chunk header is checked before anything is allocated for it: the reassembly buffer is created after the first
  * header, at most `min(maxBytes, MAX_BLOB_BYTES)` bytes. A chunk count that does not fit the length, a class other than
