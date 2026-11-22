@@ -58,6 +58,9 @@ private class HeldClient(
     val calls = AtomicInteger()
     val futures = CopyOnWriteArrayList<CompletableFuture<AttachmentFetchResult>>()
 
+    /** The future of each call by the CID it asked for: which coroutine reaches the client first is not deterministic. */
+    val futuresByCid = java.util.concurrent.ConcurrentHashMap<Cid, CompletableFuture<AttachmentFetchResult>>()
+
     @Volatile var answer: AttachmentFetchResult? = null
 
     override fun fetch(
@@ -71,6 +74,7 @@ private class HeldClient(
         val f = CompletableFuture<AttachmentFetchResult>()
         answer?.let { f.complete(it) }
         futures += f
+        futuresByCid[cid] = f
         return f
     }
 }
@@ -177,18 +181,20 @@ class AnonymousAttachmentFetcherTest :
             val client = HeldClient(store.order)
             val fetcher = AnonymousAttachmentFetcher(store, { client })
             runBlocking(Dispatchers.Default) {
-                val one = launch { fetcher.fetch(sender, rawCidOf(byteArrayOf(1)), key, 10) }
-                val two = async { fetcher.fetch(sender, rawCidOf(byteArrayOf(2)), key, 10) }
+                val cidOne = rawCidOf(byteArrayOf(1))
+                val cidTwo = rawCidOf(byteArrayOf(2))
+                val one = launch { fetcher.fetch(sender, cidOne, key, 10) }
+                val two = async { fetcher.fetch(sender, cidTwo, key, 10) }
                 while (client.futures.size < 2) delay(10)
                 fetcher.fetch(sender, rawCidOf(byteArrayOf(3)), key, 10) shouldBe
                     AnonymousAttachmentFetcher.Outcome.Busy
                 one.cancelAndJoin()
-                client.futures[0].isCancelled shouldBe true
+                client.futuresByCid.getValue(cidOne).isCancelled shouldBe true
                 // the slot is free again
                 client.answer = AttachmentFetchResult.NotFound
                 fetcher.fetch(sender, rawCidOf(byteArrayOf(4)), key, 10) shouldBe
                     AnonymousAttachmentFetcher.Outcome.Unavailable
-                client.futures[1].complete(AttachmentFetchResult.NotFound)
+                client.futuresByCid.getValue(cidTwo).complete(AttachmentFetchResult.NotFound)
                 two.await() shouldBe AnonymousAttachmentFetcher.Outcome.Unavailable
             }
         }
