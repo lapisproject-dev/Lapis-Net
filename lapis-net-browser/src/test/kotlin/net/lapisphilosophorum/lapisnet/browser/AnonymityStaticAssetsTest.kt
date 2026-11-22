@@ -147,7 +147,9 @@ class AnonymityStaticAssetsTest :
             js shouldContain "\"recipient-unreachable\""
         }
 
-        test("dm.js maps error codes to fixed texts, never shows the server's text, and disables attachments") {
+        test(
+            "dm.js maps error codes to fixed texts, never shows the server's text; attachments are fetched over circuits",
+        ) {
             val js = resource("dm.js")
             for (
             code in
@@ -157,13 +159,19 @@ class AnonymityStaticAssetsTest :
                 "rate-limited",
                 "message-too-large-anonymous",
                 "attachments-unavailable-anonymous",
+                "attachment-too-large-anonymous",
+                "attachment-fetch-timeout-anonymous",
                 "dm-send-failed",
             )
             ) {
                 js shouldContain "\"$code\""
             }
             js shouldContain "dmErrorText(error)"
-            js shouldContain "addAttachmentButton.disabled = true"
+            // wave Q21: attachments are no longer disabled in anonymity mode; a download goes through fetch() and a
+            // refusal is shown as fixed text looked up by its code
+            js shouldNotContain "addAttachmentButton.disabled = true"
+            js shouldContain "downloadAttachmentAnonymously(url, attachment.name, statusEl)"
+            js shouldContain "attachmentDownloadText(body && body.error)"
             js shouldContain "DM_ANONYMITY_NOTICE"
             js
                 .lines()
@@ -174,6 +182,23 @@ class AnonymityStaticAssetsTest :
             html shouldNotContain "dm-anonymity-notice-close"
             // the notice sits above the input field and has no button inside it
             (html.indexOf("id=\"dm-anonymity-notice\"") < html.indexOf("id=\"dm-compose-body\"")) shouldBe true
+        }
+
+        test("Q21: mail.js maps the attachment download codes to fixed texts") {
+            val js = resource("mail.js")
+            for (code in listOf(
+                "attachments-unavailable-anonymous",
+                "attachment-too-large-anonymous",
+                "attachment-fetch-timeout-anonymous",
+                "anonymity-not-ready",
+                "rate-limited",
+            )) {
+                js shouldContain "\"$code\""
+            }
+            js shouldContain "downloadAttachmentAnonymously(url, attachment.name, statusEl)"
+            js shouldContain "attachmentDownloadText(body && body.error)"
+            resource("mail.html") shouldContain "class=\"mail-attachment-status\" role=\"status\""
+            resource("dm.html") shouldContain "class=\"dm-message-attachment-status\" role=\"status\""
         }
 
         test("J3: every warning text says experimental, incomplete and unreviewed, in sentences") {
@@ -191,7 +216,8 @@ class AnonymityStaticAssetsTest :
                     text shouldNotContain "; padding is off"
                     // no lookup of mail or names is claimed (none is wired in this mode)
                     text shouldNotContain "mail and names are fetched"
-                    text shouldContain "Attachments and inbox rendezvous records are not reachable in this mode."
+                    text shouldContain
+                        "Attachments are fetched from the sender's onion service while the sender is online (up to 4 MiB each); inbox rendezvous records are not reachable in this mode."
                     text shouldContain "which nodes do for the newest posts they hold"
                     text shouldNotContain "nodes do not announce posts in the DHT"
                 }

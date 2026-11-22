@@ -30,6 +30,7 @@ import net.lapisphilosophorum.lapisnet.dm.DmSessionException
 import net.lapisphilosophorum.lapisnet.dm.DmSessionManager
 import net.lapisphilosophorum.lapisnet.dm.DmStore
 import net.lapisphilosophorum.lapisnet.dm.EncryptedDmAttachmentBlobCodec
+import net.lapisphilosophorum.lapisnet.dmonion.attachment.AnonymousAttachmentLimits
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.storage.NabuStorage
 import java.util.Base64
@@ -173,7 +174,41 @@ class DmApiDependencies(
     val dmSessionManager: DmSessionManager,
     val dmStore: DmStore,
     val dmAcceptedContacts: DmAcceptedContacts,
+    /** Wave Q21: the anonymity-mode download of attachments that are not local; `null` outside anonymity mode. */
+    val anonymousAttachments: AnonymousAttachmentFetcher? = null,
 )
+
+/** Wave Q21: refusal codes of the anonymity-mode attachment routes (fixed, content-free). */
+internal const val CODE_ATTACHMENTS_UNAVAILABLE_ANONYMOUS = "attachments-unavailable-anonymous"
+internal const val CODE_ATTACHMENT_TOO_LARGE_ANONYMOUS = "attachment-too-large-anonymous"
+internal const val CODE_ATTACHMENT_FETCH_TIMEOUT_ANONYMOUS = "attachment-fetch-timeout-anonymous"
+internal const val CODE_ANONYMITY_NOT_READY = "anonymity-not-ready"
+internal const val CODE_RATE_LIMITED = "rate-limited"
+
+/**
+ * Wave Q21: the largest DM attachment (plaintext) that can be sent in anonymity mode - what still fits one attachment
+ * fetch over circuits once encrypted: [AnonymousAttachmentLimits.MAX_BLOB_BYTES] minus the blob header and GCM tag
+ * (4,193,946 bytes, about 4 MiB; the normal mode keeps 16 MiB).
+ */
+const val MAX_ANONYMOUS_DM_ATTACHMENT_BYTES: Int =
+    AnonymousAttachmentLimits.MAX_BLOB_BYTES - EncryptedDmAttachmentBlobCodec.OVERHEAD_BYTES
+
+/** Maps a failed anonymity-mode download to its status and fixed code; `null` for [AnonymousAttachmentFetcher.Outcome.Bytes]. */
+internal fun AnonymousAttachmentFetcher.Outcome.refusal(): Pair<HttpStatusCode, String>? =
+    when (this) {
+        is AnonymousAttachmentFetcher.Outcome.Bytes -> null
+        AnonymousAttachmentFetcher.Outcome.Unavailable ->
+            HttpStatusCode.NotFound to
+                CODE_ATTACHMENTS_UNAVAILABLE_ANONYMOUS
+        AnonymousAttachmentFetcher.Outcome.Timeout ->
+            HttpStatusCode.GatewayTimeout to
+                CODE_ATTACHMENT_FETCH_TIMEOUT_ANONYMOUS
+        AnonymousAttachmentFetcher.Outcome.TooLarge ->
+            HttpStatusCode.PayloadTooLarge to
+                CODE_ATTACHMENT_TOO_LARGE_ANONYMOUS
+        AnonymousAttachmentFetcher.Outcome.Busy -> HttpStatusCode.ServiceUnavailable to CODE_RATE_LIMITED
+        AnonymousAttachmentFetcher.Outcome.NotReady -> HttpStatusCode.ServiceUnavailable to CODE_ANONYMITY_NOT_READY
+    }
 
 /** [inboundRoute] is the route of this node's own mode: an anonymity-mode node receives over circuits only. */
 private fun DmHistoryEntry.toResponse(inboundRoute: DmRoute): DmMessageResponse =
@@ -245,13 +280,6 @@ internal fun Route.installDmRoutes(
         if (!call.requireLoopbackRequest()) return@post
         val request = call.receive<NewDmRequest>()
 
-        // Anonymity mode: attachments are fetched from the sender's node, which would break the mode, so they are
-        // refused up front - before storage, cipher or any session is touched.
-        if (anonymous && request.attachments.isNotEmpty()) {
-            call.respond(HttpStatusCode.Conflict, ErrorResponse("attachments-unavailable-anonymous"))
-            return@post
-        }
-
         val bodyBytes = request.body.toByteArray(Charsets.UTF_8)
         if (bodyBytes.size > DmContentCodec.MAX_DM_BODY_BYTES) {
             call.respond(
@@ -291,6 +319,12 @@ internal fun Route.installDmRoutes(
             // Cheap upper bound BEFORE any Base64 decoding - mirrors MailApi.kt's identical
             // pre-check ordering for MAX_MAIL_ATTACHMENT_UPLOAD_BYTES.
             val approxDecodedSize = (attachment.contentBase64.length.toLong() * 3) / 4
+            // Wave Q21: in anonymity mode an attachment must fit one fetch over circuits (about 4 MiB); refused before
+            // any decoding, storage, cipher or session is touched, and again on the decoded size below.
+            if (anonymous && approxDecodedSize > MAX_ANONYMOUS_DM_ATTACHMENT_BYTES) {
+                call.respond(HttpStatusCode.PayloadTooLarge, ErrorResponse(CODE_ATTACHMENT_TOO_LARGE_ANONYMOUS))
+                return@post
+            }
             if (approxDecodedSize > MAX_DM_ATTACHMENT_UPLOAD_BYTES) {
                 call.respond(
                     HttpStatusCode.BadRequest,
@@ -318,6 +352,10 @@ internal fun Route.installDmRoutes(
                         HttpStatusCode.BadRequest,
                         ErrorResponse("attachment '${attachment.name}' content must not be empty"),
                     )
+                    return@post
+                }
+                if (anonymous && rawBytes.size > MAX_ANONYMOUS_DM_ATTACHMENT_BYTES) {
+                    call.respond(HttpStatusCode.PayloadTooLarge, ErrorResponse(CODE_ATTACHMENT_TOO_LARGE_ANONYMOUS))
                     return@post
                 }
                 if (rawBytes.size.toLong() > MAX_DM_ATTACHMENT_UPLOAD_BYTES) {
@@ -359,7 +397,10 @@ internal fun Route.installDmRoutes(
             try {
                 decodedAttachments.map { (attachment, rawBytes) ->
                     val encrypted = DmAttachmentCipher.encrypt(rawBytes)
-                    val cid = storage.put(EncryptedDmAttachmentBlobCodec.encode(encrypted.blob))
+                    val blobBytes = EncryptedDmAttachmentBlobCodec.encode(encrypted.blob)
+                    // Wave Q21: in anonymity mode the blob goes to the store that is never served or announced (also
+                    // not after a later switch to normal mode); this node's onion service hands it out on request.
+                    val cid = if (anonymous) storage.putUnserved(blobBytes) else storage.put(blobBytes)
                     DmAttachmentRef(cid, attachment.name, attachment.mime, rawBytes.size.toLong(), encrypted.key)
                 }
             } catch (e: IllegalArgumentException) {
@@ -426,6 +467,10 @@ internal fun Route.installDmRoutes(
     // mirroring MailApi.kt's `/api/mail/attachment/{cid}` route's identical "acceptable at this
     // codebase's established personal-node-scale tolerance" reasoning.
     get("/api/dm/attachment/{peerHex}/{cid}") {
+        // Security fix (Q21): in anonymity mode this GET can fetch from the sender's onion service, at a moment the
+        // requester chooses. A cross-site subresource must not trigger that (deanonymization oracle: the attacker's
+        // onion service sees the fetch). Same-origin fetch and user navigation (Sec-Fetch-Site: none) still pass.
+        if (!call.requireLoopbackRequest()) return@get
         val peer = parseHexPublicKeyOrNull(call.parameters["peerHex"] ?: "")
         if (peer == null) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("peerHex must be a valid secp256k1 public key hex"))
@@ -456,10 +501,28 @@ internal fun Route.installDmRoutes(
             return@get
         }
 
-        // Anonymity mode: never ask the sender's node for the blob (that is a direct connection); a blob that is
-        // not already local is simply unavailable.
-        if (anonymous && storage.getLocal(foundRef.cid) == null) {
-            call.respond(HttpStatusCode.Conflict, ErrorResponse("attachments-unavailable-anonymous"))
+        // Anonymity mode (wave Q21): never a direct connection to the sender's node. A blob that is not local is
+        // fetched from the sender's onion service (AnonymousAttachmentFetcher); the bytes are then only decrypted and
+        // checked here (decryptVerified), never handed to the dialling DmAttachmentFetcher.fetchAndDecrypt.
+        if (anonymous) {
+            val ref = foundRef
+            val blobBytes =
+                anonymousDmBlob(deps, storage, ref, foundSender, localPublicKey) ?: run {
+                    call.respond(HttpStatusCode.ServiceUnavailable, ErrorResponse(CODE_ANONYMITY_NOT_READY))
+                    return@get
+                }
+            val refusal = blobBytes.refusal()
+            if (refusal != null) {
+                call.respond(refusal.first, ErrorResponse(refusal.second))
+                return@get
+            }
+            val bytes = (blobBytes as AnonymousAttachmentFetcher.Outcome.Bytes).bytes
+            val opened = DmAttachmentFetcher.decryptVerified(ref, bytes)
+            if (opened == null) {
+                call.respond(HttpStatusCode.NotFound, ErrorResponse(CODE_ATTACHMENTS_UNAVAILABLE_ANONYMOUS))
+                return@get
+            }
+            call.respondAttachmentBytes(ref.name, ref.mime, opened)
             return@get
         }
         val plaintext =
@@ -488,4 +551,46 @@ internal fun Route.installDmRoutes(
             }.getOrDefault(ContentType.Application.OctetStream)
         call.respondBytes(plaintext, contentType)
     }
+}
+
+/**
+ * Wave Q21: the encrypted blob of [ref] in anonymity mode - local, or fetched from [sender]'s onion service. An outbound
+ * attachment (sender = this node) is only ever local. `null` when no fetcher is wired (not ready).
+ */
+private suspend fun anonymousDmBlob(
+    deps: DmApiDependencies,
+    storage: NabuStorage,
+    ref: DmAttachmentRef,
+    sender: Secp256k1PublicKey,
+    localPublicKey: Secp256k1PublicKey,
+): AnonymousAttachmentFetcher.Outcome? {
+    val fetcher = deps.anonymousAttachments
+    if (fetcher == null || sender == localPublicKey) {
+        val local = runCatching { storage.getLocal(ref.cid) }.getOrNull()
+        return when {
+            local != null -> AnonymousAttachmentFetcher.Outcome.Bytes(local)
+            sender == localPublicKey -> AnonymousAttachmentFetcher.Outcome.Unavailable
+            else -> null
+        }
+    }
+    val maxBytes =
+        (ref.size + EncryptedDmAttachmentBlobCodec.OVERHEAD_BYTES)
+            .coerceAtMost(
+                Int.MAX_VALUE.toLong(),
+            ).toInt()
+    return fetcher.fetch(sender, ref.cid, ref.encryptionKey, maxBytes)
+}
+
+/** Sends [bytes] as a download named [name] with content type [mime] (or octet-stream). */
+internal suspend fun io.ktor.server.application.ApplicationCall.respondAttachmentBytes(
+    name: String,
+    mime: String,
+    bytes: ByteArray,
+) {
+    response.header(
+        HttpHeaders.ContentDisposition,
+        ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, name).toString(),
+    )
+    val contentType = runCatching { ContentType.parse(mime) }.getOrDefault(ContentType.Application.OctetStream)
+    respondBytes(bytes, contentType)
 }

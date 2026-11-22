@@ -18,17 +18,30 @@ const MAX_DM_BODY_BYTES = 32768;
 // V0.10.0-F1 anonymity mode. Every text below is fixed in this file; nothing from the server response is ever shown
 // for an error (only the code is looked up here), and everything is written through setText()/textContent.
 const DM_ANONYMITY_NOTICE =
-  "Anonymity mode: messages travel over circuits. The recipient sees who you are. Only people who are in anonymity mode as well can be reached, and there are no attachments.";
-const DM_ATTACHMENT_NOTE = "Attachments are not available in anonymity mode.";
+  "Anonymity mode: messages travel over circuits. The recipient sees who you are. Only people who are in anonymity mode as well can be reached. Attachments (at most 4 MiB each) are fetched from the sender's node through circuits, only while the sender is online.";
+const DM_ATTACHMENT_NOTE =
+  "Attachments: at most 4 MiB each. The recipient fetches them from your node through circuits while you are online.";
 const DM_ERROR_TEXTS = {
   "recipient-not-reachable-anonymously":
     "This person cannot be reached anonymously. Nothing was sent.",
   "anonymity-not-ready": "Anonymity mode is not ready yet. Nothing was sent, please try again shortly.",
   "rate-limited": "Circuit builds are being rate limited. Nothing was sent, please try again later.",
   "message-too-large-anonymous": "This message is too long for anonymity mode (about 5 KB). Nothing was sent.",
-  "attachments-unavailable-anonymous": "Attachments are not available in anonymity mode. Nothing was sent.",
+  "attachments-unavailable-anonymous": "An attachment is not available on this node. Nothing was sent.",
+  "attachment-too-large-anonymous": "An attachment is too large for anonymity mode (at most 4 MiB each). Nothing was sent.",
   "dm-send-failed": "The message could not be sent.",
 };
+// Wave Q21: downloads in anonymity mode go through fetch(); a refusal shows one of these fixed texts, never the
+// server's text.
+const DM_ATTACHMENT_DOWNLOAD_TEXTS = {
+  "attachments-unavailable-anonymous": "This attachment is not available: the sender is offline or no longer has it.",
+  "attachment-too-large-anonymous": "This attachment is too large for anonymity mode (at most 4 MiB).",
+  "attachment-fetch-timeout-anonymous": "Fetching the attachment through circuits took too long. Please try again.",
+  "anonymity-not-ready": "Anonymity mode is not ready yet. Please try again shortly.",
+  "rate-limited": "Too many attachment fetches right now. Please try again shortly.",
+};
+const DM_ATTACHMENT_DOWNLOAD_FALLBACK = "The attachment could not be fetched.";
+const DM_ATTACHMENT_DOWNLOAD_PENDING = "fetching through circuits…";
 const DM_ERROR_FALLBACK = "The message could not be sent.";
 const DM_DELIVERY_TEXTS = {
   direct: { SENT: "SENT", QUEUED_FOR_PICKUP: "QUEUED_FOR_PICKUP" },
@@ -42,6 +55,37 @@ let anonymousMode = false;
 function dmErrorText(error) {
   const code = error && error.message;
   return Object.prototype.hasOwnProperty.call(DM_ERROR_TEXTS, code) ? DM_ERROR_TEXTS[code] : DM_ERROR_FALLBACK;
+}
+
+function attachmentDownloadText(code) {
+  return Object.prototype.hasOwnProperty.call(DM_ATTACHMENT_DOWNLOAD_TEXTS, code)
+    ? DM_ATTACHMENT_DOWNLOAD_TEXTS[code]
+    : DM_ATTACHMENT_DOWNLOAD_FALLBACK;
+}
+
+/** Wave Q21: fetches an attachment in anonymity mode (it may take a while) and saves it; errors as fixed text. */
+function downloadAttachmentAnonymously(url, fileName, statusEl) {
+  setText(statusEl, DM_ATTACHMENT_DOWNLOAD_PENDING);
+  fetch(url)
+    .then((response) => {
+      if (response.ok) {
+        return response.blob().then((blob) => {
+          const href = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = href;
+          anchor.download = fileName;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(href), 60000);
+          setText(statusEl, "");
+        });
+      }
+      const contentType = response.headers.get("content-type") || "";
+      const bodyPromise = contentType.includes("application/json") ? response.json() : Promise.resolve(null);
+      return bodyPromise.then((body) => setText(statusEl, attachmentDownloadText(body && body.error)));
+    })
+    .catch(() => setText(statusEl, DM_ATTACHMENT_DOWNLOAD_FALLBACK));
 }
 
 function deliveryText(message) {
@@ -184,9 +228,15 @@ function renderMessageAttachmentsInto(container, peerHex, attachments) {
     const metaEl = fragment.querySelector(".dm-message-attachment-meta");
     setText(linkEl, attachment.name);
     if (anonymousMode) {
-      // no link and no automatic fetch: the blob would have to be requested from the sender's node directly
-      linkEl.removeAttribute("href");
-      linkEl.classList.add("dm-attachment-plain");
+      // wave Q21: no automatic fetch; a click fetches through circuits (from the sender's onion service) and shows a
+      // fixed text if that fails
+      const statusEl = fragment.querySelector(".dm-message-attachment-status");
+      const url = attachmentDownloadHref(peerHex, attachment.cid);
+      linkEl.href = url;
+      linkEl.addEventListener("click", (event) => {
+        event.preventDefault();
+        downloadAttachmentAnonymously(url, attachment.name, statusEl);
+      });
     } else {
       // DOM property assignment, never string-concatenated into markup - mirrors mail.js's
       // identical established pattern (see that file's header comment, rule 3).
@@ -327,7 +377,8 @@ composeForm.addEventListener("submit", (event) => {
     });
 });
 
-// Anonymity mode is read once; the notice is fixed text and can not be dismissed, the attachment button is disabled.
+// Anonymity mode is read once; the notice is fixed text and can not be dismissed. Since wave Q21 attachments can be
+// added in anonymity mode as well (at most 4 MiB each, checked by the server).
 function applyAnonymityMode() {
   return fetchJson("/api/node/status")
     .then((status) => {
@@ -339,7 +390,6 @@ function applyAnonymityMode() {
       if (anonymousMode) {
         setText(notice, DM_ANONYMITY_NOTICE);
         setText(note, DM_ATTACHMENT_NOTE);
-        addAttachmentButton.disabled = true;
       }
     })
     .catch(() => {});

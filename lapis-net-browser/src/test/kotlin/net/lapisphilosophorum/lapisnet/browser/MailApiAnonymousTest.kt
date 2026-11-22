@@ -4,10 +4,12 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldNotContain
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
@@ -78,7 +80,10 @@ private class ScriptedMailTransport : AnonymousMailTransport {
     override fun close() = Unit
 }
 
-private class MailAnonHarness {
+private class MailAnonHarness(
+    /** Wave Q21: the scripted fetch over circuits for attachments that are not local. */
+    val client: ScriptedAttachmentClient = ScriptedAttachmentClient(),
+) {
     val identity = DualKeyIdentity.generate()
     val node: LapisNode = LapisNode.create(identity).also { it.start(bootstrapPeers = emptyList()) }
     val storage: NabuStorage = NabuStorage.attach(node, Files.createTempDirectory("mail-api-anon"))
@@ -105,6 +110,7 @@ private class MailAnonHarness {
             mailSender,
             sentFolder,
             anonymityActive = true,
+            anonymousAttachments = AnonymousAttachmentFetcher(NabuAttachmentBlobStore(storage), { client }),
         )
 
     fun stop() {
@@ -280,6 +286,151 @@ class MailApiAnonymousTest :
                     // a provider lookup / Bitswap round would take far longer than this
                     ((System.nanoTime() - started) / 1_000_000 < 3_000) shouldBe true
                 }
+            } finally {
+                h.stop()
+            }
+        }
+
+        // Wave Q21: an encrypted attachment that is not local is fetched from the mail's sender (envelope.sender) over
+        // circuits. The message is put into the sent folder with a FOREIGN sender only to reach the route without a
+        // network; the inbox path runs through the same code (the first message that names the CID wins).
+        test("not local: the fetcher is asked with envelope.sender; without a key: 404 and no network at all") {
+            val h = MailAnonHarness()
+            try {
+                val sender = DualKeyIdentity.generate()
+                val plaintext = "mail attachment".toByteArray()
+                val encrypted =
+                    net.lapisphilosophorum.lapisnet.mail.MailAttachmentCipher
+                        .encrypt(plaintext)
+                val blob =
+                    net.lapisphilosophorum.lapisnet.mail.EncryptedAttachmentBlobCodec
+                        .encode(encrypted.blob)
+                val encryptedRef =
+                    AttachmentRef(
+                        rawCidOf(blob),
+                        "m.txt",
+                        "text/plain",
+                        plaintext.size.toLong(),
+                        encryptionKey = encrypted.key,
+                    )
+                val plainRef = AttachmentRef(rawCidOf(ByteArray(64) { 5 }), "p.bin", "application/octet-stream", 64)
+                val body = MessageBody("s", "b", listOf(encryptedRef, plainRef))
+                val bodyBytes = MessageBodyCodec.encode(body)
+                val envelope =
+                    MessageEnvelope.create(
+                        sender.secp256k1KeyPair,
+                        listOf(h.identity.secp256k1KeyPair.publicKey),
+                        MessageBodyCodec.cidFor(bodyBytes),
+                    )
+                h.sentFolder.add(
+                    SentMessage(
+                        envelope,
+                        body,
+                        MessageBodyCodec.cidFor(bodyBytes),
+                        null,
+                        MailFrameCodec.encode(MessageEnvelopeCodec.encode(envelope), bodyBytes),
+                    ),
+                )
+                testApplication {
+                    application { installBrowserApi(h.deps) }
+                    // Security (Q21): a cross-site subresource or a foreign Origin must not trigger the onion fetch.
+                    h.client.next =
+                        net.lapisphilosophorum.lapisnet.dmonion.attachment.AttachmentFetchResult
+                            .Found(blob)
+                    val crossUrl = "/api/mail/attachment/${encryptedRef.cid}"
+                    client.get(crossUrl) { header("Sec-Fetch-Site", "cross-site") }.status shouldBe
+                        HttpStatusCode.Forbidden
+                    client.get(crossUrl) { header(HttpHeaders.Origin, "https://attacker.example") }.status shouldBe
+                        HttpStatusCode.Forbidden
+                    h.client.calls.get() shouldBe 0
+                    val plain = client.get("/api/mail/attachment/${plainRef.cid}")
+                    plain.status shouldBe HttpStatusCode.NotFound
+                    plain.bodyAsText() shouldBe """{"error":"attachments-unavailable-anonymous"}"""
+                    h.client.calls.get() shouldBe 0
+
+                    h.client.next =
+                        net.lapisphilosophorum.lapisnet.dmonion.attachment.AttachmentFetchResult.Unavailable(
+                            net.lapisphilosophorum.lapisnet.dmonion.attachment.AttachmentFetchFailure.TIMEOUT,
+                        )
+                    val slow = client.get("/api/mail/attachment/${encryptedRef.cid}")
+                    slow.status shouldBe HttpStatusCode.GatewayTimeout
+                    slow.bodyAsText() shouldBe """{"error":"attachment-fetch-timeout-anonymous"}"""
+
+                    h.client.next =
+                        net.lapisphilosophorum.lapisnet.dmonion.attachment.AttachmentFetchResult
+                            .Found(blob)
+                    val ok = client.get("/api/mail/attachment/${encryptedRef.cid}")
+                    ok.status shouldBe HttpStatusCode.OK
+                    ok.bodyAsText() shouldBe "mail attachment"
+                    h.client.senders.toSet() shouldBe setOf(sender.secp256k1KeyPair.publicKey)
+                    h.client.maxBytes.last() shouldBe
+                        plaintext.size +
+                        net.lapisphilosophorum.lapisnet.mail.EncryptedAttachmentBlobCodec.OVERHEAD_BYTES
+                    h.storage.isServed(encryptedRef.cid) shouldBe false
+                }
+            } finally {
+                h.stop()
+            }
+        }
+
+        // Wave Q21 invariant (same as the DM send path): an attachment sent in anonymity mode is stored unserved, so it is
+        // never answered over Bitswap/DHT, also not after a later restart in normal mode.
+        test("outgoing mail attachments (encrypted and unencrypted) are stored unserved in anonymity mode") {
+            val h = MailAnonHarness()
+            try {
+                val recipient = hexOf(DualKeyIdentity.generate().secp256k1KeyPair.publicKey)
+                val plain = "plain attachment".toByteArray()
+                val secret = "secret attachment".toByteArray()
+                testApplication {
+                    application { installBrowserApi(h.deps) }
+                    val sent =
+                        client.post("/api/mail") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                mailJson.encodeToString(
+                                    NewMailRequest(
+                                        listOf(recipient),
+                                        "s",
+                                        "b",
+                                        attachments =
+                                            listOf(
+                                                NewMailAttachmentRequest(
+                                                    "p.txt",
+                                                    "text/plain",
+                                                    Base64.getEncoder().encodeToString(plain),
+                                                ),
+                                                NewMailAttachmentRequest(
+                                                    "s.txt",
+                                                    "text/plain",
+                                                    Base64.getEncoder().encodeToString(secret),
+                                                    encrypt = true,
+                                                ),
+                                            ),
+                                    ),
+                                ),
+                            )
+                        }
+                    sent.status shouldBe HttpStatusCode.OK
+                    val refs =
+                        h.sentFolder
+                            .latest()
+                            .single()
+                            .body.attachments
+                    refs.size shouldBe 2
+                    for (ref in refs) {
+                        h.storage.isServed(ref.cid) shouldBe false
+                        // still readable locally (the onion attachment server loads via getLocal)
+                        val response = client.get("/api/mail/attachment/${ref.cid}")
+                        response.status shouldBe HttpStatusCode.OK
+                    }
+                    refs.single { it.encryptionKey == null }.let {
+                        client.get("/api/mail/attachment/${it.cid}").bodyAsText() shouldBe "plain attachment"
+                    }
+                    refs.single { it.encryptionKey != null }.let {
+                        client.get("/api/mail/attachment/${it.cid}").bodyAsText() shouldBe "secret attachment"
+                    }
+                }
+                h.client.calls.get() shouldBe 0
             } finally {
                 h.stop()
             }

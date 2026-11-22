@@ -80,7 +80,7 @@ data class OnionLookupClientConfig(
      */
     val legacyDestroyWindow: Duration = 1500.milliseconds,
     /**
-     * Wave V0.10.0-J3 (Q15, not yet confirmed by the user; deviates from the confirmed Q8 "1 by the client"): requests
+     * Wave V0.10.0-J3 (Q15, confirmed by the user (2026-11-22); deviates from the earlier Q8 "1 by the client"): requests
      * on one TIMELINE circuit, sequential, one outstanding. Never more than the relay allows (4).
      */
     val requestsPerCircuitTimeline: Int = 4,

@@ -88,7 +88,50 @@ const MAIL_ANONYMITY_ERROR_TEXTS = {
   "mail-too-large-anonymous": "This mail is too large for anonymity mode (at most 1 MiB including attachments). Nothing was sent.",
   "attachments-unavailable-anonymous": "An attachment is not available on this node. Nothing was sent.",
 };
+// Wave Q21: downloads in anonymity mode go through fetch(); a refusal shows one of these fixed texts, never the
+// server's text.
+const MAIL_ATTACHMENT_DOWNLOAD_TEXTS = {
+  "attachments-unavailable-anonymous":
+    "This attachment is not available: it is not encrypted, or the sender is offline or no longer has it.",
+  "attachment-too-large-anonymous": "This attachment is too large for anonymity mode (at most 4 MiB).",
+  "attachment-fetch-timeout-anonymous": "Fetching the attachment through circuits took too long. Please try again.",
+  "anonymity-not-ready": "Anonymity mode is not ready yet. Please try again shortly.",
+  "rate-limited": "Too many attachment fetches right now. Please try again shortly.",
+};
+const MAIL_ATTACHMENT_DOWNLOAD_FALLBACK = "The attachment could not be fetched.";
+const MAIL_ATTACHMENT_DOWNLOAD_PENDING = "fetching through circuits…";
 let anonymousMode = false;
+
+function attachmentDownloadText(code) {
+  return Object.prototype.hasOwnProperty.call(MAIL_ATTACHMENT_DOWNLOAD_TEXTS, code)
+    ? MAIL_ATTACHMENT_DOWNLOAD_TEXTS[code]
+    : MAIL_ATTACHMENT_DOWNLOAD_FALLBACK;
+}
+
+/** Wave Q21: fetches an attachment in anonymity mode (it may take a while) and saves it; errors as fixed text. */
+function downloadAttachmentAnonymously(url, fileName, statusEl) {
+  setText(statusEl, MAIL_ATTACHMENT_DOWNLOAD_PENDING);
+  fetch(url)
+    .then((response) => {
+      if (response.ok) {
+        return response.blob().then((blob) => {
+          const href = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = href;
+          anchor.download = fileName;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(href), 60000);
+          setText(statusEl, "");
+        });
+      }
+      const contentType = response.headers.get("content-type") || "";
+      const bodyPromise = contentType.includes("application/json") ? response.json() : Promise.resolve(null);
+      return bodyPromise.then((body) => setText(statusEl, attachmentDownloadText(body && body.error)));
+    })
+    .catch(() => setText(statusEl, MAIL_ATTACHMENT_DOWNLOAD_FALLBACK));
+}
 
 function mailErrorText(error) {
   if (!anonymousMode) return `failed: ${error.message}`;
@@ -188,6 +231,15 @@ function renderAttachmentsInto(container, attachments) {
     // server-generated/CID-validated, not raw user text, so this is defense-in-depth on top of an
     // already-safe value (see this file's header comment, rule 3).
     linkEl.href = attachmentDownloadHref(attachment.cid);
+    if (anonymousMode) {
+      // wave Q21: a click fetches through circuits (from the sender's onion service) and shows a fixed text on failure
+      const statusEl = fragment.querySelector(".mail-attachment-status");
+      const url = linkEl.href;
+      linkEl.addEventListener("click", (event) => {
+        event.preventDefault();
+        downloadAttachmentAnonymously(url, attachment.name, statusEl);
+      });
+    }
     setText(metaEl, `${attachment.mime}, ${attachment.size} bytes`);
     container.appendChild(fragment);
   }

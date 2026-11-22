@@ -21,7 +21,11 @@ enum class MailAnonymousFailure(
     /** The bundle exceeds [AnonymousMailSizing.MAX_CIRCUIT_BUNDLE_BYTES] or [AnonymousMailSizing.MAX_ATTACHMENTS]. */
     MAIL_TOO_LARGE_ANONYMOUS("mail-too-large-anonymous"),
 
-    /** An attachment blob is not held locally; anonymity mode never fetches blobs from the network. */
+    /**
+     * An attachment blob is not held locally. Sending never fetches a blob first (forwarding a reference that is not
+     * local stays refused, decision Q21-I); since wave Q21 the browser's DOWNLOAD route answers this code (404) when the
+     * fetch from the sender's onion service found nothing.
+     */
     ATTACHMENTS_UNAVAILABLE_ANONYMOUS("attachments-unavailable-anonymous"),
 }
 

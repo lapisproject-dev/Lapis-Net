@@ -1,5 +1,6 @@
 package net.lapisphilosophorum.lapisnet.browser
 
+import io.ipfs.cid.Cid
 import io.ktor.http.ContentDisposition
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -12,6 +13,7 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import kotlinx.serialization.Serializable
+import net.lapisphilosophorum.lapisnet.dmonion.attachment.AnonymousAttachmentLimits
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1KeyPair
 import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.mail.AnonymousMailSizing
@@ -370,7 +372,7 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
             decodedAttachments.map { (attachment, rawBytes) ->
                 if (attachment.encrypt) {
                     val encrypted = MailAttachmentCipher.encrypt(rawBytes)
-                    val cid = deps.storage.put(EncryptedAttachmentBlobCodec.encode(encrypted.blob))
+                    val cid = storeOutgoingAttachment(deps, EncryptedAttachmentBlobCodec.encode(encrypted.blob))
                     AttachmentRef(
                         cid,
                         attachment.name,
@@ -379,7 +381,12 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
                         encryptionKey = encrypted.key,
                     )
                 } else {
-                    AttachmentRef(deps.storage.put(rawBytes), attachment.name, attachment.mime, rawBytes.size.toLong())
+                    AttachmentRef(
+                        storeOutgoingAttachment(deps, rawBytes),
+                        attachment.name,
+                        attachment.mime,
+                        rawBytes.size.toLong(),
+                    )
                 }
             }
 
@@ -449,6 +456,11 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
     // established "personal-node scale" tolerance (see e.g. InboxIndex's own "provisional, should
     // be revisited against real usage" doc comment); the same caveat applies here.
     get("/api/mail/attachment/{cid}") {
+        // Security fix (Q21): this GET can make a network action (a fetch from the sender's onion service at a moment
+        // the requester chooses). A cross-site subresource (<img src=...>) must not trigger it, or a web page could
+        // link its visitor to the anonymous identity. The UI uses a same-origin fetch, a user navigation sends
+        // Sec-Fetch-Site: none; both pass. Checked before any lookup, so a refused request touches nothing.
+        if (!call.requireLoopbackRequest()) return@get
         val target = parseCidOrNull(call.parameters["cid"] ?: "")
         if (target == null) {
             call.respond(HttpStatusCode.BadRequest, ErrorResponse("cid is not a valid CID"))
@@ -456,6 +468,7 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
         }
 
         val known = deps.mailInbox.messages() + deps.sentFolder.latest().map { it.toInboxMessage() }
+        var foundSender: Secp256k1PublicKey? = null
         val found =
             known.firstNotNullOfOrNull { msg ->
                 val body =
@@ -466,7 +479,7 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
                                 HybridEcies.open(msg.envelope, payload.sealedBody, deps.identity.secp256k1KeyPair)
                             }.getOrNull()
                     }
-                body?.attachments?.find { it.cid == target }
+                body?.attachments?.find { it.cid == target }?.also { foundSender = msg.envelope.sender }
             }
         if (found == null) {
             call.respond(HttpStatusCode.NotFound, ErrorResponse("attachment not found"))
@@ -479,19 +492,20 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
         // NabuStorage.get's doc comment for the underlying provider-discovery gap.
         // Anonymity mode: the local blockstore only. storage.get would fall back to provider lookup and Bitswap on a
         // miss, i.e. dial other peers; attachments arrive in-band with the mail or not at all.
+        // Wave Q21: a blob that is not local is fetched from the sender's onion service (only an encrypted attachment:
+        // its key makes the fetch token; an unencrypted one is refused without any network use).
         val blobBytes =
             if (deps.anonymityActive) {
-                runCatching { deps.storage.getLocal(found.cid) }.getOrNull()
+                val outcome = anonymousMailBlob(deps, found, foundSender)
+                val refusal = outcome.refusal()
+                if (refusal != null) {
+                    call.respond(refusal.first, ErrorResponse(refusal.second))
+                    return@get
+                }
+                (outcome as AnonymousAttachmentFetcher.Outcome.Bytes).bytes
             } else {
                 runCatching { deps.storage.get(found.cid) }.getOrNull()
             }
-        if (blobBytes == null && deps.anonymityActive) {
-            call.respond(
-                HttpStatusCode.NotFound,
-                ErrorResponse(MailAnonymousFailure.ATTACHMENTS_UNAVAILABLE_ANONYMOUS.wire),
-            )
-            return@get
-        }
         if (blobBytes == null) {
             call.respond(
                 HttpStatusCode.NotFound,
@@ -531,4 +545,39 @@ internal fun Route.installMailRoutes(deps: BrowserApiDependencies) {
             }.getOrDefault(ContentType.Application.OctetStream)
         call.respondBytes(plaintext, contentType)
     }
+}
+
+/**
+ * Wave Q21 invariant: a blob written while anonymity mode is active goes to the store that is never served over Bitswap
+ * or announced to the DHT, also not after a later restart in normal mode (otherwise a recipient who knows the CID could
+ * link this node's PeerId/IP to the anonymous sending). Same rule as the DM send path. The onion attachment server
+ * loads via getLocal (both stores), so recipients can still fetch it.
+ */
+private fun storeOutgoingAttachment(
+    deps: BrowserApiDependencies,
+    bytes: ByteArray,
+): Cid = if (deps.anonymityActive) deps.storage.putUnserved(bytes) else deps.storage.put(bytes)
+
+/**
+ * Wave Q21: the blob of a mail attachment in anonymity mode - local, else (only with a key, only from another sender)
+ * fetched from the sender's onion service. The declared size of a mail attachment is unverified, so the accepted blob
+ * size stays capped at [AnonymousAttachmentLimits.MAX_BLOB_BYTES].
+ */
+private suspend fun anonymousMailBlob(
+    deps: BrowserApiDependencies,
+    found: AttachmentRef,
+    sender: Secp256k1PublicKey?,
+): AnonymousAttachmentFetcher.Outcome {
+    val local = runCatching { deps.storage.getLocal(found.cid) }.getOrNull()
+    if (local != null) return AnonymousAttachmentFetcher.Outcome.Bytes(local)
+    val key = found.encryptionKey ?: return AnonymousAttachmentFetcher.Outcome.Unavailable
+    if (sender == null || sender == deps.identity.secp256k1KeyPair.publicKey) {
+        return AnonymousAttachmentFetcher.Outcome.Unavailable
+    }
+    val fetcher = deps.anonymousAttachments ?: return AnonymousAttachmentFetcher.Outcome.NotReady
+    val maxBytes =
+        (found.size + EncryptedAttachmentBlobCodec.OVERHEAD_BYTES)
+            .coerceIn(1L, AnonymousAttachmentLimits.MAX_BLOB_BYTES.toLong())
+            .toInt()
+    return fetcher.fetch(sender, found.cid, key, maxBytes)
 }

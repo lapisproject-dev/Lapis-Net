@@ -291,4 +291,48 @@ class DmAttachmentFetcherTest :
                 fetcher.stop()
             }
         }
+
+        // Wave Q21: the pure decrypt-and-verify half, used by the anonymity-mode download (bytes from the sender's onion
+        // service). Same failure cases as fetchAndDecrypt, no storage involved.
+        fun ref(
+            cid: Cid,
+            size: Long,
+            key: ByteArray,
+        ) = DmAttachmentRef(cid, "file.bin", "application/octet-stream", size, key)
+
+        val anyCid = Cid.buildCidV1(Cid.Codec.Raw, Multihash.Type.sha2_256, ByteArray(32) { 3 })
+
+        test("decryptVerified: a genuine blob decrypts to the exact plaintext") {
+            val plaintext = "anonymous attachment".toByteArray()
+            val encrypted = DmAttachmentCipher.encrypt(plaintext)
+            val blob = EncryptedDmAttachmentBlobCodec.encode(encrypted.blob)
+            blob.size shouldBe plaintext.size + EncryptedDmAttachmentBlobCodec.OVERHEAD_BYTES
+            DmAttachmentFetcher.decryptVerified(ref(anyCid, plaintext.size.toLong(), encrypted.key), blob) shouldBe
+                plaintext
+        }
+
+        test("decryptVerified: a lying size, a wrong key, a broken blob and an oversized blob are all null") {
+            val plaintext = "sixteen bytes!!!".toByteArray()
+            val encrypted = DmAttachmentCipher.encrypt(plaintext)
+            val blob = EncryptedDmAttachmentBlobCodec.encode(encrypted.blob)
+            DmAttachmentFetcher.decryptVerified(ref(anyCid, 1L, encrypted.key), blob).shouldBeNull()
+            val otherKey = DmAttachmentCipher.encrypt("x".toByteArray()).key
+            DmAttachmentFetcher.decryptVerified(ref(anyCid, plaintext.size.toLong(), otherKey), blob).shouldBeNull()
+            val flipped = blob.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
+            DmAttachmentFetcher
+                .decryptVerified(
+                    ref(anyCid, plaintext.size.toLong(), encrypted.key),
+                    flipped,
+                ).shouldBeNull()
+            DmAttachmentFetcher
+                .decryptVerified(ref(anyCid, 1L, encrypted.key), "not a blob".toByteArray())
+                .shouldBeNull()
+            DmAttachmentFetcher
+                .decryptVerified(
+                    ref(anyCid, 1L, encrypted.key),
+                    ByteArray(
+                        EncryptedDmAttachmentBlobCodec.MAX_BLOB_BYTES + 1,
+                    ),
+                ).shouldBeNull()
+        }
     })

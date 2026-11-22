@@ -48,6 +48,9 @@ object EncryptedAttachmentBlobCodec {
     const val MAX_CIPHERTEXT_BYTES: Int = (MessageBodyCodec.MAX_ATTACHMENT_SIZE_BYTES + GCM_TAG_SIZE).toInt()
     const val MAX_PLAINTEXT_BYTES: Int = MAX_CIPHERTEXT_BYTES - GCM_TAG_SIZE
 
+    /** Wave Q21: bytes an encoded blob adds to its plaintext (header plus GCM tag), so `blob = plaintext + OVERHEAD_BYTES`. */
+    const val OVERHEAD_BYTES: Int = HEADER_SIZE + GCM_TAG_SIZE
+
     fun encode(blob: EncryptedAttachmentBlob): ByteArray {
         val out = ByteArrayOutputStream()
         DataOutputStream(out).apply {

@@ -10,12 +10,23 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private val logger = KotlinLogging.logger {}
 
-/** The applications that share the one onion service of a node (wave V0.10.0-F1). MAIL joined in wave V0.10.0-F2; CALL is reserved for a later wave. */
+/**
+ * The applications that share the one onion service of a node (wave V0.10.0-F1). MAIL joined in wave V0.10.0-F2;
+ * ATTACHMENT in wave Q21. CALL is reserved for a later wave.
+ */
 enum class OnionServiceApp(
     val id: Byte,
 ) {
     DM(1),
     MAIL(2),
+
+    /**
+     * Wave Q21 (unreleased, design not confirmed by the user): a recipient in anonymity mode fetches the encrypted blob
+     * of an attachment that this node sent from this node's onion service. One request per stream; the answer is padded
+     * to lookup size classes. The HELLO version stays 1: an older node does not know the id and closes the stream after
+     * its HELLO timeout, which the fetching side treats as "not reachable".
+     */
+    ATTACHMENT(3),
     ;
 
     companion object {

@@ -39,8 +39,8 @@ internal interface LookupBackend {
  * lookup through a circuit ([OnionLookupClient]).
  *
  * - The blocking calls ([fetchBlock], [resolveIpnsRecord]) wait for the answer and must never run on an event loop. A
- *   blocking [fetchBlock] is a [LookupContext.MAILBOX] lookup (a circuit of its own; no production caller exists in
- *   wave J3), an IPNS record always an [LookupContext.IPNS] one.
+ *   blocking [fetchBlock] is a [LookupContext.MAILBOX] lookup (a circuit of its own; production caller since wave Q21: the
+ *   last-resort attachment fallback of the browser), an IPNS record always an [LookupContext.IPNS] one.
  * - [blockState] never blocks: it answers from a small LRU cache of verified blocks (entries and bytes bounded), from
  *   the set of running background lookups and from a bounded memo of recent outcomes (a confirmed NOT_FOUND for
  *   [notFoundMemo], an unconfirmed one or a failed lookup for [unavailableMemo]; a lookup that reached no relay, was

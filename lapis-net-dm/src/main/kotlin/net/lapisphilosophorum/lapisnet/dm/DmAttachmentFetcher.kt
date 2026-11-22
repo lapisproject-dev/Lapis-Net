@@ -53,32 +53,39 @@ object DmAttachmentFetcher {
         storage: NabuStorage,
     ): ByteArray? {
         val blobBytes = fetch(ref.cid, sender, peerDirectory, storage) ?: return null
+        return decryptVerified(ref, blobBytes)
+    }
+
+    /**
+     * Wave Q21: the pure second half of [fetchAndDecrypt] - the [EncryptedDmAttachmentBlobCodec.MAX_BLOB_BYTES] check,
+     * decode, decrypt under [DmAttachmentRef.encryptionKey] and the comparison with [DmAttachmentRef.size] - for bytes
+     * that arrived some other way (anonymity mode: the sender's onion service). `null` for every failure, never throws.
+     * Nothing it logs names the CID, the sender or the key: the anonymity-mode caller must not leave them in a log.
+     */
+    fun decryptVerified(
+        ref: DmAttachmentRef,
+        blobBytes: ByteArray,
+    ): ByteArray? {
         if (blobBytes.size > EncryptedDmAttachmentBlobCodec.MAX_BLOB_BYTES) {
-            logger.debug {
-                "DM attachment blob for ${ref.cid} (${blobBytes.size} bytes) exceeds " +
-                    "${EncryptedDmAttachmentBlobCodec.MAX_BLOB_BYTES}-byte MAX_BLOB_BYTES - rejecting"
-            }
+            logger.debug { "DM attachment blob exceeds MAX_BLOB_BYTES - rejecting" }
             return null
         }
         val blob =
             try {
                 EncryptedDmAttachmentBlobCodec.decode(blobBytes)
             } catch (e: MalformedEncryptedDmAttachmentBlobException) {
-                logger.debug(e) { "DM attachment blob for ${ref.cid} failed to decode - rejecting" }
+                logger.debug { "DM attachment blob failed to decode - rejecting" }
                 return null
             }
         val plaintext =
             try {
                 DmAttachmentCipher.decrypt(blob, ref.encryptionKey)
             } catch (e: DmAttachmentDecryptionException) {
-                logger.debug(e) { "DM attachment blob for ${ref.cid} failed to decrypt - rejecting" }
+                logger.debug { "DM attachment blob failed to decrypt - rejecting" }
                 return null
             }
         if (plaintext.size.toLong() != ref.size) {
-            logger.debug {
-                "DM attachment ${ref.cid} declared size ${ref.size} but decrypted plaintext was " +
-                    "${plaintext.size} bytes - rejecting as a lying/corrupted ref"
-            }
+            logger.debug { "DM attachment plaintext length differs from the declared size - rejecting" }
             return null
         }
         return plaintext

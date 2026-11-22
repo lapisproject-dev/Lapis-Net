@@ -236,6 +236,8 @@ class BrowserApiDependencies(
      * the node's dialable address, so those two routes answer 409 (leak #17). Default `false` = unchanged behaviour.
      */
     val anonymityActive: Boolean = false,
+    /** Wave Q21: the anonymity-mode download of mail attachments that are not local; `null` outside anonymity mode. */
+    val anonymousAttachments: AnonymousAttachmentFetcher? = null,
 )
 
 /** 409 body of the wave V0.10.0-J1a refusals: a human text plus a stable machine code. */

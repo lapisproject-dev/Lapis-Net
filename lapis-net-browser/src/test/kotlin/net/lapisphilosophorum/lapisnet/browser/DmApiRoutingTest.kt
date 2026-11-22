@@ -539,6 +539,48 @@ class DmApiRoutingTest :
             }
         }
 
+        // Wave Q21: the normal mode is unchanged - the anonymity-mode attachment limit (about 4 MiB) does not apply
+        // here, the 16 MiB route limit still does, and the download still goes through the local blockstore /
+        // DmAttachmentFetcher.fetchAndDecrypt (see the decrypt test above).
+        test(
+            "Q21: normal mode keeps the 16 MiB limit; an attachment above the anonymity limit is not refused as too large",
+        ) {
+            val harness = DmTestHarness()
+            val peer = DualKeyIdentity.generate().secp256k1KeyPair.publicKey
+            try {
+                testApplication {
+                    application { installBrowserApi(harness.deps) }
+                    val content =
+                        java.util.Base64.getEncoder().encodeToString(
+                            ByteArray(
+                                MAX_ANONYMOUS_DM_ATTACHMENT_BYTES + 1,
+                            ),
+                        )
+                    val response =
+                        client.post("/api/dm/${hexOf(peer)}") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                json.encodeToString(
+                                    NewDmRequest(
+                                        body = "hi",
+                                        attachments =
+                                            listOf(
+                                                NewDmAttachmentRequest("a.bin", "application/octet-stream", content),
+                                            ),
+                                    ),
+                                ),
+                            )
+                        }
+                    // the unknown recipient makes the send fail exactly like without an attachment
+                    response.status shouldBe HttpStatusCode.BadGateway
+                    response.bodyAsText() shouldBe """{"error":"dm-send-failed"}"""
+                }
+                harness.deps.dm!!.anonymousAttachments shouldBe null
+            } finally {
+                harness.stop()
+            }
+        }
+
         test("a BrowserApiDependencies with dm = null installs no /api/dm routes") {
             val identity = DualKeyIdentity.generate()
             val node = LapisNode.create(identity)

@@ -39,6 +39,9 @@ import net.lapisphilosophorum.lapisnet.dmonion.AnonymousMailboxRedelivery
 import net.lapisphilosophorum.lapisnet.dmonion.AnonymousMailboxSubscriber
 import net.lapisphilosophorum.lapisnet.dmonion.OnionDmInboundHandler
 import net.lapisphilosophorum.lapisnet.dmonion.OnionDmTransport
+import net.lapisphilosophorum.lapisnet.dmonion.attachment.OnionAttachmentClient
+import net.lapisphilosophorum.lapisnet.dmonion.attachment.OnionAttachmentRuntimePortImpl
+import net.lapisphilosophorum.lapisnet.dmonion.attachment.OnionAttachmentServer
 import net.lapisphilosophorum.lapisnet.identity.DualKeyIdentity
 import net.lapisphilosophorum.lapisnet.identity.Ed25519KeyPair
 import net.lapisphilosophorum.lapisnet.identity.PassphraseProvider
@@ -239,7 +242,17 @@ class BrowserServer private constructor(
     /** Wave Q20 - `null` in anonymity mode or with `provide-post-bodies=false`. Closed by the supervisor. */
     private val postBodyProvider: BlockProvideScheduler? = null,
     private val postBodyProviderJob: NodeServiceSupervisor.PeriodicJob? = null,
+    /** Wave Q21 - `null` unless `anonymity=on`: the download of attachments over circuits. */
+    private val anonymousAttachments: AnonymousAttachmentFetcher? = null,
+    /** Wave Q21 - `null` unless `anonymity=on`: this node's ATTACHMENT service. Closed by the supervisor. */
+    private val attachmentServer: OnionAttachmentServer? = null,
 ) {
+    /** Test seam (wave Q21): `null` outside anonymity mode. */
+    internal val anonymousAttachmentsForTesting: AnonymousAttachmentFetcher? get() = anonymousAttachments
+
+    /** Test seam (wave Q21): `null` outside anonymity mode. */
+    internal val attachmentServerForTesting: OnionAttachmentServer? get() = attachmentServer
+
     /** `null` iff post bodies are not announced (anonymity mode or `provide-post-bodies=false`). */
     internal val postBodyProviderForTesting: BlockProvideScheduler? get() = postBodyProvider
 
@@ -985,6 +998,8 @@ class BrowserServer private constructor(
 
                 // Anonymity mode: path selection with persistent guards and the circuit-based directory publication.
                 var anonymityRuntime: AnonymityRuntime? = null
+                var anonymousAttachments: AnonymousAttachmentFetcher? = null
+                var attachmentServer: OnionAttachmentServer? = null
                 if (anonymous) {
                     val ranker = checkNotNull(relayRanker)
                     val started =
@@ -1085,6 +1100,30 @@ class BrowserServer private constructor(
                     }
                     cleanupOnFailure += stopMail
                     supervisor.register("anonymity-mail") { stopMail() }
+                    // Attachments over circuits (wave Q21, unreleased): this node hands out ONLY attachments it sent
+                    // itself, over its onion service; a recipient fetches over a rendezvous stream, never directly.
+                    // Registered after mail, so the supervisor stops it first.
+                    val server =
+                        OnionAttachmentServer(
+                            BrowserOutboundAttachmentSource(dmStore, sentFolder, { cid ->
+                                runCatching { storage.getLocal(cid) }.getOrNull()
+                            }),
+                        )
+                    attachmentServer = server
+                    started.serviceRouter().register(OnionServiceApp.ATTACHMENT, server::handle)
+                    val attachmentClient = OnionAttachmentClient(OnionAttachmentRuntimePortImpl(started))
+                    anonymousAttachments =
+                        AnonymousAttachmentFetcher(
+                            NabuAttachmentBlobStore(storage),
+                            { attachmentClient.takeIf { started.ready() } },
+                        )
+                    val stopAttachments = {
+                        runCatching { attachmentClient.close() }
+                        runCatching { server.close() }
+                        Unit
+                    }
+                    cleanupOnFailure += stopAttachments
+                    supervisor.register("anonymity-attachments") { stopAttachments() }
                     logger.warn { anonymityWarning }
                 }
 
@@ -1196,11 +1235,19 @@ class BrowserServer private constructor(
                         mailInbox,
                         mailSender,
                         sentFolder,
-                        dm = DmApiDependencies(peerDirectory, dmSessionManager, dmStore, dmAcceptedContacts),
+                        dm =
+                            DmApiDependencies(
+                                peerDirectory,
+                                dmSessionManager,
+                                dmStore,
+                                dmAcceptedContacts,
+                                anonymousAttachments = anonymousAttachments,
+                            ),
                         call = callDeps,
                         nodeStatus = nodeStatus,
                         acceptedContacts = dmAcceptedContacts,
                         anonymityActive = anonymous,
+                        anonymousAttachments = anonymousAttachments,
                     )
                 val httpEngine =
                     embeddedServer(Netty, port = httpPort, host = httpHost) {
@@ -1264,6 +1311,8 @@ class BrowserServer private constructor(
                     boundPort,
                     postBodyProvider = postBodyProvider,
                     postBodyProviderJob = postBodyProviderJob,
+                    anonymousAttachments = anonymousAttachments,
+                    attachmentServer = attachmentServer,
                 )
             } catch (e: Exception) {
                 cleanupOnFailure.asReversed().forEach { action -> runCatching(action) }
