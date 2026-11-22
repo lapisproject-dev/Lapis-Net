@@ -94,7 +94,7 @@ class NodeWiringOptionsAnonymityTest :
 
         test("the help text names the option as experimental and says what it does not do") {
             NodeWiringOptions.HELP_TEXT shouldContain "--anonymity=on|off"
-            NodeWiringOptions.HELP_TEXT shouldContain "(experimental, default off)"
+            NodeWiringOptions.HELP_TEXT shouldContain "(experimental, incomplete, default off, no external review)"
             NodeWiringOptions.HELP_TEXT shouldContain "call media is direct"
             NodeWiringOptions.HELP_TEXT shouldContain "--anonymity-allow-call-media=true|false"
         }
