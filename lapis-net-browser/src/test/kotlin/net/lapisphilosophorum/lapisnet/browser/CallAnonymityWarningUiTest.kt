@@ -102,8 +102,8 @@ class CallAnonymityWarningUiTest :
                 setMedia(page, "disabled")
                 page.getElementById("call-anonymity").isDisplayed shouldBe true
                 page.getElementById("call-anonymity-title").textContent shouldBe "Anonymitätsmodus: Anrufe sind aus"
-                page.getElementById("call-place-peer").getAttribute("disabled").isNotEmpty() shouldBe true
-                page.getElementById("call-place-submit").getAttribute("disabled").isNotEmpty() shouldBe true
+                page.getElementById("call-place-peer").hasAttribute("disabled") shouldBe true
+                page.getElementById("call-place-submit").hasAttribute("disabled") shouldBe true
                 submitPlace(page, peerHex)
                 Thread.sleep(400)
                 remote.totalMutatingCalls shouldBe 0

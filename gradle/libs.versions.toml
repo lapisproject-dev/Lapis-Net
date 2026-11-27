@@ -1,12 +1,12 @@
 [versions]
-kotlin = "2.4.20"
+kotlin = "2.4.21"
 ktlint-gradle = "14.2.0"
-slf4j = "2.0.19"
-kotlin-logging = "8.0.4"
-kotest = "6.2.4"
-logback = "1.5.38"
+slf4j = "2.0.20"
+kotlin-logging = "8.0.7"
+kotest = "6.2.7"
+logback = "1.6.8"
 secp256k1-kmp = "0.24.0"
-bouncycastle = "1.85.2"
+bouncycastle = "1.87"
 # jvm-libp2p and nabu: NOT bumped in the 2026-09-08 dependency-maintenance wave. A newer
 # jvm-libp2p release (1.3.6-RELEASE) exists on Cloudsmith, and nabu v0.8.1 is a real GitHub tag
 # (pure patch bump from v0.8.0), but nabu is consumed via JitPack (com.github.peergos:nabu) and
@@ -29,6 +29,11 @@ bouncycastle = "1.85.2"
 # both are now fixed inside lapis-net-storage against v0.8.0. See docs/architecture.adoc,
 # "Cross-node DHT provider discovery". No dependency coordinate changed in that repair, so the
 # fork-exclusion/bytecode-compatibility verification recorded below still stands unmodified.
+# Re-checked in the 2026-11-27 dependency wave: jvm-libp2p 1.4.0-RELEASE (and 1.3.6 to 1.3.8) exist
+# on Cloudsmith, and nabu v0.8.1 is still unbuildable on JitPack. Trying 1.4.0 failed to compile:
+# GossipParamsBuilder no longer has maxSubscriptions (GossipPubSub.kt:356), which is a real API
+# migration, and nabu v0.8.0 is compiled against 1.3.5. Both stay on the known-good pair until a
+# separate wave migrates the gossip configuration and verifies the nabu fork pairing.
 jvm-libp2p = "1.3.5-RELEASE"
 # Netty's protobuf codec. jvm-libp2p already pulls this in, but only at *runtime* scope, so the
 # classes are present when the process runs and absent when this project compiles. That is fine for
@@ -40,10 +45,10 @@ jvm-libp2p = "1.3.5-RELEASE"
 netty = "4.2.10.Final"
 nabu = "v0.8.0"
 java-cid = "v1.3.10"
-ktor = "3.5.2"
-kotlinx-serialization-json = "1.11.0"
-electrum-client = "0.3.0"
-bitcoin-kmp = "0.31.0"
+ktor = "3.6.2"
+kotlinx-serialization-json = "1.13.0"
+electrum-client = "1.0.0"
+bitcoin-kmp = "0.33.0"
 zxing = "3.5.4"
 # Plan's originally-specified 1.13.0 does not exist on Maven Central (verified: the highest
 # published fr.acinq.lightning:lightning-kmp-jvm version is 1.8.4) - using the real latest
@@ -55,7 +60,7 @@ lightning-kmp = "1.8.4"
 # actually escapes an injected <script>/onerror payload, not just describe the intent. Bumped
 # 5.3.0 -> 5.5.0 during the 2026-09-08 dependency-maintenance wave; verified current on Maven
 # Central via maven-metadata.xml at that time - re-verify at a later implementation time, versions drift.
-htmlunit = "5.5.0"
+htmlunit = "5.9.0"
 # V0.8.7 - libwebrtc JNI bindings (Apache-2.0; gebundeltes libwebrtc BSD-3), used exclusively by
 # lapis-net-call/WebRtcCallMediaEngine.kt. Bytecode target Java 8, verified runnable on JDK 25
 # (Temurin 25.0.4) via an executable probe on 2026-09-02 - two RTCPeerConnections in one JVM process,
@@ -63,7 +68,7 @@ htmlunit = "5.5.0"
 # ~25 MB each - only the host platform's classifier is resolved, see
 # lapis-net-call/build.gradle.kts's own webrtcNativeClassifier() function. Verified current on Maven
 # Central as of this wave (2026-09-02) via maven-metadata.xml - versions drift, re-verify later.
-webrtc-java = "0.16.0"
+webrtc-java = "1.0.2"
 
 [libraries]
 jvm-libp2p = { group = "io.libp2p", name = "jvm-libp2p", version.ref = "jvm-libp2p" }

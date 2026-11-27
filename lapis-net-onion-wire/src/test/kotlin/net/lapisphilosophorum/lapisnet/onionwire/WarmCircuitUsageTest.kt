@@ -91,11 +91,20 @@ class WarmCircuitUsageTest :
                     .filter { it != lastIdx }
                     .take(2)
                     .map { descriptors[it] } + descriptors[lastIdx]
+            // Building the warm circuit is only the fixture of these tests. Under the load of a full parallel
+            // build an extend can be torn down with INTERNAL (seen twice in full `check` runs, never in
+            // isolation), so a failed build is retried; the behaviour under test starts after it.
+            var attempt = 0
             val circuit =
-                sender.wire
-                    .circuitFactory()
-                    .build(path, 20.seconds)
-                    .get(60, TimeUnit.SECONDS)
+                generateSequence {
+                    attempt++
+                    runCatching {
+                        sender.wire
+                            .circuitFactory()
+                            .build(path, 20.seconds)
+                            .get(60, TimeUnit.SECONDS)
+                    }.also { if (it.isFailure && attempt >= 3) throw it.exceptionOrNull()!! }
+                }.first { it.isSuccess }.getOrThrow()
             return WarmCircuitPool.Prebuilt(circuit, descriptors[lastIdx], System.currentTimeMillis())
         }
 
