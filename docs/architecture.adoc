@@ -831,7 +831,7 @@ locally for tests:
   (`maxPublishedMessages` etc.) at jvm-libp2p's actual default of "no limit" (confirmed by
   decompiling the real jar) — one peer could pack thousands of distinct grants into a single RPC
   frame, forcing unbounded decode+verify work per frame. Fixed by explicitly bounding
-  `maxPublishedMessages`/`maxSubscriptions` via `GossipParamsBuilder`.
+  `maxPublishedMessages`/`maxSubscriptionsPerRpc` via `GossipParamsBuilder`.
 * *Major:* `VeritasGrantIndex` had no eviction once full — a cheap attacker filling the shared cap
   could permanently prevent a node from ever tracking new legitimate grants, including a legitimate
   revocation of a compromised or malicious truster (per the domain model, revocation is just a new

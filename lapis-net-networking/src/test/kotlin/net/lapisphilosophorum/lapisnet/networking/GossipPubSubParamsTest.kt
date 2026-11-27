@@ -23,10 +23,10 @@ class GossipPubSubParamsTest :
             params.maxPublishedMessages shouldBe 48
         }
 
-        test("buildGossipParams sets an explicit, non-null maxSubscriptions bound") {
+        test("buildGossipParams sets an explicit, non-null maxSubscriptionsPerRpc bound") {
             val params = GossipPubSub.buildGossipParams()
 
-            params.maxSubscriptions shouldBe 64
+            params.maxSubscriptionsPerRpc shouldBe 64
         }
 
         test("buildGossipParams keeps the existing maxGossipMessageSize bound") {

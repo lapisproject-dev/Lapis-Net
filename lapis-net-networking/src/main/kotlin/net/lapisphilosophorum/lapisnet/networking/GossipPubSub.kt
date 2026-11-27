@@ -60,7 +60,7 @@ private const val MAX_PUBLISHED_MESSAGES_PER_RPC = 48
 
 /**
  * Cap on how many `SUBSCRIBE`/`UNSUBSCRIBE` entries a single incoming RPC frame may carry
- * (`GossipParams.maxSubscriptions`) - same "real default is `null`, i.e. unbounded" finding as
+ * (`GossipParams.maxSubscriptionsPerRpc`) - same "real default is `null`, i.e. unbounded" finding as
  * [MAX_PUBLISHED_MESSAGES_PER_RPC], for a different RPC-shape dimension. This project's own topic
  * surface is small and fixed at any given time (a handful of well-known topic strings, e.g.
  * [net.lapisphilosophorum.lapisnet.trust.VeritasGossip.VERITAS_GRANT_GOSSIP_TOPIC]), so a
@@ -353,7 +353,7 @@ class GossipPubSub private constructor(
                 GossipParamsBuilder()
                     .maxGossipMessageSize(MAX_GOSSIP_MESSAGE_SIZE)
                     .maxPublishedMessages(MAX_PUBLISHED_MESSAGES_PER_RPC)
-                    .maxSubscriptions(MAX_SUBSCRIPTIONS_PER_RPC)
+                    .maxSubscriptionsPerRpc(MAX_SUBSCRIPTIONS_PER_RPC)
             if (anonymous) {
                 // Wave V0.10.0-J1b, peer exchange (PX) is ignored in anonymity mode. jvm-libp2p 1.3.5 has no `doPX`
                 // switch on GossipParamsBuilder (checked with javap): PX peers of a PRUNE are handed to

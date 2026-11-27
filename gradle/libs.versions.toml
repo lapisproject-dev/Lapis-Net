@@ -29,12 +29,10 @@ bouncycastle = "1.87"
 # both are now fixed inside lapis-net-storage against v0.8.0. See docs/architecture.adoc,
 # "Cross-node DHT provider discovery". No dependency coordinate changed in that repair, so the
 # fork-exclusion/bytecode-compatibility verification recorded below still stands unmodified.
-# Re-checked in the 2026-11-27 dependency wave: jvm-libp2p 1.4.0-RELEASE (and 1.3.6 to 1.3.8) exist
-# on Cloudsmith, and nabu v0.8.1 is still unbuildable on JitPack. Trying 1.4.0 failed to compile:
-# GossipParamsBuilder no longer has maxSubscriptions (GossipPubSub.kt:356), which is a real API
-# migration, and nabu v0.8.0 is compiled against 1.3.5. Both stay on the known-good pair until a
-# separate wave migrates the gossip configuration and verifies the nabu fork pairing.
-jvm-libp2p = "1.3.5-RELEASE"
+# 2026-11-27: bumped 1.3.5 -> 1.4.0-RELEASE (the only API change here was GossipParamsBuilder.maxSubscriptions
+# being renamed maxSubscriptionsPerRpc). nabu v0.8.0 (built against 1.3.5) is verified at runtime by the
+# storage/DHT/gossip tests; nabu v0.8.1 still does not build on JitPack. Netty follows the 1.4.0 resolution.
+jvm-libp2p = "1.4.0-RELEASE"
 # Netty's protobuf codec. jvm-libp2p already pulls this in, but only at *runtime* scope, so the
 # classes are present when the process runs and absent when this project compiles. That is fine for
 # jvm-libp2p's own (precompiled) circuit-relay handlers and not fine for
@@ -42,7 +40,7 @@ jvm-libp2p = "1.3.5-RELEASE"
 # stream when a relay control stream becomes a raw byte pipe. Declared explicitly, pinned to the
 # version jvm-libp2p:1.3.5-RELEASE itself resolves (verified via the runtimeClasspath report) so the
 # compile and runtime classpaths cannot drift apart - re-check when jvm-libp2p is next bumped.
-netty = "4.2.10.Final"
+netty = "4.2.18.Final"
 nabu = "v0.8.0"
 java-cid = "v1.3.10"
 ktor = "3.6.2"
