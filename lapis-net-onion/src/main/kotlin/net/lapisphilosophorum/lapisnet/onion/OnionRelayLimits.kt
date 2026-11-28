@@ -38,6 +38,8 @@ data class OnionRelayLimits(
     val lookupRequestsPerCircuit: Int = 4,
     val lookupRequestsPerLinkPerMinute: Int = 60,
     val lookupRequestsGlobalPerMinute: Int = 240,
+    // Batch lookups (wave Q16, LOOKUP version 2). Provisional, not measured in a pilot. Counted per item.
+    val lookupItemsPerCircuit: Int = 16,
 ) {
     init {
         require(maxCircuitsTotal > 0 && maxCircuitsPerLink > 0 && maxPendingExtends >= 0) { "limits must be positive" }
@@ -67,6 +69,7 @@ data class OnionRelayLimits(
         require(
             lookupRequestsPerCircuit > 0 && lookupRequestsPerLinkPerMinute >= 0 && lookupRequestsGlobalPerMinute >= 0,
         ) { "lookup limits must not be negative (and the per-circuit limit must be positive)" }
+        require(lookupItemsPerCircuit > 0) { "the per-circuit lookup item limit must be positive" }
         require(
             maxIntroPointsPerLink <= maxIntroPointsTotal && maxPendingRendezvousPerLink <= maxPendingRendezvousTotal,
         ) {
@@ -111,14 +114,15 @@ internal class WindowCounter(
     private var count = 0
 
     @Synchronized
-    fun tryAcquire(): Boolean {
+    fun tryAcquire(permits: Int = 1): Boolean {
+        require(permits > 0) { "permits must be positive" }
         val now = clock.millis()
         if (now - windowStart >= windowMillis || now < windowStart) {
             windowStart = now
             count = 0
         }
-        if (count >= limit) return false
-        count++
+        if (count + permits > limit) return false
+        count += permits
         return true
     }
 }

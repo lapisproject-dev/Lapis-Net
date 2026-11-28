@@ -88,7 +88,7 @@ These existed before waves D and E; the current leaks are listed in <<leak-inven
 . *Relay position.* A relay learns its hop index from the CREATE; with the default of three hops that equals Tor's exposure of position, stated here deliberately.
 . *Correlation by provoked teardown.* Any party on a path can destroy a circuit and correlate the effect elsewhere (DoS-based correlation). Not prevented.
 
-Wave J continues this list (numbers 9 to 28; the D-row numbers of the table in <<directory-anonymity>> are a different numbering and are cited as "D-row N"). The state after wave J2:
+Wave J continues this list (numbers 9 to 30; the D-row numbers of the table in <<directory-anonymity>> are a different numbering and are cited as "D-row N"). The state after wave J2:
 
 [cols="1,4,3,3"]
 |===
@@ -112,9 +112,10 @@ Wave J continues this list (numbers 9 to 28; the D-row numbers of the table in <
 | 24 | A snapshot request marks the asking peer as a fresh or anonymous node towards the bootstrap peer or guard it asks (new in J1b) | The request carries no parameter (no "since" field) | Bootstrap peers and guards can tell that a node asks; normal nodes do not ask in this version
 | 25 | Topic coverage through the guards (new in J1b, Q11): a confined node receives only the topics its guards subscribe to; a CLI relay subscribes to Madli only with flags and never to Virtus, Karma and post announcements | - | Documented and measured only; the browser timeline and Madli weights of a confined node stay empty unless its guards subscribe
 | 26 | Eclipse by the directory sources (new in J1b), see <<eclipse-analysis>> | Per-source budgets, provenance, gate and preference of the guard choice | Sources that are all hostile control the view; a targeted fake view for middle hops stays open
-| 27 | Cache and timing oracle at the LOOKUP relay (new in J2): the negative cache and the attempt limit per key answer without a lookup, so the answer time tells that another client recently asked the same key | Minimum answer delay of 1.5 s plus up to 1 s jitter for every answer, cache hits included; caches keyed by SHA-256, never by the key | The delay narrows the oracle, it does not close it: a lookup that runs longer than the delay is still slower than a cache hit
-| 28 | Probing of older relays (new in J2): a relay of version 0.12.0 destroys a circuit that carries LOOKUP_REQUEST (AUTH_FAILED); the middle relay of the new version counts that against the older relay's reliability (`recordDestroyedByTarget`) | Client backoff for such a relay from 30 minutes up to 24 hours; a relay with `--onion-relay-lookup=false` answers DISABLED instead of destroying, so it is not penalised | Until every relay has the role, lookups cost older relays some reliability counts at middle relays
+| 27 | Cache and timing oracle at the LOOKUP relay (new in J2): the negative cache and the attempt limit per key answer without a lookup, so the answer time tells that another client recently asked the same key | Minimum answer delay of 1.5 s plus up to 1 s jitter for every answer, cache hits included; caches keyed by SHA-256, never by the key | The delay narrows the oracle, it does not close it: a lookup that runs longer than the delay is still slower than a cache hit *Wave Q16:* in a batch of two or more items the answer waits for the slowest item, so a cache or attempt-limit hit of one item can not be told apart by time from a real lookup of another item in the same batch; a prober still sends single version-1 requests, for whom nothing changes. The oracle is narrowed, not closed.
+| 28 | Probing of older relays (new in J2): a relay of version 0.12.0 destroys a circuit that carries LOOKUP_REQUEST (AUTH_FAILED); the middle relay of the new version counts that against the older relay's reliability (`recordDestroyedByTarget`) | Client backoff for such a relay from 30 minutes up to 24 hours; a relay with `--onion-relay-lookup=false` answers DISABLED instead of destroying, so it is not penalised | Until every relay has the role, lookups cost older relays some reliability counts at middle relays *Wave Q16:* a version-2 request to a relay of 0.13.0 gets a clean `UNSUPPORTED_VERSION` (the relay checks length, flags and the item-count field before the version, and the request is laid out to pass those checks); a relay of 0.12.0 destroys the circuit on it as on any lookup (unchanged).
 | 29 | Holder sets of post bodies (new in Q20): a node in normal mode announces the bodies it holds; the DHT peers closest to a body's CID (about 10 per announcement) learn that this PeerId, with its addresses, holds that post, and over time a set of holders per post builds up. Author-to-post is already public (signed gossip); in normal mode the PeerId is derived from the identity and the addresses are published | – (random first delay of 0 to 2 minutes, random choice of due CIDs, own and received posts on the same path; `--provide-post-bodies=false` switches it off) | Normal mode only; a node in anonymity mode never announces
+| 30 | Version fingerprint and linked batches (new in Q16): a version-2 request tells the exit relay that the client runs Q16 or later (single lookups stay version 1 and show nothing); the keys of one batch, and of the retried items of a cross-check, are linked for that exit as a set | Item budget of 4 keys per timeline circuit (what Q15 allowed); request always 720 bytes, item count not visible on the wire; no dummy items | The exit relay sees up to 4 keys of one unknown client as one set and learns the client version when a group of two or more is sent; the number of answer cells (the sum of the item classes) is visible to an observer of the circuit. Limits are provisional and not measured in a pilot
 |===
 
 == Circuit design
@@ -1483,7 +1484,7 @@ Wave J2 gives a node in anonymity mode a way to content and IPNS values it does 
 [[lookup-consumers]]
 === Lookup consumers and circuit reuse (wave J3)
 
-Wave J3 connects the lookups of J2 to their consumers, raises the throughput for timeline posts by reusing circuits, cross-checks a `NOT_FOUND` at a second relay, shows lookup counters in the status and replaces the start warning. The wire format (LOOKUP version 1), the relay limits, the governor (one open LOOKUP circuit, two builds per minute) and every persisted format are unchanged; there is no batch operation (Q16).
+Wave J3 connects the lookups of J2 to their consumers, raises the throughput for timeline posts by reusing circuits, cross-checks a `NOT_FOUND` at a second relay, shows lookup counters in the status and replaces the start warning. The wire format (LOOKUP version 1), the relay limits, the governor (one open LOOKUP circuit, two builds per minute) and every persisted format are unchanged; there is no batch operation (Q16). _Superseded by wave Q16: LOOKUP version 2 adds a batch operation for timeline block lookups, see <<lookup-batch>>._
 
 *What the code showed before J3 started* (these findings changed the premises of the design draft):
 
@@ -1509,6 +1510,94 @@ Wave J3 connects the lookups of J2 to their consumers, raises the throughput for
 *Start warning* (Q19; the same character for character in `AnonymityStatus.kt`, `app.js` and here, compared by a test). Calls off, padding standard (the default): _Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends. Calls are off because call media would reveal your IP address. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; such lookups find a post only if a node in normal mode announces it in the DHT, which nodes do for the newest posts they hold. Attachments are fetched from the sender's onion service while the sender is online (up to 4 MiB each); inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable._ Calls allowed with `--anonymity-allow-call-media=true`, padding standard: _Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits, padded to size classes with cover cells towards the guard; this does not hide traffic from an observer who sees both ends. Calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; such lookups find a post only if a node in normal mode announces it in the DHT, which nodes do for the newest posts they hold. Attachments are fetched from the sender's onion service while the sender is online (up to 4 MiB each); inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable._ Calls off, `--anonymity-padding=off`: _Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits. Padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection. Calls are off because call media would reveal your IP address. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; such lookups find a post only if a node in normal mode announces it in the DHT, which nodes do for the newest posts they hold. Attachments are fetched from the sender's onion service while the sender is online (up to 4 MiB each); inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable._ Calls allowed, padding off: _Anonymity mode is experimental and incomplete, and it has had no external security review. Direct messages, mail and call signals travel over circuits. Padding is off (--anonymity-padding=off), so message sizes and timing are visible to an observer of your connection. Calls are allowed (--anonymity-allow-call-media=true) and call media connects directly: every call reveals your IP address to the other party and to network observers. The transport key is fresh per run. The node connects only to its two guards, which see your address, when you are online and which topics you receive. At every start, and while it lacks relays or a guard connection, it also connects to its bootstrap peers, which see your address. Missing posts are looked up through circuits: the last relay of a circuit sees what is asked and when, but not by whom, and up to four post lookups on one circuit are linked to each other; such lookups find a post only if a node in normal mode announces it in the DHT, which nodes do for the newest posts they hold. Attachments are fetched from the sender's onion service while the sender is online (up to 4 MiB each); inbox rendezvous records are not reachable in this mode. Posting, votes and trust grants are unavailable._ The text no longer claims that mail or names are fetched through circuits (no such consumer is wired in this mode); Q15 was confirmed as up to four requests per circuit, so the sub-clause about four linked lookups stays. Wave Q21 replaced the sentence _Attachments and inbox rendezvous records are not reachable in this mode._ by the attachment sentence above (decision Q21-F, *confirmed by the user (2026-11-22)*).
 
 [[leak-inventory-j3]]
+[[lookup-batch]]
+=== Batch lookups (wave Q16, LOOKUP version 2)
+
+Wave Q16 lets a client ask one LOOKUP relay for up to 8 keys of one operation in a single request (the client sends up to 4). It exists for the timeline consumers of J3: until then they asked their exit one key at a time on a reused circuit, each round trip costing the relay's minimum answer time of 1.5 s plus jitter, and the lookup slot of the governor (one open LOOKUP circuit, two builds per minute) stayed busy for all of them. A batch costs one such round trip plus the slowest lookup. *The throughput bound does not change with the defaults:* with 4 keys per circuit and two builds per minute the client still reaches at most 8 lookups per minute; the gain is latency and an earlier free lookup slot. More throughput would need a larger key budget per circuit and therefore more linkability for the exit relay (see the decisions below). All limits in this section are *provisional and were not measured in a pilot*; nothing here is a claim of anonymity, and no external review has taken place.
+
+[kuml, lookup-v2-batch-sequence, svg]
+----
+import dev.kuml.core.dsl.sequenceDiagram
+
+sequenceDiagram(name = "LOOKUP version 2 batch with version 1 fallback") {
+    val client = lifeline(name = "Client")
+    val guard = lifeline(name = "Guard")
+    val middle = lifeline(name = "Middle")
+    val exit = lifeline(name = "Exit (LOOKUP relay)")
+
+    message(from = client, to = guard, label = "RELAY LOOKUP_REQUEST v2 (op, up to 4 keys)")
+    message(from = guard, to = middle, label = "forwarded unchanged (720 bytes)")
+    message(from = middle, to = exit, label = "forwarded unchanged (720 bytes)")
+    reply(from = exit, to = client, label = "LOOKUP_RESPONSE v2: item 0, item 1, ... in order, after the slowest item")
+    reply(from = exit, to = client, label = "relay of 0.13.0 instead: UNSUPPORTED_VERSION (v1 framing), circuit stays open")
+    message(from = client, to = guard, label = "fallback: LOOKUP_REQUEST v1 (one key), no penalty")
+}
+----
+
+*Wire format.* The relay commands stay `LOOKUP_REQUEST` and `LOOKUP_RESPONSE`; the first byte is the version.
+
+* Request, always 720 bytes: `version(1) = 2 | requestId(1) | op(1) | flags(1) = 0 | itemCount(2) | items: [keyLength(1) | key] x itemCount | random padding`. One operation per batch. `itemCount` is 1 to 8, a key is 1 to 64 bytes (a CID is 36 bytes, an IPNS routing key about 44), duplicate keys in one batch are refused. A broken batch destroys the circuit, as a broken version-1 request does.
+* Answer: per item the unchanged payload `status(1) | classIndex(1) | length(4) | content | random padding`, padded to the smallest class (2, 8, 32, 128 KiB), in fragments `version(1) = 2 | requestId(1) | itemIndex(1) | fragIndex(2) | fragCount(2) | data(713)`. The fragment counts per class stay 3, 12, 46 and 184, so there are no new size classes and the largest content stays 131,066 bytes. Items come strictly in request order, the fragments of one item contiguously. A status other than `FOUND` is always class 0.
+* The `itemCount` field sits where version 1 carries its key length (bytes 4 and 5) and byte 3 is zero on purpose: a relay of 0.13.0 checks the length, `flags` and a key length of 1 to 256 *before* it looks at the version, so it answers a version-2 request with `UNSUPPORTED_VERSION` (three fragments, version-1 framing) and keeps the circuit instead of destroying it. A unit test runs the unchanged version-1 decoder over batches. A relay of 0.12.0 destroys the circuit as before (leak row 28).
+* A refusal of the whole batch by the relay (rate limit, lookup role off, unknown operation) is answered per item, in class 0, in version-2 framing, so it costs as many cells as the same number of misses.
+
+*Compatibility.* There is no version negotiation round trip and no descriptor flag: a client sends version 2 only when two or more timeline block lookups are waiting, and only to an exit it does not know to be version-1 only. If the exit answers `UNSUPPORTED_VERSION` (or, as an older relay does before it looks at the version, `RATE_LIMITED`) in the version-1 framing as the first answer, the client accepts exactly these two and no other version-1 answer to a version-2 request; it remembers the exit as version-1 only for 6 hours (memory only, 1024 entries, never persisted) and sends the group on as version-1 requests over the same circuit, without any penalty for the relay. Every other deviation is a manipulation.
+
+[cols="2,2,2,2"]
+|===
+| | Relay 0.12.0 | Relay 0.13.0 | Relay with Q16
+
+| Client 0.13.0 (version 1 only)
+| `LOOKUP` destroys the circuit (legacy, unchanged)
+| works
+| works (version 1 unchanged, byte for byte)
+
+| Client with Q16, single lookup
+| as above
+| works (version 1)
+| works (version 1)
+
+| Client with Q16, group of two or more
+| circuit destroyed, relay backed off as legacy (30 min to 24 h)
+| `UNSUPPORTED_VERSION`, fallback to version 1, no penalty
+| one version-2 request
+|===
+
+*Relay side.* `OnionRelay` counts the batch as one request against `lookupRequestsPerCircuit` (4) and its items against the new `lookupItemsPerCircuit` (16, provisional); beyond it the circuit is closed with `RESOURCE_LIMIT`. The per-link and global counters are charged *per item*, all or nothing, so batching does not loosen the abuse limits. The item count is read before the full decode; nothing is allocated from declared lengths. `OnionLookupService.onBatch` runs every item through the same admission as a single lookup, in the same order (shape check, negative cache, attempt limit, byte budget), the in-flight limit applies per item (the excess of a batch gets `RATE_LIMITED` for those items), content is verified at the relay as before, and nothing unverified is sent. The whole answer leaves no earlier than the minimum answer time plus jitter after the batch arrived and only when the slowest item is done, paced at 8 fragments per 50 ms over all items. Worst case about 32 s for 8 largest-class items, below the client's 45 s answer deadline (plus an allowance per extra item).
+
+*Client side.* Only `TIMELINE` block lookups are batched; `MAILBOX` and `IPNS` keep one circuit and one request each. A group is formed when the request is sent: the lead lookup plus waiting timeline lookups for which this exit is neither one that answered `NOT_FOUND` nor one that refused them (at most `batchItemsTimeline = 4` and never more distinct keys than `itemsPerCircuitTimeline = 4` over the life of the circuit; a circuit therefore shows its exit at most the 4 keys Q15 allowed). Each item is verified on its own against its CID (the IPNS rule is the same). If any item is manipulated (a block that does not hash to its CID, `MALFORMED` for a key the client had checked) the relay gets the 24-hour backoff once and the circuit is closed; items verified by their hash are still taken, the others go on at another relay. Without manipulation each item follows the J3 rules: `FOUND` ends it, `NOT_FOUND` is cross-checked as a group at a second exit (Q17), a refused item is asked elsewhere without penalising the relay unless the relay refused every item, in which case it gets the usual failure backoff once. Counters in the status are unchanged: every key still counts exactly once as found, not found, unconfirmed or failed.
+
+*Anonymity assessment (no claim of anonymity).*
+
+* *Linked sets.* The exit relay links the keys of one batch. With the default budget that is no more than before (4 keys on a reused circuit were already linked by the circuit); the batch only shows them as one simultaneous set instead of one after another, and the order "newest first" shows a slice of the timeline as before. The retried items of a cross-check go together to the second exit and are linked there as well.
+* *Version fingerprint (new, leak row 30).* A version-2 request tells the exit that the client runs wave Q16 or later and splits the set of clients by version. Single lookups stay version 1 and show nothing.
+* *Downgrade.* A relay can force version 1 with `UNSUPPORTED_VERSION`. Version 1 links the same or fewer keys; the cost is latency only. The client does not penalise it, so a relay cannot use the penalty to play clients against other relays.
+* *Selective censorship of single items* stays possible as in version 1 and is caught by the per-item cross-check.
+* *No dummy items.* Random keys would make the relay run DHT walks for a stranger and the exit knows the item count anyway.
+* *Network observer.* The request is always 720 bytes and hides the item count. The answer is one burst whose length is the sum of the items' fragment counts; some sums point to one composition (for example 187 = 184 + 3). That is not worse than separate bursts in version 1 and gives no new guarantee.
+* *Rejections* come per item in class 0 and look like that many misses.
+* *Timing oracle.* See leak row 27: narrowed in batches, not closed.
+* *Load.* The per-item counters, the per-item in-flight limit and the byte budget keep an anonymous client from getting more work out of a batch than out of the same number of single requests; one batch can fill the relay's lookup pool, and the excess is refused per item (a fairness cap per batch is open, decision Q16-C).
+
+*What does not change.* Version 1 is byte-identical (golden test). The governor (one open LOOKUP circuit, two builds per minute), the circuit lifetime, the 4-request limit per circuit, the start warning, the browser texts and every persisted format are unchanged. There is no new option and no descriptor field.
+
+*Honest limits.*
+
+* Verified on loopback only (unit tests, multi-node tests with a relay of 0.13.0 behaviour and a relay without the lookup role); no real network, no pilot measurement of the limits.
+* The throughput stays at 8 lookups per minute with the defaults; a higher key budget per circuit would raise it and the linkability together.
+* Single lookups stay version 1, so the fingerprint only appears for groups; two code paths have to be kept.
+* IPNS batches are supported by the wire format and the relay but not used by any client (the IPNS consumer is open, Q18).
+* No external cryptographic or anonymity review has taken place.
+
+*Decisions (Q16-A to Q16-F), each implemented with the conservative variant and open for the user to change:*
+
+* *Q16-A, key budget per timeline circuit:* 4 (as Q15). 8 would double the throughput bound and the number of linked keys and would change the start warning in three files.
+* *Q16-B, sizes:* 4 items per request from the client, 8 on the wire, 16 items per circuit at the relay.
+* *Q16-C, fairness:* a batch may use all 8 in-flight places of the relay; the excess gets `RATE_LIMITED` per item. A cap of half could be added.
+* *Q16-D, answer strategy:* all items together after the slowest (narrows the timing oracle, costs latency); streaming item by item is the alternative.
+* *Q16-E, partly manipulated batch:* items verified by hash are kept; the alternative is to discard all.
+* *Q16-F, memory of version-1-only exits:* 6 hours, memory only; release assignment: with the next release after `v0.13.0`.
+
 === Leak inventory after wave J3
 
 Closed or narrowed by J3:
@@ -1555,10 +1644,10 @@ A browser node in normal mode now announces (DHT `provide`) the bodies of the ne
 
 === Assumptions awaiting confirmation (wave J3)
 
-Each is implemented with the conservative variant. Q15, Q17, Q19, Q20 and Q21 (detailed design Q21-A to Q21-I) are *confirmed by the user (2026-11-22)*; Q16 and Q18 stay deferred; Q21 is implemented in wave Q21 (released in `v0.13.0`):
+Each is implemented with the conservative variant. Q15, Q17, Q19, Q20 and Q21 (detailed design Q21-A to Q21-I) are *confirmed by the user (2026-11-22)*; Q18 stays deferred (Q16 was implemented later, in wave Q16); Q21 is implemented in wave Q21 (released in `v0.13.0`):
 
 * *Q15, circuit reuse* (*confirmed by the user (2026-11-22)*): up to 4 requests per timeline circuit, reuse at most 10 minutes (minus the answer and build timeouts), no idle hold, contexts separated; this deviates from the confirmed Q8 ("1 by the client"). The governor is unchanged (1 open, 2 builds per minute). Switching back to one request per circuit is one constant (`requestsPerCircuitTimeline = 1`).
-* *Q16, no batch operation* (deferred): not in J3. A batch could come later as LOOKUP version 2, at the price of more size classes, more checking code at the relay, the same linkability as reuse, and a version negotiation.
+* *Q16, no batch operation:* not in J3. _Implemented in wave Q16 as LOOKUP version 2 (<<lookup-batch>>), without new size classes and without a negotiation round trip._
 * *Q17, NOT_FOUND cross-check* (*confirmed by the user (2026-11-22)*): through a second relay; unconfirmed results are cached for 2 minutes; no penalty for a contradicted `NOT_FOUND`; no positive cache at the relay.
 * *Q18, rendezvous and IPNS* (deferred): rendezvous records stay unreachable, no new LOOKUP operation; no IPNS consumer is wired in anonymity mode (directory reads through circuits would show the exit that someone wants to reach node X).
 * *Q19, wording* (*confirmed by the user (2026-11-22)*): the final warning text and the four timeline states deviate from the design draft for honesty ("mail and names are fetched" would be false; "not found" only when two relays agreed).

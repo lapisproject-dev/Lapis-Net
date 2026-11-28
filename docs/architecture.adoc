@@ -6006,6 +6006,8 @@ Relay roles of `OnionRelay` (each accepted only at the last hop of a circuit wit
 
 Wave V0.10.0-J3 changed the client flow described above: `OnionLookupClient` no longer uses one circuit per request for every lookup. It separates three contexts (`LookupContext`: timeline, mailbox, IPNS; a circuit carries one context only), reuses a timeline circuit for up to four sequential requests while the next timeline lookup is already queued (no idle hold), and cross-checks a `NOT_FOUND` at a second relay. `RemoteContentSource.blockState` and `NabuStorage.localOrRemoteState` give the browser timeline a non-blocking view (`TimelineBodyResolver`). No wire or persisted format changed. Details: `anonymity.adoc`, section "Lookup consumers and circuit reuse (wave J3)".
 
+Wave Q16 adds LOOKUP version 2 (batches of up to 8 keys of one operation; the client sends up to 4 timeline block lookups at once). `lapis-net-onion`: `LookupBatchRequestBody` and `LookupBatchResponseBody` (additive, version 1 byte-identical), `RelayAction.DeliverLookupBatch`, `OnionRelayLimits.lookupItemsPerCircuit`, `WindowCounter.tryAcquire(n)`. `lapis-net-onion-wire`: `OnionLookupService.onBatch`, `BatchAssembler` (`lookup/BatchAssembler.kt`), batch groups, retry list and the version-1 fallback in `OnionLookupClient`. The module graph and the persisted formats are unchanged. Details: `anonymity.adoc`, section "Batch lookups (wave Q16, LOOKUP version 2)".
+
 
 === Attachments over circuits (wave Q21, released in `v0.13.0`)
 

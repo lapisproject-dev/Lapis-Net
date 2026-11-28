@@ -9,6 +9,7 @@ import net.lapisphilosophorum.lapisnet.identity.Secp256k1PublicKey
 import net.lapisphilosophorum.lapisnet.onion.CellFormatException
 import net.lapisphilosophorum.lapisnet.onion.CircuitPurpose
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
+import net.lapisphilosophorum.lapisnet.onion.LookupBatchRequestBody
 import net.lapisphilosophorum.lapisnet.onion.LookupOperation
 import net.lapisphilosophorum.lapisnet.onion.LookupRequestBody
 import net.lapisphilosophorum.lapisnet.onion.LookupResponseBody
@@ -41,6 +42,9 @@ private val logger = KotlinLogging.logger {}
 
 /** The number of lookups a relay accepts on one circuit (`OnionRelayLimits.lookupRequestsPerCircuit`). */
 internal val RELAY_LOOKUP_REQUESTS_PER_CIRCUIT: Int = OnionRelayLimits().lookupRequestsPerCircuit
+
+/** The number of lookup items (keys over all requests) a relay accepts on one circuit (wave Q16). */
+internal val RELAY_LOOKUP_ITEMS_PER_CIRCUIT: Int = OnionRelayLimits().lookupItemsPerCircuit
 
 /**
  * What a lookup is for (wave V0.10.0-J3). A circuit only ever carries lookups of ONE context, so the exit relay can not
@@ -99,6 +103,20 @@ data class OnionLookupClientConfig(
      * way until its deadline; no attempt is used.
      */
     val admissionPause: Duration = 500.milliseconds,
+    /**
+     * Wave Q16 (LOOKUP version 2; provisional, not measured in a pilot): the most TIMELINE block lookups sent to one exit
+     * in ONE request. 1 switches batching off (every lookup is a version-1 request, as before Q16). A group of one is
+     * always sent as a version-1 request.
+     */
+    val batchItemsTimeline: Int = 4,
+    /**
+     * Wave Q16: the most distinct keys one TIMELINE circuit carries for its exit relay, over all its requests (the
+     * linkability budget; with 4 it is what Q15 allowed). At least [batchItemsTimeline], at most what a relay accepts.
+     */
+    val itemsPerCircuitTimeline: Int = 4,
+    /** Wave Q16: how long an exit that answered UNSUPPORTED_VERSION to a batch is sent version-1 requests only (memory only). */
+    val v1OnlyMemoTtl: Duration = 6.hours,
+    val v1OnlyMemoEntries: Int = 1024,
 ) {
     init {
         require(buildTimeout.isPositive() && answerTimeout.isPositive()) { "timeouts must be positive" }
@@ -120,6 +138,11 @@ data class OnionLookupClientConfig(
         }
         require(maxQueuedTimeline > 0) { "the timeline queue bound must be positive" }
         require(admissionPause.isPositive()) { "the admission pause must be positive" }
+        require(batchItemsTimeline in 1..LookupBatchRequestBody.MAX_ITEMS) { "batch size out of range" }
+        require(itemsPerCircuitTimeline in batchItemsTimeline..RELAY_LOOKUP_ITEMS_PER_CIRCUIT) {
+            "items per timeline circuit must be within [batch size, the relay's item limit]"
+        }
+        require(v1OnlyMemoTtl.isPositive() && v1OnlyMemoEntries > 0) { "the version-1-only memo must be positive" }
     }
 }
 
@@ -189,6 +212,11 @@ data class LookupClientStats(
     val notFoundContradicted: Long = 0,
     /** Pauses because the governor refused for now (pool full, rate limit or backoff); no attempt was counted. */
     val admissionPauses: Long = 0,
+    /** Version-2 requests (batches) sent, and the keys in them (wave Q16). */
+    val batchesSent: Long = 0,
+    val batchItemsSent: Long = 0,
+    /** Batches answered UNSUPPORTED_VERSION: the group went on as version-1 requests, without penalty. */
+    val v1Fallbacks: Long = 0,
 )
 
 /**
@@ -289,6 +317,9 @@ class OnionLookupClient internal constructor(
         @Volatile var attemptsUsed: Int = 0
 
         @Volatile var lastReason: LookupFailure = LookupFailure.NO_RELAY
+
+        /** Exits that refused this job for now (rate limit, timeout, too large, disabled): tried again elsewhere. */
+        val avoidExits: MutableSet<Secp256k1PublicKey> = ConcurrentHashMap.newKeySet()
     }
 
     /** A circuit that may carry further lookups of its [context]. Only the running job touches it. */
@@ -299,6 +330,9 @@ class OnionLookupClient internal constructor(
         val openedAtMillis: Long,
     ) {
         @Volatile var requestsSent: Int = 0
+
+        /** The keys this exit has seen on this circuit (the linkability budget of wave Q16). Guarded by the client lock. */
+        val seen: MutableSet<ByteBuffer> = HashSet()
     }
 
     /** What an attempt says about the relay: [NONE] is no verdict (the cause was not the relay). */
@@ -330,6 +364,9 @@ class OnionLookupClient internal constructor(
          * or the backoff after failed builds): try again shortly, no attempt used, no verdict about a relay.
          */
         data object Pause : Attempt
+
+        /** The attempt was a batch; its own continuation settles every job (wave Q16). */
+        data object Handled : Attempt
     }
 
     /** An [Attempt] plus the circuit when it is still open after a verified answer (a candidate for reuse). */
@@ -347,6 +384,16 @@ class OnionLookupClient internal constructor(
     private val queue = ArrayDeque<Job>()
     private val byKey = HashMap<ByteBuffer, Job>()
     private var running: Job? = null
+
+    /** Jobs of a finished batch that go on before the queue (wave Q16); not counted against the queue bounds. */
+    private val retryHead = ArrayDeque<Job>()
+
+    /** Exits known to answer version-1 only, with the end of the memo. Memory only, bounded. */
+    private val v1OnlyExits =
+        object : LinkedHashMap<Secp256k1PublicKey, Long>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Secp256k1PublicKey, Long>): Boolean =
+                size > config.v1OnlyMemoEntries
+        }
 
     /** The circuit kept for the next (already chosen) TIMELINE job; at most one (the governor allows one). */
     private var current: ReusableCircuit? = null
@@ -378,6 +425,9 @@ class OnionLookupClient internal constructor(
     private val crossChecks = AtomicLong()
     private val notFoundContradicted = AtomicLong()
     private val admissionPauses = AtomicLong()
+    private val batchesSent = AtomicLong()
+    private val batchItemsSent = AtomicLong()
+    private val v1Fallbacks = AtomicLong()
 
     fun statsForTest(): LookupClientStats =
         LookupClientStats(
@@ -398,6 +448,9 @@ class OnionLookupClient internal constructor(
             crossChecks = crossChecks.get(),
             notFoundContradicted = notFoundContradicted.get(),
             admissionPauses = admissionPauses.get(),
+            batchesSent = batchesSent.get(),
+            batchItemsSent = batchItemsSent.get(),
+            v1Fallbacks = v1Fallbacks.get(),
         )
 
     /** The counters of the node status (see [LookupStatusCounters]); never throws, contains no identities. */
@@ -577,9 +630,11 @@ class OnionLookupClient internal constructor(
         rc.context == LookupContext.TIMELINE &&
             job.context == LookupContext.TIMELINE &&
             rc.requestsSent < requestLimit(rc.context) &&
+            (job.cacheKey in rc.seen || rc.seen.size < config.itemsPerCircuitTimeline) &&
             now - rc.openedAtMillis < reuseAgeLimitMillis &&
             !rc.circuit.isClosed &&
             rc.exit.identity !in job.excludedExits &&
+            rc.exit.identity !in job.avoidExits &&
             (backoff[rc.exit.identity]?.untilMillis ?: 0L) <= now &&
             now < job.deadlineMillis
 
@@ -623,6 +678,7 @@ class OnionLookupClient internal constructor(
             warm != null &&
                 !warm.circuit.isClosed &&
                 warm.lastHop.identity !in job.excludedExits &&
+                warm.lastHop.identity !in job.avoidExits &&
                 (backoff[warm.lastHop.identity]?.untilMillis ?: 0L) <= now
         if (warm != null && warmUsable) {
             circuitsBuilt.incrementAndGet()
@@ -634,8 +690,11 @@ class OnionLookupClient internal constructor(
         val relay =
             try {
                 lookupRelays()
-                    .filter { (backoff[it.identity]?.untilMillis ?: 0L) <= now && it.identity !in job.excludedExits }
-                    .distinctBy { it.identity }
+                    .filter {
+                        (backoff[it.identity]?.untilMillis ?: 0L) <= now &&
+                            it.identity !in job.excludedExits &&
+                            it.identity !in job.avoidExits
+                    }.distinctBy { it.identity }
                     .shuffled(random)
                     .firstOrNull()
             } catch (e: RuntimeException) {
@@ -686,22 +745,28 @@ class OnionLookupClient internal constructor(
                         )
                     }
                 } else {
-                    exchange(rc, job)
+                    exchangeOrBatch(rc, job, relay)
                 }
             }.thenCompose { it }
             .exceptionally { Outcome(Attempt.Next(Kind.FAILURE, LookupFailure.TIMEOUT), null) }
             .thenAcceptAsync({ outcome -> afterAttempt(job, relay, outcome) }, offLoopExecutor)
     }
 
-    /** What happens after one attempt: finish, retry (another relay) or cross-check, and whether the circuit is kept. */
-    private fun afterAttempt(
+    /** What a job does next after one attempt: a [result], or a retry (the job goes on at another relay). */
+    private class Decision(
+        val result: LookupResult?,
+        val retry: Boolean,
+    )
+
+    /** The verdict about one job after one attempt at [relay]. No pause here (see [afterAttempt]). */
+    private fun decide(
         job: Job,
         relay: OnionRelayDescriptor,
-        outcome: Outcome,
-    ) {
+        a: Attempt,
+    ): Decision {
         var result: LookupResult? = null
         var retry = false
-        when (val a = outcome.attempt) {
+        when (a) {
             is Attempt.Done -> {
                 backoff.remove(relay.identity)
                 when (val r = a.result) {
@@ -723,21 +788,6 @@ class OnionLookupClient internal constructor(
                 }
             }
             is Attempt.Stop -> result = exhausted(job, a.reason)
-            is Attempt.Pause -> {
-                // no relay was involved: the attempt is given back and the same job tries again after a pause
-                job.attemptsUsed--
-                if (job.notFoundCount > 0) crossChecks.decrementAndGet()
-                admissionPauses.incrementAndGet()
-                if (closed) {
-                    result = LookupResult.Unavailable(LookupFailure.CLOSED)
-                } else {
-                    discard(outcome.keep)
-                    CompletableFuture
-                        .delayedExecutor(config.admissionPause.inWholeMilliseconds, TimeUnit.MILLISECONDS)
-                        .execute { offLoopExecutor.execute { runJob(job) } }
-                    return
-                }
-            }
             is Attempt.Next -> {
                 if (!closed && a.kind != Kind.NONE) penalise(relay.identity, a.kind)
                 job.lastReason = a.reason
@@ -749,11 +799,42 @@ class OnionLookupClient internal constructor(
                     result = exhausted(job, a.reason)
                 }
             }
+            is Attempt.Pause, is Attempt.Handled -> error("not a verdict")
         }
+        return Decision(result, retry)
+    }
+
+    /** What happens after one attempt: finish, retry (another relay) or cross-check, and whether the circuit is kept. */
+    private fun afterAttempt(
+        job: Job,
+        relay: OnionRelayDescriptor,
+        outcome: Outcome,
+    ) {
+        when (outcome.attempt) {
+            is Attempt.Handled -> return
+            is Attempt.Pause -> {
+                // no relay was involved: the attempt is given back and the same job tries again after a pause
+                job.attemptsUsed--
+                if (job.notFoundCount > 0) crossChecks.decrementAndGet()
+                admissionPauses.incrementAndGet()
+                if (closed) {
+                    finish(job, LookupResult.Unavailable(LookupFailure.CLOSED), outcome.keep)
+                } else {
+                    discard(outcome.keep)
+                    CompletableFuture
+                        .delayedExecutor(config.admissionPause.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+                        .execute { offLoopExecutor.execute { runJob(job) } }
+                }
+                return
+            }
+            else -> Unit
+        }
+        val d = decide(job, relay, outcome.attempt)
+        val result = d.result
         if (result != null) {
             finish(job, result, outcome.keep)
         } else {
-            check(retry)
+            check(d.retry)
             discard(outcome.keep)
             // the same job goes on at once (it stays the running job): a retry or the NOT_FOUND cross-check
             val task = Runnable { runJob(job) }
@@ -814,12 +895,16 @@ class OnionLookupClient internal constructor(
             discard(rc)
             return CompletableFuture.completedFuture(Outcome(Attempt.Stop(LookupFailure.TIMEOUT), null))
         }
-        if (rc.requestsSent >= requestLimit(rc.context) || rc.context != job.context) {
+        if (rc.requestsSent >= requestLimit(rc.context) ||
+            rc.context != job.context ||
+            synchronized(lock) { job.cacheKey !in rc.seen && rc.seen.size >= config.itemsPerCircuitTimeline }
+        ) {
             // never more requests than the relay allows, never two contexts on one circuit: close, never send
             discard(rc)
             return CompletableFuture.completedFuture(Outcome(Attempt.Next(Kind.NONE, LookupFailure.TIMEOUT), null))
         }
         rc.requestsSent++
+        synchronized(lock) { rc.seen += job.cacheKey }
         val reused = rc.requestsSent > 1
         val requestId = random.nextInt(256)
         val answer = CompletableFuture<Attempt>()
@@ -876,16 +961,22 @@ class OnionLookupClient internal constructor(
     private fun armDeadline(
         job: Job,
         answer: CompletableFuture<Attempt>,
+    ) = armDeadline({ job.deadlineMillis }, answer, Attempt.Stop(LookupFailure.TIMEOUT))
+
+    private fun <T> armDeadline(
+        deadline: () -> Long,
+        answer: CompletableFuture<T>,
+        expired: T,
     ) {
         if (answer.isDone) return
-        val remaining = job.deadlineMillis - clock.millis()
+        val remaining = deadline() - clock.millis()
         if (remaining <= 0) {
-            answer.complete(Attempt.Stop(LookupFailure.TIMEOUT))
+            answer.complete(expired)
             return
         }
         CompletableFuture
             .delayedExecutor(remaining, TimeUnit.MILLISECONDS)
-            .execute { armDeadline(job, answer) }
+            .execute { armDeadline(deadline, answer, expired) }
     }
 
     /**
@@ -912,6 +1003,362 @@ class OnionLookupClient internal constructor(
             }
             else -> Attempt.Next(Kind.FAILURE, LookupFailure.TIMEOUT)
         }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Wave Q16: batches (LOOKUP version 2)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /** What a batch exchange ended in, before the per-job verdicts. */
+    private sealed interface BatchEnd {
+        /** The complete, still unverified answer. */
+        class Raw(
+            val items: List<BatchAssembler.Item>,
+        ) : BatchEnd
+
+        /** The answers after verification: one [Attempt] per job, in group order. */
+        class Items(
+            val attempts: List<Attempt>,
+            /** The one verdict about the relay, applied after the per-item verdicts (a verified item must not clear it). */
+            val penalty: Kind? = null,
+        ) : BatchEnd
+
+        /** The exit does not know version 2 (it answered UNSUPPORTED_VERSION in the version-1 framing). */
+        data object V1Only : BatchEnd
+
+        /** One verdict for the whole batch (a failure, a refusal of the whole batch, a manipulation, a deadline, closed). */
+        class Whole(
+            val attempt: Attempt,
+        ) : BatchEnd
+    }
+
+    private class BatchResult(
+        val end: BatchEnd,
+        val keep: ReusableCircuit?,
+    )
+
+    private fun v1OnlyKnown(
+        exit: Secp256k1PublicKey,
+        now: Long,
+    ): Boolean =
+        synchronized(lock) {
+            val until = v1OnlyExits[exit] ?: return@synchronized false
+            if (until <= now) {
+                v1OnlyExits.remove(exit)
+                false
+            } else {
+                true
+            }
+        }
+
+    /**
+     * Sends [job] alone as a version-1 request, or together with waiting TIMELINE block lookups as one version-2 batch.
+     * Only TIMELINE block lookups are batched (MAILBOX and IPNS keep a circuit each), only to an exit that is not
+     * known to be version-1 only, only up to the batch size and the keys this circuit may still show its exit. A group
+     * of one is always a version-1 request.
+     */
+    private fun exchangeOrBatch(
+        rc: ReusableCircuit,
+        job: Job,
+        relay: OnionRelayDescriptor,
+    ): CompletableFuture<Outcome> {
+        val members = gatherMembers(rc, job)
+        if (members.isEmpty()) return exchange(rc, job)
+        val group = ArrayList<Job>(members.size + 1)
+        group += job
+        group += members
+        exchangeBatch(rc, group)
+            .exceptionally { BatchResult(BatchEnd.Whole(Attempt.Next(Kind.FAILURE, LookupFailure.TIMEOUT)), null) }
+            .thenAcceptAsync({ r ->
+                try {
+                    afterBatch(group, relay, r)
+                } catch (e: RuntimeException) {
+                    logger.debug { "lookup batch failed: ${e.javaClass.simpleName}" }
+                    discard(r.keep)
+                    group.forEach { j -> settleMember(j, LookupResult.Unavailable(LookupFailure.TIMEOUT)) }
+                }
+            }, offLoopExecutor)
+        return CompletableFuture.completedFuture(Outcome(Attempt.Handled, null))
+    }
+
+    /** Takes the jobs that join [job] in a batch to [rc]'s exit out of the retry list and the queue. */
+    private fun gatherMembers(
+        rc: ReusableCircuit,
+        job: Job,
+    ): List<Job> {
+        if (config.batchItemsTimeline <= 1 || closed) return emptyList()
+        if (job.context != LookupContext.TIMELINE || job.op != LookupOperation.GET_BLOCK) return emptyList()
+        if (rc.context != LookupContext.TIMELINE) return emptyList()
+        val now = clock.millis()
+        val exit = rc.exit.identity
+        return synchronized(lock) {
+            if (v1OnlyKnown(exit, now) || rc.requestsSent >= requestLimit(rc.context) || job.cacheKey in rc.seen) {
+                return@synchronized emptyList()
+            }
+            val cap = minOf(config.batchItemsTimeline, config.itemsPerCircuitTimeline - rc.seen.size)
+            if (cap < 2) return@synchronized emptyList()
+            val picked = ArrayList<Job>(cap - 1)
+
+            fun eligible(m: Job): Boolean =
+                m.context == LookupContext.TIMELINE &&
+                    m.op == LookupOperation.GET_BLOCK &&
+                    now < m.deadlineMillis &&
+                    exit !in m.excludedExits &&
+                    exit !in m.avoidExits &&
+                    m.attemptsUsed < config.maxAttempts
+
+            for (source in listOf(retryHead, queue)) {
+                val it = source.iterator()
+                while (it.hasNext() && picked.size < cap - 1) {
+                    val m = it.next()
+                    if (eligible(m)) {
+                        it.remove()
+                        picked += m
+                    }
+                }
+            }
+            picked.forEach { m ->
+                m.attemptsUsed++
+                if (m.notFoundCount > 0) crossChecks.incrementAndGet()
+            }
+            picked
+        }
+    }
+
+    /** One version-2 request for [group] on [rc]; the circuit stays open only after verified answers or a version-1 fallback. */
+    private fun exchangeBatch(
+        rc: ReusableCircuit,
+        group: List<Job>,
+    ): CompletableFuture<BatchResult> {
+        val circuit = rc.circuit
+        open += circuit
+
+        fun whole(a: Attempt) = CompletableFuture.completedFuture(BatchResult(BatchEnd.Whole(a), null))
+        if (closed) {
+            discard(rc)
+            return whole(Attempt.Stop(LookupFailure.CLOSED))
+        }
+        if (clock.millis() >= group.maxOf { it.deadlineMillis }) {
+            discard(rc)
+            return whole(Attempt.Stop(LookupFailure.TIMEOUT))
+        }
+        if (rc.requestsSent >= requestLimit(rc.context) ||
+            group.any { it.context != rc.context } ||
+            synchronized(lock) {
+                rc.seen.size + group.count { it.cacheKey !in rc.seen } > config.itemsPerCircuitTimeline
+            }
+        ) {
+            // never more than the relay allows, never two contexts on one circuit: close, never send
+            discard(rc)
+            return whole(Attempt.Next(Kind.NONE, LookupFailure.TIMEOUT))
+        }
+        rc.requestsSent++
+        synchronized(lock) { rc.seen += group.map { it.cacheKey } }
+        batchesSent.incrementAndGet()
+        batchItemsSent.addAndGet(group.size.toLong())
+        val reused = rc.requestsSent > 1
+        val requestId = random.nextInt(256)
+        val answer = CompletableFuture<BatchEnd>()
+        val assembler = BatchAssembler(requestId, group.size)
+        circuit.onInbound = { msg ->
+            // circuit callback (event loop): only reassembly here; verification runs off the loop
+            when (val r = assembler.accept(msg)) {
+                null -> Unit
+                is BatchAssembler.Result.Complete -> answer.complete(BatchEnd.Raw(r.items))
+                BatchAssembler.Result.V1Only -> answer.complete(BatchEnd.V1Only)
+                BatchAssembler.Result.WholeRefused ->
+                    answer.complete(BatchEnd.Whole(Attempt.Next(Kind.FAILURE, LookupFailure.REFUSED)))
+                BatchAssembler.Result.Broken -> {
+                    manipulated.incrementAndGet()
+                    answer.complete(BatchEnd.Whole(Attempt.Next(Kind.MANIPULATION, LookupFailure.MANIPULATED)))
+                }
+            }
+        }
+        val sentAt = AtomicLong(Long.MAX_VALUE)
+        circuit.onClosed = {
+            answer.complete(
+                BatchEnd.Whole(closedOutcome(circuit, assembler.started, clock.millis() - sentAt.get(), reused)),
+            )
+        }
+        val body = LookupBatchRequestBody.encode(requestId, group[0].op, group.map { it.key }, random)
+        sentAt.set(clock.millis())
+        check(rc.requestsSent <= requestLimit(rc.context)) { "lookup request limit per circuit exceeded" }
+        if (circuit.isClosed || !circuit.send(RelayMessage(RelayCommand.LOOKUP_REQUEST, 0, body))) {
+            discard(rc)
+            // the link or this side refused the cell: nothing reached the relay, no verdict about it
+            return whole(Attempt.Next(Kind.NONE, LookupFailure.TIMEOUT))
+        }
+        armDeadline({ group.maxOf { it.deadlineMillis } }, answer, BatchEnd.Whole(Attempt.Stop(LookupFailure.TIMEOUT)))
+        // the relay answers all items together, after its slowest lookup and paced: allow for the extra fragments
+        val timeoutMillis =
+            config.answerTimeout.inWholeMilliseconds + (group.size - 1) * BATCH_PACING_ALLOWANCE_MILLIS
+        return answer
+            .completeOnTimeout(
+                BatchEnd.Whole(Attempt.Next(Kind.FAILURE, LookupFailure.TIMEOUT)),
+                timeoutMillis,
+                TimeUnit.MILLISECONDS,
+            ).thenApplyAsync({ end ->
+                circuit.onClosed = {}
+                circuit.onInbound = {}
+                val alive = { !closed && !circuit.isClosed }
+                when (val processed = if (end is BatchEnd.Raw) verifyItems(group, rc, end.items) else end) {
+                    is BatchEnd.Items -> {
+                        if (alive() && processed.attempts.none { it is Attempt.Next && it.kind == Kind.MANIPULATION }) {
+                            BatchResult(processed, rc)
+                        } else {
+                            discard(rc)
+                            BatchResult(processed, null)
+                        }
+                    }
+                    BatchEnd.V1Only ->
+                        if (alive()) {
+                            BatchResult(processed, rc)
+                        } else {
+                            discard(rc)
+                            BatchResult(processed, null)
+                        }
+                    else -> {
+                        discard(rc)
+                        BatchResult(processed, null)
+                    }
+                }
+            }, offLoopExecutor)
+    }
+
+    /**
+     * Every FOUND item is verified on its own (block against its CID, record against the name's key). A MALFORMED
+     * answer to a key the client had checked is a provable lie. If any item is manipulated the relay is put on the
+     * long backoff once, verified FOUND items are still taken (the hash proves them), and every other item uses its
+     * attempt without a verdict. Without manipulation, items the relay refused go to another exit; if it refused
+     * all of them, the relay is penalised once.
+     */
+    private fun verifyItems(
+        group: List<Job>,
+        rc: ReusableCircuit,
+        items: List<BatchAssembler.Item>,
+    ): BatchEnd {
+        val exit = rc.exit.identity
+        val raw =
+            items.mapIndexed { i, item ->
+                when (item.status) {
+                    LookupStatus.FOUND -> verify(group[i], item.content)
+                    LookupStatus.NOT_FOUND -> Attempt.Done(LookupResult.NotFound(confirmed = false))
+                    LookupStatus.DISABLED, LookupStatus.UNSUPPORTED_VERSION, LookupStatus.UNSUPPORTED_OPERATION -> {
+                        disabled.incrementAndGet()
+                        Attempt.Next(Kind.UNSUPPORTED, LookupFailure.REFUSED)
+                    }
+                    LookupStatus.MALFORMED -> {
+                        manipulated.incrementAndGet()
+                        Attempt.Next(Kind.MANIPULATION, LookupFailure.MANIPULATED)
+                    }
+                    else -> Attempt.Next(Kind.FAILURE, LookupFailure.REFUSED)
+                }
+            }
+        val manipulation = raw.any { it is Attempt.Next && it.kind == Kind.MANIPULATION }
+        if (manipulation) {
+            return BatchEnd.Items(
+                raw.map { a ->
+                    if (a is Attempt.Done && a.result is LookupResult.Found) {
+                        a
+                    } else {
+                        Attempt.Next(Kind.NONE, LookupFailure.MANIPULATED)
+                    }
+                },
+                Kind.MANIPULATION,
+            )
+        }
+        val refused = raw.filter { it is Attempt.Next }
+        var penalty: Kind? = null
+        if (refused.isNotEmpty()) {
+            if (refused.size == raw.size) {
+                penalty =
+                    if (refused.any {
+                            (it as Attempt.Next).kind == Kind.UNSUPPORTED
+                        }
+                    ) {
+                        Kind.UNSUPPORTED
+                    } else {
+                        Kind.FAILURE
+                    }
+            }
+            group.forEachIndexed { i, j -> if (raw[i] is Attempt.Next) j.avoidExits += exit }
+        }
+        return BatchEnd.Items(
+            raw.map { a -> if (a is Attempt.Next) Attempt.Next(Kind.NONE, LookupFailure.REFUSED) else a },
+            penalty,
+        )
+    }
+
+    /** Settles a job without moving the queue on (a batch member; the lead job's [finish] does that). */
+    private fun settleMember(
+        job: Job,
+        result: LookupResult,
+    ) {
+        countResult(result)
+        synchronized(lock) { recordResultLocked(job, result) }
+        completeOff(job.result, result)
+    }
+
+    /** What happens after a batch: every job gets its verdict; the lead job moves the queue on or retries. */
+    private fun afterBatch(
+        group: List<Job>,
+        relay: OnionRelayDescriptor,
+        result: BatchResult,
+    ) {
+        val lead = group[0]
+        val members = group.drop(1)
+        val end = result.end
+        if (end is BatchEnd.V1Only) {
+            // an older relay: no verdict, no penalty; the group goes on as version-1 requests, on this circuit if it lives
+            synchronized(
+                lock,
+            ) { v1OnlyExits[relay.identity] = clock.millis() + config.v1OnlyMemoTtl.inWholeMilliseconds }
+            v1Fallbacks.incrementAndGet()
+            group.forEach { j ->
+                j.attemptsUsed--
+                if (j.notFoundCount > 0) crossChecks.decrementAndGet()
+            }
+            synchronized(lock) { retryHead.addAll(0, members) }
+            val kept = result.keep
+            if (kept != null) {
+                startAttempt(lead, relay, CompletableFuture.completedFuture(kept))
+            } else {
+                val task = Runnable { runJob(lead) }
+                if (!runCatching { offLoop(task) }.getOrDefault(false)) CompletableFuture.runAsync(task)
+            }
+            return
+        }
+        val attempts: List<Attempt> =
+            when (end) {
+                is BatchEnd.Items -> end.attempts
+                is BatchEnd.Whole -> {
+                    val a = end.attempt
+                    // one verdict about the relay for the whole batch, not one per item
+                    if (a is Attempt.Next && a.kind != Kind.NONE && !closed) penalise(relay.identity, a.kind)
+                    val each: Attempt = if (a is Attempt.Next) Attempt.Next(Kind.NONE, a.reason) else a
+                    group.map { each }
+                }
+                else -> error("unexpected batch end")
+            }
+        val decisions = group.indices.map { decide(group[it], relay, attempts[it]) }
+        if (end is BatchEnd.Items) {
+            val penalty = end.penalty
+            if (penalty != null && !closed) penalise(relay.identity, penalty)
+        }
+        val retries = ArrayList<Job>()
+        for (i in 1 until group.size) {
+            val r = decisions[i].result
+            if (r != null) settleMember(group[i], r) else retries += group[i]
+        }
+        if (retries.isNotEmpty()) synchronized(lock) { retryHead.addAll(retries) }
+        val leadResult = decisions[0].result
+        if (leadResult != null) {
+            finish(lead, leadResult, result.keep)
+        } else {
+            discard(result.keep)
+            val task = Runnable { runJob(lead) }
+            if (!runCatching { offLoop(task) }.getOrDefault(false)) CompletableFuture.runAsync(task)
+        }
+    }
 
     /** Internal carrier of an unverified FOUND answer between the assembler and [verify]. */
     private class AnswerFound(
@@ -1042,26 +1489,12 @@ class OnionLookupClient internal constructor(
         result: LookupResult,
         keep: ReusableCircuit? = null,
     ) {
-        when (result) {
-            is LookupResult.Found -> found.incrementAndGet()
-            is LookupResult.NotFound ->
-                if (result.confirmed) notFound.incrementAndGet() else notFoundUnconfirmed.incrementAndGet()
-            else -> failed.incrementAndGet()
-        }
+        countResult(result)
         val next: Job?
         var kept = false
         synchronized(lock) {
-            if (result is LookupResult.NotFound) {
-                val now = clock.millis()
-                val existing = negative[job.cacheKey]
-                // an unconfirmed result never overrides a confirmed entry that is still valid
-                if (!(existing != null && existing.confirmed && !result.confirmed && existing.untilMillis > now)) {
-                    val ttl = if (result.confirmed) config.negativeTtl else config.negativeTtlUnconfirmed
-                    negative[job.cacheKey] = NegativeEntry(now + ttl.inWholeMilliseconds, result.confirmed)
-                }
-            }
-            byKey.remove(job.cacheKey, job)
-            next = if (closed) null else queue.removeFirstOrNull()
+            recordResultLocked(job, result)
+            next = if (closed) null else retryHead.removeFirstOrNull() ?: queue.removeFirstOrNull()
             running = next
             // reuse only for a TIMELINE lookup that is already queued; otherwise the circuit is closed at once
             if (keep != null && next != null && reusableFor(keep, next, clock.millis())) {
@@ -1077,12 +1510,39 @@ class OnionLookupClient internal constructor(
         }
     }
 
+    private fun countResult(result: LookupResult) {
+        when (result) {
+            is LookupResult.Found -> found.incrementAndGet()
+            is LookupResult.NotFound ->
+                if (result.confirmed) notFound.incrementAndGet() else notFoundUnconfirmed.incrementAndGet()
+            else -> failed.incrementAndGet()
+        }
+    }
+
+    /** Caller holds [lock]: the negative cache entry of a NOT_FOUND result, and the job leaves the merge table. */
+    private fun recordResultLocked(
+        job: Job,
+        result: LookupResult,
+    ) {
+        if (result is LookupResult.NotFound) {
+            val now = clock.millis()
+            val existing = negative[job.cacheKey]
+            // an unconfirmed result never overrides a confirmed entry that is still valid
+            if (!(existing != null && existing.confirmed && !result.confirmed && existing.untilMillis > now)) {
+                val ttl = if (result.confirmed) config.negativeTtl else config.negativeTtlUnconfirmed
+                negative[job.cacheKey] = NegativeEntry(now + ttl.inWholeMilliseconds, result.confirmed)
+            }
+        }
+        byKey.remove(job.cacheKey, job)
+    }
+
     override fun close() {
         if (closed) return
         closed = true
         val (pending, held) =
             synchronized(lock) {
-                val all = queue.toList()
+                val all = retryHead.toList() + queue.toList()
+                retryHead.clear()
                 queue.clear()
                 byKey.clear()
                 negative.clear()
@@ -1103,6 +1563,9 @@ class OnionLookupClient internal constructor(
 
     private companion object {
         const val MAX_UNSUPPORTED_SHIFT = 10
+
+        /** Pacing time of one largest-class item at the relay (184 fragments, 8 per 50 ms), rounded up. */
+        const val BATCH_PACING_ALLOWANCE_MILLIS = 1200L
 
         /** Governor refusals that pass: the lookup pauses instead of failing. */
         val TRANSIENT_ADMISSION =

@@ -120,7 +120,13 @@ class OnionLookupClientReuseTest :
             OnionPathProvider { last: OnionRelayDescriptor, _: CircuitPurpose ->
                 descriptors.filter { it.identity != last.identity }.take(2) + last
             }
-        val fast = OnionLookupClientConfig(buildTimeout = 15.seconds, answerTimeout = 10.seconds, maxAttempts = 2)
+        val fast =
+            OnionLookupClientConfig(
+                buildTimeout = 15.seconds,
+                answerTimeout = 10.seconds,
+                maxAttempts = 2,
+                batchItemsTimeline = 1,
+            )
 
         // what the scripted relays answer: block bytes by hex key; everything else NOT_FOUND
         val content = ConcurrentHashMap<String, ByteArray>()

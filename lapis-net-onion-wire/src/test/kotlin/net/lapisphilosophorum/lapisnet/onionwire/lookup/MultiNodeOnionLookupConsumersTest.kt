@@ -237,6 +237,8 @@ class MultiNodeOnionLookupConsumersTest :
             val refusedBefore = confinement.refusedDials
             val builtBefore = lookup().statsForTest().circuitsBuilt
             val reusedBefore = lookup().statsForTest().circuitsReused
+            val batchItemsBefore = lookup().statsForTest().batchItemsSent
+            val batchesBefore = lookup().statsForTest().batchesSent
             val started = System.nanoTime()
             // exactly the timeline code path: a non-blocking view that schedules background lookups
             posts.forEach { (cid, _) ->
@@ -258,7 +260,11 @@ class MultiNodeOnionLookupConsumersTest :
             val reused = lookup().statsForTest().circuitsReused - reusedBefore
             println("J3 measurement: 6 timeline bodies in $millis ms over $built circuit(s), $reused reused request(s)")
             (built <= 2) shouldBe true
-            reused shouldBe (6 - built)
+            // every request is on a new or a reused circuit; since wave Q16 a batch of n items is ONE request
+            val st = lookup().statsForTest()
+            val batchedItems = st.batchItemsSent - batchItemsBefore
+            val batches = st.batchesSent - batchesBefore
+            (built + reused) shouldBe (6 - (batchedItems - batches))
             (clientRemotes() - guardPeers()).shouldBeEmpty()
             confinement.refusedDials shouldBe refusedBefore
             client.storage.bitswapRequestCount shouldBe 0

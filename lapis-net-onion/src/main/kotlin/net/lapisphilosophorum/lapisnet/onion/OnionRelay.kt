@@ -86,6 +86,23 @@ sealed interface RelayAction {
         override fun toString(): String = "DeliverLookupRequest(op=$op)"
     }
 
+    /**
+     * A validated version-2 LOOKUP_REQUEST (a batch, wave Q16) arrived: the host looks every key up and answers with
+     * the fragments of one batch response, item by item in order, through [OnionRelay.replyLookupFragment]. The keys
+     * are never logged.
+     */
+    class DeliverLookupBatch(
+        val circuitHandle: Long,
+        val requestId: Int,
+        val op: LookupOperation,
+        keys: List<ByteArray>,
+    ) : RelayAction {
+        private val storedKeys = keys.map { it.copyOf() }
+        val keys: List<ByteArray> get() = storedKeys.map { it.copyOf() }
+
+        override fun toString(): String = "DeliverLookupBatch(op=$op, items=${storedKeys.size})"
+    }
+
     /** The circuit identified by [circuitHandle] is gone. */
     data class CircuitClosed(
         val circuitHandle: Long,
@@ -150,6 +167,9 @@ private class RelayCircuit(
     // Lookups (wave V0.10.0-J2); guarded by [lock].
     var lookupRequests = 0
     var lookupOutstanding = false
+    var lookupItems = 0
+    var lookupOutstandingVersion = 0
+    var lookupOutstandingItems = 0
 }
 
 /**
@@ -214,6 +234,14 @@ class OnionRelay(
     @ExperimentalOnionApi
     @Volatile
     var legacyNoLookup = false
+
+    /**
+     * Test seam (wave Q16): behaves like a relay of version 0.13.0 that knows LOOKUP version 1 but not version 2 (a
+     * version-2 request is answered with UNSUPPORTED_VERSION in the version-1 framing). Never set in production.
+     */
+    @ExperimentalOnionApi
+    @Volatile
+    var lookupV1OnlyForTest = false
 
     // Work that must run OUTSIDE every circuit lock (never hold two circuit locks at once): collected while a
     // lock is held, executed by the public entry points after all locks are released.
@@ -437,6 +465,19 @@ class OnionRelay(
             val c = byHandle[circuitHandle] ?: return@entry emptyList()
             c.lock.withLock {
                 if (c.closed || c.role != CircuitRole.LOOKUP || !c.lookupOutstanding) return@withLock emptyList()
+                if (c.lookupOutstandingVersion == 2) {
+                    val header =
+                        try {
+                            LookupBatchResponseBody.decodeFragmentHeader(body, c.lookupOutstandingItems)
+                        } catch (e: CellFormatException) {
+                            return@withLock emptyList()
+                        }
+                    val out = sendBackward(c, RelayMessage(RelayCommand.LOOKUP_RESPONSE, 0, body))
+                    if (header.itemIndex == c.lookupOutstandingItems - 1 && header.fragIndex == header.fragCount - 1) {
+                        c.lookupOutstanding = false
+                    }
+                    return@withLock out
+                }
                 val header =
                     try {
                         LookupResponseBody.decodeFragmentHeader(body)
@@ -953,6 +994,10 @@ class OnionRelay(
         c.lookupRequests++
         val data = msg.data
         if (data.size != LookupRequestBody.BODY_SIZE) return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        @OptIn(ExperimentalOnionApi::class)
+        if (lookupRequestVersion(data) == LookupBatchRequestBody.VERSION && !lookupV1OnlyForTest) {
+            return handleLookupBatch(c, data)
+        }
         val linkCounter =
             linkLookupCounters.computeIfAbsent(c.prevLink.value) {
                 WindowCounter(limits.lookupRequestsPerLinkPerMinute, clock)
@@ -974,9 +1019,71 @@ class OnionRelay(
                     answerLookup(c, decoded.requestId, LookupStatus.DISABLED)
                 } else {
                     c.lookupOutstanding = true
+                    c.lookupOutstandingVersion = 1
                     listOf(RelayAction.DeliverLookupRequest(c.handle, decoded.requestId, decoded.op, decoded.key))
                 }
         }
+    }
+
+    /**
+     * Version-2 lookup (a batch, wave Q16). The item count is peeked first; the per-circuit item budget is checked
+     * before anything else, the per-link and global counters are charged per item (all or nothing), and only then is
+     * the body decoded in full. A whole-batch refusal is answered per item in class 0, framed as version 2.
+     */
+    private fun handleLookupBatch(
+        c: RelayCircuit,
+        data: ByteArray,
+    ): List<RelayAction> {
+        val n = LookupBatchRequestBody.peekItemCount(data) ?: return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+        if (c.lookupItems + n > limits.lookupItemsPerCircuit) {
+            return teardown(c, DestroyReason.RESOURCE_LIMIT, Notify.BOTH)
+        }
+        val requestId = data[1].toInt() and 0xFF
+        val linkCounter =
+            linkLookupCounters.computeIfAbsent(c.prevLink.value) {
+                WindowCounter(limits.lookupRequestsPerLinkPerMinute, clock)
+            }
+        if (!linkCounter.tryAcquire(n) || !globalLookupCounter.tryAcquire(n)) {
+            logger.debug { "lookup batch refused: rate limit" }
+            return answerLookupBatch(c, requestId, n, LookupStatus.RATE_LIMITED)
+        }
+        val decoded =
+            try {
+                LookupBatchRequestBody.decode(data)
+            } catch (e: CellFormatException) {
+                return teardown(c, DestroyReason.PROTOCOL, Notify.BOTH)
+            }
+        return when (decoded) {
+            is LookupBatchRequestBody.Decoded.Unsupported ->
+                answerLookupBatch(c, decoded.requestId, decoded.itemCount, decoded.status)
+            is LookupBatchRequestBody.Decoded.Batch ->
+                if (!limits.lookupEnabled) {
+                    answerLookupBatch(c, decoded.requestId, decoded.itemCount, LookupStatus.DISABLED)
+                } else {
+                    c.lookupItems += decoded.itemCount
+                    c.lookupOutstanding = true
+                    c.lookupOutstandingVersion = 2
+                    c.lookupOutstandingItems = decoded.itemCount
+                    listOf(RelayAction.DeliverLookupBatch(c.handle, decoded.requestId, decoded.op, decoded.keys))
+                }
+        }
+    }
+
+    /** Caller holds [c]'s lock: [status] for each of [items] items, version-2 framed, class 0. */
+    private fun answerLookupBatch(
+        c: RelayCircuit,
+        requestId: Int,
+        items: Int,
+        status: Byte,
+    ): List<RelayAction> {
+        val out = ArrayList<RelayAction>()
+        val bodies =
+            LookupBatchResponseBody.encodeBatch(requestId, List(items) { status to ByteArray(0) }, random)
+        for (body in bodies) {
+            out += sendBackward(c, RelayMessage(RelayCommand.LOOKUP_RESPONSE, 0, body))
+            if (c.closed) break
+        }
+        return out
     }
 
     /** Caller holds [c]'s lock: the error answer [status] as the fragments of class 0. */

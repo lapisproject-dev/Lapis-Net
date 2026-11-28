@@ -1,6 +1,7 @@
 package net.lapisphilosophorum.lapisnet.onionwire.lookup
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import net.lapisphilosophorum.lapisnet.onion.LookupBatchResponseBody
 import net.lapisphilosophorum.lapisnet.onion.LookupOperation
 import net.lapisphilosophorum.lapisnet.onion.LookupResponseBody
 import net.lapisphilosophorum.lapisnet.onion.LookupSizeClass
@@ -21,6 +22,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReferenceArray
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -100,6 +102,9 @@ data class LookupServiceStats(
     val fragmentsSent: Long,
     /** Lookups without content of a key marked as found here, answered TIMEOUT instead of counting as a miss. */
     val foundMarkShielded: Long = 0,
+    /** Version-2 batches (wave Q16) and the items in them. */
+    val batches: Long = 0,
+    val batchItems: Long = 0,
 )
 
 /**
@@ -181,6 +186,8 @@ internal class OnionLookupService(
     private val timeouts = AtomicLong()
     private val fragmentsSent = AtomicLong()
     private val foundMarkShielded = AtomicLong()
+    private val batches = AtomicLong()
+    private val batchItems = AtomicLong()
 
     fun statsForTest(): LookupServiceStats =
         LookupServiceStats(
@@ -197,7 +204,23 @@ internal class OnionLookupService(
             timeouts.get(),
             fragmentsSent.get(),
             foundMarkShielded.get(),
+            batches.get(),
+            batchItems.get(),
         )
+
+    /** Result of the admission checks of one key (shape, negative cache, attempt limit, byte budget). */
+    private sealed interface Admission {
+        /** Answered without a lookup. */
+        class Immediate(
+            val status: Byte,
+        ) : Admission
+
+        /** Admitted: the sink has to run. */
+        class Run(
+            val cid: io.ipfs.cid.Cid?,
+            val cacheKey: ByteBuffer,
+        ) : Admission
+    }
 
     /** Entry point; never blocks (the sink runs on the pool, the answer on the scheduler). */
     fun onRequest(action: RelayAction.DeliverLookupRequest) {
@@ -209,22 +232,131 @@ internal class OnionLookupService(
         fun answer(status: Byte) = sendPaced(handle, requestId, status, ByteArray(0), receivedAt)
         if (closed.get()) return
         val key = action.key
+        val admission =
+            when (val adm = admit(action.op, key, receivedAt)) {
+                is Admission.Immediate -> return answer(adm.status)
+                is Admission.Run -> adm
+            }
+        if (!inFlight.tryAcquire()) {
+            rateLimited.incrementAndGet()
+            logger.debug { "lookup refused: in-flight limit" }
+            return answer(LookupStatus.RATE_LIMITED)
+        }
+        val task =
+            Runnable {
+                try {
+                    run(action.op, key, admission.cid, admission.cacheKey, handle, requestId, receivedAt)
+                } finally {
+                    inFlight.release()
+                }
+            }
+        try {
+            pool.execute(task)
+        } catch (e: RejectedExecutionException) {
+            inFlight.release()
+            rateLimited.incrementAndGet()
+            answer(LookupStatus.RATE_LIMITED)
+        }
+    }
+
+    /**
+     * Batch entry point (wave Q16, LOOKUP version 2); never blocks. Every item goes through the same admission as a
+     * single lookup, in the same order, and counts against the in-flight limit on its own (the excess is answered
+     * RATE_LIMITED per item). The whole answer leaves no earlier than the minimum delay (plus jitter) after the batch
+     * arrived and only when the slowest item is done, so the timing of one item does not show.
+     */
+    fun onBatch(action: RelayAction.DeliverLookupBatch) {
+        val receivedAt = clock.millis()
+        val keys = action.keys
+        val n = keys.size
+        requests.addAndGet(n.toLong())
+        batches.incrementAndGet()
+        batchItems.addAndGet(n.toLong())
+        if (closed.get()) return
+        val handle = action.circuitHandle
+        val requestId = action.requestId
+        val results = AtomicReferenceArray<Pair<Byte, ByteArray>>(n)
+        val remaining = AtomicInteger(n)
+
+        fun complete(
+            index: Int,
+            result: Pair<Byte, ByteArray>,
+        ) {
+            if (!results.compareAndSet(index, null, result)) return
+            if (remaining.decrementAndGet() == 0) {
+                sendPacedBatch(handle, requestId, List(n) { checkNotNull(results.get(it)) }, receivedAt)
+            }
+        }
+
+        val empty = ByteArray(0)
+        for (i in 0 until n) {
+            val key = keys[i]
+            when (val adm = admit(action.op, key, receivedAt)) {
+                is Admission.Immediate -> complete(i, adm.status to empty)
+                is Admission.Run -> {
+                    if (!inFlight.tryAcquire()) {
+                        rateLimited.incrementAndGet()
+                        logger.debug { "lookup refused: in-flight limit" }
+                        complete(i, LookupStatus.RATE_LIMITED to empty)
+                        continue
+                    }
+                    val task =
+                        Runnable {
+                            val result =
+                                try {
+                                    if (closed.get()) {
+                                        null
+                                    } else {
+                                        lookupOne(
+                                            action.op,
+                                            key,
+                                            adm.cid,
+                                            adm.cacheKey,
+                                            receivedAt,
+                                        )
+                                    }
+                                } catch (e: RuntimeException) {
+                                    logger.debug { "lookup failed: ${e.javaClass.simpleName}" }
+                                    LookupStatus.TIMEOUT to empty
+                                } finally {
+                                    inFlight.release()
+                                }
+                            if (result != null) complete(i, result)
+                        }
+                    try {
+                        pool.execute(task)
+                    } catch (e: RejectedExecutionException) {
+                        inFlight.release()
+                        rateLimited.incrementAndGet()
+                        complete(i, LookupStatus.RATE_LIMITED to empty)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Shape check, negative cache, attempt limit and byte budget of one key, in this order (counters included). */
+    private fun admit(
+        op: LookupOperation,
+        key: ByteArray,
+        receivedAt: Long,
+    ): Admission {
         val cid =
-            when (action.op) {
+            when (op) {
                 LookupOperation.GET_BLOCK -> RemoteContentVerifier.parseRawSha256Cid(key)
                 LookupOperation.GET_IPNS_RECORD -> null
             }
         val shapeOk =
-            when (action.op) {
+            when (op) {
                 LookupOperation.GET_BLOCK -> cid != null
                 LookupOperation.GET_IPNS_RECORD -> RemoteContentVerifier.isIpnsRoutingKey(key)
             }
         if (!shapeOk) {
             malformed.incrementAndGet()
             logger.debug { "lookup refused: malformed key" }
-            return answer(LookupStatus.MALFORMED)
+            return Admission.Immediate(LookupStatus.MALFORMED)
         }
-        val cacheKey = cacheKeyOf(action.op, key)
+        val cacheKey = cacheKeyOf(op, key)
         var negativeStatus: Byte = LookupStatus.NOT_FOUND
         val admitted =
             synchronized(lock) {
@@ -246,43 +378,24 @@ internal class OnionLookupService(
                 if (budgetExhausted(receivedAt)) return@synchronized ADMIT_BUDGET
                 ADMIT_OK
             }
-        when (admitted) {
+        return when (admitted) {
             ADMIT_NEGATIVE -> {
                 negativeHits.incrementAndGet()
                 if (negativeStatus == LookupStatus.TOO_LARGE) tooLarge.incrementAndGet() else notFound.incrementAndGet()
-                return answer(negativeStatus)
+                Admission.Immediate(negativeStatus)
             }
             ADMIT_ATTEMPTS -> {
                 attemptLimited.incrementAndGet()
                 notFound.incrementAndGet()
                 logger.debug { "lookup refused: attempt limit" }
-                return answer(LookupStatus.NOT_FOUND)
+                Admission.Immediate(LookupStatus.NOT_FOUND)
             }
             ADMIT_BUDGET -> {
                 rateLimited.incrementAndGet()
                 logger.debug { "lookup refused: byte budget" }
-                return answer(LookupStatus.RATE_LIMITED)
+                Admission.Immediate(LookupStatus.RATE_LIMITED)
             }
-        }
-        if (!inFlight.tryAcquire()) {
-            rateLimited.incrementAndGet()
-            logger.debug { "lookup refused: in-flight limit" }
-            return answer(LookupStatus.RATE_LIMITED)
-        }
-        val task =
-            Runnable {
-                try {
-                    run(action.op, key, cid, cacheKey, handle, requestId, receivedAt)
-                } finally {
-                    inFlight.release()
-                }
-            }
-        try {
-            pool.execute(task)
-        } catch (e: RejectedExecutionException) {
-            inFlight.release()
-            rateLimited.incrementAndGet()
-            answer(LookupStatus.RATE_LIMITED)
+            else -> Admission.Run(cid, cacheKey)
         }
     }
 
@@ -296,6 +409,18 @@ internal class OnionLookupService(
         receivedAt: Long,
     ) {
         if (closed.get()) return
+        val (status, content) = lookupOne(op, key, cid, cacheKey, receivedAt)
+        sendPaced(handle, requestId, status, content, receivedAt)
+    }
+
+    /** The sink call and the validation of what it returned; the status and content to answer. */
+    private fun lookupOne(
+        op: LookupOperation,
+        key: ByteArray,
+        cid: io.ipfs.cid.Cid?,
+        cacheKey: ByteBuffer,
+        receivedAt: Long,
+    ): Pair<Byte, ByteArray> {
         sinkCalls.incrementAndGet()
         val timeout = config.lookupTimeout.toJavaDuration()
         val outcome =
@@ -384,7 +509,7 @@ internal class OnionLookupService(
                     LookupStatus.TOO_LARGE to ByteArray(0)
                 }
             }
-        sendPaced(handle, requestId, status, content, receivedAt)
+        return status to content
     }
 
     private fun rememberNegative(
@@ -503,6 +628,24 @@ internal class OnionLookupService(
     ) {
         if (closed.get()) return
         val fragments = LookupResponseBody.encodeAnswer(requestId, status, content, random)
+        val jitter =
+            config.answerDelayJitter.inWholeMilliseconds.let { if (it <= 0) 0L else random.nextLong(it + 1) }
+        val due = receivedAt + config.minAnswerDelay.inWholeMilliseconds + jitter
+        val delay = (due - clock.millis()).coerceAtLeast(0)
+        if (!schedule(delay) { sendBatch(handle, fragments, 0) }) {
+            logger.debug { "lookup answer dropped: scheduler closed" }
+        }
+    }
+
+    /** The fragments of all items, in order, paced over all of them; never before the minimum delay (plus jitter). */
+    private fun sendPacedBatch(
+        handle: Long,
+        requestId: Int,
+        answers: List<Pair<Byte, ByteArray>>,
+        receivedAt: Long,
+    ) {
+        if (closed.get()) return
+        val fragments = LookupBatchResponseBody.encodeBatch(requestId, answers, random)
         val jitter =
             config.answerDelayJitter.inWholeMilliseconds.let { if (it <= 0) 0L else random.nextLong(it + 1) }
         val due = receivedAt + config.minAnswerDelay.inWholeMilliseconds + jitter

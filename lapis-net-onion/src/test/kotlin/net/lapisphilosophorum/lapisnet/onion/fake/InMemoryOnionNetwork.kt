@@ -66,6 +66,7 @@ class InMemoryOnionNetwork(
     val publishes = mutableListOf<PublishDelivered>()
     val mailboxItems = mutableListOf<Pair<Long, ByteArray>>()
     val lookupRequests = mutableListOf<RelayAction.DeliverLookupRequest>()
+    val lookupBatches = mutableListOf<RelayAction.DeliverLookupBatch>()
     val closed = mutableListOf<Closed>()
 
     private val peers = HashMap<Pair<Int, Long>, Peer>()
@@ -164,6 +165,7 @@ class InMemoryOnionNetwork(
                     publishes += PublishDelivered(idx, a.circuitHandle, a.type, a.objectBytes)
                 is RelayAction.DeliverMailboxItem -> mailboxItems += a.circuitHandle to a.itemBytes
                 is RelayAction.DeliverLookupRequest -> lookupRequests += a
+                is RelayAction.DeliverLookupBatch -> lookupBatches += a
                 is RelayAction.CircuitClosed -> closed += Closed(idx, a.circuitHandle, a.reason)
             }
         }

@@ -16,6 +16,7 @@ import net.lapisphilosophorum.lapisnet.onion.DestroyReason
 import net.lapisphilosophorum.lapisnet.onion.DirectoryPublishStatus
 import net.lapisphilosophorum.lapisnet.onion.ExperimentalOnionApi
 import net.lapisphilosophorum.lapisnet.onion.LinkId
+import net.lapisphilosophorum.lapisnet.onion.LookupBatchResponseBody
 import net.lapisphilosophorum.lapisnet.onion.LookupResponseBody
 import net.lapisphilosophorum.lapisnet.onion.LookupStatus
 import net.lapisphilosophorum.lapisnet.onion.MailboxPublishStatus
@@ -73,6 +74,18 @@ class OnionRelayService private constructor(
      * fragments (sent unpaced and unvalidated), so client tests can play a lying or broken relay. `null` = normal.
      */
     @Volatile internal var lookupAnswerOverrideForTest: ((RelayAction.DeliverLookupRequest) -> List<ByteArray>?)? = null
+
+    /** Test seam (wave Q16, never set in production): replaces the whole answer to a batch lookup, like the one above. */
+    @Volatile internal var lookupBatchAnswerOverrideForTest: (
+        (
+            RelayAction.DeliverLookupBatch,
+        ) -> List<ByteArray>?
+    )? = null
+
+    /** Test seam (wave Q16): the relay behaves like version 0.13.0 and does not know LOOKUP version 2. */
+    internal fun simulateLookupV1OnlyForTest(v1Only: Boolean) {
+        relay.lookupV1OnlyForTest = v1Only
+    }
 
     /** Test seam: the relay state machine behaves like a relay without the LOOKUP role (see `OnionRelay.legacyNoLookup`). */
     internal fun simulateLegacyRelayForTest(legacy: Boolean) {
@@ -167,6 +180,7 @@ class OnionRelayService private constructor(
                 is RelayAction.DeliverDirectoryPublish -> deliverDirectoryPublish(action)
                 is RelayAction.DeliverMailboxItem -> deliverMailboxItem(action)
                 is RelayAction.DeliverLookupRequest -> deliverLookup(action)
+                is RelayAction.DeliverLookupBatch -> deliverLookupBatch(action)
                 is RelayAction.CircuitClosed -> Unit
             }
         }
@@ -264,6 +278,22 @@ class OnionRelayService private constructor(
             // the state machine accepted the request although no sink exists: answer as a disabled role
             LookupResponseBody
                 .encodeAnswer(action.requestId, LookupStatus.DISABLED, ByteArray(0), random)
+                .forEach { replyLookupFragment(action.circuitHandle, it) }
+        }
+    }
+
+    private fun deliverLookupBatch(action: RelayAction.DeliverLookupBatch) {
+        val override = lookupBatchAnswerOverrideForTest?.invoke(action)
+        if (override != null) {
+            override.forEach { replyLookupFragment(action.circuitHandle, it) }
+            return
+        }
+        val service = lookupService
+        if (service != null) {
+            service.onBatch(action)
+        } else {
+            LookupBatchResponseBody
+                .encodeBatch(action.requestId, action.keys.map { LookupStatus.DISABLED to ByteArray(0) }, random)
                 .forEach { replyLookupFragment(action.circuitHandle, it) }
         }
     }
